@@ -76,14 +76,30 @@ find_cc_pid() {
 
 CC_PID=$(find_cc_pid 2>/dev/null || true)
 
-# --- Best-effort cleanup of stale cc-instance files. ---
-# Any cc-instance.<pid> whose pid is dead is left over from a previous CC
-# run and can be removed safely.
+# --- Cleanup of stale cc-instance files and their orphan watchers. ---
+# A cc-instance.<pid> whose CC pid is dead is left over from a previous CC.
+# Before removing it, kill the watcher bound to its last session_id — that
+# watcher would otherwise linger if the CC crashed without propagating
+# signals (force-quit, OOM, etc.). Only kills watchers we have explicit
+# evidence for (dead CC → known last session_id), so a manually-invoked
+# Monitor whose CC is alive but never wrote a cc-instance is left alone.
 for f in "$RUN_DIR"/cc-instance.*; do
   [ -f "$f" ] || continue
   pid=${f##*.}
   case "$pid" in ''|*[!0-9]*) continue ;; esac
-  kill -0 "$pid" 2>/dev/null || rm -f "$f"
+  kill -0 "$pid" 2>/dev/null && continue
+  dead_sid=$(cat "$f" 2>/dev/null || true)
+  if [ -n "$dead_sid" ]; then
+    orphan_pidfile="$RUN_DIR/watch.$dead_sid.pid"
+    if [ -f "$orphan_pidfile" ]; then
+      orphan_pid=$(cat "$orphan_pidfile" 2>/dev/null || true)
+      if [ -n "$orphan_pid" ] && kill -0 "$orphan_pid" 2>/dev/null; then
+        kill "$orphan_pid" 2>/dev/null || true
+      fi
+      rm -f "$orphan_pidfile"
+    fi
+  fi
+  rm -f "$f"
 done
 
 # Same defensive pass for stale watcher pidfiles. A pidfile whose recorded
@@ -99,6 +115,7 @@ for f in "$RUN_DIR"/watch.*.pid; do
   fi
   kill -0 "$pid" 2>/dev/null || rm -f "$f"
 done
+
 
 # --- Dedup against the previous watcher in this CC instance. ---
 if [ -n "$CC_PID" ]; then

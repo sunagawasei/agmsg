@@ -408,7 +408,7 @@ JSON
   [ ! -f "$TEST_SKILL_DIR/run/watch.empty-pid.pid" ]
 }
 
-@test "session-start.sh leaves alive watcher pidfiles alone" {
+@test "session-start.sh leaves alive watcher pidfiles alone (when bound to a live CC instance)" {
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
@@ -418,6 +418,8 @@ JSON
   sleep 30 &
   local alive_pid=$!
   echo "$alive_pid" > "$TEST_SKILL_DIR/run/watch.live-session.pid"
+  # Bind this watcher to a live CC instance (use $$ as a stand-in).
+  echo "live-session" > "$TEST_SKILL_DIR/run/cc-instance.$$"
   echo '{"session_id":"x"}' | bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" >/dev/null
   [ -f "$TEST_SKILL_DIR/run/watch.live-session.pid" ]
   kill "$alive_pid" 2>/dev/null || true
@@ -512,4 +514,40 @@ JSON
 JSON
   run bash "$SCRIPTS/watch.sh" t-sid "$TEST_PROJECT" claude-code nobody
   [[ "$output" =~ "no registration for agent 'nobody'" ]]
+}
+
+# --- session-start.sh orphan watcher cleanup ---
+
+@test "session-start.sh kills orphan watchers whose owning CC instance is gone" {
+  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
+  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
+{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
+JSON
+  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  # Orphan: watcher referenced by a cc-instance.<dead-pid> file.
+  sleep 30 &
+  local orphan_pid=$!
+  echo "$orphan_pid" > "$TEST_SKILL_DIR/run/watch.orphan-sid.pid"
+  # Use a PID that's almost certainly not in use as the dead CC ancestor.
+  local dead_cc_pid=999999
+  echo "orphan-sid" > "$TEST_SKILL_DIR/run/cc-instance.$dead_cc_pid"
+
+  # Untracked watcher: no cc-instance points to it. Conservative semantics
+  # leave it alone (we have no evidence the CC is dead).
+  sleep 30 &
+  local untracked_pid=$!
+  echo "$untracked_pid" > "$TEST_SKILL_DIR/run/watch.untracked-sid.pid"
+
+  echo "{\"session_id\":\"current-sid\"}" \
+    | bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" >/dev/null
+
+  ! kill -0 "$orphan_pid" 2>/dev/null
+  [ ! -f "$TEST_SKILL_DIR/run/watch.orphan-sid.pid" ]
+  [ ! -f "$TEST_SKILL_DIR/run/cc-instance.$dead_cc_pid" ]
+  # Untracked watcher untouched
+  kill -0 "$untracked_pid" 2>/dev/null
+  [ -f "$TEST_SKILL_DIR/run/watch.untracked-sid.pid" ]
+  kill "$untracked_pid" 2>/dev/null || true
 }

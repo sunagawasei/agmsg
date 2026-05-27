@@ -85,6 +85,14 @@ Four possible outputs:
 
 **Only use scripts in `~/.agents/skills/__SKILL_NAME__/scripts/` — do not read or modify files under `teams/` or `db/` directly.**
 
+**Ensure monitor is running first.** Before processing any subcommand below, check whether this session already has an `agmsg inbox stream` Monitor task in its TaskList. If not, and the project's delivery mode is `monitor` or `both` (check via `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh status claude-code "$(pwd)"`), invoke the Monitor tool now:
+
+- command: `~/.agents/skills/__SKILL_NAME__/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code`
+- description: `agmsg inbox stream`
+- persistent: true
+
+Then continue with the user's subcommand. This catches the case where the user invokes `/__SKILL_NAME__` as the first prompt before the SessionStart-hook directive has been acted on.
+
 **If no arguments provided (DEFAULT action — always do this when the command is invoked without arguments):**
 1. **IMMEDIATELY** run inbox check for each TEAM: `~/.agents/skills/__SKILL_NAME__/scripts/inbox.sh $TEAM $AGENT`
 2. Do NOT ask the user what to do — just run the inbox check.
