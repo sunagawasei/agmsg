@@ -98,8 +98,19 @@ Same project, same agent type, different role — for example a `tech-lead` iden
 Mechanics:
 
 - `actas <name>` is **exclusive**: switches both sending and receiving to `<name>`. The skill joins the role under your current team if needed, then TaskStops the running `agmsg inbox stream` Monitor and relaunches one filtered to `<name>` only (via `watch.sh`'s optional 4th argument). Messages addressed to other roles stop reaching the session until you `actas` again or end the session.
-- `drop <name>` removes only that role's registration for this project (via `reset.sh`). If the role is no longer registered anywhere, it's also dropped from the team config. If `<name>` was the currently-active role, the watcher is restarted in default mode (all your registered roles).
+- `drop <name>` removes only that role's registration for this project (via `reset.sh`). If the role is no longer registered anywhere, it's also dropped from the team config. If `<name>` was the currently-active role, the watcher is restarted in default mode (all roles registered for this project at relaunch time).
 - Switching is session-scoped state held by the agent. `/clear` or a new session resets back to the multiple-identities picker.
+
+#### Subscription model
+
+agmsg follows a **one CC session = one active role** model. Each watcher subscribes to a *static* set of identities decided at launch:
+
+- **Without `actas`**: the watcher subscribes to whichever `(team, agent)` pairs were registered for this `(project, agent_type)` at the moment `watch.sh` started. The set is *not* re-resolved later. A role joined mid-session via `actas` from another CC does *not* start arriving in CCs that were launched before it.
+- **After `actas <name>`**: the watcher is relaunched filtered to `<name>` only. Other registered roles stop arriving in this CC even if they pre-existed.
+
+This is intentional: it keeps each CC bound to one role's inbox, so a `tech-lead` window stays clear of `biz-analyst` traffic and vice versa — even when both roles are registered under the same project. To pick up a role added after a CC launched (without switching to it exclusively), restart the CC or `/clear` so SessionStart re-launches `watch.sh` with the fresh identity list.
+
+The send side mirrors this: every `send.sh` call from this CC uses the active role as the `from` agent, whether that's the implicit one (default) or the one set by the most recent `actas`.
 
 ### Reusing the same identity across projects
 
