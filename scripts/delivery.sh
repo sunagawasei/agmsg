@@ -74,11 +74,18 @@ strip_agmsg_event_file() {
   local event="$2"
   local sql_path
   sql_path=$(sql_readfile_path "$path")
-  local tmp
+  local tmp tmp_sql
   tmp=$(mktemp "${TMPDIR:-/tmp}/agmsg.XXXXXX")
+  tmp_sql=$(sql_readfile_path "$tmp")
+  # Write the result with writefile() rather than redirecting sqlite3's CLI
+  # output. On strict sqlite3 builds (>= 3.50, shipped on Windows) the CLI
+  # renders control bytes — e.g. a CR that rode in on a CRLF settings file —
+  # using caret notation ("^M"), corrupting the JSON so the next read fails
+  # with "malformed JSON" (#143/#138, same root cause as #102). writefile()
+  # emits the bytes verbatim. See also strip's readfile() (#95).
   if ! sqlite3 :memory: "
     WITH src AS (SELECT readfile('$sql_path') AS j)
-    SELECT CASE
+    SELECT writefile('$tmp_sql', coalesce(CASE
       WHEN json_extract(src.j, '\$.hooks.$event') IS NULL THEN
         src.j
       WHEN (SELECT count(*) FROM json_each(json_extract(src.j, '\$.hooks.$event')) AS s
@@ -96,9 +103,9 @@ strip_agmsg_event_file() {
              WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
            ))
         )
-    END
+    END, ''))
     FROM src;
-  " > "$tmp"; then
+  " >/dev/null; then
     rm -f "$tmp"
     return 1
   fi
@@ -140,15 +147,18 @@ add_event_entry_file() {
   local entry_esc
   entry_esc=$(printf '%s' "$entry" | sed "s/'/''/g")
 
-  local tmp
+  local tmp tmp_sql
   tmp=$(mktemp "${TMPDIR:-/tmp}/agmsg.XXXXXX")
+  tmp_sql=$(sql_readfile_path "$tmp")
+  # writefile() instead of CLI redirect — see strip_agmsg_event_file for why
+  # (strict sqlite3 caret-escapes control bytes in CLI output, #143/#102).
   if ! sqlite3 :memory: "
     WITH base AS (
       SELECT CASE WHEN json_extract(readfile('$sql_path'), '\$.hooks') IS NULL
                   THEN json_set(readfile('$sql_path'), '\$.hooks', json('{}'))
                   ELSE readfile('$sql_path') END AS s
     )
-    SELECT CASE
+    SELECT writefile('$tmp_sql', CASE
       WHEN json_extract(s, '\$.hooks.$event') IS NULL THEN
         json_set(s, '\$.hooks.$event', json_array(json('$entry_esc')))
       ELSE
@@ -159,9 +169,9 @@ add_event_entry_file() {
              SELECT '$entry_esc'
            ) v)
         )
-    END
+    END)
     FROM base;
-  " > "$tmp"; then
+  " >/dev/null; then
     rm -f "$tmp"
     return 1
   fi
@@ -175,18 +185,20 @@ prune_empty_hooks_file() {
   local path="$1"
   local sql_path
   sql_path=$(sql_readfile_path "$path")
-  local tmp
+  local tmp tmp_sql
   tmp=$(mktemp "${TMPDIR:-/tmp}/agmsg.XXXXXX")
+  tmp_sql=$(sql_readfile_path "$tmp")
+  # writefile() instead of CLI redirect — see strip_agmsg_event_file (#143/#102).
   if ! sqlite3 :memory: "
     WITH src AS (SELECT readfile('$sql_path') AS j)
-    SELECT CASE
+    SELECT writefile('$tmp_sql', coalesce(CASE
       WHEN json_extract(src.j, '\$.hooks') IS NULL THEN src.j
       WHEN (SELECT count(*) FROM json_each(json_extract(src.j, '\$.hooks'))) = 0 THEN
         json_remove(src.j, '\$.hooks')
       ELSE src.j
-    END
+    END, ''))
     FROM src;
-  " > "$tmp"; then
+  " >/dev/null; then
     rm -f "$tmp"
     return 1
   fi
