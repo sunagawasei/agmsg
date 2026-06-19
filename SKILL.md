@@ -125,6 +125,14 @@ Do NOT manually edit config files. Always use join.sh.
 #   --ready-timeout N    seconds to wait for readiness (default 90; on timeout
 #                        prints status=timeout and exits 3). Codex skips the
 #                        wait (it has no Monitor).
+#   --headless           (codex only) run a no-terminal bridge worker instead of
+#                        a TUI — codex talks over the bus with no window, cwd is a
+#                        neutral scratch under run/, sandboxed to read anywhere but
+#                        write only agmsg's db/teams/run. --project selects the
+#                        team/subscription, not codex's cwd. Tear down with despawn.
+#   --interactive        (codex only; alias --no-headless) force the TUI even when
+#                        config spawn.codex_headless=true makes codex headless by
+#                        default. Set that key to run every codex spawn headless.
 ~/.agents/skills/agmsg/scripts/spawn.sh <claude-code|codex> <name> [options]
 
 # Tear down a spawned member — the inverse of spawn.

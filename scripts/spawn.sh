@@ -36,6 +36,15 @@ set -euo pipefail
 #                      as the agent is launched (fire-and-forget)
 #   --ready-timeout N  seconds to wait for readiness before giving up
 #                      (default 90; on timeout, prints status=timeout, exit 3)
+#   --headless         (codex only) run a no-terminal bridge worker instead of
+#                      opening a TUI — codex talks over the agmsg bus with no
+#                      window. Its cwd is a neutral scratch dir under run/ and it
+#                      is sandboxed to read anywhere but write only agmsg's
+#                      db/teams/run. --project here selects the team/subscription,
+#                      not codex's working dir. Tear down with `despawn`.
+#   --interactive      (codex only; alias --no-headless) force the TUI even when
+#                      config spawn.codex_headless=true makes codex default to
+#                      headless. Set that key to run every codex spawn headless.
 #
 # Readiness: by default spawn blocks until the new agent's watcher attaches and
 # is receiving (it prints `status=ready ...`), so a leader can safely send work
@@ -80,6 +89,8 @@ SPLIT="h"            # h | v
 TERMINAL_TMPL=""     # --terminal override (resolved below if empty)
 WAIT_READY=1         # block until the spawned agent's watcher attaches
 READY_TIMEOUT=90     # seconds to wait for readiness before giving up
+HEADLESS=0           # codex only: run a no-terminal bridge worker (resolved value)
+HEADLESS_SET=0       # whether an explicit --headless/--interactive flag was given
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -90,12 +101,28 @@ while [ $# -gt 0 ]; do
     --terminal) TERMINAL_TMPL="${2:?--terminal needs a template}"; shift 2 ;;
     --no-wait) WAIT_READY=0; shift ;;
     --ready-timeout) READY_TIMEOUT="${2:?--ready-timeout needs seconds}"; shift 2 ;;
+    --headless)                  HEADLESS=1; HEADLESS_SET=1; shift ;;
+    --interactive|--no-headless) HEADLESS=0; HEADLESS_SET=1; shift ;;
     *) die "unknown option: $1" ;;
   esac
 done
 
 case "$SPLIT" in h|v) ;; *) die "--split must be 'h' or 'v'" ;; esac
 case "$READY_TIMEOUT" in ''|*[!0-9]*) die "--ready-timeout must be a whole number of seconds" ;; esac
+
+# Resolve the headless default for codex from config when no explicit flag was
+# given. Headless runs codex as a no-terminal bridge worker (see launch_headless
+# below) instead of opening a TUI — useful as a persistent reviewer that talks
+# over the agmsg bus. The config key keeps the upstream default (TUI) unchanged.
+#   precedence: --headless / --interactive  >  config spawn.codex_headless  >  TUI
+if [ "$HEADLESS_SET" = 0 ] && [ "$AGENT_TYPE" = "codex" ]; then
+  case "$("$SCRIPT_DIR/config.sh" get spawn.codex_headless false 2>/dev/null || true)" in
+    true|1|yes|on) HEADLESS=1 ;;
+  esac
+fi
+if [ "$HEADLESS" = 1 ] && [ "$AGENT_TYPE" != "codex" ]; then
+  die "--headless is only supported for codex (claude-code needs an interactive Monitor)"
+fi
 
 # Resolve the terminal override for the non-tmux path:
 #   --terminal  >  $AGMSG_TERMINAL  >  config spawn.terminal
@@ -187,6 +214,61 @@ case "$STATE" in
   other:*)
     die "actas '$NAME' in team '$TEAM' is held by a live session (${STATE#other:}); drop it there first" ;;
 esac
+
+# --- Headless codex: launch a no-terminal bridge worker and exit ----------------
+# Defined before the dispatch below because bash executes top-to-bottom; calling
+# a function before its definition is reached would be a "command not found".
+#
+# The worker is a codex-bridge.js process driving its own stdio app-server. Its
+# working dir is a neutral scratch dir under run/, NOT the user's repo: codex's
+# workspace-write sandbox always permits writing the cwd, and writable_roots is
+# additive (it cannot revoke cwd write), so using the repo as cwd would let codex
+# write the repo even with writable_roots scoped to agmsg. scratch + writable_roots
+# limited to agmsg's db/teams/run = codex can read anywhere but write only agmsg.
+# approval_policy=never because a headless worker cannot answer approval prompts.
+launch_headless() {
+  local run_dir="$SKILL_DIR/run"
+  local scratch="$run_dir/codex-$TEAM-cwd"
+  mkdir -p "$scratch"
+  # Register codex on the team (pin the path; opt out of #92 rewrite) so the
+  # bridge has a subscription — otherwise it loops on "no available subscription".
+  AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$TEAM" "$NAME" codex "$scratch" >/dev/null
+  # Refuse to start a second bridge for the same (team,name) — two bridges on one
+  # identity produce duplicate replies. The bridge writes its own pidfile, but it
+  # can remove that file during its own cleanup while still running, so fall back
+  # to scanning for a live codex-bridge.js bound to this team+name.
+  local pidfile="$run_dir/codex-bridge.$TEAM.$NAME.pid"
+  local running=""
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+    running="$(cat "$pidfile" 2>/dev/null)"
+  else
+    running="$(pgrep -f "codex-bridge\.js .*--team $TEAM --name $NAME --inline-inbox" 2>/dev/null | head -1 || true)"
+  fi
+  if [ -n "$running" ]; then
+    echo "spawn: headless codex '$NAME' already running in '$TEAM' (pid $running)"
+    return 0
+  fi
+  local wr="[\"$SKILL_DIR/db\",\"$SKILL_DIR/teams\",\"$run_dir\"]"
+  local appcmd="codex app-server --listen stdio:// -c sandbox_mode=workspace-write -c sandbox_workspace_write.writable_roots='$wr' -c web_search=live -c approval_policy=never"
+  local bridge="${AGMSG_CODEX_BRIDGE_CMD:-$SCRIPT_DIR/codex-bridge.js}"
+  local log="$run_dir/codex-bridge.$TEAM.$NAME.log"
+  AGMSG_CODEX_APP_SERVER_CMD="$appcmd" nohup "$bridge" \
+    --project "$scratch" --type codex --team "$TEAM" --name "$NAME" --inline-inbox \
+    >> "$log" 2>&1 &
+  local bpid=$!
+  # Record placement as pid:<n> so despawn tears it down by pid (not a tmux id).
+  # The project field is the scratch dir so despawn --force's reset.sh drops the
+  # registration we actually created above.
+  printf '%s\t%s\t%s\n' "pid:$bpid" "$scratch" "codex" \
+    > "$(agmsg_spawn_path "$TEAM" "$NAME")" 2>/dev/null || true
+  echo "spawned headless codex '$NAME' in team '$TEAM' (pid $bpid)"
+  echo "  log: $log"
+}
+
+if [ "$HEADLESS" = 1 ]; then
+  launch_headless
+  exit 0
+fi
 
 # --- Pre-join so the child's actas just claims (no interactive team prompt) ---
 # PROJECT here is the explicit spawn target (--project / $PWD), which may not be

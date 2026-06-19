@@ -50,18 +50,53 @@ case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout must be a whole number of seconds
 
 SPAWN_REC="$(agmsg_spawn_path "$TEAM" "$NAME")"
 
-# Kill the recorded tmux target. ids are self-describing: %N pane, @N window.
+# Headless codex workers (recorded as pid:<n>) have no watcher to answer a
+# ctrl:despawn — the graceful path's free-lock branch would just drop the record
+# and leave the bridge running. Promote to the force path so we actually stop it.
+if [ "$FORCE" != "1" ] && [ -f "$SPAWN_REC" ]; then
+  IFS=$'\t' read -r _hid _ _ < "$SPAWN_REC"
+  case "$_hid" in pid:*) FORCE=1 ;; esac
+fi
+
+# Stop a headless codex bridge worker (placement recorded as pid:<n>) safely.
+# Guard against PID reuse: if the bridge's meta records a different pid, the
+# recorded pid is stale — skip rather than kill an unrelated process. SIGTERM
+# first (the bridge stops its client and kills its stdio app-server child), then
+# fall back to SIGKILL if it doesn't exit.
+kill_headless_pid() {
+  local pid="$1" team="$2" name="$3" meta meta_pid n=0
+  meta="$SKILL_DIR/run/codex-bridge.$team.$name.meta"
+  [ -f "$meta" ] && meta_pid="$(sed -n 's/^pid=//p' "$meta" 2>/dev/null)"
+  if [ -n "${meta_pid:-}" ] && [ "$meta_pid" != "$pid" ]; then
+    echo "despawn: recorded pid $pid != bridge meta pid $meta_pid for $team/$name — skipping kill (stale record?)" >&2
+    return 0
+  fi
+  kill -0 "$pid" 2>/dev/null || return 0
+  kill "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 5 ]; do sleep 1; n=$((n + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+    echo "despawn: bridge pid $pid did not exit on SIGTERM — sent SIGKILL" >&2
+  fi
+}
+
+# Kill the recorded placement. ids are self-describing: %N pane, @N window,
+# pid:<n> headless bridge worker.
 kill_recorded_placement() {
   [ -f "$SPAWN_REC" ] || return 1
   local id _proj _type
   IFS=$'\t' read -r id _proj _type < "$SPAWN_REC"
   [ -n "$id" ] || return 1
-  if command -v tmux >/dev/null 2>&1; then
-    case "$id" in
-      %*) tmux kill-pane   -t "$id" 2>/dev/null || true ;;
-      @*) tmux kill-window -t "$id" 2>/dev/null || true ;;
-    esac
-  fi
+  case "$id" in
+    pid:*) kill_headless_pid "${id#pid:}" "$TEAM" "$NAME" ;;
+    %*|@*)
+      if command -v tmux >/dev/null 2>&1; then
+        case "$id" in
+          %*) tmux kill-pane   -t "$id" 2>/dev/null || true ;;
+          @*) tmux kill-window -t "$id" 2>/dev/null || true ;;
+        esac
+      fi ;;
+  esac
   printf '%s\t%s\t%s' "$id" "$_proj" "$_type"   # echo back for the caller
 }
 

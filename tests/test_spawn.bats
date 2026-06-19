@@ -251,3 +251,76 @@ teardown() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"skipping readiness wait"* ]]
 }
+
+# --- headless codex (config-driven default) ---
+
+# A fake codex-bridge that records its args AND the injected app-server command,
+# so headless tests can assert the sandbox policy without launching real codex.
+_make_fake_bridge() {
+  cat > "$STUB_BIN/fake-bridge.sh" <<EOF
+#!/usr/bin/env bash
+printf 'ARGS: %s\n' "\$*" >> "$CAPTURE"
+printf 'APPCMD: %s\n' "\${AGMSG_CODEX_APP_SERVER_CMD:-}" >> "$CAPTURE"
+exit 0
+EOF
+  chmod +x "$STUB_BIN/fake-bridge.sh"
+}
+
+@test "spawn: --headless is rejected for claude-code" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --headless
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "only supported for codex" ]]
+}
+
+@test "spawn: codex defaults to headless when spawn.codex_headless=true" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_headless true
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless codex 'reviewer'"* ]]
+
+  # The bridge runs in the background (nohup &); wait for its capture to land.
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"--type codex"* ]]
+  [[ "$output" == *"--team myteam"* ]]
+  [[ "$output" == *"--name reviewer"* ]]
+  [[ "$output" == *"--inline-inbox"* ]]
+  [[ "$output" == *"codex-myteam-cwd"* ]]                # --project = scratch cwd
+  [[ "$output" == *"sandbox_mode=workspace-write"* ]]    # app-server policy injected
+  [[ "$output" == *"approval_policy=never"* ]]
+  [[ "$output" == *"web_search=live"* ]]
+  [[ "$output" == *"writable_roots="* ]]
+
+  # reviewer was registered to the scratch dir, not the real project.
+  run cat "$TEST_SKILL_DIR/teams/myteam/config.json"
+  [[ "$output" == *"codex-myteam-cwd"* ]]
+}
+
+@test "spawn: codex --interactive forces the TUI even when headless is the default" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_headless true
+  run bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --interactive
+  [ "$status" -eq 0 ]
+  # TUI path: the {cmd} terminal template (record.sh) captured a boot script path.
+  boot="$(cat "$CAPTURE")"
+  [ -f "$boot" ]
+  run cat "$boot"
+  [[ "$output" == *"codex"* ]]
+  [[ "$output" == *"actas"* ]]
+  [[ "$output" == *"reviewer"* ]]
+}
+
+@test "spawn: codex --headless works without the config key (explicit opt-in)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless codex 'reviewer'"* ]]
+}

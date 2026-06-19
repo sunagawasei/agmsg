@@ -110,3 +110,36 @@ teardown() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"no-live-lock"* ]]
 }
+
+# --- headless codex worker (pid:<n> placement) ---
+
+@test "despawn: headless codex (pid: placement) is force-torn-down on a graceful call" {
+  bash "$SCRIPTS/join.sh" team rev codex "$PROJ" >/dev/null
+  # Stand-in for the bridge worker.
+  sleep 300 &
+  local dummy=$!
+  printf 'pid:%s\t%s\t%s\n' "$dummy" "$PROJ" codex > "$RUN/spawn.team__rev"
+  printf 'pid=%s\nteam=team\nname=rev\ntype=codex\n' "$dummy" > "$RUN/codex-bridge.team.rev.meta"
+
+  run bash "$SCRIPTS/despawn.sh" team leader rev    # graceful → auto-promotes to force
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"status=forced"* ]]
+  ! kill -0 "$dummy" 2>/dev/null                    # bridge stand-in was killed
+  [ ! -f "$RUN/spawn.team__rev" ]                   # placement record cleaned
+  kill "$dummy" 2>/dev/null || true; wait "$dummy" 2>/dev/null || true
+}
+
+@test "despawn: skips kill when recorded pid disagrees with bridge meta (PID-reuse guard)" {
+  bash "$SCRIPTS/join.sh" team rev codex "$PROJ" >/dev/null
+  sleep 300 &
+  local dummy=$!
+  printf 'pid:%s\t%s\t%s\n' "$dummy" "$PROJ" codex > "$RUN/spawn.team__rev"
+  # meta records a different pid → the recorded pid is treated as stale.
+  printf 'pid=%s\nteam=team\nname=rev\ntype=codex\n' 999999 > "$RUN/codex-bridge.team.rev.meta"
+
+  run bash "$SCRIPTS/despawn.sh" team leader rev
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skipping kill"* ]]
+  kill -0 "$dummy" 2>/dev/null                       # NOT killed
+  kill "$dummy" 2>/dev/null || true; wait "$dummy" 2>/dev/null || true
+}
