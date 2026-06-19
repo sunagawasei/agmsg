@@ -93,10 +93,25 @@ If argument is "history":
 If argument is "team":
 1. For each TEAM, run: `~/.agents/skills/__SKILL_NAME__/scripts/team.sh $TEAM`
 
+**send vs ask.** `send` is one-way (notifications, acks, fire-and-forget,
+control) and returns immediately. `ask` is request/reply: it sends, then BLOCKS
+until <to_agent> replies back to you, and prints the reply. Use `ask` when you
+need an answer before continuing; use `send` when you do not expect a reply.
+
 If argument starts with "send" (e.g. "send misaki check the server"):
 1. Parse target agent and message from the arguments
 2. Determine which team the target agent belongs to, then run:
    `~/.agents/skills/__SKILL_NAME__/scripts/send.sh $TEAM $AGENT <to_agent> "<message>"`
+
+If argument starts with "ask" (e.g. "ask misaki does the server look healthy?"):
+1. Parse target agent and message from the arguments.
+2. Determine which team the target agent belongs to, then run:
+   `~/.agents/skills/__SKILL_NAME__/scripts/send.sh $TEAM $AGENT <to_agent> "<message>" --wait [--timeout <sec>] [--interval <sec>]`
+   (equivalently `dispatch.sh ... ask <to_agent> "<message>"`).
+3. It blocks until <to_agent> replies, then prints `status=reply` + the reply
+   line; on timeout it prints `status=timeout` and exits 2. Defaults:
+   `--timeout 300 --interval 2`. It is id-scoped (waits for a reply newer than
+   this send), needs no inbox draining, and does not mark anything read.
 
 If argument is "config":
 1. Run: `~/.agents/skills/__SKILL_NAME__/scripts/config.sh show`

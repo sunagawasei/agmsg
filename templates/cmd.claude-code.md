@@ -123,10 +123,41 @@ If argument is "history":
 If argument is "team":
 1. For each TEAM, run: `~/.agents/skills/__SKILL_NAME__/scripts/team.sh $TEAM`
 
+**send vs ask — pick by whether you expect a reply.** Use `ask` for any message
+where you want an answer back (questions, requests, consultations, code-review
+asks). Use `send` for one-way traffic (notifications, acknowledgements,
+fire-and-forget, control). The difference is busy-keep: `ask` blocks until the
+reply lands so the session keeps "running"; `send` returns immediately.
+
 If argument starts with "send" (e.g. "send misaki check the server"):
 1. Parse target agent and message from the arguments
 2. Determine which team the target agent belongs to, then run:
    `~/.agents/skills/__SKILL_NAME__/scripts/send.sh $TEAM $AGENT <to_agent> "<message>"`
+3. This returns immediately — use it only when you do NOT expect a reply. If you
+   are awaiting an answer, use `ask` instead so the turn stays active.
+
+If argument starts with "ask" (e.g. "ask misaki does the server look healthy?"):
+This is the request/reply sibling of `send` — it sends, then BLOCKS in the
+foreground until <to_agent> replies to you, holding the assistant turn (and the
+terminal's "running" indicator) open the whole time. This is the busy-keep path:
+prefer it whenever you expect an answer so the session does not go idle while waiting.
+1. Parse target agent and message from the arguments.
+2. Determine which team the target agent belongs to, then run:
+   `~/.agents/skills/__SKILL_NAME__/scripts/send.sh $TEAM $AGENT <to_agent> "<message>" --wait --timeout 540`
+   (equivalently `dispatch.sh ... ask <to_agent> "<message>"`).
+3. On success it prints `status=reply` + the reply line. Read it and continue
+   **in the same turn**: to keep the exchange unbroken, fire the next `ask`
+   without emitting a final response (a final text response ends the turn and the
+   terminal goes idle).
+4. A Bash tool call caps at 10 minutes, so keep `--timeout` under that (≈540s) and
+   loop `ask` calls within the turn for longer waits. On timeout it prints
+   `status=timeout` and exits 2 — re-run to keep waiting, or stop and yield.
+5. `ask`/`--wait` is id-scoped (it waits for a reply newer than this send), so it
+   needs no inbox draining and coexists with monitor delivery. A monitor watcher
+   also delivers the same reply as a later duplicate event — the `ask` output is
+   authoritative; ignore the duplicate. Do not fire parallel `ask`s on the same
+   from/to pair: with no conversation id yet, concurrent asks can't be correlated
+   and the first reply satisfies whichever was waiting.
 
 If argument starts with "actas" followed by an agent name (e.g. "actas alice"):
 1. Parse the new role name.

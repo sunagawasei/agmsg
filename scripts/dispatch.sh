@@ -24,6 +24,7 @@ usage: agmsg [--team <team>] [--agent <agent>] [command ...]
 commands:
   inbox
   send <to> <message>
+  ask <to> <message> [--timeout <sec>] [--interval <sec>]
   history [agent] [limit]
   team [team]
   config [show|set ...]
@@ -174,6 +175,72 @@ case "$COMMAND" in
     shift
     body="$*"
     run_script send.sh "$(first_team "$RESOLVED_TEAM")" "$RESOLVED_AGENT" "$to" "$body"
+    ;;
+
+  # ask is send's request/reply sibling: it sends, then blocks until <to> replies
+  # back to us (send.sh --wait). send stays one-way (notifications, acks, control
+  # fan-out) — keeping the default-wait out of the send primitive so spawn /
+  # dispatch / despawn never block on a reply that isn't coming.
+  #
+  # Option parsing must not corrupt the request body. We recognize --timeout /
+  # --interval only as TRAILING option pairs (peeled from the end), so a flag
+  # that appears inside the message — "set --timeout 5 in the config" — survives
+  # verbatim. An explicit `--` is the escape hatch: tokens before it (after <to>)
+  # are leading options, everything after it is the literal body, so a body that
+  # itself ends with flag-looking tokens can still be sent. Indices are bounded,
+  # so this stays bash 3.2 safe (no empty-array "$@" expansion under set -u).
+  ask)
+    require_args "agmsg ask <to> <message> [--timeout <sec>] [--interval <sec>]" 2 "$@"
+    resolve_identity 1 1
+    to="$1"
+    shift
+    timeout_opt=""
+    interval_opt=""
+    body=""
+
+    has_ddash=0
+    for a in "$@"; do
+      [ "$a" = "--" ] && { has_ddash=1; break; }
+    done
+
+    if [ "$has_ddash" -eq 1 ]; then
+      # Leading options up to `--`; the remainder is the literal body.
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --timeout)  timeout_opt="${2:?--timeout needs seconds}"; shift 2 ;;
+          --interval) interval_opt="${2:?--interval needs seconds}"; shift 2 ;;
+          --) shift; break ;;
+          *) echo "usage: agmsg ask <to> [--timeout <sec>] [--interval <sec>] -- <message>" >&2; exit 2 ;;
+        esac
+      done
+      body="$*"
+    else
+      # No delimiter: peel recognized option pairs from the END only.
+      ask_args=("$@")
+      n=${#ask_args[@]}
+      while [ "$n" -ge 2 ]; do
+        case "${ask_args[$((n-2))]}" in
+          --timeout)  timeout_opt="${ask_args[$((n-1))]}"; n=$((n-2)) ;;
+          --interval) interval_opt="${ask_args[$((n-1))]}"; n=$((n-2)) ;;
+          *) break ;;
+        esac
+      done
+      i=0
+      while [ "$i" -lt "$n" ]; do
+        body="${body:+$body }${ask_args[$i]}"
+        i=$((i+1))
+      done
+    fi
+
+    if [ -z "$body" ]; then
+      echo "usage: agmsg ask <to> <message> [--timeout <sec>] [--interval <sec>]" >&2
+      exit 2
+    fi
+
+    set -- send.sh "$(first_team "$RESOLVED_TEAM")" "$RESOLVED_AGENT" "$to" "$body" --wait
+    [ -n "$timeout_opt" ] && set -- "$@" --timeout "$timeout_opt"
+    [ -n "$interval_opt" ] && set -- "$@" --interval "$interval_opt"
+    run_script "$@"
     ;;
 
   history)

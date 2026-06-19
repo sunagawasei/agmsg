@@ -56,8 +56,18 @@ Do NOT manually edit config files. Always use join.sh.
 # Check inbox (marks messages as read) — DEFAULT action
 ~/.agents/skills/agmsg/scripts/inbox.sh <team> <agent_id>
 
-# Send a message
+# Send a message (one-way: notifications, acks, fire-and-forget, control). Returns immediately.
 ~/.agents/skills/agmsg/scripts/send.sh <team> <from_agent> <to_agent> "<message>"
+
+# Ask and wait for a reply (request/reply). BLOCKS until <to_agent> replies, then
+# prints it. Use for questions/requests/consultations where you expect an answer —
+# on Claude Code this holds the turn open so the terminal stays "running" while
+# waiting. Defaults: --timeout 300 --interval 2.
+~/.agents/skills/agmsg/scripts/send.sh <team> <from_agent> <to_agent> "<message>" --wait [--timeout <sec>] [--interval <sec>]
+# High-level verb (same thing via the dispatcher / `agmsg` CLI): `send` = one-way,
+# `ask` = request/reply (= send + --wait). Trailing --timeout/--interval are options;
+# a flag inside the message is kept verbatim, and `--` forces the rest to be body.
+~/.agents/skills/agmsg/scripts/dispatch.sh --team <team> --agent <from_agent> -- ask <to_agent> "<message>" [--timeout <sec>] [--interval <sec>]
 
 # Message history
 ~/.agents/skills/agmsg/scripts/history.sh <team> [agent_id] [limit]
