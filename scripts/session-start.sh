@@ -340,6 +340,31 @@ if agmsg_session_team_enabled; then
   done < <(pgrep -af "codex-bridge\.js .*--team s-.* --name codex" 2>/dev/null || true)
 fi
 
+# --- Stale session-team GC (session-team mode). ---
+# Session teams accumulate one dir per session. Reap teams/s-<uuid> whose owner
+# session is no longer alive AND whose dir has been untouched past the TTL
+# (delivery.session_team_ttl_days, default 7). A resume re-joins and bumps the
+# mtime, so active/recent sessions are safe, and the liveness check guards
+# in-flight ones. Scratch cwd, pidfiles, placement and logs go too. Messages are
+# deliberately KEPT — rows keyed on the team stay queryable as history and are
+# governed by a separate retention policy, not this hygiene pass.
+if agmsg_session_team_enabled; then
+  _ttl="$("$SCRIPT_DIR/config.sh" get delivery.session_team_ttl_days 7 2>/dev/null || echo 7)"
+  case "$_ttl" in ''|*[!0-9]*) _ttl=7 ;; esac
+  for _d in "$SKILL_DIR"/teams/s-*/; do
+    [ -d "$_d" ] || continue
+    _tn="$(basename "$_d")"                                       # s-<uuid>
+    agmsg_instance_alive "${_tn#s-}" 2>/dev/null && continue      # owner alive → keep
+    # `find -mtime` exits 0 whether or not the dir matches, so gate on its
+    # OUTPUT (non-empty == older than the TTL), not its exit code.
+    [ -n "$(find "$_d" -maxdepth 0 -mtime +"$_ttl" 2>/dev/null)" ] || continue  # too recent → keep
+    rm -rf "$_d" 2>/dev/null || true
+    rm -rf "$SKILL_DIR/run/codex-$_tn-cwd" 2>/dev/null || true
+    rm -f "$SKILL_DIR/run/codex-bridge.$_tn".* 2>/dev/null || true
+    rm -f "$SKILL_DIR/run/spawn.$_tn"__* 2>/dev/null || true
+  done
+fi
+
 WATCH="$SKILL_DIR/scripts/watch.sh"
 WATCH_ARGS="$INSTANCE_ID $PROJECT $TYPE"
 if [ -n "$SESSION_TEAM" ]; then

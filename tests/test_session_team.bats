@@ -150,3 +150,21 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   sleep 1
   ! kill -0 "$fake" 2>/dev/null
 }
+
+# --- PR3: stale session-team TTL GC ------------------------------------------
+
+@test "session-start: TTL GC reaps a stale (old + dead-owner) session team, keeps recent" {
+  enable_st
+  # Old + dead owner → reaped.
+  mkdir -p "$TEST_SKILL_DIR/teams/s-OLDGC"
+  echo '{"name":"s-OLDGC","agents":{}}' > "$TEST_SKILL_DIR/teams/s-OLDGC/config.json"
+  touch -t 202501010000 "$TEST_SKILL_DIR/teams/s-OLDGC/config.json" "$TEST_SKILL_DIR/teams/s-OLDGC"
+  # Recent (dead owner but fresh mtime) → kept.
+  mkdir -p "$TEST_SKILL_DIR/teams/s-RECENTGC"
+  echo '{"name":"s-RECENTGC","agents":{}}' > "$TEST_SKILL_DIR/teams/s-RECENTGC/config.json"
+
+  printf '{"session_id":"sess-ttl-self"}' | bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
+
+  [ ! -d "$TEST_SKILL_DIR/teams/s-OLDGC" ]      # old + dead → reaped
+  [ -d "$TEST_SKILL_DIR/teams/s-RECENTGC" ]     # too recent → kept
+}

@@ -142,6 +142,14 @@ delivery:
   turn:
     # Stop hook cooldown, seconds. Legacy alias: hook.check_interval
     check_interval: 60
+  # Opt-in: give each Claude session its OWN team (s-<session-uuid>) instead of
+  # the project-derived team, so concurrent / resumed sessions sharing a
+  # directory are fully isolated (no cross-session codex crosstalk). The session
+  # codex is spawned lazily and torn down on session end. Off by default; enable:
+  #   agmsg config set delivery.session_team true
+  # session_team: false
+  # Days before a dead session's team dir is garbage-collected (default 7):
+  # session_team_ttl_days: 7
 YAML
 }
 
