@@ -114,3 +114,39 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
+
+# --- PR2: SessionEnd teardown + orphan GC ------------------------------------
+
+@test "session-end: tears down this session's codex worker, keeps team/history" {
+  enable_st
+  # Fake a spawned headless codex: a live process + its placement record.
+  sleep 300 & local fake=$!
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-end" > "$TEST_SKILL_DIR/run/spawn.s-sessEND__codex"
+  printf '{"session_id":"sessEND"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
+  sleep 1
+  ! kill -0 "$fake" 2>/dev/null                                  # worker torn down
+  [ ! -f "$TEST_SKILL_DIR/run/spawn.s-sessEND__codex" ]          # placement removed
+}
+
+@test "session-end: no teardown when session-team mode is off" {
+  sleep 30 & local fake=$!
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-off" > "$TEST_SKILL_DIR/run/spawn.s-sessOFF__codex"
+  printf '{"session_id":"sessOFF"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
+  kill -0 "$fake" 2>/dev/null                                    # untouched
+  kill "$fake" 2>/dev/null || true
+}
+
+@test "session-start: orphan-codex GC reaps a bridge whose owner session is dead" {
+  enable_st
+  # Fake a headless codex bridge for a DEAD session (no live cc-instance for it).
+  ( exec -a "node /x/codex-bridge.js --team s-DEADGC --name codex --inline-inbox" sleep 300 ) &
+  local fake=$!
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-gc" > "$TEST_SKILL_DIR/run/spawn.s-DEADGC__codex"
+  # A live (different) session start runs the GC pass.
+  printf '{"session_id":"sess-gc-self"}' | bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
+  sleep 1
+  ! kill -0 "$fake" 2>/dev/null
+}

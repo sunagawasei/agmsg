@@ -322,6 +322,24 @@ if [ -n "$CC_PID" ]; then
   printf '%s\n' "$INSTANCE_ID" > "$STATE"
 fi
 
+# --- Orphan-codex GC (session-team mode). ---
+# A per-session codex whose owning Claude session is gone (SessionEnd did not
+# fire — e.g. the terminal was force-closed) would otherwise linger. Tear down
+# headless codex bridges for s-<uuid> teams whose owner session is no longer
+# alive. Runs AFTER this session's cc-instance is recorded above, so a resuming
+# session's own codex (same uuid → seen alive via upgrade-compat) is never
+# reaped. Best-effort; never blocks the directive below.
+if agmsg_session_team_enabled; then
+  while IFS= read -r _line; do
+    [ -n "$_line" ] || continue
+    _gteam=$(printf '%s' "$_line" | sed -n 's/.*--team \(s-[^ ]*\).*/\1/p')
+    [ -n "$_gteam" ] || continue
+    if ! agmsg_instance_alive "${_gteam#s-}" 2>/dev/null; then
+      "$SCRIPT_DIR/despawn.sh" "$_gteam" claude codex --force >/dev/null 2>&1 || true
+    fi
+  done < <(pgrep -af "codex-bridge\.js .*--team s-.* --name codex" 2>/dev/null || true)
+fi
+
 WATCH="$SKILL_DIR/scripts/watch.sh"
 WATCH_ARGS="$INSTANCE_ID $PROJECT $TYPE"
 if [ -n "$SESSION_TEAM" ]; then

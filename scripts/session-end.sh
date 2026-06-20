@@ -26,6 +26,8 @@ RUN_DIR="$SKILL_DIR/run"
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/session-team.sh"
 
 # Drop project markers (#92) whose agent process has exited. Liveness-based, so
 # a session that persists across /clear keeps its marker until the process dies.
@@ -39,6 +41,19 @@ if [ -n "$INPUT" ]; then
     | head -1)
 fi
 [ -z "$SESSION_ID" ] && exit 0
+
+# session-team mode: tear down THIS session's codex worker so it does not linger
+# after the session ends. We keep the team config and the message history, so a
+# --continue/--resume (same session id => same team) can lazily re-spawn a codex
+# that reads this session's prior log. Only acts if a codex was actually spawned
+# (placement record or a live bridge); best-effort.
+if [ "$TYPE" = "claude-code" ] && agmsg_session_team_enabled; then
+  STEAM="s-${SESSION_ID%%.*}"
+  if [ -f "$(agmsg_spawn_path "$STEAM" codex)" ] \
+     || pgrep -f "codex-bridge\.js .*--team $STEAM --name codex" >/dev/null 2>&1; then
+    "$SCRIPT_DIR/despawn.sh" "$STEAM" claude codex --force >/dev/null 2>&1 || true
+  fi
+fi
 
 # Re-derive the per-process instance id this session's watcher/locks are keyed
 # under (#93). The enclosing agent process is still alive during the hook, so
