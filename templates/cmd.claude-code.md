@@ -133,9 +133,10 @@ reply lands so the session keeps "running"; `send` returns immediately.
 
 If argument starts with "send" (e.g. "send misaki check the server"):
 1. Parse target agent and message from the arguments
-2. Determine which team the target agent belongs to, then run:
+2. If `<to_agent>` is `codex`, first run `~/.agents/skills/__SKILL_NAME__/scripts/ensure-codex.sh "$(pwd)"` (lazily starts this session's codex in session-team mode; no-op otherwise).
+3. Determine which team the target agent belongs to, then run:
    `~/.agents/skills/__SKILL_NAME__/scripts/send.sh $TEAM $AGENT <to_agent> "<message>"`
-3. This returns immediately — use it only when you do NOT expect a reply. If you
+4. This returns immediately — use it only when you do NOT expect a reply. If you
    are awaiting an answer, use `ask` instead so the turn stays active.
 
 If argument starts with "ask" (e.g. "ask misaki does the server look healthy?"):
@@ -144,7 +145,7 @@ foreground until <to_agent> replies to you, holding the assistant turn (and the
 terminal's "running" indicator) open the whole time. This is the busy-keep path:
 prefer it whenever you expect an answer so the session does not go idle while waiting.
 1. Parse target agent and message from the arguments.
-2. Determine which team the target agent belongs to, then run:
+2. If `<to_agent>` is `codex`, first run `~/.agents/skills/__SKILL_NAME__/scripts/ensure-codex.sh "$(pwd)"` (lazily starts this session's codex in session-team mode; no-op otherwise). Then determine which team the target agent belongs to, and run:
    `~/.agents/skills/__SKILL_NAME__/scripts/send.sh $TEAM $AGENT <to_agent> "<message>" --wait --timeout 540`
    (equivalently `dispatch.sh ... ask <to_agent> "<message>"`).
 3. On success it prints `status=reply` + the reply line. Read it and continue

@@ -42,19 +42,6 @@ if [ -n "$INPUT" ]; then
 fi
 [ -z "$SESSION_ID" ] && exit 0
 
-# session-team mode: tear down THIS session's codex worker so it does not linger
-# after the session ends. We keep the team config and the message history, so a
-# --continue/--resume (same session id => same team) can lazily re-spawn a codex
-# that reads this session's prior log. Only acts if a codex was actually spawned
-# (placement record or a live bridge); best-effort.
-if [ "$TYPE" = "claude-code" ] && agmsg_session_team_enabled; then
-  STEAM="s-${SESSION_ID%%.*}"
-  if [ -f "$(agmsg_spawn_path "$STEAM" codex)" ] \
-     || pgrep -f "codex-bridge\.js .*--team $STEAM --name codex" >/dev/null 2>&1; then
-    "$SCRIPT_DIR/despawn.sh" "$STEAM" claude codex --force >/dev/null 2>&1 || true
-  fi
-fi
-
 # Re-derive the per-process instance id this session's watcher/locks are keyed
 # under (#93). The enclosing agent process is still alive during the hook, so
 # agmsg_instance_id normally resolves the same "<sid>.<pid>" that session-start
@@ -64,6 +51,34 @@ fi
 # artifacts); we deliberately do NOT glob-delete "<sid>.*", which would kill a
 # living sibling — those are left to session-start's liveness GC instead.
 INSTANCE_ID="$(agmsg_instance_id "$SESSION_ID" "$TYPE")"
+
+# session-team mode: tear down THIS session's codex worker so it does not linger
+# after the session ends — but ONLY if this is the last live instance of the
+# session. Parallel --continue/--resume processes share the bare-session team
+# s-<uuid> (and its single codex worker); if a sibling is still alive, killing
+# the worker would break its in-flight ask. The team config and message history
+# are kept regardless, so a later resume lazily re-spawns a codex that reads this
+# session's prior log.
+if [ "$TYPE" = "claude-code" ] && agmsg_session_team_enabled; then
+  STEAM="s-${SESSION_ID%%.*}"
+  self_pid=""
+  agmsg_instance_is_composite "$INSTANCE_ID" && self_pid="${INSTANCE_ID##*.}"
+  sibling_alive=0
+  for f in "$RUN_DIR"/cc-instance.*; do
+    [ -f "$f" ] || continue
+    p=${f##*.}
+    case "$p" in ''|*[!0-9]*) continue ;; esac
+    [ -n "$self_pid" ] && [ "$p" = "$self_pid" ] && continue
+    kill -0 "$p" 2>/dev/null || continue
+    s="$(cat "$f" 2>/dev/null || true)"
+    [ "${s%%.*}" = "${SESSION_ID%%.*}" ] && { sibling_alive=1; break; }
+  done
+  if [ "$sibling_alive" -eq 0 ] \
+     && { [ -f "$(agmsg_spawn_path "$STEAM" codex)" ] \
+          || pgrep -f "codex-bridge\.js .*--team $STEAM --name codex" >/dev/null 2>&1; }; then
+    "$SCRIPT_DIR/despawn.sh" "$STEAM" claude codex --force >/dev/null 2>&1 || true
+  fi
+fi
 
 PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
 if [ -f "$PIDFILE" ]; then

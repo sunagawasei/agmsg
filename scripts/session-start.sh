@@ -43,11 +43,31 @@ source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/session-team.sh"
 
-# Session-team mode: this Claude session belongs to its own team s-<uuid>
-# (resolved from the env; empty unless mode is on and CLAUDE_CODE_SESSION_ID is
-# set — so always empty for codex). When set, we set up that team below even if
-# the project has no prior registration.
-SESSION_TEAM="$(agmsg_session_team_name)"
+# Read the hook input JSON (stdin) up-front. The hook's session_id is the
+# authoritative source for the session team, and stdin can be read only once —
+# the codex branch and the claude-code path below both rely on this single read.
+# Fall back to the env, then to a synthetic id outside the hook flow.
+INPUT=$(cat 2>/dev/null || true)
+SESSION_ID=""
+if [ -n "$INPUT" ]; then
+  SESSION_ID=$(printf '%s' "$INPUT" \
+    | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -1)
+fi
+[ -z "$SESSION_ID" ] && SESSION_ID="${CLAUDE_CODE_SESSION_ID:-}"
+
+# Session-team mode: a claude-code session belongs to its own team s-<uuid>,
+# resolved from the REAL session id (stdin/env) only — NOT the synthetic
+# fallback below. So a genuinely absent session_id falls back to the normal
+# project->team resolution instead of fabricating an s-unknown-<pid> team.
+# Gated to claude-code (codex never gets a session team here).
+SESSION_TEAM=""
+[ "$TYPE" = "claude-code" ] && SESSION_TEAM="$(agmsg_session_team_name_from_id "$SESSION_ID")"
+
+# Synthetic fallback for the watcher instance id only (keeps the directive
+# actionable outside the hook flow); deliberately AFTER team resolution so it
+# never feeds the session team.
+[ -z "$SESSION_ID" ] && SESSION_ID="unknown-$$"
 
 # Identity sanity check — no point launching a watcher with an empty pair set,
 # UNLESS session-team mode will create one.
@@ -176,16 +196,7 @@ if [ "$TYPE" = "codex" ]; then
   exit 0
 fi
 
-# Read hook input JSON from stdin. session_id field is sent for SessionStart.
-INPUT=$(cat 2>/dev/null || true)
-SESSION_ID=""
-if [ -n "$INPUT" ]; then
-  SESSION_ID=$(printf '%s' "$INPUT" \
-    | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -1)
-fi
-# Fallback so the instruction is still actionable even outside CC's hook flow.
-[ -z "$SESSION_ID" ] && SESSION_ID="unknown-$$"
+# (INPUT / SESSION_ID were parsed at the top — stdin is read only once.)
 
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 

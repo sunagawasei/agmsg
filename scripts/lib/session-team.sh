@@ -37,15 +37,23 @@ agmsg_session_team_enabled() {
   esac
 }
 
-# Echo the session team name (s-<bare-uuid>) when mode is enabled AND a bare
-# session id is available; empty otherwise. The bare CLAUDE_CODE_SESSION_ID is
-# used deliberately (NOT the "<uuid>.<pid>" instance id): it is preserved across
-# --continue/--resume, so a resumed session keeps the same team instead of
-# splitting per process. A composite token, if ever passed, is reduced to its
-# bare part (UUIDs contain no '.').
-agmsg_session_team_name() {
+# Echo the session team name (s-<bare-uuid>) for an EXPLICIT session id when
+# mode is enabled; empty otherwise. The id's bare part is used deliberately (NOT
+# the "<uuid>.<pid>" instance id): it is preserved across --continue/--resume,
+# so a resumed session keeps the same team instead of splitting per process. A
+# composite token is reduced to its bare part (UUIDs contain no '.').
+#
+# Hooks (session-start/end) pass the authoritative session_id from their stdin
+# hook input here. agmsg_session_team_name (below) is the env-sourced
+# convenience for whoami / ordinary slash-command invocations.
+agmsg_session_team_name_from_id() {
   agmsg_session_team_enabled || { printf ''; return 0; }
-  local sid="${CLAUDE_CODE_SESSION_ID:-}"
+  local sid="$1"
   [ -n "$sid" ] || { printf ''; return 0; }
   printf 's-%s' "${sid%%.*}"
+}
+
+# Convenience: resolve the session team from CLAUDE_CODE_SESSION_ID in the env.
+agmsg_session_team_name() {
+  agmsg_session_team_name_from_id "${CLAUDE_CODE_SESSION_ID:-}"
 }

@@ -129,6 +129,36 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   [ ! -f "$TEST_SKILL_DIR/run/spawn.s-sessEND__codex" ]          # placement removed
 }
 
+@test "session-start: derives the session team from the stdin session_id (env-independent)" {
+  enable_st
+  local out
+  out="$(env -u CLAUDE_CODE_SESSION_ID bash -c 'printf "{\"session_id\":\"sess-STDIN\"}" | bash "'"$SCRIPTS"'/session-start.sh" claude-code "'"$PROJ"'"' 2>/dev/null || true)"
+  [ -d "$TEST_SKILL_DIR/teams/s-sess-STDIN" ]          # team created from stdin id
+  [[ "$out" == *"--team s-sess-STDIN"* ]]              # watcher pinned to it
+}
+
+@test "session-start: a genuinely absent session_id makes NO synthetic session team" {
+  enable_st
+  env -u CLAUDE_CODE_SESSION_ID bash -c 'printf "{}" | bash "'"$SCRIPTS"'/session-start.sh" claude-code "'"$PROJ"'"' >/dev/null 2>&1 || true
+  # No s-unknown-* team fabricated → falls back to normal project->team.
+  run bash -c "ls -d '$TEST_SKILL_DIR'/teams/s-unknown-* 2>/dev/null"
+  [ -z "$output" ]
+}
+
+@test "session-end: keeps the codex worker if a parallel-resume sibling is alive" {
+  enable_st
+  sleep 300 & local fake=$!
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-sib" > "$TEST_SKILL_DIR/run/spawn.s-sessSIB__codex"
+  # A live sibling instance of the SAME bare session (different pid).
+  sleep 300 & local sib=$!
+  printf 'sessSIB.%s\n' "$sib" > "$TEST_SKILL_DIR/run/cc-instance.$sib"
+  printf '{"session_id":"sessSIB"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
+  sleep 1
+  kill -0 "$fake" 2>/dev/null                          # NOT torn down (sibling alive)
+  kill "$fake" "$sib" 2>/dev/null || true
+}
+
 @test "session-end: no teardown when session-team mode is off" {
   sleep 30 & local fake=$!
   mkdir -p "$TEST_SKILL_DIR/run"
