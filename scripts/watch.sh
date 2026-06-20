@@ -30,10 +30,27 @@ set -u
 #   - Writes a pidfile at ~/.agents/agmsg/run/watch.<session_id>.pid and
 #     removes it on EXIT / SIGTERM / SIGINT.
 
-SESSION_ID="${1:?Usage: watch.sh <session_id> <project_path> <agent_type> [active_name]}"
+SESSION_ID="${1:?Usage: watch.sh <session_id> <project_path> <agent_type> [active_name] [--team <team>]}"
 PROJECT_PATH="${2:?Missing project_path}"
 AGENT_TYPE="${3:?Missing agent_type}"
-ACTIVE_NAME="${4:-}"
+shift 3
+
+# [active_name] narrows the subscription to one agent name (actas mode).
+# [--team <team>] pins the subscription to a single team — required by
+# session-team mode, where one project dir is registered into many s-<uuid>
+# teams and identities.sh would otherwise enumerate all of them (cross-session
+# delivery). With the pin, only the current session's team is subscribed.
+ACTIVE_NAME=""
+TEAM_PIN=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --team) TEAM_PIN="${2:?--team needs a value}"; shift 2 ;;
+    *)
+      if [ -z "$ACTIVE_NAME" ]; then ACTIVE_NAME="$1"; shift
+      else echo "watch: unexpected argument: $1" >&2; shift; fi
+      ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -128,6 +145,9 @@ trap 'exit 0' INT TERM HUP
 
 # Resolve subscription set.
 PAIRS="$("$SCRIPT_DIR/identities.sh" "$PROJECT_PATH" "$AGENT_TYPE")"
+if [ -n "$TEAM_PIN" ]; then
+  PAIRS=$(printf '%s\n' "$PAIRS" | awk -v t="$TEAM_PIN" -F'\t' 'NF >= 2 && $1 == t')
+fi
 if [ -n "$ACTIVE_NAME" ]; then
   PAIRS=$(printf '%s\n' "$PAIRS" | awk -v n="$ACTIVE_NAME" -F'\t' 'NF >= 2 && $2 == n')
 fi

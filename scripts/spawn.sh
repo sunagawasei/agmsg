@@ -63,6 +63,8 @@ TEAMS_DIR="$SKILL_DIR/teams"
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/storage.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/session-team.sh"
 
 die() { echo "spawn: $*" >&2; exit 1; }
 
@@ -193,6 +195,15 @@ resolve_team() {
   done
   printf '%s' "$found"
 }
+
+# session-team mode: default the team to this Claude session's own team
+# (s-<uuid>) when --team was not given, so `spawn codex` and ensure-codex.sh
+# land the worker in the current session's team. Empty unless mode is on and
+# CLAUDE_CODE_SESSION_ID is set.
+if [ -z "$TEAM" ]; then
+  _steam="$(agmsg_session_team_name 2>/dev/null || true)"
+  [ -n "$_steam" ] && TEAM="$_steam"
+fi
 
 if [ -z "$TEAM" ]; then
   CANDIDATES="$(resolve_team)"

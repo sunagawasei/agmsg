@@ -87,6 +87,22 @@ source "$SCRIPT_DIR/lib/resolve-project.sh"
 source "$SCRIPT_DIR/lib/storage.sh"
 PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
 
+# Session-team mode: a Claude session's identity is fixed to its own team
+# (s-<bare-session-uuid>), resolved from the environment rather than the
+# project->team registration. This is the single source of truth for "current
+# team" in that mode and sidesteps the multi-team ambiguity a shared project dir
+# would otherwise produce. Only claude-code carries CLAUDE_CODE_SESSION_ID, so
+# this never fires for codex/other types.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/session-team.sh"
+if [ "$AGENT_TYPE" = "claude-code" ]; then
+  _steam="$(agmsg_session_team_name)"
+  if [ -n "$_steam" ]; then
+    echo "agent=claude teams=$_steam type=claude-code project=$PROJECT_PATH"
+    exit 0
+  fi
+fi
+
 if [ ! -d "$TEAMS_DIR" ]; then
   echo "not_joined=true available_teams=none"
   exit 0

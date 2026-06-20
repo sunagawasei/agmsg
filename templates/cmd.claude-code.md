@@ -111,6 +111,8 @@ Then continue with the user's subcommand. This catches the case where the user i
 
 The allowlist merges across scopes and takes effect immediately — no restart needed. (The `BASH_SOURCE`-empty case under the sandbox — the Bash tool runs commands via pipe/eval, so `BASH_SOURCE[0]` is empty inside sourced functions — is handled internally: `watch.sh` resolves `SKILL_DIR` from `$0` and `storage.sh` falls back to it. No user configuration needed.)
 
+**Session-team mode (`delivery.session_team`).** When this config is enabled, your identity is your OWN per-session team `s-$CLAUDE_CODE_SESSION_ID` (agent `claude`). `whoami.sh` already returns it, so `$TEAM`/`$AGENT` resolve to the session team with no extra step, and each Claude session is fully isolated — you never see other sessions' traffic. The session's codex worker is started lazily: **before the first `send`/`ask` to codex, run** `~/.agents/skills/__SKILL_NAME__/scripts/ensure-codex.sh "$(pwd)"`. It brings up a headless codex in your session team (and is a no-op when the mode is off, so it is always safe to run first). On `--continue`/`--resume` the team name is unchanged (same session id), so the re-spawned codex can read this session's prior history with `history.sh s-$CLAUDE_CODE_SESSION_ID`.
+
 **If no arguments provided (DEFAULT action — always do this when the command is invoked without arguments):**
 1. **IMMEDIATELY** run inbox check for each TEAM: `~/.agents/skills/__SKILL_NAME__/scripts/inbox.sh $TEAM $AGENT`
 2. Do NOT ask the user what to do — just run the inbox check.

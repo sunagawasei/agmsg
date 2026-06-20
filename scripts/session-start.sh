@@ -40,10 +40,19 @@ source "$SCRIPT_DIR/lib/node.sh"
 source "$SCRIPT_DIR/lib/hash.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/storage.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/session-team.sh"
 
-# Identity sanity check — no point launching a watcher with an empty pair set.
+# Session-team mode: this Claude session belongs to its own team s-<uuid>
+# (resolved from the env; empty unless mode is on and CLAUDE_CODE_SESSION_ID is
+# set — so always empty for codex). When set, we set up that team below even if
+# the project has no prior registration.
+SESSION_TEAM="$(agmsg_session_team_name)"
+
+# Identity sanity check — no point launching a watcher with an empty pair set,
+# UNLESS session-team mode will create one.
 PAIRS=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null || true)
-[ -n "$PAIRS" ] || exit 0
+if [ -z "$PAIRS" ] && [ -z "$SESSION_TEAM" ]; then exit 0; fi
 
 # Resolve the current Codex thread id. CODEX_THREAD_ID is only exported on the
 # interactive --remote path; fresh and `codex exec` sessions never export it, so
@@ -314,12 +323,21 @@ if [ -n "$CC_PID" ]; then
 fi
 
 WATCH="$SKILL_DIR/scripts/watch.sh"
+WATCH_ARGS="$INSTANCE_ID $PROJECT $TYPE"
+if [ -n "$SESSION_TEAM" ]; then
+  # session-team mode: register this Claude as `claude` in its own per-session
+  # team and pin the watcher to it, so the monitor stream carries only this
+  # session's traffic — no cross-session crosstalk. Idempotent; opt out of #92
+  # pwd-rewrite so the registration pins exactly this project.
+  AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$SESSION_TEAM" claude "$TYPE" "$PROJECT" >/dev/null 2>&1 || true
+  WATCH_ARGS="$INSTANCE_ID $PROJECT $TYPE claude --team $SESSION_TEAM"
+fi
 
 cat <<EOF
 AGMSG monitor mode: invoke the Monitor tool now with the following parameters,
 before any other action in this session.
 
-  command: $WATCH $INSTANCE_ID $PROJECT $TYPE
+  command: $WATCH $WATCH_ARGS
   description: agmsg inbox stream
   persistent: true
 
