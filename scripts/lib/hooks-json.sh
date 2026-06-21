@@ -54,7 +54,7 @@ strip_agmsg_event_file() {
   # miscounted by character-based length()); anything but an exact match fails.
   # Guard contributed in #162 (kevinsj15).
   local wrote
-  wrote=$(sqlite3 :memory: "
+  wrote=$(agmsg_sqlite_mem "
     WITH src AS (SELECT readfile('$sql_path') AS j),
     out AS (SELECT coalesce(CASE
       WHEN json_extract(src.j, '\$.hooks.$event') IS NULL THEN
@@ -132,7 +132,7 @@ add_event_entry_file() {
   # Validate writefile()'s byte count vs the content length — see
   # strip_agmsg_event_file for why the exit code alone is insufficient (#162).
   local wrote
-  wrote=$(sqlite3 :memory: "
+  wrote=$(agmsg_sqlite_mem "
     WITH base AS (
       SELECT CASE WHEN json_extract(readfile('$sql_path'), '\$.hooks') IS NULL
                   THEN json_set(readfile('$sql_path'), '\$.hooks', json('{}'))
@@ -170,7 +170,7 @@ prune_empty_hooks_file() {
   # Validate writefile()'s byte count vs the content length — see
   # strip_agmsg_event_file for why the exit code alone is insufficient (#162).
   local wrote
-  wrote=$(sqlite3 :memory: "
+  wrote=$(agmsg_sqlite_mem "
     WITH src AS (SELECT readfile('$sql_path') AS j),
     out AS (SELECT coalesce(CASE
       WHEN json_extract(src.j, '\$.hooks') IS NULL THEN src.j

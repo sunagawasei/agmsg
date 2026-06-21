@@ -41,6 +41,10 @@ RUN_DIR="$SKILL_DIR/run"
 . "$SCRIPT_DIR/lib/node.sh"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/type-registry.sh"
+# storage.sh provides agmsg_sqlite_mem (CR-safe sqlite, #180); hooks-json.sh's
+# primitives use it, so source storage first.
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/storage.sh"
 # JSON/SQLite hook-file primitives (sourced after SKILL_NAME is set above —
 # strip/add reference it to detect agmsg-owned entries).
 # shellcheck disable=SC1091
@@ -352,13 +356,13 @@ do_status() {
       if [ -f "$hf" ]; then
         local sql_hf
         sql_hf=$(sql_readfile_path "$hf")
-        has_ss=$(sqlite3 :memory: "
+        has_ss=$(agmsg_sqlite_mem "
           SELECT EXISTS(
             SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.SessionStart')) AS s,
               json_each(json_extract(s.value, '\$.hooks')) AS h
             WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
           );" 2>/dev/null || echo 0)
-        has_st=$(sqlite3 :memory: "
+        has_st=$(agmsg_sqlite_mem "
           SELECT EXISTS(
             SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.Stop')) AS s,
               json_each(json_extract(s.value, '\$.hooks')) AS h
@@ -383,14 +387,14 @@ do_status() {
       sql_hooks_file=$(sql_readfile_path "$hooks_file")
       # readfile() rather than interpolating the file contents into argv —
       # for large settings (#95) the latter hits MAX_ARG_STRLEN on Linux.
-      count=$(sqlite3 :memory: "SELECT json_array_length(json_extract(readfile('$sql_hooks_file'), '\$.hooks.SessionStart'));" 2>/dev/null || echo 0)
+      count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hooks_file'), '\$.hooks.SessionStart'));" 2>/dev/null || echo 0)
       case "$count" in ''|*[!0-9]*) count=0 ;; esac
       echo "settings hooks file: $hooks_file"
       echo "  SessionStart entries: $count"
-      count=$(sqlite3 :memory: "SELECT json_array_length(json_extract(readfile('$sql_hooks_file'), '\$.hooks.SessionEnd'));" 2>/dev/null || echo 0)
+      count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hooks_file'), '\$.hooks.SessionEnd'));" 2>/dev/null || echo 0)
       case "$count" in ''|*[!0-9]*) count=0 ;; esac
       echo "  SessionEnd entries:   $count"
-      count=$(sqlite3 :memory: "SELECT json_array_length(json_extract(readfile('$sql_hooks_file'), '\$.hooks.Stop'));" 2>/dev/null || echo 0)
+      count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hooks_file'), '\$.hooks.Stop'));" 2>/dev/null || echo 0)
       case "$count" in ''|*[!0-9]*) count=0 ;; esac
       echo "  Stop entries:         $count"
     fi

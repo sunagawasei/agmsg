@@ -36,6 +36,10 @@ source "$SCRIPT_DIR/lib/actas-lock.sh"
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/node.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/hash.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/storage.sh"
 
 # Identity sanity check — no point launching a watcher with an empty pair set.
 PAIRS=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null || true)
@@ -68,10 +72,10 @@ agmsg_resolve_codex_thread() {
       first=$(head -1 "$f" 2>/dev/null)
       case "$first" in *'"session_meta"'*) ;; *) continue ;; esac
       esc=$(printf '%s' "$first" | sed "s/'/''/g")
-      cwd=$(sqlite3 ":memory:" "SELECT COALESCE(json_extract('$esc','\$.payload.cwd'),'')" 2>/dev/null)
+      cwd=$(agmsg_sqlite_mem "SELECT COALESCE(json_extract('$esc','\$.payload.cwd'),'')" 2>/dev/null)
       cwd_phys=$(agmsg_canonical_path "$cwd")
       [ "$cwd_phys" = "$project_phys" ] || continue
-      tid=$(sqlite3 ":memory:" "SELECT COALESCE(json_extract('$esc','\$.payload.id'),'')" 2>/dev/null)
+      tid=$(agmsg_sqlite_mem "SELECT COALESCE(json_extract('$esc','\$.payload.id'),'')" 2>/dev/null)
       if [ -n "$tid" ]; then
         printf '%s' "$tid"
         return 0
@@ -107,7 +111,7 @@ if [ "$TYPE" = "codex" ]; then
     fi
   fi
   if [ -z "$app_server" ]; then
-    project_hash=$(printf '%s' "$PROJECT" | shasum | awk '{print $1}')
+    project_hash=$(printf '%s' "$PROJECT" | agmsg_sha1)
     socket_path="$RUN_DIR/codex-app-server.$project_hash.sock"
     if [ -S "$socket_path" ] || [ "${AGMSG_TEST_ASSUME_CODEX_SOCKET:-}" = "$socket_path" ]; then
       app_server="unix://$socket_path"
@@ -122,7 +126,7 @@ if [ "$TYPE" = "codex" ]; then
   [ -n "$team" ] && [ -n "$name" ] || exit 0
 
   if [ "${AGMSG_CODEX_BRIDGE_LAUNCHER:-}" = "1" ]; then
-    project_hash=$(printf '%s' "$PROJECT" | shasum | awk '{print $1}')
+    project_hash=$(printf '%s' "$PROJECT" | agmsg_sha1)
     request_file="$RUN_DIR/codex-bridge-request.$project_hash"
     tmp_request="$request_file.$$"
     mkdir -p "$RUN_DIR" 2>/dev/null || true

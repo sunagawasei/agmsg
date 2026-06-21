@@ -13,6 +13,12 @@ const SKILL_DIR = path.resolve(SCRIPT_DIR, "..", "..");    // skill root
 const SCRIPTS_DIR = path.join(SKILL_DIR, "scripts");       // top-level scripts (siblings live here)
 const RUN_DIR = path.join(SKILL_DIR, "run");
 
+// Git Bash on Windows cannot exec a .sh path directly — spawnSync of the script
+// fails with EFTYPE. Invoke the helper scripts through bash on every platform.
+// bash is always present in agmsg's runtime (the bridge is launched from a bash
+// context); honour the same overrides delivery.sh's windows_wrap uses.
+const BASH_BIN = process.env.GIT_BASH || process.env.AGMSG_BASH || "bash";
+
 function usage() {
   console.log(`Usage: codex-bridge.js --project <path> [--type codex] [--team <team>] [--name <agent>]
 
@@ -117,7 +123,7 @@ function parseArgs(argv) {
 }
 
 function runScript(script, args) {
-  const result = spawnSync(path.join(SCRIPTS_DIR, script), args, {
+  const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, script), ...args], {
     cwd: SKILL_DIR,
     encoding: "utf8",
   });
@@ -832,7 +838,7 @@ class CodexBridge {
   }
 
   readInboxForPrompt() {
-    const result = spawnSync(path.join(SCRIPTS_DIR, "inbox.sh"), [this.identity.team, this.identity.name], {
+    const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, "inbox.sh"), this.identity.team, this.identity.name], {
       cwd: this.opts.project,
       encoding: "utf8",
     });
