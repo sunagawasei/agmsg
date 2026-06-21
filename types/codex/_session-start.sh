@@ -115,7 +115,7 @@ agmsg_session_start() {
   if [ -n "${AGMSG_CODEX_BRIDGE_CMD:-}" ]; then
     bridge_run=("$AGMSG_CODEX_BRIDGE_CMD")
   else
-    bridge_run=("$(agmsg_resolve_node)" "$SCRIPT_DIR/codex/codex-bridge.js")
+    bridge_run=("$(agmsg_resolve_node)" "$SKILL_DIR/types/codex/codex-bridge.js")
   fi
   nohup "${bridge_run[@]}" \
     --project "$PROJECT" \

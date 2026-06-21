@@ -272,7 +272,7 @@ Codex supports `mode monitor` as a **beta** app-server bridge, plus `mode turn` 
 
 > ⚠️ **The monitor beta changes how Codex starts — opt in only if you understand it.** Codex has no Monitor tool, so `mode monitor` installs a shim at `~/.agents/bin/codex` and asks you to put `~/.agents/bin` **first on your PATH**, so `codex` then resolves to the shim instead of the real binary. In monitor-mode projects the shim routes interactive launches through a bridge that turns incoming agmsg messages into turns on the current Codex thread; `codex exec` and non-monitor projects pass straight through to the real Codex. It depends on experimental Codex app-server behavior and has known rough edges (orphans on TUI close — #149; one identity per project — #150).
 
-If the shim can't be installed, launch with `~/.agents/skills/<cmd>/scripts/codex/codex-monitor.sh`. Codex sandboxing must allow writes to the skill's `db/`, `teams/`, and `run/` dirs — `install.sh` configures those `writable_roots` when `~/.codex/config.toml` exists. Setup, PATH notes, and internals: [docs/codex-monitor-beta.md](docs/codex-monitor-beta.md).
+If the shim can't be installed, launch with `~/.agents/skills/<cmd>/types/codex/codex-monitor.sh`. Codex sandboxing must allow writes to the skill's `db/`, `teams/`, and `run/` dirs — `install.sh` configures those `writable_roots` when `~/.codex/config.toml` exists. Setup, PATH notes, and internals: [docs/codex-monitor-beta.md](docs/codex-monitor-beta.md).
 
 ### GitHub Copilot CLI
 

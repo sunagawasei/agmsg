@@ -8,7 +8,7 @@
 # Args (both hooks): on_enable <mode> <type> <project>; on_disable <type> <project>.
 
 agmsg_delivery_on_enable() {
-  if AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$SKILL_DIR/scripts/codex/codex-shim-install.sh" install; then
+  if AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$SKILL_DIR/types/codex/codex-shim-install.sh" install; then
     echo "Codex monitor shim installed at ~/.agents/bin/codex."
     case ":$PATH:" in
       *":$HOME/.agents/bin:"*)
@@ -24,7 +24,7 @@ agmsg_delivery_on_enable() {
     esac
   else
     echo "Codex monitor mode is enabled, but the codex shim was not installed."
-    echo "Future Codex sessions: launch with $SKILL_DIR/scripts/codex/codex-monitor.sh, or resolve the shim install issue above."
+    echo "Future Codex sessions: launch with $SKILL_DIR/types/codex/codex-monitor.sh, or resolve the shim install issue above."
   fi
   # Node preflight: the bridge (codex-bridge.js) is a Node program, so without
   # Node it silently never starts — flag it at enable time. Resolve via the same
@@ -50,6 +50,6 @@ agmsg_delivery_on_disable() {
   fi
   echo "Note: the codex shim (~/.agents/bin/codex) is shared across projects, so it was left in place."
   echo "  If no other project uses monitor mode, remove it and restore your PATH:"
-  echo "    $SKILL_DIR/scripts/codex/codex-shim-install.sh remove"
+  echo "    $SKILL_DIR/types/codex/codex-shim-install.sh remove"
   echo "    # then drop ~/.agents/bin from PATH if you added it for monitor"
 }

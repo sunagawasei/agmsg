@@ -47,13 +47,13 @@ case "$INTERVAL" in ''|*[!0-9]*) echo "watch-once: --interval must be a whole nu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-source "$SCRIPT_DIR/../lib/storage.sh"
+source "$SCRIPT_DIR/../../scripts/lib/storage.sh"
 # shellcheck disable=SC1091
-source "$SCRIPT_DIR/../lib/actas-lock.sh"
+source "$SCRIPT_DIR/../../scripts/lib/actas-lock.sh"
 # shellcheck disable=SC1091
-source "$SCRIPT_DIR/../lib/resolve-project.sh"
+source "$SCRIPT_DIR/../../scripts/lib/resolve-project.sh"
 # shellcheck disable=SC1091
-source "$SCRIPT_DIR/../lib/subscription.sh"
+source "$SCRIPT_DIR/../../scripts/lib/subscription.sh"
 
 PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
 DB="$(agmsg_db_path)"

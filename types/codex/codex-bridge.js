@@ -8,9 +8,9 @@ const net = require("net");
 const path = require("path");
 const readline = require("readline");
 
-const SCRIPT_DIR = __dirname;                              // .../scripts/codex
+const SCRIPT_DIR = __dirname;                              // .../types/codex (codex siblings live here)
 const SKILL_DIR = path.resolve(SCRIPT_DIR, "..", "..");    // skill root
-const SCRIPTS_DIR = path.join(SKILL_DIR, "scripts");       // top-level scripts (siblings live here)
+const SCRIPTS_DIR = path.join(SKILL_DIR, "scripts");       // type-independent engine scripts (identities/inbox/send)
 const RUN_DIR = path.join(SKILL_DIR, "run");
 
 // Git Bash on Windows cannot exec a .sh path directly — spawnSync of the script

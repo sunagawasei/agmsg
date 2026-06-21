@@ -106,7 +106,7 @@ first_non_option() {
 is_monitor_project() {
   local project="$1"
   local status
-  status="$("$SCRIPT_DIR/../delivery.sh" status codex "$project" 2>/dev/null || true)"
+  status="$("$SCRIPT_DIR/../../scripts/delivery.sh" status codex "$project" 2>/dev/null || true)"
   printf '%s\n' "$status" | grep -qx "mode: monitor"
 }
 

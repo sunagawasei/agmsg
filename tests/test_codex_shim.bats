@@ -38,7 +38,7 @@ teardown() {
 @test "codex shim: monitor project routes resume through codex-monitor" {
   bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
 
-  run bash -c 'cd "$TEST_PROJECT" && AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" bash "$SCRIPTS/codex/codex-shim.sh" resume --last'
+  run bash -c 'cd "$TEST_PROJECT" && AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" bash "$TYPES/codex/codex-shim.sh" resume --last'
 
   [ "$status" -eq 0 ]
   grep -q "monitor real=$FAKE_CODEX <--project> <$TEST_PROJECT> <--codex-command> <resume> <--> <--last>" "$CALL_LOG"
@@ -47,7 +47,7 @@ teardown() {
 @test "codex shim: monitor project routes prompt launches through top-level codex" {
   bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
 
-  run bash -c 'cd "$TEST_PROJECT" && AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" bash "$SCRIPTS/codex/codex-shim.sh" "fix this"'
+  run bash -c 'cd "$TEST_PROJECT" && AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" bash "$TYPES/codex/codex-shim.sh" "fix this"'
 
   [ "$status" -eq 0 ]
   grep -q "monitor real=$FAKE_CODEX <--project> <$TEST_PROJECT> <--codex-command> <codex> <--> <fix this>" "$CALL_LOG"
@@ -57,7 +57,7 @@ teardown() {
   bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT" >/dev/null
 
   AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" \
-    run bash "$SCRIPTS/codex/codex-shim.sh" resume --last
+    run bash "$TYPES/codex/codex-shim.sh" resume --last
 
   [ "$status" -eq 0 ]
   grep -q "real-codex <resume> <--last>" "$CALL_LOG"
@@ -68,7 +68,7 @@ teardown() {
   bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
 
   AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" \
-    run bash "$SCRIPTS/codex/codex-shim.sh" exec echo hi
+    run bash "$TYPES/codex/codex-shim.sh" exec echo hi
 
   [ "$status" -eq 0 ]
   grep -q "real-codex <exec> <echo> <hi>" "$CALL_LOG"
@@ -79,7 +79,7 @@ teardown() {
   bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
 
   AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" \
-    run bash "$SCRIPTS/codex/codex-shim.sh" --cd "$TEST_PROJECT" resume
+    run bash "$TYPES/codex/codex-shim.sh" --cd "$TEST_PROJECT" resume
 
   [ "$status" -eq 0 ]
   grep -q "monitor real=$FAKE_CODEX <--project> <$TEST_PROJECT> <--codex-command> <resume> <--> <--cd> <$TEST_PROJECT>" "$CALL_LOG"
