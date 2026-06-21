@@ -10,10 +10,12 @@ setup() {
   # a terminal. PATH is prepended so the stubs win.
   export STUB_BIN="$TEST_SKILL_DIR/stub-bin"
   mkdir -p "$STUB_BIN"
-  for bin in claude codex; do
-    printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/$bin"
-    chmod +x "$STUB_BIN/$bin"
-  done
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/claude"
+  # codex stub: `codex sandbox ...` is the reviewer enforcement probe — exit
+  # non-zero to simulate the probed repo write being DENIED (profile enforced).
+  # Tests that want to simulate a fail-open build override this per-test.
+  printf '#!/usr/bin/env bash\n[ "$1" = sandbox ] && exit 1\nexit 0\n' > "$STUB_BIN/codex"
+  chmod +x "$STUB_BIN/claude" "$STUB_BIN/codex"
   export CAPTURE="$TEST_SKILL_DIR/launch-capture.txt"
   cat > "$STUB_BIN/record.sh" <<EOF
 #!/usr/bin/env bash
@@ -323,4 +325,72 @@ EOF
     bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless
   [ "$status" -eq 0 ]
   [[ "$output" == *"spawned headless codex 'reviewer'"* ]]
+}
+
+@test "spawn: codex --reviewer launches in the repo under the read-only profile" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless reviewer codex 'rv'"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"--name rv"* ]]
+  [[ "$output" == *"--project $PROJ"* ]]                  # cwd = the real repo
+  [[ "$output" != *"codex-myteam-cwd"* ]]                 # NOT the scratch dir
+  [[ "$output" == *"default_permissions=agmsg-reviewer"* ]]
+  [[ "$output" == *"permissions.agmsg-reviewer.filesystem="* ]]
+  [[ "$output" == *":workspace_roots"* ]]
+  [[ "$output" != *"sandbox_mode=workspace-write"* ]]     # profile supersedes sandbox_mode
+  [[ "$output" == *"web_search=live"* ]]
+  [[ "$output" == *"approval_policy=never"* ]]
+
+  # registered to the real project, not a scratch dir.
+  run cat "$TEST_SKILL_DIR/teams/myteam/config.json"
+  [[ "$output" != *"codex-myteam-cwd"* ]]
+}
+
+@test "spawn: codex defaults to reviewer when spawn.codex_reviewer=true" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_headless true
+  bash "$SCRIPTS/config.sh" set spawn.codex_reviewer true
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless reviewer codex 'rv'"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"default_permissions=agmsg-reviewer"* ]]
+  [[ "$output" != *"sandbox_mode=workspace-write"* ]]
+}
+
+@test "spawn: --reviewer on an interactive codex spawn is rejected" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --interactive --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"requires headless"* ]]
+}
+
+@test "spawn: --reviewer refuses to launch when the sandbox is not enforced (fail closed)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  # Simulate a codex build that does NOT enforce the profile: the sandbox probe's
+  # repo write succeeds (exit 0), which the guard must treat as fail-open.
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/codex"
+  chmod +x "$STUB_BIN/codex"
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not enforced"* ]]
+  # The bridge must NOT have been launched (no capture written).
+  [ ! -s "$CAPTURE" ]
 }

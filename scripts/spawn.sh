@@ -45,6 +45,13 @@ set -euo pipefail
 #   --interactive      (codex only; alias --no-headless) force the TUI even when
 #                      config spawn.codex_headless=true makes codex default to
 #                      headless. Set that key to run every codex spawn headless.
+#   --reviewer         (headless codex only) cwd = the target repo (so codex can
+#                      autonomously explore it) under a permission profile that
+#                      grants the repo READ-only and confines writes to agmsg's
+#                      own db/teams/run — a persistent repo reviewer that cannot
+#                      modify the repo. --no-reviewer forces it off. Defaults from
+#                      config spawn.codex_reviewer. Without it, headless codex sits
+#                      in a neutral scratch cwd (read-anywhere, write only agmsg).
 #
 # Readiness: by default spawn blocks until the new agent's watcher attaches and
 # is receiving (it prints `status=ready ...`), so a leader can safely send work
@@ -93,6 +100,8 @@ WAIT_READY=1         # block until the spawned agent's watcher attaches
 READY_TIMEOUT=90     # seconds to wait for readiness before giving up
 HEADLESS=0           # codex only: run a no-terminal bridge worker (resolved value)
 HEADLESS_SET=0       # whether an explicit --headless/--interactive flag was given
+REVIEWER=0           # headless codex only: cwd=repo + read-only-repo profile (resolved)
+REVIEWER_SET=0       # whether an explicit --reviewer/--no-reviewer flag was given
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -105,6 +114,8 @@ while [ $# -gt 0 ]; do
     --ready-timeout) READY_TIMEOUT="${2:?--ready-timeout needs seconds}"; shift 2 ;;
     --headless)                  HEADLESS=1; HEADLESS_SET=1; shift ;;
     --interactive|--no-headless) HEADLESS=0; HEADLESS_SET=1; shift ;;
+    --reviewer)                  REVIEWER=1; REVIEWER_SET=1; shift ;;
+    --no-reviewer)               REVIEWER=0; REVIEWER_SET=1; shift ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -124,6 +135,26 @@ if [ "$HEADLESS_SET" = 0 ] && [ "$AGENT_TYPE" = "codex" ]; then
 fi
 if [ "$HEADLESS" = 1 ] && [ "$AGENT_TYPE" != "codex" ]; then
   die "--headless is only supported for codex (claude-code needs an interactive Monitor)"
+fi
+
+# Resolve reviewer mode (headless codex only) from config when no explicit flag
+# was given. Reviewer runs codex with cwd = the target repo and a permission
+# profile that grants the repo READ-only while confining writes to agmsg's own
+# db/teams/run (so replies via send.sh still work). See launch_headless below.
+#   precedence: --reviewer / --no-reviewer  >  config spawn.codex_reviewer  >  off
+if [ "$REVIEWER_SET" = 0 ] && [ "$AGENT_TYPE" = "codex" ]; then
+  case "$("$SCRIPT_DIR/config.sh" get spawn.codex_reviewer false 2>/dev/null || true)" in
+    true|1|yes|on) REVIEWER=1 ;;
+  esac
+fi
+# Reviewer only changes the headless worker's cwd/sandbox; it is meaningless for a
+# TUI spawn (which already launches in the project dir). Error only on an explicit
+# flag; a config opt-in silently does not apply to interactive spawns.
+if [ "$REVIEWER" = 1 ] && [ "$HEADLESS" != 1 ]; then
+  if [ "$REVIEWER_SET" = 1 ]; then
+    die "--reviewer requires headless codex (interactive spawns already run in the project dir)"
+  fi
+  REVIEWER=0
 fi
 
 # Resolve the terminal override for the non-tmux path:
@@ -230,20 +261,69 @@ esac
 # Defined before the dispatch below because bash executes top-to-bottom; calling
 # a function before its definition is reached would be a "command not found".
 #
-# The worker is a codex-bridge.js process driving its own stdio app-server. Its
-# working dir is a neutral scratch dir under run/, NOT the user's repo: codex's
-# workspace-write sandbox always permits writing the cwd, and writable_roots is
-# additive (it cannot revoke cwd write), so using the repo as cwd would let codex
-# write the repo even with writable_roots scoped to agmsg. scratch + writable_roots
-# limited to agmsg's db/teams/run = codex can read anywhere but write only agmsg.
-# approval_policy=never because a headless worker cannot answer approval prompts.
+# The worker is a codex-bridge.js process driving its own stdio app-server.
+# Two sandbox layouts, selected by REVIEWER:
+#
+#   default (consultant) — cwd is a neutral scratch dir under run/, NOT the repo.
+#     codex's workspace-write sandbox always permits writing the cwd and
+#     writable_roots is additive (it cannot revoke cwd write), so using the repo
+#     as cwd would let codex write the repo. scratch + writable_roots scoped to
+#     agmsg = codex can read anywhere but write only agmsg.
+#
+#   reviewer — cwd IS the target repo so codex can autonomously explore it, under
+#     a permission profile (default_permissions) that grants the repo READ-only
+#     and confines writes to agmsg's db/teams/run (replies via send.sh still work).
+#     Reads are scoped to the repo + toolchain dirs + agmsg, so the repo cannot be
+#     modified and unrelated secrets (e.g. ~/.ssh) stay unreadable. Permission
+#     profiles supersede sandbox_mode — the two systems must not be mixed, so this
+#     branch sets no sandbox_mode flag. :tmpdir=write and the toolchain read grants
+#     are required for git/mktemp and tools installed under /nix or /opt/homebrew.
+#
+# approval_policy=never in both because a headless worker cannot answer approvals.
 launch_headless() {
   local run_dir="$SKILL_DIR/run"
-  local scratch="$run_dir/codex-$TEAM-cwd"
-  mkdir -p "$scratch"
+  mkdir -p "$run_dir"   # reviewer mode's cwd is the repo, so nothing else creates run/
+  local bridge="${AGMSG_CODEX_BRIDGE_CMD:-$SCRIPT_DIR/codex-bridge.js}"
+
+  # Resolve the working dir + app-server sandbox for the selected mode.
+  local cwd appcmd
+  if [ "$REVIEWER" = 1 ]; then
+    cwd="$PROJECT"
+    # Read-only repo + tmp/toolchain reads + writes confined to agmsg. The toolchain
+    # roots let codex run git/rg/etc. installed outside the repo; extend this list if
+    # a review needs another global read root (e.g. a language's module cache). The
+    # -c values that contain spaces are single-quoted: the bridge runs the command
+    # via `sh -lc`, which re-parses the string (see codex-bridge.js).
+    local fs="{ \":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"read\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\" }"
+    appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-reviewer -c 'permissions.agmsg-reviewer.filesystem=$fs' -c 'permissions.agmsg-reviewer.network={ enabled=false }' -c web_search=live -c approval_policy=never"
+  else
+    cwd="$run_dir/codex-$TEAM-cwd"
+    mkdir -p "$cwd"
+    local wr="[\"$SKILL_DIR/db\",\"$SKILL_DIR/teams\",\"$run_dir\"]"
+    appcmd="codex app-server --listen stdio:// -c sandbox_mode=workspace-write -c sandbox_workspace_write.writable_roots='$wr' -c web_search=live -c approval_policy=never"
+  fi
+
+  # Fail closed before registering anything: a reviewer runs approval_policy=never,
+  # so if this codex build silently ignores default_permissions (e.g. too old for
+  # permission profiles) it would fall back to workspace-write on the repo cwd and
+  # could MODIFY the repo. Verify enforcement on the real binary — probe a repo
+  # write under the same profile via `codex sandbox`; if it is NOT denied, refuse.
+  # (`codex sandbox` exits 0 only when the probed command succeeded, i.e. the write
+  # went through, i.e. the sandbox is not enforcing — the fail-open case.)
+  if [ "$REVIEWER" = 1 ]; then
+    local probe="$cwd/.agmsg_reviewer_probe"
+    if codex sandbox -P agmsg-reviewer -C "$cwd" \
+         -c "permissions.agmsg-reviewer.filesystem=$fs" \
+         -c 'permissions.agmsg-reviewer.network={ enabled=false }' \
+         -- /bin/sh -c "touch -- \"$probe\"" >/dev/null 2>&1; then
+      rm -f "$probe" 2>/dev/null || true
+      die "reviewer sandbox is not enforced by this codex build (the repo would be writable); refusing to launch. Upgrade codex, or spawn with --no-reviewer for the scratch consultant."
+    fi
+  fi
+
   # Register codex on the team (pin the path; opt out of #92 rewrite) so the
   # bridge has a subscription — otherwise it loops on "no available subscription".
-  AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$TEAM" "$NAME" codex "$scratch" >/dev/null
+  AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$TEAM" "$NAME" codex "$cwd" >/dev/null
   # Refuse to start a second bridge for the same (team,name) — two bridges on one
   # identity produce duplicate replies. The bridge writes its own pidfile, but it
   # can remove that file during its own cleanup while still running, so fall back
@@ -259,20 +339,19 @@ launch_headless() {
     echo "spawn: headless codex '$NAME' already running in '$TEAM' (pid $running)"
     return 0
   fi
-  local wr="[\"$SKILL_DIR/db\",\"$SKILL_DIR/teams\",\"$run_dir\"]"
-  local appcmd="codex app-server --listen stdio:// -c sandbox_mode=workspace-write -c sandbox_workspace_write.writable_roots='$wr' -c web_search=live -c approval_policy=never"
-  local bridge="${AGMSG_CODEX_BRIDGE_CMD:-$SCRIPT_DIR/codex-bridge.js}"
   local log="$run_dir/codex-bridge.$TEAM.$NAME.log"
   AGMSG_CODEX_APP_SERVER_CMD="$appcmd" nohup "$bridge" \
-    --project "$scratch" --type codex --team "$TEAM" --name "$NAME" --inline-inbox \
+    --project "$cwd" --type codex --team "$TEAM" --name "$NAME" --inline-inbox \
     >> "$log" 2>&1 &
   local bpid=$!
   # Record placement as pid:<n> so despawn tears it down by pid (not a tmux id).
-  # The project field is the scratch dir so despawn --force's reset.sh drops the
-  # registration we actually created above.
-  printf '%s\t%s\t%s\n' "pid:$bpid" "$scratch" "codex" \
+  # The project field is the cwd we registered above so despawn --force's reset.sh
+  # drops exactly that registration.
+  printf '%s\t%s\t%s\n' "pid:$bpid" "$cwd" "codex" \
     > "$(agmsg_spawn_path "$TEAM" "$NAME")" 2>/dev/null || true
-  echo "spawned headless codex '$NAME' in team '$TEAM' (pid $bpid)"
+  local kind="headless codex"; [ "$REVIEWER" = 1 ] && kind="headless reviewer codex"
+  echo "spawned $kind '$NAME' in team '$TEAM' (pid $bpid)"
+  [ "$REVIEWER" = 1 ] && echo "  cwd (repo, read-only): $cwd"
   echo "  log: $log"
 }
 
