@@ -394,3 +394,35 @@ EOF
   # The bridge must NOT have been launched (no capture written).
   [ ! -s "$CAPTURE" ]
 }
+
+@test "spawn: refuses when nested inside an outer Seatbelt sandbox (sandbox_apply)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  # Simulate codex running inside an outer macOS Seatbelt sandbox: applying its own
+  # per-command sandbox fails with sandbox-exec's sandbox_apply error. The worker
+  # could read but never run send.sh to reply, so refuse before registering.
+  printf '#!/usr/bin/env bash\n[ "$1" = sandbox ] && { echo "sandbox-exec: sandbox_apply: Operation not permitted" >&2; exit 1; }\nexit 0\n' > "$STUB_BIN/codex"
+  chmod +x "$STUB_BIN/codex"
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"outer macOS Seatbelt sandbox"* ]]
+  # The bridge must NOT have been launched (no capture written).
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: a normal write denial is enforcement, not nesting (no sandbox_apply)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  # The enforcing case: the probed repo write is DENIED and surfaced as touch's own
+  # "Operation not permitted" (NO sandbox_apply). This must launch normally and not
+  # be mistaken for a nested outer sandbox.
+  printf '#!/usr/bin/env bash\n[ "$1" = sandbox ] && { echo "touch: probe: Operation not permitted" >&2; exit 1; }\nexit 0\n' > "$STUB_BIN/codex"
+  chmod +x "$STUB_BIN/codex"
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless reviewer codex 'rv'"* ]]
+}

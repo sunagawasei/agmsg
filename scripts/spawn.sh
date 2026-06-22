@@ -280,6 +280,31 @@ esac
 #     are required for git/mktemp and tools installed under /nix or /opt/homebrew.
 #
 # approval_policy=never in both because a headless worker cannot answer approvals.
+
+# Refuse to start a headless codex from inside an outer macOS Seatbelt sandbox
+# (e.g. Claude Code's bash sandbox, when this script is run by the Bash tool
+# without a top-level excludedCommands rule). codex sandboxes every command it runs
+# via sandbox-exec; a nested sandbox_apply is denied by a restrictive outer profile
+# ("sandbox-exec: sandbox_apply: Operation not permitted"), so the worker could read
+# but never run send.sh to reply — the bridge would just spin on "no available
+# subscription". `codex sandbox -- <cmd>` exercises the exact same path, so it
+# reproduces the failure before we register anything. Only a genuine nesting signal
+# in stderr triggers the refusal; any other failure (old codex, CLI error) is left
+# to the normal launch so we don't block on unrelated breakage.
+preflight_seatbelt_nesting() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  command -v codex >/dev/null 2>&1 || return 0
+  local out
+  out="$(codex sandbox -- /usr/bin/true 2>&1)" && return 0
+  # Match the sandbox_apply failure specifically — NOT a bare "Operation not
+  # permitted", which a normal in-sandbox file-write denial also prints.
+  case "$out" in
+    *sandbox_apply*)
+      die "headless codex can't start inside an outer macOS Seatbelt sandbox: codex can't apply its own sandbox to run send.sh, so it could never reply (got: ${out}). Spawn from an unsandboxed session, add a top-level excludedCommands rule for this script (spawn.sh / ensure-codex.sh), or launch via the SessionStart hook/launcher path." ;;
+  esac
+  return 0
+}
+
 launch_headless() {
   local run_dir="$SKILL_DIR/run"
   mkdir -p "$run_dir"   # reviewer mode's cwd is the repo, so nothing else creates run/
@@ -303,22 +328,35 @@ launch_headless() {
     appcmd="codex app-server --listen stdio:// -c sandbox_mode=workspace-write -c sandbox_workspace_write.writable_roots='$wr' -c web_search=live -c approval_policy=never"
   fi
 
+  # Refuse before registering anything if we're nested inside an outer macOS
+  # Seatbelt sandbox (see preflight_seatbelt_nesting): the bridge and its codex
+  # app-server would inherit it and codex could never run send.sh to reply.
+  preflight_seatbelt_nesting
+
   # Fail closed before registering anything: a reviewer runs approval_policy=never,
   # so if this codex build silently ignores default_permissions (e.g. too old for
   # permission profiles) it would fall back to workspace-write on the repo cwd and
   # could MODIFY the repo. Verify enforcement on the real binary — probe a repo
-  # write under the same profile via `codex sandbox`; if it is NOT denied, refuse.
-  # (`codex sandbox` exits 0 only when the probed command succeeded, i.e. the write
-  # went through, i.e. the sandbox is not enforcing — the fail-open case.)
+  # write under the same profile via `codex sandbox`. Capture stderr so we can tell
+  # three outcomes apart: write succeeded → sandbox not enforcing (fail-open, refuse);
+  # sandbox_apply denied → nested outer sandbox (preflight should have caught it, but
+  # guard here too); write denied → enforcing as intended (proceed).
   if [ "$REVIEWER" = 1 ]; then
-    local probe="$cwd/.agmsg_reviewer_probe"
-    if codex sandbox -P agmsg-reviewer -C "$cwd" \
+    local probe="$cwd/.agmsg_reviewer_probe" probe_out
+    if probe_out="$(codex sandbox -P agmsg-reviewer -C "$cwd" \
          -c "permissions.agmsg-reviewer.filesystem=$fs" \
          -c 'permissions.agmsg-reviewer.network={ enabled=false }' \
-         -- /bin/sh -c "touch -- \"$probe\"" >/dev/null 2>&1; then
+         -- /bin/sh -c "touch -- \"$probe\"" 2>&1)"; then
       rm -f "$probe" 2>/dev/null || true
       die "reviewer sandbox is not enforced by this codex build (the repo would be writable); refusing to launch. Upgrade codex, or spawn with --no-reviewer for the scratch consultant."
     fi
+    # Only sandbox_apply means a nested outer sandbox. A normal write denial here
+    # is the enforcing-as-intended case and prints "touch: ...: Operation not
+    # permitted" (no sandbox_apply) — must NOT be treated as nesting.
+    case "$probe_out" in
+      *sandbox_apply*)
+        die "headless codex can't apply its sandbox — this spawn is running inside an outer macOS Seatbelt sandbox (e.g. Claude Code's bash sandbox). Spawn from an unsandboxed session, add a top-level excludedCommands rule for this script (spawn.sh / ensure-codex.sh), or use the hook/launcher path." ;;
+    esac
   fi
 
   # Register codex on the team (pin the path; opt out of #92 rewrite) so the
