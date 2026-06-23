@@ -156,28 +156,20 @@ write_node_launcher_fixtures() {
 }
 
 @test "type-registry: refactored scripts hardcode no per-type branch" {
-  # join.sh must be fully data-driven. Any other type literal on a non-comment
-  # line is a re-introduced per-type branch.
+  # join.sh and spawn.sh must be fully data-driven. Any other type literal on a
+  # non-comment line is a re-introduced per-type branch. (spawn.sh's local
+  # headless/reviewer codex-worker feature lives in its scripts/drivers/types/codex/
+  # _spawn.sh plug, so the core stays clean — see that plug + the Template Method
+  # dispatch in spawn.sh.)
   #
-  # TWO deliberate fork divergences from upstream's 1.1.0 invariant (both are
-  # local features that are inherently type-specific and predate the restructure):
-  #
-  #   1. spawn.sh — EXEMPT (dropped from the loop). The local headless/reviewer
-  #      codex-worker feature (spawn of `codex app-server --listen stdio://…`
-  #      under a read-only sandbox profile) is inherently codex-specific and
-  #      cannot be expressed through the data-driven type registry without a
-  #      dedicated codex spawn plug. Proper fix: extract that logic into a
-  #      scripts/drivers/types/codex/ plug, then restore spawn.sh to the loop.
-  #
-  #   2. whoami.sh — its session-team block carries a claude-code gate
-  #      (`[ "$AGENT_TYPE" = "claude-code" ]`) + a `type=claude-code` identity
-  #      line, in addition to the default `echo "claude-code"` fallback. The gate
-  #      is NOT removable: a codex spawned from a Claude session INHERITS that
-  #      session's CLAUDE_CODE_SESSION_ID, so without the explicit type gate a
-  #      codex would be mis-resolved as `agent=claude`. These lines are exempted
-  #      below.
+  # whoami.sh is exempted below for ONE deliberate fork divergence: its session-team
+  # block carries a claude-code gate (`[ "$AGENT_TYPE" = "claude-code" ]`) + a
+  # `type=claude-code` identity line, in addition to the default `echo "claude-code"`
+  # fallback. The gate is NOT removable: a codex spawned from a Claude session
+  # INHERITS that session's CLAUDE_CODE_SESSION_ID, so without the explicit type gate
+  # a codex would be mis-resolved as `agent=claude`.
   local types='claude-code|codex|gemini|antigravity|copilot|opencode|hermes'
-  for f in join.sh; do
+  for f in join.sh spawn.sh; do
     run bash -c "sed 's/#.*//' '$SCRIPTS/$f' | grep -nE '$types' || true"
     [ -z "$output" ] || { echo "hardcoded type literal in $f:"; echo "$output"; false; }
   done

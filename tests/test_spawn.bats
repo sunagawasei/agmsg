@@ -272,7 +272,7 @@ EOF
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
   run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --headless
   [ "$status" -ne 0 ]
-  [[ "$output" =~ "only supported for codex" ]]
+  [[ "$output" == *"--headless is not supported"* ]]
 }
 
 @test "spawn: codex defaults to headless when spawn.codex_headless=true" {
@@ -376,7 +376,7 @@ EOF
   bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
   run bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --interactive --reviewer
   [ "$status" -ne 0 ]
-  [[ "$output" == *"requires headless"* ]]
+  [[ "$output" == *"requires --headless"* ]]
 }
 
 @test "spawn: --reviewer refuses to launch when the sandbox is not enforced (fail closed)" {
