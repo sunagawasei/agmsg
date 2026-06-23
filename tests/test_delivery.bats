@@ -382,13 +382,18 @@ has_session_end() {
 
 @test "session-end.sh kills the watcher matching session_id and removes pidfile" {
   mkdir -p "$TEST_SKILL_DIR/run"
-  sleep 30 &
+  # Disguise the fake watcher's argv as watch.sh so the pid-reuse guard (which
+  # only kills a pid whose command line is our watch.sh) actually fires — a bare
+  # `sleep` would be (correctly) skipped, leaving the kill unverified.
+  ( exec -a "bash $SCRIPTS/watch.sh sess-A $TEST_PROJECT claude-code" sleep 30 ) &
   local target_pid=$!
   echo "$target_pid" > "$TEST_SKILL_DIR/run/watch.sess-A.pid"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
-  sleep 1
-  ! kill -0 "$target_pid" 2>/dev/null
+  # Teardown is detached; poll for the pidfile removal (its last watcher step).
+  wait_until 8 bash -c "[ ! -f '$TEST_SKILL_DIR/run/watch.sess-A.pid' ]"
   [ ! -f "$TEST_SKILL_DIR/run/watch.sess-A.pid" ]
+  run kill -0 "$target_pid"; [ "$status" -ne 0 ]   # watcher killed (enforced; bare ! is set-e exempt)
+  kill "$target_pid" 2>/dev/null || true
 }
 
 @test "session-end.sh leaves other sessions' watchers alone" {
@@ -407,6 +412,8 @@ has_session_end() {
   echo "sess-A" > "$TEST_SKILL_DIR/run/cc-instance.12345"
   echo "sess-B" > "$TEST_SKILL_DIR/run/cc-instance.67890"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
+  # Teardown is detached; poll for the matching cc-instance removal.
+  wait_until 8 bash -c "[ ! -f '$TEST_SKILL_DIR/run/cc-instance.12345' ]"
   [ ! -f "$TEST_SKILL_DIR/run/cc-instance.12345" ]
   [ -f "$TEST_SKILL_DIR/run/cc-instance.67890" ]
 }

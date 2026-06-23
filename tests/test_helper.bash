@@ -46,3 +46,20 @@ setup_live_owner() {
   mkdir -p "$run_dir"
   echo "$sid" > "$run_dir/cc-instance.$$"
 }
+
+# Poll a condition until it succeeds or a timeout elapses. The SessionEnd hook
+# now detaches its teardown (session-end-worker.sh) so the effects (codex kill,
+# spawn-record/pidfile/cc-instance removal) land asynchronously, a beat after the
+# hook returns. A fixed `sleep 1` races that under load; this polls instead.
+#
+# Usage: wait_until <timeout_secs> <command...>
+# Returns 0 as soon as <command> exits 0, or non-zero if the timeout elapses.
+wait_until() {
+  local timeout="$1"; shift
+  local deadline=$(( SECONDS + timeout ))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if "$@"; then return 0; fi
+    sleep 0.1
+  done
+  "$@"
+}

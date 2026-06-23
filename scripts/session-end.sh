@@ -5,16 +5,30 @@ set -euo pipefail
 #
 # Usage: session-end.sh <type> <project_path>
 #
-# When Claude Code terminates a session (matchers: clear / resume / logout /
-# prompt_input_exit / bypass_permissions_disabled / other), this script:
-#   1. Reads session_id from the hook input JSON on stdin.
-#   2. Kills the watch.sh process for that session via its pidfile.
-#   3. Removes the matching cc-instance.<cc_pid> file if it still points at
-#      this session_id, so the next SessionStart starts cleanly.
+# Claude Code's SessionEnd hook budget is short (default 1500ms; override with
+# CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS) and SessionEnd BLOCKS process exit
+# while the hook runs. The full teardown (reaping this session's codex worker via
+# SIGTERM + a short wait, DB-backed registration drops, marker/lock GC) routinely
+# overruns that, so CC was force-killing the hook ("Hook cancelled") part-way
+# through — leaving codex bridges and spawn records behind, and stalling the
+# user's exit. So this entry does only the sub-millisecond bookkeeping it must do
+# synchronously, then DETACHES session-end-worker.sh to finish the teardown after
+# we have already returned 0.
 #
-# Cleanup is best-effort: any missing pieces just result in nothing to do.
-# The script always exits 0 — SessionEnd cannot block session termination
-# anyway, and a non-zero exit would only generate noise in logs.
+# Synchronous work kept here (all cheap — no despawn, DB writes, or sleeps):
+#   1. Read session_id from the hook input JSON on stdin.
+#   2. Resolve the per-process instance id (#93) WHILE the enclosing Claude Code
+#      process tree is still alive. This MUST happen here, not in the detached
+#      worker: the worker is reparented to init and can no longer see the agent
+#      pid, so it would fall back to the bare session_id and miss every artifact
+#      keyed under the composite "<sid>.<pid>" (watch pidfile/watermark,
+#      cc-instance, actas locks). The worker is handed the resolved id.
+#   3. Snapshot the session-team codex spawn record so the worker can pass it to
+#      despawn --expect-record and refuse to tear down a worker a fast lazy-
+#      respawn replaced after we fired.
+#
+# Cleanup is best-effort and the script always exits 0 — SessionEnd cannot block
+# termination, and a non-zero exit would only add log noise.
 
 TYPE="${1:?Usage: session-end.sh <type> <project_path>}"
 PROJECT="${2:?Missing project_path}"
@@ -22,17 +36,8 @@ PROJECT="${2:?Missing project_path}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/actas-lock.sh"
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/resolve-project.sh"
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/session-team.sh"
 
-# Drop project markers (#92) whose agent process has exited. Liveness-based, so
-# a session that persists across /clear keeps its marker until the process dies.
-agmsg_marker_gc_stale 2>/dev/null || true
-
+# Read session_id from the hook input JSON on stdin.
 INPUT=$(cat 2>/dev/null || true)
 SESSION_ID=""
 if [ -n "$INPUT" ]; then
@@ -42,77 +47,32 @@ if [ -n "$INPUT" ]; then
 fi
 [ -z "$SESSION_ID" ] && exit 0
 
-# Re-derive the per-process instance id this session's watcher/locks are keyed
-# under (#93). The enclosing agent process is still alive during the hook, so
-# agmsg_instance_id normally resolves the same "<sid>.<pid>" that session-start
-# computed — cleaning ONLY this process's state, never a sibling --continue/
-# --resume process that shares the bare session_id. If the pid can't be
-# resolved we fall back to the bare session_id (and clean only the bare-keyed
-# artifacts); we deliberately do NOT glob-delete "<sid>.*", which would kill a
-# living sibling — those are left to session-start's liveness GC instead.
+# Resolve the instance id in-process (see #93 note above). actas-lock.sh pulls in
+# instance-id.sh; resolve-project.sh provides agmsg_agent_pid. Both are cheap.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/actas-lock.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/resolve-project.sh"
 INSTANCE_ID="$(agmsg_instance_id "$SESSION_ID" "$TYPE")"
 
-# session-team mode: tear down THIS session's codex worker so it does not linger
-# after the session ends — but ONLY if this is the last live instance of the
-# session. Parallel --continue/--resume processes share the bare-session team
-# s-<uuid> (and its single codex worker); if a sibling is still alive, killing
-# the worker would break its in-flight ask. The team config and message history
-# are kept regardless, so a later resume lazily re-spawns a codex that reads this
-# session's prior log.
-if [ "$TYPE" = "claude-code" ] && agmsg_session_team_enabled; then
-  STEAM="s-${SESSION_ID%%.*}"
-  self_pid=""
-  agmsg_instance_is_composite "$INSTANCE_ID" && self_pid="${INSTANCE_ID##*.}"
-  sibling_alive=0
-  for f in "$RUN_DIR"/cc-instance.*; do
-    [ -f "$f" ] || continue
-    p=${f##*.}
-    case "$p" in ''|*[!0-9]*) continue ;; esac
-    [ -n "$self_pid" ] && [ "$p" = "$self_pid" ] && continue
-    kill -0 "$p" 2>/dev/null || continue
-    s="$(cat "$f" 2>/dev/null || true)"
-    [ "${s%%.*}" = "${SESSION_ID%%.*}" ] && { sibling_alive=1; break; }
-  done
-  if [ "$sibling_alive" -eq 0 ] \
-     && { [ -f "$(agmsg_spawn_path "$STEAM" codex)" ] \
-          || pgrep -f "codex-bridge\.js .*--team $STEAM --name codex" >/dev/null 2>&1; }; then
-    "$SCRIPT_DIR/despawn.sh" "$STEAM" claude codex --force >/dev/null 2>&1 || true
-  fi
+# Snapshot the session-team codex spawn record (team s-<uuid>, agent codex — both
+# already filesystem-safe, so agmsg_spawn_path's encoding is the identity here).
+# Empty if there is none.
+STEAM="s-${SESSION_ID%%.*}"
+SNAPSHOT="$(cat "$RUN_DIR/spawn.${STEAM}__codex" 2>/dev/null || true)"
+
+# Detach the cleanup so it survives this hook returning AND CC exiting. Prefer
+# setsid (a clean new session) where present; macOS has no setsid binary, so fall
+# back to nohup + & — the same pattern spawn.sh uses to launch the codex bridge,
+# which already outlives its launching session in this environment. stdio is fully
+# redirected so the child is never tied to the hook's pipes.
+mkdir -p "$RUN_DIR" 2>/dev/null || true
+LOG="$RUN_DIR/session-end.log"
+WORKER="$SCRIPT_DIR/session-end-worker.sh"
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$WORKER" "$TYPE" "$PROJECT" "$SESSION_ID" "$INSTANCE_ID" "$SNAPSHOT" </dev/null >>"$LOG" 2>&1 &
+else
+  nohup "$WORKER" "$TYPE" "$PROJECT" "$SESSION_ID" "$INSTANCE_ID" "$SNAPSHOT" </dev/null >>"$LOG" 2>&1 &
 fi
-
-PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
-if [ -f "$PIDFILE" ]; then
-  pid=$(cat "$PIDFILE" 2>/dev/null || true)
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    # Defensive: only kill if the pid's command line still looks like our
-    # watch.sh. Pids can be recycled — a stale pidfile could point at an
-    # unrelated process that took the same pid.
-    cmd=$(ps -o args= -p "$pid" 2>/dev/null || true)
-    case "$cmd" in
-      *"$SKILL_DIR/scripts/watch.sh"*) kill "$pid" 2>/dev/null || true ;;
-      *) ;;
-    esac
-  fi
-  rm -f "$PIDFILE"
-fi
-
-# Drop the per-session stream watermark (see #107) — the session is ending, so
-# there is no restart to resume; a future session_id reuse should start fresh.
-rm -f "$RUN_DIR/watch.$INSTANCE_ID.watermark" 2>/dev/null || true
-
-# Clean the cc-instance entry that points at this instance id. The enclosing
-# CC process may itself be exiting (matcher=logout/etc.), in which case its
-# cc-instance.<pid> file would otherwise be left stale. A sibling process that
-# shares the bare session_id stores a different instance id, so it is untouched.
-for f in "$RUN_DIR"/cc-instance.*; do
-  [ -f "$f" ] || continue
-  state=$(cat "$f" 2>/dev/null || true)
-  [ "$state" = "$INSTANCE_ID" ] && rm -f "$f"
-done
-
-# Release any actas exclusivity locks owned by this instance so peers can
-# reclaim those identities on their next watcher cycle. Keyed by instance id so
-# a sibling resume process's locks are not released out from under it. See #62.
-actas_lock_release_all "$INSTANCE_ID" 2>/dev/null || true
 
 exit 0

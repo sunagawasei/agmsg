@@ -21,6 +21,15 @@ set -euo pipefail
 # placement recorded at spawn time — kill its tmux pane/window and drop its
 # registration. For when the member's watcher can't respond.
 #
+# --expect-record <line> (force only): a compare-and-act guard. The live spawn
+# record must still equal <line> exactly, or despawn does nothing and reports
+# status=skipped reason=record-changed. kill/reset/rm then act ONLY on the id/
+# proj/type parsed from <line>, never a value re-read from the file. This lets a
+# DETACHED teardown (session-end's worker) snapshot the record at hook time and
+# safely refuse to tear down a worker that a fast lazy-respawn replaced in the
+# meantime. The whole force section runs under a placement lock so the compare
+# and the rm are atomic against a concurrent spawn-record write.
+#
 # See #109. Graceful teardown's full pane-close is tmux-only (the member needs a
 # tmux pane to close); an OS-terminal member drops its role but its window must
 # be closed by hand.
@@ -39,10 +48,13 @@ shift 3 || true
 
 FORCE=0
 TIMEOUT=30
+EXPECT_RECORD=""        # --expect-record <line>: compare-and-act guard (force only)
+EXPECT_SET=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --force) FORCE=1; shift ;;
     --timeout) TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
+    --expect-record) EXPECT_RECORD="${2-}"; EXPECT_SET=1; shift 2 ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -59,19 +71,34 @@ if [ "$FORCE" != "1" ] && [ -f "$SPAWN_REC" ]; then
 fi
 
 # Stop a headless codex bridge worker (placement recorded as pid:<n>) safely.
-# Guard against PID reuse: if the bridge's meta records a different pid, the
-# recorded pid is stale — skip rather than kill an unrelated process. SIGTERM
-# first (the bridge stops its client and kills its stdio app-server child), then
-# fall back to SIGKILL if it doesn't exit.
+# Guard against PID reuse two ways before killing:
+#   - meta present: the bridge's meta pid must equal the recorded pid, else the
+#     record is stale (a re-spawn updated meta but not the placement) — skip.
+#   - meta absent/empty: confirm the live pid's command line IS our bridge for
+#     this team+name via `ps -o args=`. A recycled pid (now an unrelated process)
+#     fails the match and is left alone. The old code skipped the guard entirely
+#     when meta was missing and killed the pid blindly — a PID-reuse footgun.
+# Neither verifiable (pid already gone) → nothing to do. SIGTERM first (the bridge
+# stops its client and kills its stdio app-server child), SIGKILL fallback.
 kill_headless_pid() {
-  local pid="$1" team="$2" name="$3" meta meta_pid n=0
+  local pid="$1" team="$2" name="$3" meta meta_pid n=0 args
   meta="$SKILL_DIR/run/codex-bridge.$team.$name.meta"
   [ -f "$meta" ] && meta_pid="$(sed -n 's/^pid=//p' "$meta" 2>/dev/null)"
-  if [ -n "${meta_pid:-}" ] && [ "$meta_pid" != "$pid" ]; then
-    echo "despawn: recorded pid $pid != bridge meta pid $meta_pid for $team/$name — skipping kill (stale record?)" >&2
-    return 0
-  fi
   kill -0 "$pid" 2>/dev/null || return 0
+  if [ -n "${meta_pid:-}" ]; then
+    if [ "$meta_pid" != "$pid" ]; then
+      echo "despawn: recorded pid $pid != bridge meta pid $meta_pid for $team/$name — skipping kill (stale record?)" >&2
+      return 0
+    fi
+  else
+    args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+    case "$args" in
+      *"codex-bridge.js"*"--team $team"*"--name $name"*) ;;   # ours → proceed
+      *)
+        echo "despawn: pid $pid is not a codex-bridge for $team/$name and no meta confirms it — skipping kill (pid reuse?)" >&2
+        return 0 ;;
+    esac
+  fi
   kill "$pid" 2>/dev/null || true
   while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 5 ]; do sleep 1; n=$((n + 1)); done
   if kill -0 "$pid" 2>/dev/null; then
@@ -80,12 +107,13 @@ kill_headless_pid() {
   fi
 }
 
-# Kill the recorded placement. ids are self-describing: %N pane, @N window,
-# pid:<n> headless bridge worker.
+# Kill the placement described by a record LINE ("<id>\t<proj>\t<type>"). ids are
+# self-describing: %N pane, @N window, pid:<n> headless bridge worker. Operates on
+# the LINE passed in, never a re-read of the file, so a caller that snapshotted
+# the record (despawn --expect-record) tears down exactly what it verified.
 kill_recorded_placement() {
-  [ -f "$SPAWN_REC" ] || return 1
   local id _proj _type
-  IFS=$'\t' read -r id _proj _type < "$SPAWN_REC"
+  IFS=$'\t' read -r id _proj _type <<<"${1-}"
   [ -n "$id" ] || return 1
   case "$id" in
     pid:*) kill_headless_pid "${id#pid:}" "$TEAM" "$NAME" ;;
@@ -97,13 +125,38 @@ kill_recorded_placement() {
         esac
       fi ;;
   esac
-  printf '%s\t%s\t%s' "$id" "$_proj" "$_type"   # echo back for the caller
 }
 
 if [ "$FORCE" = "1" ]; then
-  [ -f "$SPAWN_REC" ] || die "no placement record for '$TEAM/$NAME' — nothing to force (was it launched via 'spawn'? graceful despawn does not need this)"
-  IFS=$'\t' read -r _id _proj _type < "$SPAWN_REC"
-  kill_recorded_placement >/dev/null
+  # Serialize against a concurrent spawn-record write (spawn.sh launch_headless),
+  # so the compare and the rm below can't straddle a fresh lazy-respawn. Fail-open
+  # on acquire timeout — the --expect-record compare is the backstop. Released on
+  # every exit path, including the early skip.
+  agmsg_placement_lock_acquire "$TEAM" "$NAME" 10 || true
+
+  # Resolve the record line to act on. With --expect-record, the live record must
+  # still equal the snapshot or we do nothing (a respawn replaced it); and we act
+  # on the SNAPSHOT's fields, never a value re-read from the (possibly rewritten)
+  # file. Without it, fall back to the live record (manual despawn).
+  rec=""
+  if [ "$EXPECT_SET" = "1" ]; then
+    cur="$(cat "$SPAWN_REC" 2>/dev/null || true)"
+    if [ "$cur" != "$EXPECT_RECORD" ]; then
+      agmsg_placement_lock_release "$TEAM" "$NAME"
+      echo "status=skipped name=$NAME team=$TEAM reason=record-changed"
+      exit 0
+    fi
+    rec="$EXPECT_RECORD"
+  else
+    if [ ! -f "$SPAWN_REC" ]; then
+      agmsg_placement_lock_release "$TEAM" "$NAME"
+      die "no placement record for '$TEAM/$NAME' — nothing to force (was it launched via 'spawn'? graceful despawn does not need this)"
+    fi
+    rec="$(cat "$SPAWN_REC" 2>/dev/null || true)"
+  fi
+
+  IFS=$'\t' read -r _id _proj _type <<<"$rec"
+  kill_recorded_placement "$rec"
   # Drop the member's registration, and release its (now-stale) lock.
   if [ -n "${_proj:-}" ] && [ -n "${_type:-}" ]; then
     "$SCRIPT_DIR/reset.sh" "$_proj" "$_type" "$NAME" >/dev/null 2>&1 || true
@@ -111,6 +164,7 @@ if [ "$FORCE" = "1" ]; then
   owner="$(actas_lock_owner "$TEAM" "$NAME")"
   [ -n "$owner" ] && actas_lock_release "$TEAM" "$NAME" "$owner" 2>/dev/null || true
   rm -f "$SPAWN_REC" 2>/dev/null || true
+  agmsg_placement_lock_release "$TEAM" "$NAME"
   echo "status=forced name=$NAME team=$TEAM"
   exit 0
 fi

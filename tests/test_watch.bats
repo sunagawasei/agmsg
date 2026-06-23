@@ -195,6 +195,7 @@ _wait_for_file_contains() {
   mkdir -p "$TEST_SKILL_DIR/run"
   echo 5 > "$wm"
   printf '{"session_id":"sess-end"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
+  wait_until 8 bash -c "[ ! -f '$wm' ]"   # teardown is detached now
   [ ! -f "$wm" ]
 }
 

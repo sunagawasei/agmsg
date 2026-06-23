@@ -143,3 +143,31 @@ teardown() {
   kill -0 "$dummy" 2>/dev/null                       # NOT killed
   kill "$dummy" 2>/dev/null || true; wait "$dummy" 2>/dev/null || true
 }
+
+@test "despawn --force --expect-record: skips when the live record changed (race guard)" {
+  # The detached SessionEnd teardown snapshots the spawn record at hook time. If a
+  # fast lazy-respawn replaces it before the teardown runs, --expect-record must
+  # make despawn no-op rather than tear down the fresh worker / drop its record.
+  sleep 300 & local survivor=$!
+  printf 'pid:%s\t%s\tcodex\n' "$survivor" "$PROJ" > "$RUN/spawn.team__codex"  # fresh respawn record
+  local stale; stale="$(printf 'pid:%s\t%s\tcodex' 999999 /old/cwd)"           # caller's stale snapshot
+
+  run bash "$SCRIPTS/despawn.sh" team leader codex --force --expect-record "$stale"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"status=skipped"* ]]
+  [[ "$output" == *"reason=record-changed"* ]]
+  [ -f "$RUN/spawn.team__codex" ]                    # fresh record retained
+  kill -0 "$survivor" 2>/dev/null                    # fresh worker NOT killed
+  kill "$survivor" 2>/dev/null || true; wait "$survivor" 2>/dev/null || true
+}
+
+@test "despawn --force --expect-record: proceeds when the live record matches the snapshot" {
+  bash "$SCRIPTS/join.sh" team codex codex "$PROJ" >/dev/null
+  local rec; rec="$(printf 'pid:%s\t%s\tcodex' 999999 "$PROJ")"               # pid 999999: long dead
+  printf '%s\n' "$rec" > "$RUN/spawn.team__codex"
+
+  run bash "$SCRIPTS/despawn.sh" team leader codex --force --expect-record "$rec"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"status=forced"* ]]
+  [ ! -f "$RUN/spawn.team__codex" ]                  # record removed
+}

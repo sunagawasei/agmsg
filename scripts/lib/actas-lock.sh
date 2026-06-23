@@ -83,6 +83,41 @@ agmsg_spawn_path() {
   printf '%s/spawn.%s__%s' "$(_actas_lock_dir)" "$t" "$a"
 }
 
+# Placement lock path for a spawned (team, agent). Distinct prefix from the spawn
+# record so the session-team TTL GC's `spawn.<team>__*` glob never touches it.
+_agmsg_placement_lock_path() {
+  local t a; t="$(_actas_lock_encode "$1")"; a="$(_actas_lock_encode "$2")"
+  printf '%s/placement.%s__%s.lock' "$(_actas_lock_dir)" "$t" "$a"
+}
+
+# Placement lock — serializes the spawn-record WRITE (spawn.sh launch_headless)
+# against the teardown's record compare-and-REMOVE (despawn.sh --force) for one
+# (team, agent). Without it a fast lazy-respawn could write a fresh record in the
+# window between a detached teardown's --expect-record compare and its rm, letting
+# the teardown delete the fresh record and drop the new worker's registration.
+# mkdir is atomic on POSIX. A holder that crashes mid-section leaves the dir; it
+# is reclaimed after 2 minutes (a real spawn/teardown is sub-second to a few
+# seconds). Callers fail-open on acquire timeout — despawn's --expect-record
+# compare is the backstop that still refuses to act on a changed record.
+agmsg_placement_lock_acquire() {
+  local team="$1" agent="$2" timeout="${3:-10}" lock waited=0
+  lock="$(_agmsg_placement_lock_path "$team" "$agent")"
+  mkdir -p "$(_actas_lock_dir)" 2>/dev/null || true
+  while :; do
+    if [ -d "$lock" ] && find "$lock" -maxdepth 0 -mmin +2 >/dev/null 2>&1; then
+      rmdir "$lock" 2>/dev/null || true
+    fi
+    mkdir "$lock" 2>/dev/null && return 0
+    [ "$waited" -ge "$timeout" ] && return 1
+    sleep 1; waited=$((waited + 1))
+  done
+}
+
+agmsg_placement_lock_release() {
+  local lock; lock="$(_agmsg_placement_lock_path "$1" "$2")"
+  rmdir "$lock" 2>/dev/null || true
+}
+
 # Read the owner session_id of a lock file. Empty if no lock or unreadable.
 actas_lock_owner() {
   local lock; lock="$(actas_lock_path "$1" "$2")"

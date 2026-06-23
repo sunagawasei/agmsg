@@ -341,14 +341,20 @@ fi
 # session's own codex (same uuid → seen alive via upgrade-compat) is never
 # reaped. Best-effort; never blocks the directive below.
 if agmsg_session_team_enabled; then
-  while IFS= read -r _line; do
-    [ -n "$_line" ] || continue
-    _gteam=$(printf '%s' "$_line" | sed -n 's/.*--team \(s-[^ ]*\).*/\1/p')
+  # pgrep -f prints PIDs (portable: BSD/macOS + GNU). The command line is then
+  # read per-pid via `ps -o args=`. The earlier `pgrep -af` relied on a GNU-only
+  # flag (-a, "list full command line"); on macOS BSD pgrep that flag is rejected,
+  # the whole pipeline failed under `|| true`, and this GC silently did nothing —
+  # so crash/SIGKILL orphans accumulated. See the macOS BSD pgrep note.
+  while IFS= read -r _pid; do
+    [ -n "$_pid" ] || continue
+    _args="$(ps -o args= -p "$_pid" 2>/dev/null || true)"
+    _gteam=$(printf '%s' "$_args" | sed -n 's/.*--team \(s-[^ ]*\).*/\1/p')
     [ -n "$_gteam" ] || continue
     if ! agmsg_instance_alive "${_gteam#s-}" 2>/dev/null; then
       "$SCRIPT_DIR/despawn.sh" "$_gteam" claude codex --force >/dev/null 2>&1 || true
     fi
-  done < <(pgrep -af "codex-bridge\.js .*--team s-.* --name codex" 2>/dev/null || true)
+  done < <(pgrep -f "codex-bridge\.js .*--team s-.* --name codex" 2>/dev/null || true)
 fi
 
 # --- Stale session-team GC (session-team mode). ---
@@ -373,6 +379,7 @@ if agmsg_session_team_enabled; then
     rm -rf "$SKILL_DIR/run/codex-$_tn-cwd" 2>/dev/null || true
     rm -f "$SKILL_DIR/run/codex-bridge.$_tn".* 2>/dev/null || true
     rm -f "$SKILL_DIR/run/spawn.$_tn"__* 2>/dev/null || true
+    rm -rf "$SKILL_DIR/run/placement.$_tn"__*.lock 2>/dev/null || true
   done
 fi
 

@@ -359,6 +359,14 @@ launch_headless() {
     esac
   fi
 
+  # Serialize the register→spawn→record-write critical section against a
+  # concurrent teardown (despawn.sh --force) for this same (team,name), so a
+  # detached SessionEnd teardown can't rm the record we are about to write (and
+  # drop our fresh registration). Held only across the fast bookkeeping below,
+  # NOT the slow sandbox probes above. Fail-open on acquire timeout — despawn's
+  # --expect-record compare is the backstop. Released on every return path.
+  agmsg_placement_lock_acquire "$TEAM" "$NAME" 10 || true
+
   # Register codex on the team (pin the path; opt out of #92 rewrite) so the
   # bridge has a subscription — otherwise it loops on "no available subscription".
   AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$TEAM" "$NAME" codex "$cwd" >/dev/null
@@ -374,6 +382,7 @@ launch_headless() {
     running="$(pgrep -f "codex-bridge\.js .*--team $TEAM --name $NAME --inline-inbox" 2>/dev/null | head -1 || true)"
   fi
   if [ -n "$running" ]; then
+    agmsg_placement_lock_release "$TEAM" "$NAME"
     echo "spawn: headless codex '$NAME' already running in '$TEAM' (pid $running)"
     return 0
   fi
@@ -387,6 +396,7 @@ launch_headless() {
   # drops exactly that registration.
   printf '%s\t%s\t%s\n' "pid:$bpid" "$cwd" "codex" \
     > "$(agmsg_spawn_path "$TEAM" "$NAME")" 2>/dev/null || true
+  agmsg_placement_lock_release "$TEAM" "$NAME"
   local kind="headless codex"; [ "$REVIEWER" = 1 ] && kind="headless reviewer codex"
   echo "spawned $kind '$NAME' in team '$TEAM' (pid $bpid)"
   [ "$REVIEWER" = 1 ] && echo "  cwd (repo, read-only): $cwd"

@@ -119,14 +119,36 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 
 @test "session-end: tears down this session's codex worker, keeps team/history" {
   enable_st
-  # Fake a spawned headless codex: a live process + its placement record.
+  # Fake a spawned headless codex: a live process, its placement record, and the
+  # bridge meta the real worker writes — so despawn's pid-reuse guard confirms the
+  # recorded pid against meta and proceeds to kill it.
   sleep 300 & local fake=$!
   mkdir -p "$TEST_SKILL_DIR/run"
   printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-end" > "$TEST_SKILL_DIR/run/spawn.s-sessEND__codex"
+  printf 'pid=%s\n' "$fake" > "$TEST_SKILL_DIR/run/codex-bridge.s-sessEND.codex.meta"
   printf '{"session_id":"sessEND"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
-  sleep 1
-  ! kill -0 "$fake" 2>/dev/null                                  # worker torn down
+  # Teardown is detached now; poll for the placement-record removal (its last step).
+  wait_until 8 bash -c "[ ! -f '$TEST_SKILL_DIR/run/spawn.s-sessEND__codex' ]"
   [ ! -f "$TEST_SKILL_DIR/run/spawn.s-sessEND__codex" ]          # placement removed
+  # A bare `! kill -0` is exempt from set -e, so assert deadness via `run` to make
+  # the teardown genuinely enforced (it was a silent no-op before).
+  run kill -0 "$fake"; [ "$status" -ne 0 ]                       # worker torn down
+  kill "$fake" 2>/dev/null || true                               # no leak on assertion failure
+}
+
+@test "session-end: tears down a codex worker via ps-args when no meta exists" {
+  enable_st
+  # No meta file: despawn's guard must confirm the recorded pid IS our bridge by
+  # its command line before killing (PID-reuse safety). Disguise the fake's argv
+  # as the real bridge so the ps-args branch matches.
+  ( exec -a "node /x/codex-bridge.js --team s-sessAPS --name codex --inline-inbox" sleep 300 ) & local fake=$!
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-aps" > "$TEST_SKILL_DIR/run/spawn.s-sessAPS__codex"
+  printf '{"session_id":"sessAPS"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
+  wait_until 8 bash -c "[ ! -f '$TEST_SKILL_DIR/run/spawn.s-sessAPS__codex' ]"
+  [ ! -f "$TEST_SKILL_DIR/run/spawn.s-sessAPS__codex" ]
+  run kill -0 "$fake"; [ "$status" -ne 0 ]
+  kill "$fake" 2>/dev/null || true
 }
 
 @test "session-start: derives the session team from the stdin session_id (env-independent)" {

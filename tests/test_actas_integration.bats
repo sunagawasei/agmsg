@@ -111,6 +111,8 @@ fake_session() {
 
   printf '{"session_id":"sid-going"}' | bash "$SKILL_DIR/scripts/session-end.sh" claude-code /tmp/p1
 
+  # Teardown (incl. actas_lock_release_all) is detached now — poll for it.
+  wait_until 8 bash -c "[ ! -f '$(actas_lock_path T alice)' ] && [ ! -f '$(actas_lock_path T bob)' ]"
   [ ! -f "$(actas_lock_path T alice)" ]
   [ ! -f "$(actas_lock_path T bob)" ]
   [ -f   "$(actas_lock_path U alice)" ]
