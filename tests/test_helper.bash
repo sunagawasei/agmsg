@@ -32,6 +32,15 @@ setup_test_env() {
   # export is scoped to the test and needs no restore. See #41.
   export HOME="$TEST_SKILL_DIR/home"
   mkdir -p "$HOME"
+
+  # Hermeticity: the bats process inherits the developer's own
+  # CLAUDE_CODE_SESSION_ID (this suite is usually run from a Claude Code session).
+  # If it leaks into a child, session-team-aware code (whoami detection, the
+  # send.sh cross-session guard) would key off the developer's real session id
+  # instead of the test's. Tests that need it set/absent do so explicitly with
+  # `env CLAUDE_CODE_SESSION_ID=...` / `env -u CLAUDE_CODE_SESSION_ID`; clear the
+  # ambient value here so neither relies on what shell launched bats.
+  unset CLAUDE_CODE_SESSION_ID
 }
 
 teardown_test_env() {

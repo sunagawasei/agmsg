@@ -100,6 +100,58 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   ! grep -q "wrong-team-reply" "$TEST_SKILL_DIR/ask.log"
 }
 
+# --- send.sh cross-session isolation guard -----------------------------------
+
+@test "send: refuses a cross-session send in session-team mode" {
+  # session-team on + a session id present, but $TEAM is ANOTHER session's team
+  # (the exact mistake that leaked a message across sessions): must refuse before
+  # any insert, so the wrong team never receives the message.
+  enable_st
+  run env CLAUDE_CODE_SESSION_ID=sess-MINE bash "$SCRIPTS/send.sh" s-sess-OTHER claude codex "leak"
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "refusing cross-session send"
+  # And nothing landed in the other team.
+  run sqlite3 "$TEST_SKILL_DIR/db/messages.db" "SELECT count(*) FROM messages WHERE team='s-sess-OTHER';"
+  [ "$output" = "0" ]
+}
+
+@test "send: allows a send to the session's OWN team in session-team mode" {
+  enable_st
+  run env CLAUDE_CODE_SESSION_ID=sess-MINE bash "$SCRIPTS/send.sh" s-sess-MINE claude codex "ok"
+  [ "$status" -eq 0 ]
+}
+
+@test "send: AGMSG_ALLOW_CROSS_TEAM escape hatch permits a cross-team send" {
+  enable_st
+  run env CLAUDE_CODE_SESSION_ID=sess-MINE AGMSG_ALLOW_CROSS_TEAM=1 \
+    bash "$SCRIPTS/send.sh" s-sess-OTHER claude codex "deliberate"
+  [ "$status" -eq 0 ]
+}
+
+@test "send: no cross-session guard when session-team mode is off" {
+  # Mode off → no expected team → any team is allowed (legacy project-team flows).
+  run env CLAUDE_CODE_SESSION_ID=sess-MINE bash "$SCRIPTS/send.sh" s-sess-OTHER claude codex "ok"
+  [ "$status" -eq 0 ]
+}
+
+@test "send: no cross-session guard when there is no CLAUDE_CODE_SESSION_ID" {
+  # A bridge reply runs send.sh with the env var scrubbed by codex's sandbox, so
+  # there is no expected team and the reply to any team passes.
+  enable_st
+  run env -u CLAUDE_CODE_SESSION_ID bash "$SCRIPTS/send.sh" s-sess-OTHER codex claude "reply"
+  [ "$status" -eq 0 ]
+}
+
+@test "send: does not block a send to a PROJECT team even with a session id present" {
+  # Regression: a gemini/cursor agent whose env merely inherited
+  # CLAUDE_CODE_SESSION_ID resolves a project team via whoami (session-team
+  # resolution is claude-code-only). Its project-team send must NOT be refused —
+  # the guard only protects session teams (s-*), not project teams.
+  enable_st
+  run env CLAUDE_CODE_SESSION_ID=sess-MINE bash "$SCRIPTS/send.sh" myproject gemini claude "ok"
+  [ "$status" -eq 0 ]
+}
+
 # --- ensure-codex: safe no-op guard ------------------------------------------
 
 @test "ensure-codex: no-op (exit 0, silent) when session-team mode is off" {

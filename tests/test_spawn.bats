@@ -11,10 +11,24 @@ setup() {
   export STUB_BIN="$TEST_SKILL_DIR/stub-bin"
   mkdir -p "$STUB_BIN"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/claude"
-  # codex stub: `codex sandbox ...` is the reviewer enforcement probe — exit
-  # non-zero to simulate the probed repo write being DENIED (profile enforced).
-  # Tests that want to simulate a fail-open build override this per-test.
-  printf '#!/usr/bin/env bash\n[ "$1" = sandbox ] && exit 1\nexit 0\n' > "$STUB_BIN/codex"
+  # codex stub. `codex sandbox ...` drives the reviewer enforcement probes. A real
+  # enforcing reviewer profile DENIES a write under the repo cwd — surfaced as
+  # touch's own "Operation not permitted" (NOT sandbox_apply) — but ALLOWS a write
+  # under agmsg's run/ dir (the reply-path positive probe). The preflight
+  # `codex sandbox -- /usr/bin/true` (no touch) just runs. Mirror that so the
+  # hardened 3-way probe in _spawn.sh classifies the denial as enforcing and
+  # proceeds. Tests that simulate a fail-open / nested build override this per-test.
+  cat > "$STUB_BIN/codex" <<'CODEX_STUB'
+#!/usr/bin/env bash
+if [ "$1" = sandbox ]; then
+  case "$*" in
+    *"rm -f"*) exit 0 ;;                                                   # positive probe (run/ write) — allowed
+    *touch*)   echo "touch: probe: Operation not permitted" >&2; exit 1 ;; # repo write — denied (enforcing)
+    *)         exit 0 ;;                                                   # preflight (true) / other — ok
+  esac
+fi
+exit 0
+CODEX_STUB
   chmod +x "$STUB_BIN/claude" "$STUB_BIN/codex"
   export CAPTURE="$TEST_SKILL_DIR/launch-capture.txt"
   cat > "$STUB_BIN/record.sh" <<EOF
@@ -416,9 +430,19 @@ EOF
   bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
   _make_fake_bridge
   # The enforcing case: the probed repo write is DENIED and surfaced as touch's own
-  # "Operation not permitted" (NO sandbox_apply). This must launch normally and not
-  # be mistaken for a nested outer sandbox.
-  printf '#!/usr/bin/env bash\n[ "$1" = sandbox ] && { echo "touch: probe: Operation not permitted" >&2; exit 1; }\nexit 0\n' > "$STUB_BIN/codex"
+  # "Operation not permitted" (NO sandbox_apply), while the run/ positive probe is
+  # ALLOWED. This must launch normally and not be mistaken for a nested outer sandbox.
+  cat > "$STUB_BIN/codex" <<'CODEX_STUB'
+#!/usr/bin/env bash
+if [ "$1" = sandbox ]; then
+  case "$*" in
+    *"rm -f"*) exit 0 ;;
+    *touch*)   echo "touch: probe: Operation not permitted" >&2; exit 1 ;;
+    *)         exit 0 ;;
+  esac
+fi
+exit 0
+CODEX_STUB
   chmod +x "$STUB_BIN/codex"
 
   run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \

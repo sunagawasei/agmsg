@@ -58,6 +58,41 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 DB="$(agmsg_db_path)"
 
+# Cross-session isolation guard. A session team (s-<session-id>) is PRIVATE to one
+# Claude session; the bug this guards against is a message landing in ANOTHER
+# session's private team because the caller resolved $TEAM from the wrong source
+# (e.g. another session's pidfile/process list). The choke point: refuse a send
+# INTO a session team unless it is this session's own. Three gates keep it inert
+# everywhere it should be:
+#   1. only when the TARGET is a session team (s-*). A project-team target is
+#      legitimate shared traffic — e.g. a gemini/cursor agent whose env merely
+#      inherited CLAUDE_CODE_SESSION_ID still has whoami.sh resolve a PROJECT team
+#      (session-team resolution is claude-code-only, see whoami.sh), so its sends
+#      must never be blocked.
+#   2. only when CLAUDE_CODE_SESSION_ID is present. The codex bridge's own replies
+#      run send.sh inside codex's sandbox, which SCRUBS that env var (verified: the
+#      sandboxed grandchild has none), so the reply sees an empty id → inert. (A
+#      reply also only ever targets its own session team, so it would pass anyway.)
+#   3. only when this session's own team (s-<id>) differs from the target.
+# Residual (accepted): a session team's name is `s-<bare CLAUDE_CODE_SESSION_ID>`,
+# which is opaque (not provably a UUID — tests use s-sess-X), so the s-* prefix is
+# the only structural signal. A user who literally names a PROJECT team `s-foo`
+# collides with the pattern: a non-Claude agent with a leaked CLAUDE_CODE_SESSION_ID
+# sending there would be refused. Mitigation is the escape hatch; reserving the s-
+# prefix at team creation was judged too invasive for this low-likelihood case.
+# Escape hatch for a deliberate cross-team send: AGMSG_ALLOW_CROSS_TEAM=1.
+if [ "${AGMSG_ALLOW_CROSS_TEAM:-0}" != 1 ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  case "$TEAM" in
+    s-*)
+      source "$SCRIPT_DIR/lib/session-team.sh"
+      EXPECT_TEAM="$(agmsg_session_team_name 2>/dev/null || true)"
+      if [ -n "$EXPECT_TEAM" ] && [ "$TEAM" != "$EXPECT_TEAM" ]; then
+        echo "send: refusing cross-session send — '$TEAM' is another session's private team; this session's own team is '$EXPECT_TEAM'. Use \$TEAM from whoami.sh; set AGMSG_ALLOW_CROSS_TEAM=1 to override." >&2
+        exit 1
+      fi ;;
+  esac
+fi
+
 [ -f "$DB" ] || bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
 
 sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
