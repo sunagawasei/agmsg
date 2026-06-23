@@ -58,7 +58,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 DB="$(agmsg_db_path)"
 
-[ -f "$DB" ] || bash "$SCRIPT_DIR/init-db.sh" >/dev/null
+[ -f "$DB" ] || bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
 
 sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
 T_ESC="$(sql_escape "$TEAM")"
@@ -78,7 +78,7 @@ INSERT="INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('$T_ESC'
 # busy_timeout, so re-running it waits for the schema, then the INSERT lands.
 # See #114.
 if ! SENT_ID="$(agmsg_sqlite "$DB" "$INSERT" 2>/dev/null)"; then
-  bash "$SCRIPT_DIR/init-db.sh" >/dev/null
+  bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
   SENT_ID="$(agmsg_sqlite "$DB" "$INSERT")"
 fi
 case "$SENT_ID" in ''|*[!0-9]*) SENT_ID=0 ;; esac

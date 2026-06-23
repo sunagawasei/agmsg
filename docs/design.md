@@ -127,7 +127,7 @@ must track the same resolved project); direct shell invocations and
 
 | Script | Purpose |
 |---|---|
-| `init-db.sh` | Create SQLite database with schema |
+| `internal/init-db.sh` | Create SQLite database with schema |
 | `send.sh` | Insert a message into the database |
 | `inbox.sh` | Show unread messages and mark as read |
 | `history.sh` | Show message history (newest first, displayed oldest first) |
@@ -136,7 +136,6 @@ must track the same resolved project); direct shell invocations and
 | `team.sh` | List team members |
 | `whoami.sh` | Identify agent by project path and type |
 | `rename.sh` | Rename agent in config and message history |
-| `hook.sh` | Enable/disable Stop hook (on/off) |
 | `check-inbox.sh` | Hook entry point — cooldown, check, notify |
 | `config.sh` | Read/write user config (YAML) |
 

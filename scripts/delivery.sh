@@ -40,328 +40,58 @@ RUN_DIR="$SKILL_DIR/run"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/node.sh"
 # shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/type-registry.sh"
+# storage.sh provides agmsg_sqlite_mem (CR-safe sqlite, #180); hooks-json.sh's
+# primitives use it, so source storage first.
+# shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/storage.sh"
+# JSON/SQLite hook-file primitives (sourced after SKILL_NAME is set above —
+# strip/add reference it to detect agmsg-owned entries).
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/hooks-json.sh"
+# Shared "rule-file" delivery behavior (rulefile_apply), delegated to by the
+# rule-file types' _delivery.sh plugs.
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/delivery-rulefile.sh"
 
+# The per-project delivery hooks file is the type's manifest `hooks_file=`
+# (project-relative), not a hardcoded per-type case. The hook FORMAT written into
+# it is still type-specific (apply_settings_* below).
 resolve_hooks_file() {
   local type="$1"
   local project="$2"
-  case "$type" in
-    claude-code) echo "$project/.claude/settings.local.json" ;;
-    codex)       echo "$project/.codex/hooks.json" ;;
-    gemini|antigravity) echo "$project/.agent/rules/agmsg.md" ;;
-    copilot)     echo "$project/.github/hooks/agmsg.json" ;;
-    opencode)    echo "$project/.opencode/rules/agmsg.md" ;;
-    *) echo "Unknown agent type: $type" >&2; return 1 ;;
+  local rel
+  rel="$(agmsg_type_get "$type" hooks_file)"
+  if [ -z "$rel" ]; then
+    echo "Unknown agent type: $type" >&2
+    return 1
+  fi
+  # hooks_file is project-relative; reject absolute paths or traversal so a
+  # manifest can't redirect writes outside the project.
+  case "$rel" in
+    /*|*..*) echo "Invalid hooks_file for $type: $rel" >&2; return 1 ;;
   esac
+  echo "$project/$rel"
 }
 
-sql_readfile_path() {
-  local path="$1"
-  if command -v cygpath >/dev/null 2>&1; then
-    path=$(cygpath -w "$path" 2>/dev/null || printf '%s' "$path")
-  fi
-  printf '%s' "$path" | sed "s/'/''/g"
-}
-
-# Strip any agmsg-owned hook entries from <event> in the JSON at <path>. An
-# entry is "agmsg-owned" when one of its inner hooks references a path under
-# our skill directory. Result is written back to <path> atomically.
-#
-# Reads the settings via sqlite3's readfile() rather than interpolating the
-# file's contents into the SQL string. The old in-memory chain embedded the
-# settings blob 6× into a single sqlite3 argv element; on Linux that hits
-# the per-arg MAX_ARG_STRLEN cap (131072 bytes) once the settings file
-# crosses ~21 KB, so `delivery.sh set` failed with E2BIG (see #95). Using
-# readfile() keeps the file off the argv entirely.
-strip_agmsg_event_file() {
-  local path="$1"
-  local event="$2"
-  local sql_path
-  sql_path=$(sql_readfile_path "$path")
-  local tmp tmp_sql
-  tmp=$(mktemp "${TMPDIR:-/tmp}/agmsg.XXXXXX")
-  tmp_sql=$(sql_readfile_path "$tmp")
-  # Write the result with writefile() rather than redirecting sqlite3's CLI
-  # output. On strict sqlite3 builds (>= 3.50, shipped on Windows) the CLI
-  # renders control bytes — e.g. a CR that rode in on a CRLF settings file —
-  # using caret notation ("^M"), corrupting the JSON so the next read fails
-  # with "malformed JSON" (#143/#138, same root cause as #102). writefile()
-  # emits the bytes verbatim. See also strip's readfile() (#95).
-  # Validate writefile()'s result, not just sqlite3's exit code. writefile()
-  # returns the byte count written and yields NULL on a failed write (e.g. an
-  # unwritable tmp dir) — but sqlite3 still exits 0, so an exit-code-only check
-  # would mv an empty/partial tmp over the original. Compare the bytes written
-  # to the content's byte length (CAST AS BLOB so multibyte content isn't
-  # miscounted by character-based length()); anything but an exact match fails.
-  # Guard contributed in #162 (kevinsj15).
-  local wrote
-  wrote=$(agmsg_sqlite_mem "
-    WITH src AS (SELECT readfile('$sql_path') AS j),
-    out AS (SELECT coalesce(CASE
-      WHEN json_extract(src.j, '\$.hooks.$event') IS NULL THEN
-        src.j
-      WHEN (SELECT count(*) FROM json_each(json_extract(src.j, '\$.hooks.$event')) AS s
-            WHERE NOT EXISTS (
-              SELECT 1 FROM json_each(json_extract(s.value, '\$.hooks')) AS h
-              WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
-            )) = 0 THEN
-        json_remove(src.j, '\$.hooks.$event')
-      ELSE
-        json_set(src.j, '\$.hooks.$event',
-          (SELECT json_group_array(json(s.value))
-           FROM json_each(json_extract(src.j, '\$.hooks.$event')) AS s
-           WHERE NOT EXISTS (
-             SELECT 1 FROM json_each(json_extract(s.value, '\$.hooks')) AS h
-             WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
-           ))
-        )
-    END, '') AS blob FROM src)
-    SELECT writefile('$tmp_sql', blob) = length(CAST(blob AS BLOB)) FROM out;
-  ") || { rm -f "$tmp"; return 1; }
-  [ "$wrote" = "1" ] || { rm -f "$tmp"; return 1; }
-  mv "$tmp" "$path"
-}
-
-# Wrap a POSIX shell command so Codex's Windows runner executes it through Git
-# Bash. On native Windows, Codex runs each hook command via PowerShell, which
-# cannot execute a bare POSIX ".sh" path, so the hook exits non-zero. Codex hook
-# config supports a "commandWindows" key that takes precedence on Windows.
-windows_wrap() {
-  local posix_cmd="$1"
-  local bash_cmd_ps
-  bash_cmd_ps=$(printf '%s' "$posix_cmd" | sed "s/'/''/g")
-  printf "\$b=\$env:GIT_BASH; if (-not \$b) { \$b=\$env:AGMSG_BASH }; if (-not \$b) { \$b='C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe' }; & \$b -lc '%s'" "$bash_cmd_ps"
-}
-
-# Append a single entry of the form {"matcher":"","hooks":[{"type":"command","command":"<cmd>"}]}
-# to .hooks.<event> in the JSON at <path>, creating arrays/objects as needed.
-# For Codex agents (pass "codex" as the 4th arg) the entry also carries a
-# "commandWindows" so the hook runs on native Windows; other agent types are
-# unchanged. Writes the result back to <path>. As with strip_agmsg_event_file,
-# the settings are read via readfile() rather than via argv (#95).
-add_event_entry_file() {
-  local path="$1"
-  local event="$2"
-  local cmd="$3"
-  local hook_type="${4:-}"
-  local sql_path
-  sql_path=$(sql_readfile_path "$path")
-
-  # Build the entry with SQLite's own json_object()/json_array() so SQLite does
-  # every JSON-level escape. Raw values go in as ordinary SQL string literals
-  # (single quotes doubled) — the only escaping this layer needs. Hand-building
-  # the JSON string instead (and only escaping the codex commandWindows) left
-  # the "command" value's embedded " and ' unescaped, producing "malformed
-  # JSON" on tricky project paths and on native Windows sqlite builds (#134).
-  local cmd_lit
-  cmd_lit=$(printf '%s' "$cmd" | sed "s/'/''/g")
-  local hook_obj="json_object('type','command','command','$cmd_lit'"
-  if [ "$hook_type" = "codex" ]; then
-    local cw cw_lit
-    cw=$(windows_wrap "$cmd")
-    cw_lit=$(printf '%s' "$cw" | sed "s/'/''/g")
-    hook_obj="$hook_obj,'commandWindows','$cw_lit'"
-  fi
-  hook_obj="$hook_obj)"
-  local entry_sql="json_object('matcher','','hooks',json_array($hook_obj))"
-
-  local tmp tmp_sql
-  tmp=$(mktemp "${TMPDIR:-/tmp}/agmsg.XXXXXX")
-  tmp_sql=$(sql_readfile_path "$tmp")
-  # writefile() instead of CLI redirect — see strip_agmsg_event_file for why
-  # (strict sqlite3 caret-escapes control bytes in CLI output, #143/#102).
-  # Validate writefile()'s byte count vs the content length — see
-  # strip_agmsg_event_file for why the exit code alone is insufficient (#162).
-  local wrote
-  wrote=$(agmsg_sqlite_mem "
-    WITH base AS (
-      SELECT CASE WHEN json_extract(readfile('$sql_path'), '\$.hooks') IS NULL
-                  THEN json_set(readfile('$sql_path'), '\$.hooks', json('{}'))
-                  ELSE readfile('$sql_path') END AS s
-    ),
-    out AS (SELECT CASE
-      WHEN json_extract(s, '\$.hooks.$event') IS NULL THEN
-        json_set(s, '\$.hooks.$event', json_array($entry_sql))
-      ELSE
-        json_set(s, '\$.hooks.$event',
-          (SELECT json_group_array(json(v.value)) FROM (
-             SELECT value FROM json_each(json_extract(s, '\$.hooks.$event'))
-             UNION ALL
-             SELECT $entry_sql
-           ) v)
-        )
-    END AS blob FROM base)
-    SELECT writefile('$tmp_sql', blob) = length(CAST(blob AS BLOB)) FROM out;
-  ") || { rm -f "$tmp"; return 1; }
-  [ "$wrote" = "1" ] || { rm -f "$tmp"; return 1; }
-  mv "$tmp" "$path"
-}
-
-# Drop the entire .hooks object if it ended up empty after stripping. Reads
-# and writes <path> via readfile() — see strip_agmsg_event_file for the
-# rationale (#95).
-prune_empty_hooks_file() {
-  local path="$1"
-  local sql_path
-  sql_path=$(sql_readfile_path "$path")
-  local tmp tmp_sql
-  tmp=$(mktemp "${TMPDIR:-/tmp}/agmsg.XXXXXX")
-  tmp_sql=$(sql_readfile_path "$tmp")
-  # writefile() instead of CLI redirect — see strip_agmsg_event_file (#143/#102).
-  # Validate writefile()'s byte count vs the content length — see
-  # strip_agmsg_event_file for why the exit code alone is insufficient (#162).
-  local wrote
-  wrote=$(agmsg_sqlite_mem "
-    WITH src AS (SELECT readfile('$sql_path') AS j),
-    out AS (SELECT coalesce(CASE
-      WHEN json_extract(src.j, '\$.hooks') IS NULL THEN src.j
-      WHEN (SELECT count(*) FROM json_each(json_extract(src.j, '\$.hooks'))) = 0 THEN
-        json_remove(src.j, '\$.hooks')
-      ELSE src.j
-    END, '') AS blob FROM src)
-    SELECT writefile('$tmp_sql', blob) = length(CAST(blob AS BLOB)) FROM out;
-  ") || { rm -f "$tmp"; return 1; }
-  [ "$wrote" = "1" ] || { rm -f "$tmp"; return 1; }
-  mv "$tmp" "$path"
-}
-
-apply_settings_opencode() {
+# Default delivery behavior: JSON event-hooks (SessionStart / SessionEnd / Stop)
+# written into the type's hooks_file. Used by claude-code and codex. Rule-file
+# types override this by defining agmsg_delivery_apply in scripts/drivers/types/<name>/_delivery.sh.
+agmsg_delivery_apply_default() {
   local type="$1"
   local project="$2"
   local mode="$3"
-  local rule_file
-  rule_file=$(resolve_hooks_file "$type" "$project")
-
-  case "$mode" in
-    turn|off) ;;
-    monitor|both)
-      echo "Error: '$mode' mode is not supported for $type (no Monitor-tool equivalent). Use 'turn' or 'off'." >&2
-      return 1
-      ;;
-    *)
-      echo "Unknown mode: $mode (use turn|off)" >&2
-      return 1
-      ;;
-  esac
-
-  rm -f "$rule_file"
-
-  if [ "$mode" = "turn" ]; then
-    mkdir -p "$(dirname "$rule_file")"
-    cat <<EOF > "$rule_file"
-# agmsg Integration Rule
-
-## PostToolUse
-After each tool call, automatically check the agmsg inbox for unread messages.
-- Command: '$SKILL_DIR/scripts/check-inbox.sh' '$type' '$project'
-EOF
-  fi
-}
-
-apply_settings_copilot() {
-  local type="$1"
-  local project="$2"
-  local mode="$3"
-  local hooks_file
-  hooks_file=$(resolve_hooks_file "$type" "$project")
-
-  # Validate the mode BEFORE touching any existing file. Rejecting
-  # monitor/both must not destroy a working turn hook.
-  case "$mode" in
-    turn|off) ;;
-    monitor|both)
-      echo "Error: '$mode' mode is not supported for $type (no Monitor-tool equivalent). Use 'turn' or 'off'." >&2
-      return 1
-      ;;
-    *)
-      echo "Unknown mode: $mode (use turn|off)" >&2
-      return 1
-      ;;
-  esac
-
-  # Strip first so re-applying turn is an idempotent rewrite and turn->off
-  # cleanly removes the file.
-  rm -f "$hooks_file"
-
-  if [ "$mode" = "turn" ]; then
-    mkdir -p "$(dirname "$hooks_file")"
-    local cmd="'$SKILL_DIR/scripts/check-inbox.sh' '$type' '$project'"
-    # json_quote handles JSON-string escaping for arbitrary command strings
-    # (project paths may contain JSON-special chars).
-    local cmd_json
-    cmd_json=$(agmsg_sqlite_mem "SELECT json_quote('$(printf '%s' "$cmd" | sed "s/'/''/g")');")
-    # Use PascalCase 'Stop' trigger so the input payload field names match
-    # the snake_case form (session_id) that check-inbox.sh already parses.
-    cat <<EOF > "$hooks_file"
-{
-  "version": 1,
-  "hooks": {
-    "Stop": [
-      {
-        "type": "command",
-        "bash": $cmd_json,
-        "timeoutSec": 30
-      }
-    ]
-  }
-}
-EOF
-  fi
-}
-
-apply_settings_gemini() {
-  local type="$1"
-  local project="$2"
-  local mode="$3"
-  local rule_file
-  rule_file=$(resolve_hooks_file "$type" "$project")
-
-  # Remove existing rule file
-  rm -f "$rule_file"
-
-  case "$mode" in
-    turn|both)
-      mkdir -p "$(dirname "$rule_file")"
-      cat <<EOF > "$rule_file"
-# agmsg Integration Rule
-
-## PostToolUse
-After each tool call, automatically check the agmsg inbox for unread messages.
-- Command: '$SKILL_DIR/scripts/check-inbox.sh' '$type' '$project'
-EOF
-      ;;
-    monitor)
-      echo "Warning: 'monitor' mode is not fully supported for $type yet. Using turn-based hook." >&2
-      apply_settings_gemini "$type" "$project" "turn"
-      ;;
-    off)
-      ;;
-  esac
-}
-
-apply_settings() {
-  local type="$1"
-  local project="$2"
-  local mode="$3"
-
-  if [ "$type" = "gemini" ] || [ "$type" = "antigravity" ]; then
-    apply_settings_gemini "$type" "$project" "$mode"
-    return
-  fi
-
-  if [ "$type" = "copilot" ]; then
-    apply_settings_copilot "$type" "$project" "$mode"
-    return
-  fi
-
-  if [ "$type" = "opencode" ]; then
-    apply_settings_opencode "$type" "$project" "$mode"
-    return
-  fi
 
   local hooks_file
   hooks_file=$(resolve_hooks_file "$type" "$project")
   mkdir -p "$(dirname "$hooks_file")"
+
+  # Whether hook entries also need a Windows-native "commandWindows" variant is
+  # a per-type manifest fact (hook_windows_wrap=yes). Resolve it here — the layer
+  # that knows agent types — and pass a plain flag down to add_event_entry_file,
+  # which stays type-agnostic (see hooks-json.sh header).
+  local ww
+  ww=$(agmsg_type_get "$type" hook_windows_wrap 2>/dev/null || true)
 
   # Work on a temp copy so a partially-modified file never replaces the
   # original until the whole chain succeeds.
@@ -383,20 +113,20 @@ apply_settings() {
     monitor)
       local ss="'$SKILL_DIR/scripts/session-start.sh' '$type' '$project'"
       local se="'$SKILL_DIR/scripts/session-end.sh'   '$type' '$project'"
-      add_event_entry_file "$tmp_state" "SessionStart" "$ss" "$type"
-      add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$type"
+      add_event_entry_file "$tmp_state" "SessionStart" "$ss" "$ww"
+      add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$ww"
       ;;
     turn)
       local cmd="'$SKILL_DIR/scripts/check-inbox.sh' '$type' '$project'"
-      add_event_entry_file "$tmp_state" "Stop" "$cmd" "$type"
+      add_event_entry_file "$tmp_state" "Stop" "$cmd" "$ww"
       ;;
     both)
       local ss="'$SKILL_DIR/scripts/session-start.sh' '$type' '$project'"
       local se="'$SKILL_DIR/scripts/session-end.sh'   '$type' '$project'"
       local st="'$SKILL_DIR/scripts/check-inbox.sh'   '$type' '$project'"
-      add_event_entry_file "$tmp_state" "SessionStart" "$ss" "$type"
-      add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$type"
-      add_event_entry_file "$tmp_state" "Stop"         "$st" "$type"
+      add_event_entry_file "$tmp_state" "SessionStart" "$ss" "$ww"
+      add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$ww"
+      add_event_entry_file "$tmp_state" "Stop"         "$st" "$ww"
       ;;
     off)
       : # already stripped
@@ -411,6 +141,85 @@ apply_settings() {
   prune_empty_hooks_file "$tmp_state"
 
   mv "$tmp_state" "$hooks_file"
+}
+
+# Default delivery entry points (Template Method). A type's plug
+# (scripts/drivers/types/<name>/_delivery.sh) may override any subset of these:
+#   agmsg_delivery_apply      — write the hook file for a mode (default: JSON event-hooks)
+#   agmsg_delivery_on_enable  — side effects when enabling monitor/both (default: none)
+#   agmsg_delivery_on_disable — side effects when turning delivery off  (default: none)
+# A plug that wants the default apply can delegate to agmsg_delivery_apply_default.
+agmsg_delivery_apply() { agmsg_delivery_apply_default "$@"; }
+agmsg_delivery_on_enable() { :; }
+# Default 'off' teardown: stop this project's watch.sh watchers. A type with its
+# own runtime (e.g. codex's bridge) overrides this. Args: <type> <project>.
+agmsg_delivery_on_disable() { kill_all_watchers "$2" >/dev/null 2>&1 || true; }
+
+# Default delivery status (json-hooks types: claude-code, codex). Derives the mode
+# from the settings hooks file's agmsg-owned SessionStart/Stop entries, then prints
+# the per-event entry detail. Rule-file types override agmsg_delivery_status.
+agmsg_delivery_status_default() {
+  local type="$1" project="$2"
+  local hf
+  hf=$(resolve_hooks_file "$type" "$project")
+  local has_ss=0 has_st=0
+  if [ -f "$hf" ]; then
+    local sql_hf
+    sql_hf=$(sql_readfile_path "$hf")
+    has_ss=$(agmsg_sqlite_mem "
+      SELECT EXISTS(
+        SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.SessionStart')) AS s,
+          json_each(json_extract(s.value, '\$.hooks')) AS h
+        WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
+      );" 2>/dev/null || echo 0)
+    has_st=$(agmsg_sqlite_mem "
+      SELECT EXISTS(
+        SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.Stop')) AS s,
+          json_each(json_extract(s.value, '\$.hooks')) AS h
+        WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
+      );" 2>/dev/null || echo 0)
+  fi
+  local mode="off"
+  if [ "$has_ss" = "1" ] && [ "$has_st" = "1" ]; then mode="both"
+  elif [ "$has_ss" = "1" ]; then mode="monitor"
+  elif [ "$has_st" = "1" ]; then mode="turn"
+  fi
+  echo "mode: $mode"
+
+  if [ -f "$hf" ]; then
+    local sql_hf count
+    sql_hf=$(sql_readfile_path "$hf")
+    # readfile() rather than interpolating the file contents into argv —
+    # for large settings (#95) the latter hits MAX_ARG_STRLEN on Linux.
+    count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hf'), '\$.hooks.SessionStart'));" 2>/dev/null || echo 0)
+    case "$count" in ''|*[!0-9]*) count=0 ;; esac
+    echo "settings hooks file: $hf"
+    echo "  SessionStart entries: $count"
+    count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hf'), '\$.hooks.SessionEnd'));" 2>/dev/null || echo 0)
+    case "$count" in ''|*[!0-9]*) count=0 ;; esac
+    echo "  SessionEnd entries:   $count"
+    count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hf'), '\$.hooks.Stop'));" 2>/dev/null || echo 0)
+    case "$count" in ''|*[!0-9]*) count=0 ;; esac
+    echo "  Stop entries:         $count"
+  fi
+}
+agmsg_delivery_status() { agmsg_delivery_status_default "$@"; }
+
+# Source the type's delivery plug (if present) so its overrides take effect.
+# One type is handled per invocation, so the global overrides never go stale.
+agmsg_delivery_load_plug() {
+  local tdir
+  tdir="$(agmsg_type_dir "$1" 2>/dev/null || true)"
+  if [ -n "$tdir" ] && [ -f "$tdir/_delivery.sh" ]; then
+    # shellcheck disable=SC1090
+    . "$tdir/_delivery.sh"
+  fi
+}
+
+apply_settings() {
+  local type="$1" project="$2" mode="$3"
+  agmsg_delivery_load_plug "$type"
+  agmsg_delivery_apply "$type" "$project" "$mode"
 }
 
 CODEX_MONITOR_DOC_URL="https://github.com/fujibee/agmsg/blob/main/docs/codex-monitor-beta.md"
@@ -508,13 +317,27 @@ do_set() {
   local TYPE="${2:?Missing type}"
   local PROJECT="${3:?Missing project_path}"
 
+  # Two-stage validation. First: is this even a real mode? The four mode names
+  # are engine vocabulary (not type-specific), so a typo is caught here with a
+  # generic message before any per-type logic.
   case "$MODE" in monitor|turn|both|off) ;; *)
     echo "Unknown mode: $MODE (use monitor|turn|both|off)" >&2; exit 1 ;;
   esac
-  if [ "$TYPE" = "codex" ] && [ "$MODE" = "both" ]; then
-    echo "Error: 'both' mode is not supported for codex bridge beta. Use 'monitor', 'turn', or 'off'." >&2
-    exit 1
-  fi
+  # Second: does THIS type accept the mode? A type declares the modes its CLI
+  # accepts via the delivery_modes= manifest key (e.g. codex omits 'both' — the
+  # bridge beta has no both-mode; rule-file types like opencode omit
+  # 'monitor'/'both'). Reject anything not listed, before any file is touched.
+  # Types without the key fall back to the full set so an unconfigured manifest
+  # still works.
+  local SUPPORTED_MODES
+  SUPPORTED_MODES=$(agmsg_type_get "$TYPE" delivery_modes 2>/dev/null || true)
+  [ -z "$SUPPORTED_MODES" ] && SUPPORTED_MODES="monitor turn both off"
+  case " $SUPPORTED_MODES " in
+    *" $MODE "*) ;;
+    *)
+      echo "Error: '$MODE' mode is not supported for $TYPE (supported: $SUPPORTED_MODES)." >&2
+      exit 1 ;;
+  esac
 
   apply_settings "$TYPE" "$PROJECT" "$MODE"
 
@@ -522,49 +345,9 @@ do_set() {
 
   case "$MODE" in
     monitor|both)
-      if [ "$TYPE" = "codex" ]; then
-        if AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$SKILL_DIR/scripts/codex-shim-install.sh" install; then
-          echo "Codex monitor shim installed at ~/.agents/bin/codex."
-          case ":$PATH:" in
-            *":$HOME/.agents/bin:"*)
-              echo "Future Codex sessions: launch with codex. In monitor-mode projects, the agmsg shim routes interactive Codex sessions through the bridge."
-              ;;
-            *)
-              # Loud, unambiguous: this is the #1 reason monitor silently does nothing.
-              echo "WARNING: ~/.agents/bin is NOT on your PATH, so 'codex' still launches the real"
-              echo "  binary and the monitor bridge will NOT engage. Add this line, restart your shell,"
-              echo "  then launch with codex:"
-              echo "    export PATH=\"\$HOME/.agents/bin:\$PATH\""
-              ;;
-          esac
-        else
-          echo "Codex monitor mode is enabled, but the codex shim was not installed."
-          echo "Future Codex sessions: launch with $SKILL_DIR/scripts/codex-monitor.sh, or resolve the shim install issue above."
-        fi
-        # Node preflight: the bridge (codex-bridge.js) is a Node program, so
-        # without Node it silently never starts — flag it here at enable time.
-        # Presence only: the bridge uses old/stable APIs (the sole modern feature
-        # is one optional-chaining call, Node 14+), and any Node new enough to run
-        # Codex itself runs the bridge — so a version gate would be noise.
-        # Resolve via the same path the runtime uses (lib/node.sh) so this warning
-        # matches what the launcher will actually do — including a version-manager
-        # Node off PATH. AGMSG_NODE / AGMSG_CODEX_NODE override the binary.
-        codex_node="$(agmsg_resolve_node)"
-        if ! command -v "$codex_node" >/dev/null 2>&1 && [ ! -x "$codex_node" ]; then
-          echo "WARNING: Node.js ('$codex_node') was not found. The Codex bridge needs Node —"
-          echo "  monitor delivery will NOT start until Node is installed (or set AGMSG_NODE)."
-        fi
-        # The bridge launches from the Codex SessionStart hook, which fires on the
-        # FIRST turn of a new session (not the moment Codex opens) — and an
-        # already-running session is not retrofitted (#151; launcher internals #153).
-        echo "Restart your Codex session (quit and relaunch \`codex\`), then send your first"
-        echo "  message — the bridge starts on your first turn, not the moment Codex opens."
-        echo "  Already-running sessions stay unmonitored until they restart."
-        echo "For more info: $CODEX_MONITOR_DOC_URL"
-      else
-        echo "Future sessions: SessionStart hook will auto-launch the watcher."
-        emit_monitor_directive "$TYPE" "$PROJECT"
-      fi
+      # Type-specific enable side effects (shim install, watcher directive, …)
+      # live in the type's plug as agmsg_delivery_on_enable; default is none.
+      agmsg_delivery_on_enable "$MODE" "$TYPE" "$PROJECT"
       ;;
     turn)
       echo "Future sessions: Stop hook will check inbox between turns."
@@ -574,20 +357,17 @@ do_set() {
       ;;
     off)
       echo "Future sessions: no automatic delivery."
-      if [ "$TYPE" = "codex" ]; then
-        local stopped
-        stopped=$(stop_codex_bridge "$PROJECT")
-        if [ "${stopped:-0}" -gt 0 ]; then
-          echo "Stopped $stopped Codex bridge process(es) for this project and cleaned their run files."
-        fi
-        echo "Note: the codex shim (~/.agents/bin/codex) is shared across projects, so it was left in place."
-        echo "  If no other project uses monitor mode, remove it and restore your PATH:"
-        echo "    $SKILL_DIR/scripts/codex-shim-install.sh remove"
-        echo "    # then drop ~/.agents/bin from PATH if you added it for monitor"
-      else
-        kill_all_watchers "$PROJECT" >/dev/null 2>&1 || true
-      fi
-      emit_stop_directive
+      # Type-specific teardown via the plug (default: stop this project's
+      # watchers; codex stops its bridge instead).
+      agmsg_delivery_on_disable "$TYPE" "$PROJECT"
+      # Only emit the in-session watcher-stop directive for types that actually
+      # have an automatic delivery mode to stop. A manual-only type
+      # (delivery_modes=off, e.g. hermes) has no Monitor/watcher, so the
+      # directive would be noise — and a stray TaskStop could disturb an
+      # unrelated agent's watcher. Data-driven, so no per-type branch here.
+      case " $SUPPORTED_MODES " in
+        *" monitor "*|*" turn "*|*" both "*) emit_stop_directive ;;
+      esac
       ;;
   esac
 }
@@ -600,62 +380,11 @@ do_status() {
   # global mode value. When called without <type> <project>, we can't infer
   # a project-scoped mode, so we just skip the mode line and report the
   # global watcher state below.
+  # Mode + per-type status detail come from the type's delivery plug
+  # (agmsg_delivery_status); default is JSON event-hooks, rule-file types override.
   if [ -n "$TYPE" ] && [ -n "$PROJECT" ]; then
-    local hf
-    hf=$(resolve_hooks_file "$TYPE" "$PROJECT")
-    if [ "$TYPE" = "gemini" ] || [ "$TYPE" = "antigravity" ] || [ "$TYPE" = "copilot" ] || [ "$TYPE" = "opencode" ]; then
-      local mode="off"
-      if [ -f "$hf" ]; then
-        mode="turn"
-      fi
-      echo "mode: $mode"
-    else
-      local has_ss=0 has_st=0
-      if [ -f "$hf" ]; then
-        local sql_hf
-        sql_hf=$(sql_readfile_path "$hf")
-        has_ss=$(agmsg_sqlite_mem "
-          SELECT EXISTS(
-            SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.SessionStart')) AS s,
-              json_each(json_extract(s.value, '\$.hooks')) AS h
-            WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
-          );" 2>/dev/null || echo 0)
-        has_st=$(agmsg_sqlite_mem "
-          SELECT EXISTS(
-            SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.Stop')) AS s,
-              json_each(json_extract(s.value, '\$.hooks')) AS h
-            WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
-          );" 2>/dev/null || echo 0)
-      fi
-      local mode="off"
-      if [ "$has_ss" = "1" ] && [ "$has_st" = "1" ]; then mode="both"
-      elif [ "$has_ss" = "1" ]; then mode="monitor"
-      elif [ "$has_st" = "1" ]; then mode="turn"
-      fi
-      echo "mode: $mode"
-    fi
-  fi
-
-  if [ -n "$TYPE" ] && [ -n "$PROJECT" ] && [ "$TYPE" != "gemini" ] && [ "$TYPE" != "antigravity" ] && [ "$TYPE" != "copilot" ] && [ "$TYPE" != "opencode" ]; then
-    local hooks_file
-    hooks_file=$(resolve_hooks_file "$TYPE" "$PROJECT")
-    if [ -f "$hooks_file" ]; then
-      local count
-      local sql_hooks_file
-      sql_hooks_file=$(sql_readfile_path "$hooks_file")
-      # readfile() rather than interpolating the file contents into argv —
-      # for large settings (#95) the latter hits MAX_ARG_STRLEN on Linux.
-      count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hooks_file'), '\$.hooks.SessionStart'));" 2>/dev/null || echo 0)
-      case "$count" in ''|*[!0-9]*) count=0 ;; esac
-      echo "settings hooks file: $hooks_file"
-      echo "  SessionStart entries: $count"
-      count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hooks_file'), '\$.hooks.SessionEnd'));" 2>/dev/null || echo 0)
-      case "$count" in ''|*[!0-9]*) count=0 ;; esac
-      echo "  SessionEnd entries:   $count"
-      count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hooks_file'), '\$.hooks.Stop'));" 2>/dev/null || echo 0)
-      case "$count" in ''|*[!0-9]*) count=0 ;; esac
-      echo "  Stop entries:         $count"
-    fi
+    agmsg_delivery_load_plug "$TYPE"
+    agmsg_delivery_status "$TYPE" "$PROJECT"
   fi
 
   if [ -d "$RUN_DIR" ]; then

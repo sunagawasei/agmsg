@@ -61,6 +61,16 @@ teardown() {
   grep -q "backup sentinel" "$backup/SKILL.md"
 }
 
+@test "install: --update warns to re-register delivery hooks (#133)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --update
+  [ "$status" -eq 0 ]
+  # Surface the silent-delivery-loss footgun: an upgrade can drop a project's
+  # SessionStart/Stop hook, so the user is told to re-run delivery.sh set.
+  [[ "$output" =~ "delivery.sh set" ]]
+  [[ "$output" =~ "#133" ]]
+}
+
 @test "install: AGMSG_STORAGE_PATH override works against the installed skill" {
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
   local store="$FAKE_HOME/override-store"
@@ -191,15 +201,16 @@ wait_for_pidfile_pid() {
   grep -q "whoami.sh \"\$(pwd)\" opencode" "$FAKE_HOME/.config/opencode/skills/agmsg/SKILL.md"
 }
 
-@test "install: Windows PowerShell launcher stays under the skill tree" {
+@test "install: no PowerShell launcher is shipped (dispatcher only)" {
   AGMSG_FORCE_WINDOWS=1 HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd msg
 
   [ ! -f "$FAKE_HOME/.agents/msg.ps1" ]
   [ ! -f "$FAKE_HOME/.agents/msg-run.sh" ]
   [ ! -f "$FAKE_HOME/.agents/bin/sqlite3" ]
-  [ -f "$FAKE_HOME/.agents/skills/msg/scripts/windows/agmsg.ps1" ]
-  [ -f "$FAKE_HOME/.agents/skills/msg/scripts/windows/install-agmsg.ps1" ]
-  [ -f "$FAKE_HOME/.agents/skills/msg/scripts/dispatch.sh" ]
+  # The PowerShell port was removed; only the Bash dispatcher ships.
+  [ ! -f "$FAKE_HOME/.agents/skills/msg/scripts/windows/agmsg.ps1" ]
+  [ ! -f "$FAKE_HOME/.agents/skills/msg/scripts/windows/install-agmsg.ps1" ]
+  [ -f "$FAKE_HOME/.agents/skills/msg/scripts/windows/dispatch.sh" ]
 }
 
 @test "install --update: removes legacy Windows runner and sqlite shim" {
@@ -232,9 +243,9 @@ PS1
 @test "install: Windows dispatcher is shipped with the skill scripts" {
   AGMSG_FORCE_WINDOWS=1 HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
 
-  [ -f "$SK/scripts/windows/agmsg.ps1" ]
-  [ -f "$SK/scripts/windows/install-agmsg.ps1" ]
-  [ -f "$SK/scripts/dispatch.sh" ]
+  [ ! -f "$SK/scripts/windows/agmsg.ps1" ]
+  [ ! -f "$SK/scripts/windows/install-agmsg.ps1" ]
+  [ -f "$SK/scripts/windows/dispatch.sh" ]
   [ ! -f "$SK/scripts/windows/agmsg-run.sh" ]
   [ ! -f "$SK/scripts/windows/sqlite3-shim.sh" ]
 }
@@ -457,3 +468,93 @@ PY
   fi
 }
 
+
+# --- hermes Agent skill (~/.hermes/skills/<name>/SKILL.md) ---
+
+@test "install: drops a Hermes skill when ~/.hermes exists" {
+  mkdir -p "$FAKE_HOME/.hermes"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  local hermes_skill="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
+  [ -f "$hermes_skill" ]
+  grep -q "whoami.sh \"\$(pwd)\" hermes" "$hermes_skill"
+  grep -q "^name: agmsg" "$hermes_skill"
+  grep -q "~/.agents/skills/agmsg/scripts" "$hermes_skill"
+}
+
+@test "install: custom command name is substituted in Hermes skill" {
+  mkdir -p "$FAKE_HOME/.hermes"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd msg
+  local hermes_skill="$FAKE_HOME/.hermes/skills/msg/SKILL.md"
+  [ -f "$hermes_skill" ]
+  grep -q "^name: msg" "$hermes_skill"
+  grep -q "~/.agents/skills/msg/scripts" "$hermes_skill"
+  grep -q "You can now use \`/msg\`" "$hermes_skill"
+  ! grep -q "__SKILL_NAME__" "$hermes_skill"
+}
+
+@test "install: --agent-type hermes makes shared SKILL.md Hermes-typed" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type hermes
+  grep -q "whoami.sh \"\$(pwd)\" hermes" "$SK/SKILL.md"
+  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
+  ! grep -q "whoami.sh \"\$(pwd)\" gemini" "$SK/SKILL.md"
+  ! grep -q "whoami.sh \"\$(pwd)\" antigravity" "$SK/SKILL.md"
+}
+
+@test "install: --agent-type cursor makes shared SKILL.md Cursor-typed (#131)" {
+  # Regression guard: the TPL_TYPE case must list cursor, or --agent-type cursor
+  # silently falls through to the codex template and the install ships a
+  # codex-typed SKILL.md (delivery/join then run as codex, not cursor).
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type cursor
+  grep -q "whoami.sh \"\$(pwd)\" cursor" "$SK/SKILL.md"
+  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
+}
+
+@test "install --update: refreshes the Hermes skill if it was previously installed" {
+  mkdir -p "$FAKE_HOME/.hermes"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  local hermes_skill="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
+  [ -f "$hermes_skill" ]
+  echo "tampered" > "$hermes_skill"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  ! grep -q "^tampered$" "$hermes_skill"
+  grep -q "whoami.sh \"\$(pwd)\" hermes" "$hermes_skill"
+}
+
+@test "install --update: installs Hermes skill for upgraders without prior skill" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  [ ! -d "$FAKE_HOME/.hermes/skills/agmsg" ]
+  mkdir -p "$FAKE_HOME/.hermes"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ -f "$FAKE_HOME/.hermes/skills/agmsg/SKILL.md" ]
+  grep -q "whoami.sh \"\$(pwd)\" hermes" "$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
+}
+
+@test "install: --update re-points an existing Codex monitor shim to the new path" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  # Install the shim the way enabling Codex monitor mode would.
+  HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
+  local shim="$FAKE_HOME/.agents/bin/codex"
+  [ -f "$shim" ]
+  grep -q '/scripts/drivers/types/codex/codex-shim.sh' "$shim"
+
+  # Simulate a shim baked by a pre-1.1.0 layout (stale exec path), keeping the
+  # agmsg marker so it is still recognized as ours.
+  local tmp; tmp="$(mktemp)"
+  sed 's#/scripts/drivers/types/codex/#/scripts/codex/#g' "$shim" > "$tmp"
+  mv "$tmp" "$shim"
+  grep -q '/scripts/codex/codex-shim.sh' "$shim"
+  ! grep -q '/scripts/drivers/types/codex/codex-shim.sh' "$shim"
+
+  # --update must regenerate it back to the post-move path.
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  grep -q '/scripts/drivers/types/codex/codex-shim.sh' "$shim"
+  ! grep -q '/scripts/codex/codex-shim.sh' "$shim"
+}
+
+@test "install: --update does NOT create a Codex shim when none was installed" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  [ ! -e "$FAKE_HOME/.agents/bin/codex" ]
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  # The refresh is gated on an existing agmsg shim — it must not opt the user in.
+  [ ! -e "$FAKE_HOME/.agents/bin/codex" ]
+}

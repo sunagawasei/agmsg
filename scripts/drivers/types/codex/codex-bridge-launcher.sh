@@ -16,22 +16,22 @@ APP_SERVER="${3:?Missing app_server}"
 PARENT_PID="${4:?Missing parent_pid}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SKILL_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
-# shellcheck source=lib/hash.sh
-source "$SCRIPT_DIR/lib/hash.sh"
+# shellcheck source=../../../lib/hash.sh
+source "$SCRIPT_DIR/../../../lib/hash.sh"
 PROJECT_HASH="$(printf '%s' "$PROJECT" | agmsg_sha1)"
 REQUEST_FILE="$RUN_DIR/codex-bridge-request.$PROJECT_HASH"
 
-# shellcheck source=lib/node.sh
-source "$SCRIPT_DIR/lib/node.sh"
+# shellcheck source=../../../lib/node.sh
+source "$SCRIPT_DIR/../../../lib/node.sh"
 NODE_BIN="$(agmsg_resolve_node)"
 TAB="$(printf '\t')"
 
 mkdir -p "$RUN_DIR"
 
 resolve_identity() {  # prints "team<TAB>name" lines for the project's codex roles
-  "$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null \
+  "$SCRIPT_DIR/../../../identities.sh" "$PROJECT" "$TYPE" 2>/dev/null \
     | awk -v t="$TAB" 'NF >= 2 { print $1 t $2 }' \
     | sort -u
 }

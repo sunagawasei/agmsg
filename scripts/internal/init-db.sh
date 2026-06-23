@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/lib/storage.sh"
+source "$SCRIPT_DIR/../lib/storage.sh"
 DB="$(agmsg_db_path)"
 DB_DIR="$(dirname "$DB")"
 mkdir -p "$DB_DIR"

@@ -68,13 +68,13 @@ it untouched. You can either move that command aside and run `mode monitor`
 again, or launch monitor sessions explicitly:
 
 ```bash
-~/.agents/skills/agmsg/scripts/codex-monitor.sh
+~/.agents/skills/agmsg/scripts/drivers/types/codex/codex-monitor.sh
 ```
 
 For custom command names, replace `agmsg` with the installed skill name:
 
 ```bash
-~/.agents/skills/<cmd>/scripts/codex-monitor.sh
+~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-monitor.sh
 ```
 
 ## What The Shim Does
@@ -259,6 +259,6 @@ For an unattended worker, layer these on top of the gate:
 ## Related Details
 
 - [Delivery modes](../README.md#delivery-modes)
-- [Codex bridge implementation](../scripts/codex-bridge.js)
-- [Monitor launcher](../scripts/codex-monitor.sh)
-- [Codex shim](../scripts/codex-shim.sh)
+- [Codex bridge implementation](../scripts/drivers/types/codex/codex-bridge.js)
+- [Monitor launcher](../scripts/drivers/types/codex/codex-monitor.sh)
+- [Codex shim](../scripts/drivers/types/codex/codex-shim.sh)

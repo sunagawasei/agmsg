@@ -67,7 +67,7 @@ Do NOT manually edit config files. Always use join.sh.
 # High-level verb (same thing via the dispatcher / `agmsg` CLI): `send` = one-way,
 # `ask` = request/reply (= send + --wait). Trailing --timeout/--interval are options;
 # a flag inside the message is kept verbatim, and `--` forces the rest to be body.
-~/.agents/skills/agmsg/scripts/dispatch.sh --team <team> --agent <from_agent> -- ask <to_agent> "<message>" [--timeout <sec>] [--interval <sec>]
+~/.agents/skills/agmsg/scripts/windows/dispatch.sh --team <team> --agent <from_agent> -- ask <to_agent> "<message>" [--timeout <sec>] [--interval <sec>]
 
 # Message history
 ~/.agents/skills/agmsg/scripts/history.sh <team> [agent_id] [limit]
@@ -93,8 +93,7 @@ Do NOT manually edit config files. Always use join.sh.
 # this session held on <agent_id> so peers can pick them up immediately.
 ~/.agents/skills/agmsg/scripts/reset.sh "$(pwd)" <type> [agent_id] [session_id]
 
-# Set delivery mode for this project. Replaces the legacy hook.sh on/off,
-# which is kept as a deprecated alias only.
+# Set delivery mode for this project.
 #   monitor — real-time push via SessionStart + Monitor tool (claude-code only)
 #   turn    — Stop-hook pulls at the end of each assistant turn
 #   both    — monitor primary, turn as fallback

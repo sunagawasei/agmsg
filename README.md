@@ -15,6 +15,11 @@ Cross-agent messaging for CLI AI agents. No daemon, no network, no complexity.
 
 You stop being the copy-paste courier between your agents. Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, and any other CLI agent message each other directly through a shared local SQLite database — no human in the middle.
 
+<p align="center">
+  <img src="docs/logos/supported-agents.png" width="780"
+       alt="Supported agents: Claude Code, Codex, Gemini, GitHub Copilot, Antigravity, OpenCode, Hermes">
+</p>
+
 **What it isn't:**
 
 - Not MCP. No MCP server, no extra runtime — just `bash` + `sqlite3`.
@@ -36,11 +41,8 @@ In real use it looks like this — Claude Code asking Codex for a code review an
 **Requires:** `bash` and `sqlite3`. macOS ships both. On a minimal Linux box (some Debian/Ubuntu containers, Alpine) you may need to install `sqlite3` first — `sudo apt-get install -y sqlite3` or your distro's equivalent.
 
 ```bash
-# 1. Install (one-liner)
-bash <(curl -fsSL https://raw.githubusercontent.com/fujibee/agmsg/main/setup.sh)
-
-# Or clone first if you want to inspect the code
-git clone https://github.com/fujibee/agmsg.git && cd agmsg && ./install.sh
+# 1. Install — npx is the fastest path, no clone needed
+npx agmsg
 
 # 2. Restart Claude Code / Codex / Gemini CLI / Antigravity / OpenCode to pick up the new skill
 
@@ -54,7 +56,7 @@ git clone https://github.com/fujibee/agmsg.git && cd agmsg && ./install.sh
 
 That's it. The slash command prompts you for a team name and an agent name on first use, then asks you to pick a [delivery mode](#delivery-modes) (default on Claude Code: `monitor` — real-time push; Codex offers a beta `monitor` bridge or `turn`). After that, you talk to your agent naturally — see [First run](#first-run) below.
 
-Prefer a different install method? See [Install](#install) below for `npm` / `npx` and the Claude Code plugin marketplace paths.
+Prefer to inspect the code first, track the latest `main`, or pick a custom command name? See [Install](#install) below for the `setup.sh` one-liner, `git clone`, and the Claude Code plugin marketplace paths.
 
 ## How it works
 
@@ -113,34 +115,30 @@ The **command name** determines:
 
 After install, **restart your agent** (Claude Code / Codex / Gemini CLI / Copilot CLI / Antigravity / OpenCode) so it picks up the new skill.
 
-### Native Windows / PowerShell profile function
+### Windows: Git Bash & Codex
 
-When `install.sh` runs under Git Bash on Windows, it installs the PowerShell
-launcher under the skill tree. To enable an `agmsg` PowerShell command, add the
-profile function from the PowerShell host you use:
+agmsg's implementation is the Bash script set under `scripts/`, so on Windows the
+scripts run through **Git Bash** (Git for Windows, with `sqlite3` available on the
+Git Bash PATH). There is no PowerShell reimplementation.
 
-```powershell
-pwsh -ExecutionPolicy Bypass -File "$HOME\.agents\skills\agmsg\scripts\windows\install-agmsg.ps1"
-```
+- In Windows environments, Claude Code naturally works with Bash/Git Bash for
+  these script calls, but native Windows Codex commands and hooks often start
+  from PowerShell. Keep the actual agmsg execution path pinned to Git Bash so
+  all agents share the same `$HOME` and SQLite database.
+- **Codex delivery hooks** are wrapped automatically. On native Windows Codex runs
+  hook commands via PowerShell, which cannot execute a bare `.sh` path, so agmsg
+  emits a `commandWindows` entry that invokes Git Bash (`& $bash -lc '...'`). No
+  setup needed — see `windows_wrap()` in `scripts/delivery.sh`.
+- **Interactive / agent-typed commands** call the scripts through Git Bash, e.g.
+  `bash -lc 'scripts/whoami.sh "$(pwd)" codex'`.
+- Heads-up: a bare `bash` in PowerShell usually resolves to the **WSL** shim
+  (`WindowsApps\bash.exe`), which has a separate `$HOME` and database — agents
+  would then talk to a different DB than Claude Code. Pin Git Bash in your
+  PowerShell profile so everything shares one database:
 
-Use `powershell` instead of `pwsh` if you use Windows PowerShell rather than
-PowerShell 7; each host has its own profile path.
-
-Then a PowerShell session can run:
-
-```powershell
-agmsg
-agmsg history
-agmsg team
-agmsg send alice "hello from PowerShell"
-agmsg mode turn
-```
-
-The PowerShell launcher delegates to the existing Bash scripts; it does not
-reimplement agmsg logic or read the SQLite database directly. Git Bash and
-`sqlite3` must both be available from the Windows environment. See
-[Windows PowerShell launcher](docs/windows.md) for details and an optional
-profile installer.
+  ```powershell
+  Set-Alias bash 'C:\Program Files\Git\bin\bash.exe'
+  ```
 
 ## First run
 
@@ -272,7 +270,7 @@ Codex supports `mode monitor` as a **beta** app-server bridge, plus `mode turn` 
 
 > ⚠️ **The monitor beta changes how Codex starts — opt in only if you understand it.** Codex has no Monitor tool, so `mode monitor` installs a shim at `~/.agents/bin/codex` and asks you to put `~/.agents/bin` **first on your PATH**, so `codex` then resolves to the shim instead of the real binary. In monitor-mode projects the shim routes interactive launches through a bridge that turns incoming agmsg messages into turns on the current Codex thread; `codex exec` and non-monitor projects pass straight through to the real Codex. It depends on experimental Codex app-server behavior and has known rough edges (orphans on TUI close — #149; one identity per project — #150).
 
-If the shim can't be installed, launch with `~/.agents/skills/<cmd>/scripts/codex-monitor.sh`. Codex sandboxing must allow writes to the skill's `db/`, `teams/`, and `run/` dirs — `install.sh` configures those `writable_roots` when `~/.codex/config.toml` exists. Setup, PATH notes, and internals: [docs/codex-monitor-beta.md](docs/codex-monitor-beta.md).
+If the shim can't be installed, launch with `~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-monitor.sh`. Codex sandboxing must allow writes to the skill's `db/`, `teams/`, and `run/` dirs — `install.sh` configures those `writable_roots` when `~/.codex/config.toml` exists. Setup, PATH notes, and internals: [docs/codex-monitor-beta.md](docs/codex-monitor-beta.md).
 
 ### GitHub Copilot CLI
 
@@ -308,8 +306,6 @@ See [docs/opencode.md](docs/opencode.md) for full setup instructions.
 ```
 
 `send.sh` takes exactly four positional arguments: `<team> <from> <to> "<message>"`. Quote the message so the shell sees it as one argument; an unquoted message with spaces will be misparsed.
-
-`hook.sh on|off` still works as a legacy alias for `delivery.sh set turn|off` but prints a deprecation notice.
 
 ## FAQ / Design notes
 
@@ -380,6 +376,7 @@ Auto-detects installed skill directories and cleans up: skill files, slash comma
 | Variable | Default | Purpose |
 |---|---|---|
 | `AGMSG_STORAGE_PATH` | `<skill>/db` | Directory holding the SQLite message store (`messages.db`). Override to relocate the store — handy for tests, sandboxes, or running isolated instances. |
+| `AGMSG_PLUGIN_DIRS` | (unset) | `:`-separated extra directories to search for external drivers, in addition to `<skill>/plugins`. Each holds `<axis>/<name>/` subdirs. Drivers found here are still ignored until opted into with `agmsg plugin trust`. See [docs/plugins.md](docs/plugins.md). |
 
 The message store path resolves as **`AGMSG_STORAGE_PATH` (env) > built-in default**. (A config-file layer is planned to slot in between the two as part of the storage-driver work; the intended order is env > config > default.) The override is scoped to the SQLite store only — team configs under `teams/` are unaffected.
 
@@ -480,8 +477,10 @@ bats tests/    # requires bats-core: brew install bats-core
 ├── SKILL.md                      # Skill definition (read by CC & Codex)
 ├── agents/
 │   └── openai.yaml               # Codex metadata
-├── scripts/                      # Bash scripts
-├── templates/                    # Command templates per tool
+├── scripts/                      # Bash scripts (the type-agnostic engine)
+│   ├── lib/                      # Sourced helper libraries
+│   └── drivers/types/<name>/     # Built-in agent-type drivers (manifest + runtime)
+├── plugins/<axis>/<name>/        # External drivers you opt into (agmsg plugin trust)
 ├── db/messages.db                # SQLite WAL-mode message store
 └── teams/                        # Team configs (self-contained)
     └── <team>/
@@ -494,6 +493,22 @@ bats tests/    # requires bats-core: brew install bats-core
 - **Auto detection**: Stop hook checks inbox after each response (60s cooldown, configurable via `hook.check_interval`)
 - **No daemon**: Direct filesystem access
 - **No network**: Everything local
+
+## Plugins
+
+agmsg's pluggable units are **drivers** grouped by axis (`types` for agent
+runtimes; `storage` and `delivery` to follow). Built-ins ship under
+`scripts/drivers/`; you can drop your own under `<skill>/plugins/<axis>/<name>/`
+(or point `AGMSG_PLUGIN_DIRS` at a directory) to extend agmsg without forking.
+
+Because a driver is shell code that runs with your privileges, **external drivers
+are never loaded until you opt in** — an unexpected drop-in is ignored (with a
+warning) until you run `agmsg plugin trust <axis>/<name>`. List what's discovered
+and its trust state with `agmsg plugin list`.
+
+Full discovery order, the trust model, and authoring guidance:
+[docs/plugins.md](docs/plugins.md) (design rationale in
+[ADR 0002](docs/adr/0002-driver-discovery-and-plugin-opt-in.md)).
 
 ## Community
 

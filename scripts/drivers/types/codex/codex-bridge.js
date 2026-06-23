@@ -8,8 +8,9 @@ const net = require("net");
 const path = require("path");
 const readline = require("readline");
 
-const SCRIPT_DIR = __dirname;
-const SKILL_DIR = path.resolve(SCRIPT_DIR, "..");
+const SCRIPT_DIR = __dirname;                              // .../scripts/drivers/types/codex (codex siblings live here)
+const SKILL_DIR = path.resolve(SCRIPT_DIR, "..", "..", "..", "..");    // skill root
+const SCRIPTS_DIR = path.join(SKILL_DIR, "scripts");       // type-independent engine scripts (identities/inbox/send)
 const RUN_DIR = path.join(SKILL_DIR, "run");
 
 // Git Bash on Windows cannot exec a .sh path directly — spawnSync of the script
@@ -122,7 +123,7 @@ function parseArgs(argv) {
 }
 
 function runScript(script, args) {
-  const result = spawnSync(BASH_BIN, [path.join(SCRIPT_DIR, script), ...args], {
+  const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, script), ...args], {
     cwd: SKILL_DIR,
     encoding: "utf8",
   });
@@ -816,8 +817,8 @@ class CodexBridge {
   }
 
   buildPrompt() {
-    const inbox = path.join(SCRIPT_DIR, "inbox.sh");
-    const send = path.join(SCRIPT_DIR, "send.sh");
+    const inbox = path.join(SCRIPTS_DIR, "inbox.sh");
+    const send = path.join(SCRIPTS_DIR, "send.sh");
     if (this.opts.inlineInbox) {
       return [
         `agmsg delivered the following unread messages for ${this.identity.team}/${this.identity.name}:`,
@@ -837,7 +838,7 @@ class CodexBridge {
   }
 
   readInboxForPrompt() {
-    const result = spawnSync(BASH_BIN, [path.join(SCRIPT_DIR, "inbox.sh"), this.identity.team, this.identity.name], {
+    const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, "inbox.sh"), this.identity.team, this.identity.name], {
       cwd: this.opts.project,
       encoding: "utf8",
     });

@@ -14,7 +14,7 @@ teardown() {
 }
 
 @test "watch-once: exits 2 on timeout when no unread inbound exists" {
-  run bash "$SCRIPTS/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 1 --interval 1
+  run bash "$TYPES/codex/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 1 --interval 1
   [ "$status" -eq 2 ]
   [[ "$output" =~ "status=timeout" ]]
 }
@@ -22,7 +22,7 @@ teardown() {
 @test "watch-once: reports existing unread inbound without marking it read" {
   bash "$SCRIPTS/send.sh" team bob alice "hello pending" >/dev/null
 
-  run bash "$SCRIPTS/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 1 --interval 1
+  run bash "$TYPES/codex/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 1 --interval 1
   [ "$status" -eq 0 ]
   [[ "$output" =~ "status=pending" ]]
   [[ "$output" =~ "count=1" ]]
@@ -36,7 +36,7 @@ teardown() {
   bash "$SCRIPTS/send.sh" team bob alice "read already" >/dev/null
   bash "$SCRIPTS/inbox.sh" team alice >/dev/null
 
-  run bash "$SCRIPTS/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 1 --interval 1
+  run bash "$TYPES/codex/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 1 --interval 1
   [ "$status" -eq 2 ]
   [[ "$output" =~ "status=timeout" ]]
 }
@@ -44,13 +44,13 @@ teardown() {
 @test "watch-once: ignores messages addressed to another agent" {
   bash "$SCRIPTS/send.sh" team alice bob "for bob" >/dev/null
 
-  run bash "$SCRIPTS/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 1 --interval 1
+  run bash "$TYPES/codex/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 1 --interval 1
   [ "$status" -eq 2 ]
   [[ "$output" =~ "status=timeout" ]]
 }
 
 @test "watch-once: detects a message that arrives after it starts" {
-  bash "$SCRIPTS/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 5 --interval 1 \
+  bash "$TYPES/codex/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 5 --interval 1 \
     >"$TEST_SKILL_DIR/watch-once.out" 2>"$TEST_SKILL_DIR/watch-once.err" &
   local pid=$!
   sleep 1
@@ -67,7 +67,7 @@ teardown() {
   bash "$SCRIPTS/actas-claim.sh" "$PROJ" codex alice other-sid >/dev/null
   bash "$SCRIPTS/send.sh" team bob alice "locked out" >/dev/null
 
-  run bash "$SCRIPTS/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 1 --interval 1
+  run bash "$TYPES/codex/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 1 --interval 1
   [ "$status" -eq 1 ]
   [[ "$output" =~ "no available subscription" ]]
 }

@@ -1,0 +1,5 @@
+# The repo ships only this dir's README. Anything dropped here for local testing
+# (and the runtime db/trusted-plugins opt-ins) stays out of version control.
+*
+!.gitignore
+!README.md

@@ -14,6 +14,17 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"  # agmsg_agent_pid, for instance-id derivation
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/type-registry.sh"
+
+# Some Stop-hook runtimes (codex, copilot) want an explicit JSON status object
+# even when there is nothing to deliver; others (claude-code) stay silent. This
+# is the type's manifest `stop_output=` (data), not a hardcoded type list.
+STOP_OUTPUT="$(agmsg_type_get "$TYPE" stop_output 2>/dev/null || true)"
+emit_status_json() {
+  [ "$STOP_OUTPUT" = "json" ] || return 0
+  printf '{\n  "continue": true,\n  "systemMessage": "%s"\n}\n' "$1"
+}
 
 # Hook runtimes that pass JSON do so on stdin. Interactive invocations such as
 # Gemini's PostToolUse command may inherit a terminal stdin instead; reading
@@ -86,16 +97,7 @@ if [ -f "$MARKER" ]; then
   [ -z "$INTERVAL" ] && INTERVAL=$("$SCRIPT_DIR/config.sh" get hook.check_interval 60)
   case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=60 ;; esac
   if [ $(( now - last )) -lt "$INTERVAL" ]; then
-    case "$TYPE" in
-      codex|copilot)
-        cat <<'ENDJSON'
-{
-  "continue": true,
-  "systemMessage": "agmsg: check skipped (cooldown)"
-}
-ENDJSON
-        ;;
-    esac
+    emit_status_json "agmsg: check skipped (cooldown)"
     exit 0
   fi
 fi
@@ -145,16 +147,7 @@ done
 
 # No new messages
 if [ -z "$OUTPUT" ]; then
-  case "$TYPE" in
-    codex|copilot)
-      cat <<'ENDJSON'
-{
-  "continue": true,
-  "systemMessage": "agmsg: no new messages"
-}
-ENDJSON
-      ;;
-  esac
+  emit_status_json "agmsg: no new messages"
   exit 0
 fi
 

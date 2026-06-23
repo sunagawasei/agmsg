@@ -119,9 +119,9 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         run: bats --print-output-on-failure tests/
 
-  # Windows coverage for the native helpers shipped in #103 (PowerShell wrapper,
-  # Git Bash runner, sqlite3 compatibility shim, cygpath normalization). The
-  # POSIX-assuming suite is not fully green on Windows yet, so this is staged
+  # Windows coverage for the native helpers shipped in #103 (Git Bash runner,
+  # sqlite3 compatibility shim, cygpath normalization). The POSIX-assuming suite
+  # is not fully green on Windows yet, so this is staged
   # (#125): a focused leg targeting the Windows-relevant tests, plus a full leg
   # that is informational only (continue-on-error) to track how far the rest
   # gets. Neither is a required check yet — promote the focused leg to required
@@ -143,22 +143,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Required-candidate leg: the Windows-tagged tests that pass on
-          # windows-latest today — the install-side native helpers (#103) and
-          # the PowerShell runner smoke. This leg is promoted to a required
-          # check so native Windows behaviour can't silently regress.
-          #
-          # Scoped to test_install + test_windows_powershell on purpose: the
-          # delivery "commandWindows" cases also match the [Ww]indows filter but
-          # one still fails on windows-latest (the codex Stop entry's
-          # commandWindows is empty after the hook-JSON round-trip), so
-          # test_delivery stays in the informational `full (experimental)` leg
-          # with the other known-broken Windows areas (actas liveness #134,
-          # codex-bridge spawn EFTYPE, delivery path/sqlite). As each is fixed
-          # its file moves into this required leg.
-          - leg: windows tests
+          # Focused leg: the install-side native Windows helpers (#103). These
+          # are green on windows-latest today and are the candidate to promote
+          # to a required check. Other Windows-relevant tests stay in the
+          # informational full leg until they are fixed in separate PRs.
+          - leg: install helpers
             filter: "[Ww]indows"
-            target: tests/test_install.bats tests/test_windows_powershell.bats
+            target: tests/test_install.bats
             experimental: false
           - leg: full (experimental)
             filter: ""

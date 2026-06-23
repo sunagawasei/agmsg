@@ -56,7 +56,6 @@ plugin marketplace (`/plugin marketplace add fujibee/agmsg`). All paths land at
 - [docs/teams.md](docs/teams.md): team registry and membership model.
 - [docs/spec/driver-interface.md](docs/spec/driver-interface.md): the formal driver contract.
 - [docs/adr/](docs/adr/): architecture decision records (the "why").
-- [docs/windows.md](docs/windows.md): native Windows / Git Bash / PowerShell notes.
 - [docs/opencode.md](docs/opencode.md): OpenCode-specific integration.
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to propose changes.
 

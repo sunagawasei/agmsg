@@ -35,7 +35,7 @@ teardown() {
 @test "storage: init-db creates the db at the overridden path (and makes the dir)" {
   local custom="$BATS_TEST_TMPDIR/nested/store"
   [ ! -d "$custom" ]
-  AGMSG_STORAGE_PATH="$custom" bash "$SCRIPTS/init-db.sh"
+  AGMSG_STORAGE_PATH="$custom" bash "$SCRIPTS/internal/init-db.sh"
   [ -f "$custom/messages.db" ]
 }
 

@@ -84,6 +84,40 @@ teardown() {
   [[ "$output" =~ "teams=myteam" ]]
 }
 
+@test "whoami: resolves project paths containing single quotes" {
+  local project="$TEST_SKILL_DIR/pro'j"
+  mkdir -p "$project/subdir"
+  bash "$SCRIPTS/join.sh" myteam alice claude-code "$project"
+  run bash "$SCRIPTS/whoami.sh" "$project/subdir" claude-code
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "agent=alice" ]]
+  [[ "$output" =~ "teams=myteam" ]]
+  [[ "$output" =~ "project=$project" ]]
+  [[ ! "$output" =~ "not_joined=true" ]]
+  [[ ! "$output" =~ ".parameter" ]]
+}
+
+@test "whoami: resolves team and agent names containing single quotes" {
+  local team="O'Brien"
+  local agent="al'ice"
+  bash "$SCRIPTS/join.sh" "$team" "$agent" claude-code /tmp/proj
+  run bash "$SCRIPTS/whoami.sh" /tmp/proj claude-code
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "agent=$agent" ]]
+  [[ "$output" =~ "teams=$team" ]]
+  [[ ! "$output" =~ ".parameter" ]]
+}
+
+@test "whoami: ignores malformed team configs without sqlite parameter output" {
+  mkdir -p "$TEST_SKILL_DIR/teams/bad"
+  printf '{' > "$TEST_SKILL_DIR/teams/bad/config.json"
+  run bash "$SCRIPTS/whoami.sh" /tmp/proj claude-code
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "not_joined=true" ]]
+  [[ ! "$output" =~ ".parameter" ]]
+  [[ ! "$output" =~ "malformed JSON" ]]
+}
+
 @test "whoami: returns not_joined when no match" {
   run bash "$SCRIPTS/whoami.sh" /tmp/unknown claude-code
   [ "$status" -eq 0 ]
@@ -201,7 +235,7 @@ teardown() {
   [[ "$output" =~ "Renamed team oldteam → newteam" ]]
   [ ! -d "$TEST_SKILL_DIR/teams/oldteam" ]
   [ -f "$TEST_SKILL_DIR/teams/newteam/config.json" ]
-  run sqlite3 :memory: "SELECT json_extract(readfile('$TEST_SKILL_DIR/teams/newteam/config.json'), '\$.name');"
+  run sqlite_mem "SELECT json_extract(readfile('$(rf "$TEST_SKILL_DIR/teams/newteam/config.json")'), '\$.name');"
   [ "$output" = "newteam" ]
 }
 
@@ -277,8 +311,6 @@ teardown() {
   run bash "$SCRIPTS/join.sh" myteam alice opencode /tmp/proj
   [ "$status" -eq 0 ]
 }
-
-
 # --- #140: team-name path traversal ---
 
 @test "join: rejects a team name with path traversal (../)" {
@@ -346,4 +378,10 @@ teardown() {
   run bash "$SCRIPTS/join.sh" "テストチーム" alice claude-code /tmp/proj
   [ "$status" -eq 0 ]
   [ -f "$TEST_SKILL_DIR/teams/テストチーム/config.json" ]
+}
+
+@test "join: accepts hermes" {
+  run bash "$SCRIPTS/join.sh" myteam alice hermes /tmp/proj
+  [ "$status" -eq 0 ]
+  [ -f "$TEST_SKILL_DIR/teams/myteam/config.json" ]
 }

@@ -70,7 +70,7 @@ fi
 run_script() {
   local script="$1"
   shift
-  bash "$SCRIPT_DIR/$script" "$@"
+  bash "$SCRIPT_DIR/../$script" "$@"
 }
 
 require_args() {
@@ -272,14 +272,28 @@ case "$COMMAND" in
     fi
     ;;
 
+  plugin)
+    if [ "$#" -eq 0 ]; then
+      run_script plugin.sh list
+    else
+      run_script plugin.sh "$@"
+    fi
+    ;;
+
   mode)
     case "$#" in
       0)
         run_script delivery.sh status "$AGENT_TYPE" "$PROJECT"
         ;;
       1)
+        # Platform-specific guard (not incidental type coupling): the Codex
+        # monitor bridge is unsupported on Windows (its tests skip_on_windows,
+        # #182), so codex monitor/both can't work here even though the codex
+        # manifest lists 'monitor' for POSIX. delivery_modes is a global fact and
+        # can't express "monitor everywhere except Windows", so this one Windows
+        # dispatcher keeps an explicit early reject with a clear message.
         if [ "$AGENT_TYPE" = "codex" ] && { [ "$1" = "monitor" ] || [ "$1" = "both" ]; }; then
-          echo "Codex has no Monitor tool; only 'turn' or 'off' modes are supported." >&2
+          echo "Codex has no Monitor tool on Windows; only 'turn' or 'off' modes are supported." >&2
           exit 2
         fi
         run_script delivery.sh set "$1" "$AGENT_TYPE" "$PROJECT"
