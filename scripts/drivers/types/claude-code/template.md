@@ -113,6 +113,8 @@ The allowlist merges across scopes and takes effect immediately — no restart n
 
 **Session-team mode (`delivery.session_team`).** When this config is enabled, your identity is your OWN per-session team `s-$CLAUDE_CODE_SESSION_ID` (agent `claude`). `whoami.sh` already returns it, so `$TEAM`/`$AGENT` resolve to the session team with no extra step, and each Claude session is fully isolated — you never see other sessions' traffic. The session's codex worker is started lazily: **before the first `send`/`ask` to codex, run** `~/.agents/skills/__SKILL_NAME__/scripts/ensure-codex.sh "$(pwd)"`. It brings up a headless codex in your session team (and is a no-op when the mode is off, so it is always safe to run first). On `--continue`/`--resume` the team name is unchanged (same session id), so the re-spawned codex can read this session's prior history with `history.sh s-$CLAUDE_CODE_SESSION_ID`.
 
+**IMPORTANT — cross-session isolation.** `$TEAM` for `send.sh`/`ask` MUST come from `whoami.sh` output (the Identity section above). Never derive the team from pidfiles, process listings, or `ls run/codex-bridge.*` — other sessions may have live bridges whose team names look similar. Using the wrong team silently leaks your messages into another session. `ensure-codex.sh` now prints `ensure-codex: … in team '<name>'` on all paths so you can verify it targeted your session's team.
+
 **If no arguments provided (DEFAULT action — always do this when the command is invoked without arguments):**
 1. **IMMEDIATELY** run inbox check for each TEAM: `~/.agents/skills/__SKILL_NAME__/scripts/inbox.sh $TEAM $AGENT`
 2. Do NOT ask the user what to do — just run the inbox check.

@@ -34,6 +34,7 @@ mkdir -p "$RUN_DIR" 2>/dev/null || true
 # the full flag signature so a bridge for another team never counts as ours.
 BRIDGE_SIG="codex-bridge\.js .*--team $TEAM --name $NAME --inline-inbox"
 if pgrep -f "$BRIDGE_SIG" >/dev/null 2>&1; then
+  echo "ensure-codex: codex '$NAME' already running in team '$TEAM'"
   exit 0
 fi
 
@@ -49,18 +50,20 @@ fi
 
 if ! mkdir "$LOCK" 2>/dev/null; then
   # Another ensure-codex holds the lock and is bringing the worker up.
+  echo "ensure-codex: spawn already in flight for '$NAME' in team '$TEAM'"
   exit 0
 fi
 trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
 
 # Re-check under the lock: a peer may have spawned between our pgrep and here.
 if pgrep -f "$BRIDGE_SIG" >/dev/null 2>&1; then
+  echo "ensure-codex: codex '$NAME' already running in team '$TEAM'"
   exit 0
 fi
 
 if "$SCRIPT_DIR/spawn.sh" codex "$NAME" --team "$TEAM" --project "$PROJECT" --headless >/dev/null 2>&1; then
-  echo "ensure-codex: spawned headless codex '$NAME' in '$TEAM'"
+  echo "ensure-codex: spawned headless codex '$NAME' in team '$TEAM'"
 else
-  echo "ensure-codex: failed to spawn codex '$NAME' in '$TEAM'" >&2
+  echo "ensure-codex: failed to spawn codex '$NAME' in team '$TEAM' — run spawn.sh directly to see why" >&2
   exit 1
 fi
