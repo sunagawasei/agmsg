@@ -108,13 +108,22 @@ agmsg_spawn_headless() {
   # Fail closed before registering anything: a reviewer runs approval_policy=never,
   # so if this codex build silently ignores default_permissions (e.g. too old for
   # permission profiles) it would fall back to workspace-write on the repo cwd and
-  # could MODIFY the repo. Verify enforcement on the real binary — probe a repo
-  # write under the same profile via `codex sandbox`. Capture stderr so we can tell
-  # three outcomes apart: write succeeded → sandbox not enforcing (fail-open, refuse);
-  # sandbox_apply denied → nested outer sandbox (preflight should have caught it, but
-  # guard here too); write denied → enforcing as intended (proceed).
+  # could MODIFY the repo. Verify enforcement on the real binary — two probes via
+  # `codex sandbox`:
+  #
+  #   Negative probe (repo write): must be DENIED. Four outcomes:
+  #     write succeeded  → sandbox not enforcing (fail-open) → refuse
+  #     "sandbox_apply"  → nested outer sandbox              → refuse
+  #     "Operation not permitted" / "Permission denied"       → enforcing → proceed
+  #     anything else    → unknown error (old codex, parse)  → refuse (fail-closed)
+  #
+  #   Positive probe (run_dir write): must SUCCEED — proves the worker can reply via
+  #     send.sh; catches mis-configured writable_roots before we register anything.
+  #
+  # Use a PID-qualified probe name so concurrent spawns don't collide (fix #2) and
+  # no pre-existing repo file of the same name is accidentally removed.
   if [ "$REVIEWER" = 1 ]; then
-    local probe="$cwd/.agmsg_reviewer_probe" probe_out
+    local probe="$cwd/.agmsg_reviewer_probe.$$" probe_out
     if probe_out="$(codex sandbox -P agmsg-reviewer -C "$cwd" \
          -c "permissions.agmsg-reviewer.filesystem=$fs" \
          -c 'permissions.agmsg-reviewer.network={ enabled=false }' \
@@ -122,13 +131,28 @@ agmsg_spawn_headless() {
       rm -f "$probe" 2>/dev/null || true
       die "reviewer sandbox is not enforced by this codex build (the repo would be writable); refusing to launch. Upgrade codex, or spawn with --no-reviewer for the scratch consultant."
     fi
-    # Only sandbox_apply means a nested outer sandbox. A normal write denial here
-    # is the enforcing-as-intended case and prints "touch: ...: Operation not
-    # permitted" (no sandbox_apply) — must NOT be treated as nesting.
+    # Classify non-zero exit — only "Operation not permitted"/"Permission denied"
+    # on the probe file itself means enforcing-as-intended. Any other failure is
+    # unknown (unsupported -P flag, profile parse error, codex too old) → refuse
+    # fail-closed so we never accidentally grant the worker repo write access.
     case "$probe_out" in
       *sandbox_apply*)
         die "headless codex can't apply its sandbox — this spawn is running inside an outer macOS Seatbelt sandbox (e.g. Claude Code's bash sandbox). Spawn from an unsandboxed session, add a top-level excludedCommands rule for this script (spawn.sh / ensure-codex.sh), or use the hook/launcher path." ;;
+      *"Operation not permitted"* | *"Permission denied"*)
+        ;;  # enforcing — proceed
+      *)
+        die "reviewer sandbox probe failed with an unexpected error; refusing to launch fail-closed (got: ${probe_out:-<empty>}). Verify 'codex sandbox -P' is supported by this build, or spawn with --no-reviewer for the scratch consultant." ;;
     esac
+    # Positive probe: verify the worker can actually write to run_dir (replies via
+    # send.sh need db/teams/run writes). If this fails the profile is misconfigured.
+    local pos_probe="$run_dir/.agmsg_reviewer_probe.$$"
+    if ! codex sandbox -P agmsg-reviewer -C "$cwd" \
+         -c "permissions.agmsg-reviewer.filesystem=$fs" \
+         -c 'permissions.agmsg-reviewer.network={ enabled=false }' \
+         -- /bin/sh -c "touch -- \"$pos_probe\" && rm -f -- \"$pos_probe\"" \
+         >/dev/null 2>&1; then
+      die "reviewer sandbox can't write to run_dir ($run_dir); the worker would be unable to reply via send.sh. Check the filesystem profile's write grants for \$SKILL_DIR/run."
+    fi
   fi
 
   # Serialize the register→spawn→record-write critical section against a
@@ -136,8 +160,19 @@ agmsg_spawn_headless() {
   # detached SessionEnd teardown can't rm the record we are about to write (and
   # drop our fresh registration). Held only across the fast bookkeeping below,
   # NOT the slow sandbox probes above. Fail-open on acquire timeout — despawn's
-  # --expect-record compare is the backstop. Released on every return path.
+  # --expect-record compare is the backstop.
+  #
+  # The trap releases on every return path, including unexpected set -e exits,
+  # so the lock is never left held if join.sh or later steps fail.
+  local _lk_held=0
+  _agmsg_spawn_lk_release() {
+    [ "$_lk_held" = 1 ] || return 0
+    agmsg_placement_lock_release "$TEAM" "$NAME" 2>/dev/null || true
+    _lk_held=0
+  }
+  trap _agmsg_spawn_lk_release RETURN
   agmsg_placement_lock_acquire "$TEAM" "$NAME" 10 || true
+  _lk_held=1
 
   # Register codex on the team (pin the path; opt out of #92 rewrite) so the
   # bridge has a subscription — otherwise it loops on "no available subscription".
@@ -154,7 +189,6 @@ agmsg_spawn_headless() {
     running="$(pgrep -f "codex-bridge\.js .*--team $TEAM --name $NAME --inline-inbox" 2>/dev/null | head -1 || true)"
   fi
   if [ -n "$running" ]; then
-    agmsg_placement_lock_release "$TEAM" "$NAME"
     echo "spawn: headless codex '$NAME' already running in '$TEAM' (pid $running)"
     return 0
   fi
@@ -168,7 +202,6 @@ agmsg_spawn_headless() {
   # drops exactly that registration.
   printf '%s\t%s\t%s\n' "pid:$bpid" "$cwd" "codex" \
     > "$(agmsg_spawn_path "$TEAM" "$NAME")" 2>/dev/null || true
-  agmsg_placement_lock_release "$TEAM" "$NAME"
   local kind="headless codex"; [ "$REVIEWER" = 1 ] && kind="headless reviewer codex"
   echo "spawned $kind '$NAME' in team '$TEAM' (pid $bpid)"
   [ "$REVIEWER" = 1 ] && echo "  cwd (repo, read-only): $cwd"
