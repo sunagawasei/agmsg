@@ -174,7 +174,7 @@ SH
   wait
   local n
   n=$(sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
-    "SELECT COUNT(*) FROM messages WHERE from_agent='leader';")
+    "SELECT COUNT(*) FROM events WHERE type='message_sent' AND from_agent='leader';")
   [ "$n" -eq 10 ]
 }
 
@@ -189,7 +189,7 @@ SH
   done
   wait
   local n
-  n=$(sqlite3 "$AGMSG_STORAGE_PATH/messages.db" "SELECT COUNT(*) FROM messages;")
+  n=$(sqlite3 "$AGMSG_STORAGE_PATH/messages.db" "SELECT COUNT(*) FROM events WHERE type='message_sent';")
   [ "$n" -eq 10 ]
 }
 

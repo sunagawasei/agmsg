@@ -163,22 +163,19 @@ for team in "${TEAM_LIST[@]}"; do
   if [ -n "$UNREAD_JSONL" ]; then
     _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
     RESULT=$(agmsg_sqlite ':memory:' "
-      SELECT json_extract(value,'\$.id') || char(31) ||
-             json_extract(value,'\$.from') || char(31) ||
+      SELECT json_extract(value,'\$.from') || char(31) ||
              replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
-             json_extract(value,'\$.at')
+             json_extract(value,'\$.at') || char(31) ||
+             json_extract(value,'\$.id')
       FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
     ")
     COUNT=$(printf '%s\n' "$RESULT" | wc -l | tr -d ' ')
     OUTPUT+="$COUNT new message(s) in $team:"$'\n'
-    IDS=""
-    while IFS=$'\x1f' read -r id from body ts; do
-      [ -n "$ts$from$body" ] || continue
+    IDS=()
+    while IFS=$'\x1f' read -r from body ts id; do
+      [ -n "$id" ] || continue
       OUTPUT+="  [$ts] $from: $body"$'\n'
-      case "$id" in
-        ''|*[!0-9]*) ;; # event-log id (UUID) or unset -> not a legacy row; skip
-        *) IDS="${IDS:+$IDS,}$id" ;;
-      esac
+      IDS+=("$id")
     done <<< "$RESULT"
     OUTPUT+=$'\n'
     # Test seam: a two-file barrier that lets the race regression test land a
@@ -192,13 +189,13 @@ for team in "${TEAM_LIST[@]}"; do
         [ "$_agmsg_barrier_waited" -ge 200 ] && break # 10s safety cap
       done
     fi
-    # Mark read — transitional legacy UPDATE (not storage_mark_read_batch yet);
-    # flips to events at step 3 alongside watch-once, which still reads legacy
-    # read_at. See the matching note in inbox.sh. Only the numeric (legacy-
-    # table) ids captured above, so a message that arrives between the SELECT
-    # and this UPDATE is not marked read unseen.
-    if [ -n "$IDS" ]; then
-      agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id IN ($IDS);" 2>/dev/null || true
+    # Mark read via the facade (§2.1 storage_mark_read_batch): recipient-scoped,
+    # idempotent; a legacy id records a message_read event without mutating the
+    # legacy row (§2.4). Only the ids collected from the rows actually
+    # displayed above — never a blanket match — so a message that arrives
+    # after the SELECT above can never be marked read unseen.
+    if [ "${#IDS[@]}" -gt 0 ]; then
+      storage_mark_read_batch "$team" "$AGENT" "${IDS[@]}" >/dev/null 2>&1 || true
     fi
   fi
 done

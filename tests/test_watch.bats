@@ -57,6 +57,43 @@ _max_message_id() {
     agmsg_sqlite "$(agmsg_db_path)" "SELECT COALESCE(MAX(id), 0) FROM messages;" )
 }
 
+# The delivery watermark is now an opaque storage cursor (the event-log
+# high-water), not a legacy messages id. This mirrors what storage_watch_tip
+# issues, so tests can assert the watcher's persisted watermark against it.
+_storage_tip() {
+  ( # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/storage.sh"
+    agmsg_sqlite "$(agmsg_db_path)" \
+      "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0);" )
+}
+
+_wait_for_file() {
+  local file="$1" i
+  for i in $(seq 1 100); do
+    [ -f "$file" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+_wait_for_missing() {
+  local file="$1" i
+  for i in $(seq 1 100); do
+    [ ! -e "$file" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+_wait_for_file_contains() {
+  local file="$1" needle="$2" i
+  for i in $(seq 1 100); do
+    [ -f "$file" ] && grep -q "$needle" "$file" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 @test "watch: restart delivers messages that arrived while the watcher was down" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
   local sid="sess-restart"
@@ -164,8 +201,8 @@ _max_message_id() {
   [ -f "$pf" ]
 
   bash "$SCRIPTS/send.sh" team bob alice "M1-delivered" >/dev/null
-  wait_for_file_contains "$out" "M1-delivered"
-  local first_id="$(_max_message_id)"
+  _wait_for_file_contains "$out" "M1-delivered"
+  local first_id="$(_storage_tip)"
 
   # Owning session dies (reap it so kill -0 reports gone, not a zombie), then a
   # newer row arrives. The liveness guard runs before the DB poll, so the watcher
@@ -173,7 +210,7 @@ _max_message_id() {
   kill "$sesspid" 2>/dev/null || true
   wait "$sesspid" 2>/dev/null || true
   bash "$SCRIPTS/send.sh" team bob alice "M2-undelivered" >/dev/null
-  local second_id="$(_max_message_id)"
+  local second_id="$(_storage_tip)"
 
   wait_for_missing "$pf" || { kill "$w" 2>/dev/null || true; false; }
   run kill -0 "$w"; [ "$status" -ne 0 ]
