@@ -133,16 +133,13 @@ mkdir -p "$SKILL_DIR/run"
 touch "$MARKER"
 
 # Check for unread messages and mark as read
+agmsg_storage_load
 DB="$(agmsg_db_path)"
 if [ ! -f "$DB" ]; then exit 0; fi
-
-_agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
-AGENT_SQL="$(_agmsg_sqlesc "$AGENT")"
 
 OUTPUT=""
 IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
 for team in "${TEAM_LIST[@]}"; do
-  team_sql="$(_agmsg_sqlesc "$team")"
   # Honor actas exclusivity locks. If (team, AGENT) is currently held by
   # another live session, that session is the owner of that role's inbox —
   # don't deliver here. Mirrors the per-pair filtering watch.sh does for
@@ -159,19 +156,27 @@ for team in "${TEAM_LIST[@]}"; do
     other:*) continue ;;
   esac
 
-  RESULT=$(agmsg_sqlite "$DB" "
-    SELECT id || char(31) || from_agent || char(31) || replace(replace(body, char(10), '\n'), char(9), '\t') || char(31) || created_at
-    FROM messages WHERE team='$team_sql' AND to_agent='$AGENT_SQL' AND read_at IS NULL
-    ORDER BY created_at ASC;
-  ")
-  if [ -n "$RESULT" ]; then
-    COUNT=$(echo "$RESULT" | wc -l | tr -d ' ')
+  # Unread via the storage facade (§2.1 storage_list_unread = events ∪ legacy),
+  # JSONL parsed in one pass with sqlite's JSON funcs (no jq; cf. lib/hooks-json.sh).
+  # id is kept so the mark step below targets exactly the rows shown.
+  UNREAD_JSONL=$(storage_list_unread "$team" "$AGENT")
+  if [ -n "$UNREAD_JSONL" ]; then
+    _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
+    RESULT=$(agmsg_sqlite ':memory:' "
+      SELECT json_extract(value,'\$.id') || char(31) ||
+             json_extract(value,'\$.from') || char(31) ||
+             replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
+             json_extract(value,'\$.at')
+      FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
+    ")
+    COUNT=$(printf '%s\n' "$RESULT" | wc -l | tr -d ' ')
     OUTPUT+="$COUNT new message(s) in $team:"$'\n'
     IDS=""
     while IFS=$'\x1f' read -r id from body ts; do
+      [ -n "$ts$from$body" ] || continue
       OUTPUT+="  [$ts] $from: $body"$'\n'
       case "$id" in
-        ''|*[!0-9]*) ;; # defensive: never splice a non-numeric value into SQL
+        ''|*[!0-9]*) ;; # event-log id (UUID) or unset -> not a legacy row; skip
         *) IDS="${IDS:+$IDS,}$id" ;;
       esac
     done <<< "$RESULT"
@@ -187,8 +192,11 @@ for team in "${TEAM_LIST[@]}"; do
         [ "$_agmsg_barrier_waited" -ge 200 ] && break # 10s safety cap
       done
     fi
-    # Mark as read — only the ids captured above, so a message that arrives
-    # between the SELECT and this UPDATE is not marked read unseen.
+    # Mark read — transitional legacy UPDATE (not storage_mark_read_batch yet);
+    # flips to events at step 3 alongside watch-once, which still reads legacy
+    # read_at. See the matching note in inbox.sh. Only the numeric (legacy-
+    # table) ids captured above, so a message that arrives between the SELECT
+    # and this UPDATE is not marked read unseen.
     if [ -n "$IDS" ]; then
       agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id IN ($IDS);" 2>/dev/null || true
     fi

@@ -33,73 +33,53 @@ case "$FORMAT" in human|ids) ;; *) echo "inbox: --format must be 'human' or 'ids
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
+agmsg_storage_load
 DB="$(agmsg_db_path)"
 
-sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
-T_ESC="$(sql_escape "$TEAM")"
-A_ESC="$(sql_escape "$AGENT")"
-
-# --- ack mode: mark only the listed ids read, then exit -----------------------
-if [ -n "$MARK_IDS" ]; then
-  case "$MARK_IDS" in
-    *[!0-9,]* | ,* | *, | *,,*)
-      echo "inbox: --mark-read-ids must be a comma-separated list of message ids" >&2
-      exit 1 ;;
-  esac
-  [ -f "$DB" ] || exit 0
-  agmsg_sqlite "$DB" "
-    UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-    WHERE team='$T_ESC' AND to_agent='$A_ESC' AND read_at IS NULL
-      AND id IN ($MARK_IDS);
-  " 2>/dev/null || true
-  exit 0
-fi
-
+# Preserve the read-only "not initialized yet" behaviour: an inbox check must not
+# create the store, so guard on the file before touching the facade.
 if [ ! -f "$DB" ]; then
   if [ "$QUIET" = true ] || [ "$FORMAT" = ids ]; then exit 0; fi
   echo "No messages (DB not initialized)"
   exit 0
 fi
 
-# --- machine mode: id-tagged unread, never marked read ------------------------
-if [ "$FORMAT" = ids ]; then
-  # id<US>from<US>body<US>created_at, one record per line. Body newlines/tabs are
-  # escaped (as in human mode) so each message stays a single line for the reader.
-  agmsg_sqlite "$DB" "
-    SELECT id || char(31) || from_agent || char(31)
-        || replace(replace(body, char(10), '\n'), char(9), '\t') || char(31) || created_at
-    FROM messages WHERE team='$T_ESC' AND to_agent='$A_ESC' AND read_at IS NULL
-    ORDER BY id ASC;
-  "
-  exit 0
-fi
+# Unread comes from the storage facade (§2.1 storage_list_unread = the event log
+# UNION the legacy messages table), as one JSONL record per line in delivery
+# order. Parse it with sqlite's JSON funcs in a single pass — the repo idiom, no
+# jq dependency (cf. lib/hooks-json.sh).
+UNREAD_JSONL=$(storage_list_unread "$TEAM" "$AGENT")
 
-# Get unread messages — id first so the mark step below targets exactly these
-# rows; escape newlines/tabs in body to keep one record per line
-UNREAD=$(agmsg_sqlite "$DB" "
-  SELECT id || char(31) || from_agent || char(31) || replace(replace(body, char(10), '\n'), char(9), '\t') || char(31) || created_at
-  FROM messages WHERE team='$T_ESC' AND to_agent='$A_ESC' AND read_at IS NULL
-  ORDER BY created_at ASC;
-")
-
-if [ -z "$UNREAD" ]; then
+if [ -z "$UNREAD_JSONL" ]; then
   if [ "$QUIET" = true ]; then exit 0; fi
   echo "No new messages."
   exit 0
 fi
 
-# Display, collecting the ids actually shown
-COUNT=$(echo "$UNREAD" | wc -l | tr -d ' ')
+# JSONL -> JSON array -> "id \x1f from \x1f body \x1f at" rows (newlines/tabs in
+# the body escaped so each message stays one display line). id is kept so the
+# mark step below can target exactly the rows shown, not a blanket match.
+_arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
+ROWS=$(agmsg_sqlite ':memory:' "
+  SELECT json_extract(value,'\$.id') || char(31) ||
+         json_extract(value,'\$.from') || char(31) ||
+         replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
+         json_extract(value,'\$.at')
+  FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
+")
+
+COUNT=$(printf '%s\n' "$ROWS" | wc -l | tr -d ' ')
 echo "$COUNT new message(s):"
 echo ""
 IDS=""
 while IFS=$'\x1f' read -r id from body ts; do
+  [ -n "$ts$from$body" ] || continue
   echo "  [$ts] $from: $body"
   case "$id" in
-    ''|*[!0-9]*) ;; # defensive: never splice a non-numeric value into SQL
+    ''|*[!0-9]*) ;; # event-log id (UUID) or unset -> not a legacy row; skip
     *) IDS="${IDS:+$IDS,}$id" ;;
   esac
-done <<< "$UNREAD"
+done <<< "$ROWS"
 echo ""
 
 # Test seam: a two-file barrier that lets the race regression test land a
@@ -114,10 +94,17 @@ if [ -n "${AGMSG_TEST_MARK_BARRIER:-}" ]; then
   done
 fi
 
-# Mark as read (non-fatal — may fail in sandboxed environments).
-# Only the ids displayed above: a blanket "WHERE read_at IS NULL" would also
-# swallow messages that arrived between the SELECT and this UPDATE — they
-# would be marked read without ever having been shown.
+# Mark as read — transitional legacy UPDATE, NOT storage_mark_read_batch yet.
+# The read-state writers (inbox/check-inbox) and the legacy-read_at readers
+# that have not migrated (watch-once, whose codex-bridge consumes an integer
+# max_id cursor) must flip together at step 3 (send -> events + watch ->
+# facade); marking event-log rows here would be invisible to those readers
+# and split read-state, so only the numeric (legacy-table) ids collected
+# above are targeted — event-log entries get their own mark-read flip later.
+# Only the ids actually displayed: a blanket "WHERE read_at IS NULL" would
+# also swallow messages that arrived between the SELECT and this UPDATE —
+# they would be marked read without ever having been shown. Non-fatal (may
+# fail in sandboxed environments).
 if [ -n "$IDS" ]; then
   agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id IN ($IDS);" 2>/dev/null || true
 fi
