@@ -1427,3 +1427,74 @@ JSON
   kill "$watch_pid" 2>/dev/null || true
   wait 2>/dev/null || true
 }
+
+# --- delivery.sh default-mode (config-driven default for the join flow) ---
+#
+# The resolver echoes a mode ONLY when delivery.default_mode is both a valid
+# token AND supported by the type's delivery_modes; otherwise it echoes nothing
+# (empty = "ask"). This is the join flow's one unit-testable surface — the
+# template prose that consults it is LLM-executed. stderr notes are dropped
+# (2>/dev/null) so assertions see stdout — the mode — only.
+
+@test "default-mode: unset config -> empty (join prompts as before)" {
+  run bash -c "bash '$SCRIPTS/delivery.sh' default-mode claude-code 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "default-mode: supported mode echoes it (monitor for claude-code)" {
+  bash "$SCRIPTS/config.sh" set delivery.default_mode monitor >/dev/null
+  run bash -c "bash '$SCRIPTS/delivery.sh' default-mode claude-code 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ "$output" = "monitor" ]
+}
+
+@test "default-mode: turn echoes for a turn-capable type (opencode)" {
+  bash "$SCRIPTS/config.sh" set delivery.default_mode turn >/dev/null
+  run bash -c "bash '$SCRIPTS/delivery.sh' default-mode opencode 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ "$output" = "turn" ]
+}
+
+@test "default-mode: off is a valid default and echoes" {
+  bash "$SCRIPTS/config.sh" set delivery.default_mode off >/dev/null
+  run bash -c "bash '$SCRIPTS/delivery.sh' default-mode claude-code 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ "$output" = "off" ]
+}
+
+@test "default-mode: mode unsupported for the type -> empty (falls back to prompt)" {
+  # monitor is not in opencode's delivery_modes (turn off).
+  bash "$SCRIPTS/config.sh" set delivery.default_mode monitor >/dev/null
+  run bash -c "bash '$SCRIPTS/delivery.sh' default-mode opencode 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  # ...and the stderr note explains why (visible without the 2>/dev/null).
+  run bash "$SCRIPTS/delivery.sh" default-mode opencode
+  [[ "$output" =~ "not supported for opencode" ]]
+}
+
+@test "default-mode: junk value -> empty + does not break (would-be-rejected by set)" {
+  bash "$SCRIPTS/config.sh" set delivery.default_mode bogus >/dev/null
+  run bash -c "bash '$SCRIPTS/delivery.sh' default-mode claude-code 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  run bash "$SCRIPTS/delivery.sh" default-mode claude-code
+  [[ "$output" =~ "invalid delivery.default_mode" ]]
+}
+
+@test "default-mode: resolved value feeds 'set' cleanly and installs the hooks" {
+  bash "$SCRIPTS/config.sh" set delivery.default_mode monitor >/dev/null
+  local m
+  m=$(bash "$SCRIPTS/delivery.sh" default-mode claude-code 2>/dev/null)
+  [ "$m" = "monitor" ]
+  run bash "$SCRIPTS/delivery.sh" set "$m" claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  has_session_start "$(settings_file)"
+  ! has_check_inbox "$(settings_file)"
+}
+
+@test "default-mode: requires a type argument" {
+  run bash "$SCRIPTS/delivery.sh" default-mode
+  [ "$status" -ne 0 ]
+}

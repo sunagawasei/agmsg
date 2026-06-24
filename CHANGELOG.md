@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `delivery.default_mode` config: set a machine-wide default delivery mode the
+  join flow auto-applies, skipping the per-project prompt. Resolved per-type via
+  `delivery.sh default-mode <type>` (honored only where the type supports the
+  mode; unset/invalid/unsupported falls back to asking).
+
 ## [1.1.0] - 2026-06-22
 
 ### Added

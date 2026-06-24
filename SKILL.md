@@ -101,6 +101,13 @@ Do NOT manually edit config files. Always use join.sh.
 ~/.agents/skills/agmsg/scripts/delivery.sh set <mode> <type> "$(pwd)"
 ~/.agents/skills/agmsg/scripts/delivery.sh status <type> "$(pwd)"
 
+# Skip the per-project mode prompt: set a default the Claude Code join flow
+# auto-applies (unset/invalid/unsupported = ask each time). Currently consulted
+# by the claude-code join flow only; other types still prompt at join.
+#   agmsg config set delivery.default_mode <monitor|turn|both|off>
+# `delivery.sh default-mode <type>` echoes the resolved default (empty = ask).
+~/.agents/skills/agmsg/scripts/delivery.sh default-mode <type>
+
 # Multiple roles per project (one CC = one active role).
 # Claude Code: `actas` claims an exclusivity lock for <name> across sessions
 # and restarts the Monitor filtered to <name> only; peer watchers stop

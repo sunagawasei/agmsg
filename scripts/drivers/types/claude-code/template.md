@@ -45,31 +45,39 @@ Four possible outputs:
   > - `/__SKILL_NAME__ spawn <type> <name>` — launch a new agent in a tmux pane / terminal and have it actas <name>
   > - `/__SKILL_NAME__ despawn <name>` — tear down a member you spawned (graceful, or `--force`)
 
-  5. **REQUIRED — Do NOT skip this step.** Ask the user to pick a delivery mode using exactly this prompt:
+  5. **REQUIRED — Do NOT skip this step.** First check whether the user has a configured default delivery mode:
+     run `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh default-mode claude-code 2>/dev/null`
+     (the `2>/dev/null` matters — judge ONLY on stdout; the resolver may print an explanatory note to stderr).
 
-     ```
-     Choose delivery mode for incoming messages:
+     - **If stdout is exactly one of `monitor` / `turn` / `both` / `off`**: the user has set `delivery.default_mode` — **do NOT show the prompt below.** Run
+       `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh set <that-mode> claude-code "$(pwd)"`,
+       tell the user `Delivery mode auto-set to <mode> (delivery.default_mode) — change anytime with /__SKILL_NAME__ mode <monitor|turn|both|off>`,
+       read the `AGMSG-DIRECTIVE` block printed by `delivery.sh` and follow it (invoke Monitor or TaskStop as instructed), then continue to step 6.
+     - **If stdout is empty** (no default configured, or the configured value is invalid/unsupported): ask the user to pick a delivery mode using exactly this prompt:
 
-       1) monitor — Real-time push (~5s latency)
-                     SessionStart hook + Monitor tool streams events.
-                     Recommended.
+       ```
+       Choose delivery mode for incoming messages:
 
-       2) turn    — Check inbox at the end of each assistant turn
-                     Stop hook pulls after each response.
+         1) monitor — Real-time push (~5s latency)
+                       SessionStart hook + Monitor tool streams events.
+                       Recommended.
 
-       3) both    — monitor primary, turn as fallback
-                     Redundant safety net.
+         2) turn    — Check inbox at the end of each assistant turn
+                       Stop hook pulls after each response.
 
-       4) off     — No automatic delivery
-                     Manual /__SKILL_NAME__ only.
+         3) both    — monitor primary, turn as fallback
+                       Redundant safety net.
 
-     [1]:
-     ```
+         4) off     — No automatic delivery
+                       Manual /__SKILL_NAME__ only.
 
-     - **Wait for the user's answer before proceeding.** Empty input means `1` (monitor).
-     - Map the chosen number to a mode and run:
-       `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh set <mode> claude-code "$(pwd)"`
-     - Read the `AGMSG-DIRECTIVE` block printed by `delivery.sh` and follow it (invoke Monitor or TaskStop as instructed).
+       [1]:
+       ```
+
+       - **Wait for the user's answer before proceeding.** Empty input means `1` (monitor).
+       - Map the chosen number to a mode and run:
+         `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh set <mode> claude-code "$(pwd)"`
+       - Read the `AGMSG-DIRECTIVE` block printed by `delivery.sh` and follow it (invoke Monitor or TaskStop as instructed).
 
   6. Then check inbox for the newly joined team.
 

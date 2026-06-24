@@ -8,6 +8,9 @@ set -euo pipefail
 #   delivery.sh status [<type> <project_path>]
 #   delivery.sh stop
 #   delivery.sh restart [<project_path> <type>]
+#   delivery.sh default-mode <type>   # echo the configured delivery.default_mode
+#                                     # if valid+supported, else nothing (join
+#                                     # flow consults this before prompting)
 #
 # Modes:
 #   monitor  — SessionStart hook → Claude Code Monitor tool → watch.sh stream
@@ -372,6 +375,44 @@ do_set() {
   esac
 }
 
+# Resolve the configured default delivery mode FOR THIS TYPE, for the join flow
+# to consult before prompting (templates' step 5). Echoes the mode ONLY when
+# `delivery.default_mode` is both a valid token AND supported by <type>'s
+# delivery_modes; otherwise echoes nothing so the caller falls back to asking.
+# It must never fail the join: an unset key, a junk value, or a mode the type
+# can't do all degrade to empty output (with a stderr note for the last two).
+do_default_mode() {
+  local TYPE="${1:?Usage: delivery.sh default-mode <type>}"
+
+  local configured
+  configured=$("$SCRIPT_DIR/config.sh" get delivery.default_mode 2>/dev/null || true)
+  # Trim surrounding whitespace the YAML reader may leave on.
+  configured="${configured#"${configured%%[![:space:]]*}"}"
+  configured="${configured%"${configured##*[![:space:]]}"}"
+  [ -z "$configured" ] && return 0   # unset → prompt (empty output)
+
+  # Stage 1: is it even a real mode? A typo'd key value must not propagate to
+  # `delivery.sh set`, which would then reject it and break the join.
+  case "$configured" in
+    monitor|turn|both|off) ;;
+    *)
+      echo "agmsg: ignoring invalid delivery.default_mode='$configured' (use monitor|turn|both|off); will prompt" >&2
+      return 0 ;;
+  esac
+
+  # Stage 2: does THIS type accept it? default_mode=monitor under a turn-only
+  # type (opencode/copilot) is a no-op, not an error — fall back to the prompt.
+  local supported
+  supported=$(agmsg_type_get "$TYPE" delivery_modes 2>/dev/null || true)
+  [ -z "$supported" ] && supported="monitor turn both off"
+  case " $supported " in
+    *" $configured "*) echo "$configured" ;;
+    *)
+      echo "agmsg: delivery.default_mode='$configured' not supported for $TYPE (supported: $supported); will prompt" >&2
+      return 0 ;;
+  esac
+}
+
 do_status() {
   local TYPE="${1:-}"
   local PROJECT="${2:-}"
@@ -468,9 +509,10 @@ EOF
 }
 
 case "$ACTION" in
-  set)     do_set "$@" ;;
-  status)  do_status "$@" ;;
-  stop)    do_stop "$@" ;;
-  restart) do_restart "$@" ;;
-  *)       echo "Unknown action: $ACTION (use set|status|stop|restart)" >&2; exit 1 ;;
+  set)          do_set "$@" ;;
+  status)       do_status "$@" ;;
+  stop)         do_stop "$@" ;;
+  restart)      do_restart "$@" ;;
+  default-mode) do_default_mode "$@" ;;
+  *)            echo "Unknown action: $ACTION (use set|status|stop|restart|default-mode)" >&2; exit 1 ;;
 esac

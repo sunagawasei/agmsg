@@ -228,6 +228,14 @@ How incoming messages reach your agent. Pick one at first join via the prompt, o
 
 Settings are per-project. Each `<project>/.claude/settings.local.json` gets exactly the hooks the chosen mode needs — repeated `set` calls are idempotent.
 
+**Default mode for new projects (Claude Code).** To stop being prompted at every new join, set a default the Claude Code join flow applies automatically:
+
+```
+agmsg config set delivery.default_mode monitor   # monitor | turn | both | off
+```
+
+When set, the Claude Code join flow skips the mode prompt and applies that mode — if the value is unset, invalid, or a mode Claude Code can't do, it falls back to asking. Currently only the Claude Code join flow consults it; other agent types (Codex, Cursor, …) still prompt at join. Switch any individual project afterward with `/agmsg mode <name>`.
+
 **Monitor priming**: in `monitor` mode, the receiving agent doesn't react to its first inbound message until it has taken at least one turn this session. If you've just started a fresh session and a teammate has already sent something, nudge the agent with any short message ("hi") to prime it — subsequent messages stream in real time.
 
 ### Migrating from legacy `hook on/off`

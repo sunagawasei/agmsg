@@ -136,6 +136,12 @@ create_default_config() {
 # no global "mode" key. Only machine-wide tuning lives here.
 
 delivery:
+  # Default delivery mode for a NEW project's join flow, so you are not prompted
+  # to choose each time. One of: monitor | turn | both | off. Unset = ask.
+  # Currently consulted by the claude-code join flow only (other agent types
+  # still prompt); an unset/invalid/unsupported value falls back to asking.
+  #   agmsg config set delivery.default_mode monitor
+  # default_mode: monitor
   monitor:
     # watch.sh SQLite poll interval, seconds
     poll_interval: 5
