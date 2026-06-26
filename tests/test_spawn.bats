@@ -450,3 +450,95 @@ CODEX_STUB
   [ "$status" -eq 0 ]
   [[ "$output" == *"spawned headless reviewer codex 'rv'"* ]]
 }
+
+# --- reviewer /add-dir read-root inheritance (spawn.codex_inherit_add_dirs) ---
+
+@test "spawn: codex reviewer inherits /add-dir read roots when spawn.codex_inherit_add_dirs=true" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_inherit_add_dirs true
+  local adddir="$TEST_SKILL_DIR/adddir"; mkdir -p "$adddir"
+  mkdir -p "$PROJ/.claude"
+  printf '{"permissions":{"additionalDirectories":["%s"]}}' "$adddir" > "$PROJ/.claude/settings.local.json"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"\"$adddir\"=\"read\""* ]]        # the add-dir is granted READ
+  [[ "$output" == *"default_permissions=agmsg-reviewer"* ]]
+}
+
+@test "spawn: codex reviewer does NOT inherit /add-dir roots when the gate is off (default)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  local adddir="$TEST_SKILL_DIR/adddir"; mkdir -p "$adddir"
+  mkdir -p "$PROJ/.claude"
+  printf '{"permissions":{"additionalDirectories":["%s"]}}' "$adddir" > "$PROJ/.claude/settings.local.json"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"default_permissions=agmsg-reviewer"* ]]   # reviewer still active
+  [[ "$output" != *"$adddir"* ]]                              # but the add-dir is not granted
+}
+
+@test "spawn: codex reviewer skips a non-existent /add-dir entry (still launches)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_inherit_add_dirs true
+  mkdir -p "$PROJ/.claude"
+  printf '{"permissions":{"additionalDirectories":["/no/such/dir/xyz"]}}' > "$PROJ/.claude/settings.local.json"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]                                          # a stale add-dir never bricks the spawn
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *"/no/such/dir/xyz"* ]]
+}
+
+@test "spawn: codex reviewer skips an /add-dir path with a single quote (no shell injection)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_inherit_add_dirs true
+  # An existing directory whose name carries a single quote + shell metacharacters.
+  # The value is spliced into appcmd's single-quoted -c '…filesystem=…', which the
+  # bridge re-parses via `/bin/sh -lc`; a ' would break out → command injection.
+  local evil="$TEST_SKILL_DIR/ev'il; touch $TEST_SKILL_DIR/PWNED; :"
+  mkdir -p "$evil"
+  mkdir -p "$PROJ/.claude"
+  printf '{"permissions":{"additionalDirectories":["%s"]}}' "$evil" > "$PROJ/.claude/settings.local.json"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]                                       # launches on the base profile
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *"PWNED"* ]]                              # payload never reached the launch command
+  [ ! -e "$TEST_SKILL_DIR/PWNED" ]                          # and nothing executed it
+}
+
+@test "spawn: codex reviewer does not re-grant the project root as an /add-dir read root" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_inherit_add_dirs true
+  mkdir -p "$PROJ/.claude"
+  printf '{"permissions":{"additionalDirectories":["%s"]}}' "$PROJ" > "$PROJ/.claude/settings.local.json"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *"\"$PROJ\"=\"read\""* ]]   # already :workspace_roots — not re-granted
+}

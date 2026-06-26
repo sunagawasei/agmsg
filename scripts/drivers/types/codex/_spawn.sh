@@ -70,12 +70,61 @@ preflight_seatbelt_nesting() {
 #   reviewer — cwd IS the target repo so codex can autonomously explore it, under
 #     a permission profile (default_permissions) that grants the repo READ-only
 #     and confines writes to agmsg's db/teams/run (replies via send.sh still work).
-#     Reads are scoped to the repo + toolchain dirs + agmsg, so the repo cannot be
-#     modified and unrelated secrets (e.g. ~/.ssh) stay unreadable. Permission
+#     Reads are scoped to the repo + toolchain dirs + agmsg (+ the Claude
+#     session's /add-dir directories when spawn.codex_inherit_add_dirs is on),
+#     so the repo cannot be modified and unrelated secrets (e.g. ~/.ssh) stay
+#     unreadable. Permission
 #     profiles supersede sandbox_mode — the two systems must not be mixed, so this
 #     branch sets no sandbox_mode flag. :tmpdir=write and the toolchain read grants
 #     are required for git/mktemp and tools installed under /nix or /opt/homebrew.
 #
+# Collect extra READ roots for the reviewer filesystem profile from the Claude
+# session's /add-dir list (permissions.additionalDirectories in the spawned
+# project's .claude/settings.json + settings.local.json). This lets a headless
+# reviewer codex read the same out-of-repo directories the asking Claude session
+# was granted via /add-dir, while every other path (e.g. ~/.ssh) stays
+# unreadable.
+#
+# Gated by config spawn.codex_inherit_add_dirs (default off — it widens the
+# reviewer read scope, so it is opt-in). Echoes codex filesystem-table entries,
+# each prefixed ', "<dir>"="read"', ready to splice into the profile body; empty
+# when the gate is off or nothing qualifies. Skips non-existent / non-directory /
+# unsafe paths (an embedded ' " or \ would break the shell or TOML quoting the
+# value is spliced into — see the filter below) and the project root itself
+# (already :workspace_roots), and dedups by resolved path. A malformed settings
+# file yields no roots (the sqlite error is swallowed) — fail-safe, never fatal.
+agmsg_reviewer_add_dir_roots() {
+  local project="$1"
+  case "$("$SCRIPT_DIR/config.sh" get spawn.codex_inherit_add_dirs false 2>/dev/null || true)" in
+    true|1|yes|on) ;;
+    *) return 0 ;;
+  esac
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  local project_real; project_real="$(cd "$project" 2>/dev/null && pwd -P || printf '%s' "$project")"
+  local out="" seen=" " f sqlp d dreal
+  for f in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
+    [ -f "$f" ] || continue
+    sqlp="$(agmsg_sql_readfile_path "$f")"
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      case "$d" in "~") d="$HOME" ;; "~/"*) d="$HOME/${d#\~/}" ;; esac
+      # Skip any path bearing a single quote, double quote, or backslash. The
+      # value is spliced into the single-quoted `-c 'permissions…filesystem=…'`
+      # of appcmd, which the bridge re-parses via `/bin/sh -lc` (codex-bridge.js):
+      # a ' would break out of that wrapper (shell command injection from a repo-
+      # supplied settings file), and " / \ would break codex's quoted TOML table.
+      case "$d" in *"'"*|*'"'*|*'\'*) continue ;; esac
+      [ -d "$d" ] || continue                              # skip non-existent / non-directory
+      dreal="$(cd "$d" 2>/dev/null && pwd -P || printf '%s' "$d")"
+      [ "$dreal" = "$project_real" ] && continue           # project root already = :workspace_roots
+      case "$seen" in *" $dreal "*) continue ;; esac        # dedup by resolved path
+      seen="$seen$dreal "
+      out="$out, \"$d\"=\"read\""
+    done < <(agmsg_sqlite_mem "SELECT value FROM json_each(readfile('$sqlp'), '\$.permissions.additionalDirectories')" 2>/dev/null || true)
+  done
+  printf '%s' "$out"
+}
+
 # approval_policy=never in both because a headless worker cannot answer approvals.
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run"
@@ -91,7 +140,23 @@ agmsg_spawn_headless() {
     # a review needs another global read root (e.g. a language's module cache). The
     # -c values that contain spaces are single-quoted: the bridge runs the command
     # via `sh -lc`, which re-parses the string (see codex-bridge.js).
-    local fs="{ \":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"read\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\" }"
+    local fs_base="\":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"read\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\""
+    # Additively grant READ on the Claude session's /add-dir directories (gated;
+    # see agmsg_reviewer_add_dir_roots). Purely additive and fail-open: pre-flight
+    # the augmented profile with a trivial sandboxed command, and if it fails to
+    # apply (e.g. a pathological add-dir entry) drop the extra roots and fall back
+    # to the base profile, so add-dir inheritance can never brick the spawn. The
+    # base reviewer guarantee (repo read-only, secrets unreadable) is still proved
+    # fail-closed by the negative/positive probes below.
+    local add_dir_roots; add_dir_roots="$(agmsg_reviewer_add_dir_roots "$cwd")"
+    if [ -n "$add_dir_roots" ] && ! codex sandbox -P agmsg-reviewer -C "$cwd" \
+         -c "permissions.agmsg-reviewer.filesystem={ $fs_base$add_dir_roots }" \
+         -c 'permissions.agmsg-reviewer.network={ enabled=false }' \
+         -- /usr/bin/true >/dev/null 2>&1; then
+      echo "spawn: reviewer add-dir inheritance disabled (augmented sandbox profile failed to apply); using base profile" >&2
+      add_dir_roots=""
+    fi
+    local fs="{ $fs_base$add_dir_roots }"
     appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-reviewer -c 'permissions.agmsg-reviewer.filesystem=$fs' -c 'permissions.agmsg-reviewer.network={ enabled=false }' -c web_search=live -c approval_policy=never"
   else
     cwd="$run_dir/codex-$TEAM-cwd"
@@ -205,5 +270,7 @@ agmsg_spawn_headless() {
   local kind="headless codex"; [ "$REVIEWER" = 1 ] && kind="headless reviewer codex"
   echo "spawned $kind '$NAME' in team '$TEAM' (pid $bpid)"
   [ "$REVIEWER" = 1 ] && echo "  cwd (repo, read-only): $cwd"
+  [ "$REVIEWER" = 1 ] && [ -n "$add_dir_roots" ] && \
+    echo "  add-dir reads (read-only):$(printf '%s' "$add_dir_roots" | sed 's/="read"//g; s/[",]/ /g')"
   echo "  log: $log"
 }
