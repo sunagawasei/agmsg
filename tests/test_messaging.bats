@@ -117,3 +117,43 @@ line"
   [ "$status" -eq 0 ]
   [[ "$output" =~ "No message history" ]]
 }
+
+# --- send --stdin / inbox machine mode (headless bridge plumbing) ---
+
+@test "send: --stdin reads the body from standard input" {
+  printf 'line one\nline two with "quotes"' | bash "$SCRIPTS/send.sh" testteam alice bob --stdin
+  run bash "$SCRIPTS/inbox.sh" testteam bob
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"line one"* ]]
+  [[ "$output" == *'line two with "quotes"'* ]]
+}
+
+@test "inbox: --format ids prints id-tagged rows and does NOT mark read" {
+  bash "$SCRIPTS/send.sh" testteam alice bob "first"
+  bash "$SCRIPTS/send.sh" testteam alice bob "second"
+  run bash "$SCRIPTS/inbox.sh" testteam bob --format ids
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"first"* ]]
+  [[ "$output" == *"second"* ]]
+  local n1; n1=$(printf '%s\n' "$output" | grep -c .)
+  [ "$n1" -eq 2 ]
+  # fetching again still returns both — nothing was marked read
+  run bash "$SCRIPTS/inbox.sh" testteam bob --format ids
+  local n2; n2=$(printf '%s\n' "$output" | grep -c .)
+  [ "$n2" -eq 2 ]
+}
+
+@test "inbox: --mark-read-ids marks only the listed ids" {
+  bash "$SCRIPTS/send.sh" testteam alice bob "keep-unread"   # id 1
+  bash "$SCRIPTS/send.sh" testteam alice bob "ack-this"      # id 2
+  bash "$SCRIPTS/inbox.sh" testteam bob --mark-read-ids 2
+  run bash "$SCRIPTS/inbox.sh" testteam bob --format ids
+  [[ "$output" == *"keep-unread"* ]]
+  [[ "$output" != *"ack-this"* ]]
+}
+
+@test "inbox: --mark-read-ids rejects a non-numeric id list" {
+  run bash "$SCRIPTS/inbox.sh" testteam bob --mark-read-ids "1;DROP TABLE messages"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "comma-separated list of message ids" ]]
+}

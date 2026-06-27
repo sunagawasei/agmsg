@@ -282,7 +282,8 @@ if [ "$UPDATE_ONLY" = true ]; then
   fi
   cp "$SCRIPT_DIR/openai.yaml" "$SKILL_DIR/agents/openai.yaml" 2>/dev/null || true
   chmod +x "$SKILL_DIR/scripts/"*.sh
-  chmod +x "$SKILL_DIR/scripts/drivers/types/codex/"*.sh 2>/dev/null || true
+  # Per-type folded runtime scripts (codex-*.sh, cursor-bridge.sh, watch-once.sh …).
+  chmod +x "$SKILL_DIR/scripts/drivers/types/"*/*.sh 2>/dev/null || true
   # Refresh the Codex monitor shim (~/.agents/bin/codex) if it's ours. --update
   # cp's the new codex-shim-install.sh but does not re-run it, so a shim from an
   # older install keeps its stale baked exec path after the
@@ -352,7 +353,8 @@ cp "$SCRIPT_DIR/plugins/README.md" "$SKILL_DIR/plugins/README.md" 2>/dev/null ||
 
 cp "$SCRIPT_DIR/openai.yaml" "$SKILL_DIR/agents/openai.yaml" 2>/dev/null || true
 chmod +x "$SKILL_DIR/scripts/"*.sh
-chmod +x "$SKILL_DIR/scripts/drivers/types/codex/"*.sh 2>/dev/null || true
+# Per-type folded runtime scripts (codex-*.sh, cursor-bridge.sh, watch-once.sh …).
+chmod +x "$SKILL_DIR/scripts/drivers/types/"*/*.sh 2>/dev/null || true
 # Re-point an existing Codex monitor shim at the new path on a reinstall over an
 # older layout (no-op when no agmsg shim is present). See the --update block above.
 CODEX_SHIM="$SKILL_DIR/scripts/drivers/types/codex/codex-shim-install.sh"

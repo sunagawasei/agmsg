@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: send.sh <team> <from> <to> <message> [--wait] [--timeout <sec>] [--interval <sec>]
+# Usage: send.sh <team> <from> <to> <message|--stdin> [--wait] [--timeout <sec>] [--interval <sec>]
+#
+# Message body: pass it as the 4th positional argument (legacy), or pass --stdin
+# to read the entire body from standard input. --stdin keeps a large body (e.g. a
+# headless worker's full reply) off the argv, so it can't hit ARG_MAX or be
+# mangled by shell quoting — the bridge workers use it for exactly that.
 #
 # Without --wait: insert the message and return immediately (legacy behavior).
 #
@@ -28,11 +33,21 @@ set -euo pipefail
 # exchanges. A monitor watcher will also surface the same reply as a duplicate
 # event afterward — treat the --wait result as authoritative and ignore it.
 
-TEAM="${1:?Usage: send.sh <team> <from> <to> <message> [--wait] [--timeout <sec>] [--interval <sec>]}"
+TEAM="${1:?Usage: send.sh <team> <from> <to> <message|--stdin> [--wait] [--timeout <sec>] [--interval <sec>]}"
 FROM="${2:?Missing from agent}"
 TO="${3:?Missing to agent}"
-BODY="${4:?Missing message body}"
-shift 4
+shift 3
+
+# Body source: stdin when the body slot (the 4th positional) is exactly --stdin,
+# otherwise that positional IS the body. Only the body slot is inspected, so a
+# body that merely begins with '-' (or contains "--stdin") still works as the 4th
+# arg — the sole reserved value is a 4th arg that is literally "--stdin".
+if [ "${1:-}" = "--stdin" ]; then
+  BODY="$(cat)"
+else
+  BODY="${1:?Missing message body (or pass --stdin to read it from stdin)}"
+  shift
+fi
 
 WAIT=0
 TIMEOUT="${AGMSG_SEND_WAIT_TIMEOUT:-300}"
@@ -40,11 +55,12 @@ INTERVAL="${AGMSG_SEND_WAIT_INTERVAL:-2}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --stdin) shift ;;   # already consumed by the pre-scan above
     --wait) WAIT=1; shift ;;
     --timeout) TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
     --interval) INTERVAL="${2:?--interval needs seconds}"; shift 2 ;;
     -h|--help)
-      echo "Usage: send.sh <team> <from> <to> <message> [--wait] [--timeout <sec>] [--interval <sec>]"
+      echo "Usage: send.sh <team> <from> <to> <message|--stdin> [--wait] [--timeout <sec>] [--interval <sec>]"
       exit 0 ;;
     *) echo "send: unknown option: $1" >&2; exit 1 ;;
   esac

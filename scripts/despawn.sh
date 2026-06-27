@@ -70,7 +70,10 @@ if [ "$FORCE" != "1" ] && [ -f "$SPAWN_REC" ]; then
   case "$_hid" in pid:*) FORCE=1 ;; esac
 fi
 
-# Stop a headless codex bridge worker (placement recorded as pid:<n>) safely.
+# Stop a headless bridge worker (placement recorded as pid:<n>) safely. Works for
+# any headless type: the meta file and the process command line are both named
+# `<type>-bridge` (codex-bridge.js, cursor-bridge.sh, …), so the type — parsed
+# from the spawn record's 3rd field and passed in as $4 — selects which to check.
 # Guard against PID reuse two ways before killing:
 #   - meta present: the bridge's meta pid must equal the recorded pid, else the
 #     record is stale (a re-spawn updated meta but not the placement) — skip.
@@ -79,10 +82,11 @@ fi
 #     fails the match and is left alone. The old code skipped the guard entirely
 #     when meta was missing and killed the pid blindly — a PID-reuse footgun.
 # Neither verifiable (pid already gone) → nothing to do. SIGTERM first (the bridge
-# stops its client and kills its stdio app-server child), SIGKILL fallback.
+# stops its work loop and any child it owns, e.g. codex's stdio app-server),
+# SIGKILL fallback.
 kill_headless_pid() {
-  local pid="$1" team="$2" name="$3" meta meta_pid n=0 args
-  meta="$SKILL_DIR/run/codex-bridge.$team.$name.meta"
+  local pid="$1" team="$2" name="$3" type="${4:-codex}" meta meta_pid n=0 args
+  meta="$SKILL_DIR/run/$type-bridge.$team.$name.meta"
   [ -f "$meta" ] && meta_pid="$(sed -n 's/^pid=//p' "$meta" 2>/dev/null)"
   kill -0 "$pid" 2>/dev/null || return 0
   if [ -n "${meta_pid:-}" ]; then
@@ -93,9 +97,9 @@ kill_headless_pid() {
   else
     args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
     case "$args" in
-      *"codex-bridge.js"*"--team $team"*"--name $name"*) ;;   # ours → proceed
+      *"$type-bridge"*"--team $team"*"--name $name"*) ;;   # ours → proceed
       *)
-        echo "despawn: pid $pid is not a codex-bridge for $team/$name and no meta confirms it — skipping kill (pid reuse?)" >&2
+        echo "despawn: pid $pid is not a $type-bridge for $team/$name and no meta confirms it — skipping kill (pid reuse?)" >&2
         return 0 ;;
     esac
   fi
@@ -116,7 +120,7 @@ kill_recorded_placement() {
   IFS=$'\t' read -r id _proj _type <<<"${1-}"
   [ -n "$id" ] || return 1
   case "$id" in
-    pid:*) kill_headless_pid "${id#pid:}" "$TEAM" "$NAME" ;;
+    pid:*) kill_headless_pid "${id#pid:}" "$TEAM" "$NAME" "${_type:-codex}" ;;
     %*|@*)
       if command -v tmux >/dev/null 2>&1; then
         case "$id" in

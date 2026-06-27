@@ -64,7 +64,7 @@ write_node_launcher_fixtures() {
   [ "$status" -ne 0 ]
 }
 
-@test "type-registry: spawnable set is exactly claude-code, codex and hermes" {
+@test "type-registry: spawnable set is exactly claude-code, codex, cursor and hermes" {
   run env -i PATH="$PATH" bash -c \
     "source '$SCRIPTS/lib/type-registry.sh'
      while IFS= read -r t; do
@@ -72,7 +72,14 @@ write_node_launcher_fixtures() {
        [ \"\$(agmsg_type_get \"\$t\" spawnable)\" = yes ] && echo \"\$t\"
      done <<< \"\$(agmsg_known_types | sort -u)\" | paste -sd, -"
   [ "$status" -eq 0 ]
-  [ "$output" = "claude-code,codex,hermes" ]
+  [ "$output" = "claude-code,codex,cursor,hermes" ]
+}
+
+@test "type-registry: cursor manifest declares headless capability" {
+  g() { env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_type_get $1 $2"; }
+  [ "$(g cursor spawnable)" = yes ]
+  [ "$(g cursor headless)" = yes ]
+  [ "$(g cursor cli)" = cursor-agent ]
 }
 
 @test "type-registry: detection manifests carry the expected env / proc keys" {

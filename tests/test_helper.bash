@@ -14,8 +14,9 @@ setup_test_env() {
   # Agent-type manifests + per-type runtimes now live under scripts/drivers/types/
   # (the type registry reads <skill-root>/scripts/drivers/types/<name>/type.conf),
   # so the recursive scripts/ copy above already brings them along — no separate
-  # copy is needed. Just ensure codex's folded runtime scripts stay executable.
-  chmod +x "$TEST_SKILL_DIR/scripts/drivers/types/codex/"*.sh 2>/dev/null || true
+  # copy is needed. Just ensure every type's folded runtime scripts stay executable
+  # (codex-*.sh, cursor-bridge.sh, watch-once.sh …).
+  chmod +x "$TEST_SKILL_DIR/scripts/drivers/types/"*/*.sh 2>/dev/null || true
 
   # Initialize DB
   bash "$TEST_SKILL_DIR/scripts/internal/init-db.sh"
