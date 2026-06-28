@@ -161,6 +161,15 @@ settings_file() {
   [[ "$output" =~ "mode: monitor" ]]
 }
 
+@test "delivery status: claude-code still reports the watch process summary" {
+  mkdir -p "$TEST_SKILL_DIR/run"
+  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
+  run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"mode: monitor"* ]]
+  [[ "$output" == *"watch processes:"* ]]
+}
+
 @test "delivery status: derives 'turn' from settings with Stop only" {
   bash "$SCRIPTS/delivery.sh" set turn claude-code "$TEST_PROJECT" >/dev/null
   run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
@@ -194,6 +203,41 @@ settings_file() {
   run bash "$SCRIPTS/delivery.sh" set both claude-code "$TEST_PROJECT"
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
   [[ "$output" =~ "watch.sh" ]]
+}
+
+# The host pastes the emitted command into Monitor and runs it as a shell
+# command; if the argv isn't shell-quoted, a project path with whitespace
+# (iCloud Drive) or an apostrophe (/Users/o'brien/...) is mis-parsed and watch.sh
+# resolves the wrong project. These re-parse the emitted line the way the host
+# shell would and assert the project survives as one argv element. The path
+# carries BOTH a space and an apostrophe (the case a plain '...' wrap breaks on).
+# AGMSG_RESOLVE_PROJECT=0 keeps the raw path so the round-trip is deterministic.
+
+@test "delivery set monitor: directive argv round-trips through a shell (#188)" {
+  local sp="$TEST_PROJECT/Mobile Documents/o'brien proj"
+  mkdir -p "$sp"
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/delivery.sh" set monitor claude-code "$sp"
+  [ "$status" -eq 0 ]
+  local cmdline
+  cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
+  [ -n "$cmdline" ]
+  eval "set -- $cmdline"
+  [ "$3" = "$sp" ]
+  [ "$4" = "claude-code" ]
+}
+
+@test "session-start: Monitor directive argv round-trips through a shell (#188)" {
+  local sp="$TEST_PROJECT/Mobile Documents/o'brien proj"
+  mkdir -p "$sp"
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$sp" >/dev/null
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$sp" </dev/null
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "invoke the Monitor tool" ]]
+  local cmdline
+  cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
+  [ -n "$cmdline" ]
+  eval "set -- $cmdline"
+  [ "$3" = "$sp" ]
 }
 
 @test "delivery set turn: emits AGMSG-DIRECTIVE to stop any running watcher" {
@@ -256,6 +300,76 @@ JSON
   run bash "$SCRIPTS/delivery.sh" restart
   [[ "$output" =~ "TaskStop" ]]
   [[ ! "$output" =~ "invoke the Monitor tool" ]]
+}
+
+# --- watcher teardown is (project, type)-scoped (#218) ---
+# claude-code is the only type that runs a watch.sh watcher. Before scoping,
+# `set turn <any other type>` ran `kill_all_watchers "$PROJECT"` (project only)
+# and tore down the project's claude-code monitor — collateral that killed
+# unrelated agents' monitors on a shared machine.
+
+@test "delivery set turn (other type): does NOT kill the project's claude-code watcher (#218)" {
+  skip_on_windows "watcher process mgmt under Git Bash (#182)"
+  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
+  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
+{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
+JSON
+  # A live claude-code watcher for this project.
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess "$TEST_PROJECT" claude-code &
+  local watch_pid=$!
+  sleep 1
+  [ -f "$TEST_SKILL_DIR/run/watch.cc-sess.pid" ]
+  # Switching a DIFFERENT type's delivery in the SAME project must not touch it.
+  run bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [ -f "$TEST_SKILL_DIR/run/watch.cc-sess.pid" ]
+  kill -0 "$watch_pid" 2>/dev/null
+  kill "$watch_pid" 2>/dev/null || true
+}
+
+@test "delivery set off (claude-code): DOES kill the project's claude-code watcher (type matches)" {
+  skip_on_windows "watcher process mgmt under Git Bash (#182)"
+  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
+  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
+{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
+JSON
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess2 "$TEST_PROJECT" claude-code &
+  local watch_pid=$!
+  sleep 1
+  [ -f "$TEST_SKILL_DIR/run/watch.cc-sess2.pid" ]
+  run bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [ ! -f "$TEST_SKILL_DIR/run/watch.cc-sess2.pid" ]
+  sleep 1
+  ! kill -0 "$watch_pid" 2>/dev/null
+}
+
+@test "delivery (project, type) scoping holds for a project path with spaces (#218)" {
+  skip_on_windows "watcher process mgmt under Git Bash (#182)"
+  # The argv match is the literal "<project> <type>" string, so a space in the
+  # project path is matched verbatim — no false negatives (target preserved/
+  # killed correctly) and no false positives across the space boundary.
+  local sp="$TEST_PROJECT/with space proj"
+  mkdir -p "$sp"
+  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
+  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
+{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$sp"}]}}}
+JSON
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sp-sess "$sp" claude-code &
+  local watch_pid=$!
+  sleep 1
+  [ -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
+  # Another type's set turn in the SAME space-containing project: must NOT kill it.
+  run bash "$SCRIPTS/delivery.sh" set turn copilot "$sp"
+  [ "$status" -eq 0 ]
+  [ -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
+  kill -0 "$watch_pid" 2>/dev/null
+  # claude-code off for the SAME space-containing project: must kill it (right target).
+  run bash "$SCRIPTS/delivery.sh" set off claude-code "$sp"
+  [ "$status" -eq 0 ]
+  [ ! -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
+  sleep 1
+  ! kill -0 "$watch_pid" 2>/dev/null
 }
 
 # --- watch.sh signal handling ---
@@ -322,6 +436,47 @@ JSON
   touch "$TEST_SKILL_DIR/run/cc-instance.$dead_pid"
   echo '{"session_id":"x"}' | bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" >/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/cc-instance.$dead_pid" ]
+}
+
+# --- session-id resolution: vendor field-name differences (grok/cursor) ---
+# Grok Build emits the session id on stdin as camelCase "sessionId" and injects
+# GROK_SESSION_ID into every hook; Claude uses snake_case "session_id". The
+# shared resolver tries snake -> camel -> $GROK_SESSION_ID. The Monitor
+# directive echoes the resolved id as the watch.sh command's session arg, so we
+# assert through that. (Exercised via claude-code since the resolver is shared.)
+
+@test "session-start: resolves camelCase sessionId from stdin (grok/cursor field)" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<<'{"sessionId":"grokCamelSID"}'
+  [ "$status" -eq 0 ]
+  local cmdline
+  cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
+  eval "set -- $cmdline"
+  [[ "$2" =~ grokCamelSID ]]
+}
+
+@test "session-start: falls back to GROK_SESSION_ID env when stdin lacks a session id" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
+  run env AGMSG_RESOLVE_PROJECT=0 GROK_SESSION_ID=grokEnvSID bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<<'{}'
+  [ "$status" -eq 0 ]
+  local cmdline
+  cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
+  eval "set -- $cmdline"
+  [[ "$2" =~ grokEnvSID ]]
+}
+
+@test "session-start: snake_case session_id still wins over camelCase (claude-code unaffected)" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<<'{"session_id":"snakeWins","sessionId":"camelLoses"}'
+  [ "$status" -eq 0 ]
+  local cmdline
+  cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
+  eval "set -- $cmdline"
+  [[ "$2" =~ snakeWins ]]
+  [[ ! "$2" =~ camelLoses ]]
 }
 
 # --- SessionEnd hook integration ---
@@ -1315,6 +1470,147 @@ EOF
   [[ "$output" == *"not supported for codex"* ]]
 }
 
+@test "delivery status (codex): live bridge reports alive and suppresses watch count" {
+  skip_on_windows "codex bridge status liveness under Git Bash (#182)"
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  sleep 60 &
+  local bpid=$!
+  # shellcheck disable=SC2064  # capture the current child pid for EXIT cleanup
+  trap "kill $bpid 2>/dev/null || true" EXIT
+  printf '%s\n' "$bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+  cat > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta" <<EOF
+pid=$bpid
+project=$TEST_PROJECT
+team=team
+name=alice
+type=codex
+EOF
+  printf '%s\n' 99999999 > "$TEST_SKILL_DIR/run/watch.fake.pid"
+
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"mode: monitor"* ]]
+  [[ "$output" == *"Codex bridge: team/alice alive (pid $bpid)"* ]]
+  [[ "$output" != *"watch processes:"* ]]
+
+  kill "$bpid" 2>/dev/null || true
+  trap - EXIT
+}
+
+@test "delivery status (codex): stale bridge pidfile is reported as stale" {
+  skip_on_windows "codex bridge status liveness under Git Bash (#182)"
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  local dead_pid=999999
+  while kill -0 "$dead_pid" 2>/dev/null; do
+    dead_pid=$((dead_pid + 1))
+  done
+  printf '%s\n' "$dead_pid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+  cat > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta" <<EOF
+pid=$dead_pid
+project=$TEST_PROJECT
+team=team
+name=alice
+type=codex
+EOF
+
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"mode: monitor"* ]]
+  [[ "$output" == *"Codex bridge: team/alice stale pidfile (pid $dead_pid not running)"* ]]
+  [[ "$output" != *"watch processes:"* ]]
+}
+
+@test "delivery status (codex): bridge metadata mismatch is reported as stale" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  printf '%s\n' "$$" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+  cat > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta" <<EOF
+pid=$$
+project=$TEST_PROJECT-other
+team=team
+name=alice
+type=codex
+EOF
+
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"mode: monitor"* ]]
+  [[ "$output" == *"Codex bridge: team/alice stale pidfile (metadata mismatch)"* ]]
+  [[ "$output" != *"watch processes:"* ]]
+}
+
+@test "delivery status (codex): missing bridge metadata is reported as stale" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  printf '%s\n' "$$" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"mode: monitor"* ]]
+  [[ "$output" == *"Codex bridge: team/alice stale pidfile (missing metadata)"* ]]
+  [[ "$output" != *"watch processes:"* ]]
+}
+
+@test "delivery status (codex): identity with no bridge reports not running" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"mode: monitor"* ]]
+  [[ "$output" == *"Codex bridge: team/alice not running"* ]]
+  [[ "$output" != *"watch processes:"* ]]
+}
+
+@test "delivery status (codex): multiple identities are enumerated independently" {
+  skip_on_windows "codex bridge status liveness under Git Bash (#182)"
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" team bob codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  sleep 60 &
+  local bpid=$!
+  # shellcheck disable=SC2064  # capture the current child pid for EXIT cleanup
+  trap "kill $bpid 2>/dev/null || true" EXIT
+  printf '%s\n' "$bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+  cat > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta" <<EOF
+pid=$bpid
+project=$TEST_PROJECT
+team=team
+name=alice
+type=codex
+EOF
+
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Codex bridge: team/alice alive (pid $bpid)"* ]]
+  [[ "$output" == *"Codex bridge: team/bob not running"* ]]
+  [[ "$output" != *"watch processes:"* ]]
+
+  kill "$bpid" 2>/dev/null || true
+  trap - EXIT
+}
+
+@test "delivery status (codex): monitor mode with no identities is explicit" {
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"mode: monitor"* ]]
+  [[ "$output" == *"Codex bridge: no identities registered for this project"* ]]
+  [[ "$output" != *"watch processes:"* ]]
+}
 
 @test "session-start.sh for codex resolves thread id from rollout when CODEX_THREAD_ID is unset" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
@@ -1364,6 +1660,15 @@ EOF
   echo "$bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
   echo "pid=$bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta"
   : > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.log"
+  # The launcher's stale-binding sidecar + the project's shared app-server record
+  # must be torn down too. Use a non-codex pid for the server record so the
+  # cmdline guard skips the kill — the record is still dropped.
+  : > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.appserver"
+  source "$SCRIPTS/lib/hash.sh"
+  local h; h="$(printf '%s' "$TEST_PROJECT" | agmsg_sha1)"
+  echo 2147483647 > "$TEST_SKILL_DIR/run/codex-app-server.$h.pid"
+  : > "$TEST_SKILL_DIR/run/codex-app-server.$h.port"
+  : > "$TEST_SKILL_DIR/run/codex-app-server.$h.version"
 
   run bash "$SCRIPTS/delivery.sh" set off codex "$TEST_PROJECT"
   [ "$status" -eq 0 ]
@@ -1372,6 +1677,10 @@ EOF
   ! kill -0 "$bpid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid" ]
   [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta" ]
+  [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.appserver" ]
+  [ ! -f "$TEST_SKILL_DIR/run/codex-app-server.$h.pid" ]
+  [ ! -f "$TEST_SKILL_DIR/run/codex-app-server.$h.port" ]
+  [ ! -f "$TEST_SKILL_DIR/run/codex-app-server.$h.version" ]
   kill "$bpid" 2>/dev/null || true
 }
 
@@ -1497,4 +1806,82 @@ JSON
 @test "default-mode: requires a type argument" {
   run bash "$SCRIPTS/delivery.sh" default-mode
   [ "$status" -ne 0 ]
+}
+
+# --- grok-build (turn|off via a markdown rule file .grok/rules/agmsg.md) ---
+# Grok passive hooks can't inject (stdout is discarded), so grok delivers via the
+# rule-file self-poll model (like gemini/opencode): a .grok/rules/agmsg.md that
+# tells the agent to poll inbox.sh each turn. turn => rule present, off => absent.
+
+@test "delivery set turn (grok-build): writes .grok/rules/agmsg.md self-poll rule" {
+  run bash "$SCRIPTS/delivery.sh" set turn grok-build "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Delivery mode set to 'turn'" ]]
+  local rule_file="$TEST_PROJECT/.grok/rules/agmsg.md"
+  [ -f "$rule_file" ]
+  # The rule points at inbox.sh (clean display + same-call mark = loss-safe),
+  # not the hook-only check-inbox.sh, and references this type + project.
+  run cat "$rule_file"
+  [[ "$output" == *"inbox.sh"* ]]
+  [[ "$output" != *"check-inbox.sh"* ]]
+  [[ "$output" == *"grok-build"* ]]
+  [[ "$output" == *"$TEST_PROJECT"* ]]
+}
+
+@test "delivery set off (grok-build): removes the rule file" {
+  bash "$SCRIPTS/delivery.sh" set turn grok-build "$TEST_PROJECT"
+  [ -f "$TEST_PROJECT/.grok/rules/agmsg.md" ]
+  run bash "$SCRIPTS/delivery.sh" set off grok-build "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [ ! -f "$TEST_PROJECT/.grok/rules/agmsg.md" ]
+}
+
+@test "delivery set monitor (grok-build): writes a monitor rule and emits the launch directive" {
+  GROK_SESSION_ID="grok-sess-1" run bash "$SCRIPTS/delivery.sh" set monitor grok-build "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Delivery mode set to 'monitor'" ]]
+  # Emits an in-session directive to launch watch.sh via the monitor tool, with
+  # GROK_SESSION_ID baked into the command (not CLAUDE_CODE_SESSION_ID).
+  [[ "$output" == *"AGMSG-DIRECTIVE"* ]]
+  [[ "$output" == *"watch.sh"* ]]
+  [[ "$output" == *"grok-sess-1"* ]]
+  [[ "$output" == *"grok-build"* ]]
+  # The rule carries the monitor marker and points at the monitor tool.
+  local rule_file="$TEST_PROJECT/.grok/rules/agmsg.md"
+  [ -f "$rule_file" ]
+  run cat "$rule_file"
+  [[ "$output" == *"agmsg-delivery-mode: monitor"* ]]
+  [[ "$output" == *"monitor"* ]]
+  [[ "$output" == *"watch.sh"* ]]
+}
+
+@test "delivery status (grok-build): reports monitor when the monitor rule is present" {
+  GROK_SESSION_ID="grok-sess-2" bash "$SCRIPTS/delivery.sh" set monitor grok-build "$TEST_PROJECT" >/dev/null
+  run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
+  [[ "$output" =~ "mode: monitor" ]]
+}
+
+@test "delivery set turn then monitor (grok-build): rewrites the rule from turn to monitor" {
+  bash "$SCRIPTS/delivery.sh" set turn grok-build "$TEST_PROJECT" >/dev/null
+  run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
+  [[ "$output" =~ "mode: turn" ]]
+  GROK_SESSION_ID="grok-sess-3" bash "$SCRIPTS/delivery.sh" set monitor grok-build "$TEST_PROJECT" >/dev/null
+  run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
+  [[ "$output" =~ "mode: monitor" ]]
+}
+
+@test "delivery set both (grok-build): rejected; does NOT delete an existing turn rule" {
+  bash "$SCRIPTS/delivery.sh" set turn grok-build "$TEST_PROJECT" >/dev/null
+  run bash "$SCRIPTS/delivery.sh" set both grok-build "$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  [ -f "$TEST_PROJECT/.grok/rules/agmsg.md" ]
+}
+
+@test "delivery status (grok-build): derives mode from rule file existence" {
+  run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
+  [[ "$output" =~ "mode: off" ]]
+
+  bash "$SCRIPTS/delivery.sh" set turn grok-build "$TEST_PROJECT"
+  run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
+  [[ "$output" =~ "mode: turn" ]]
 }

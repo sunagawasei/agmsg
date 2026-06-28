@@ -66,7 +66,7 @@ agmsg_session_start() {
   if [ -z "$app_server" ]; then
     agent_pid=$(agmsg_agent_pid "$TYPE" 2>/dev/null || true)
     if [ -n "$agent_pid" ]; then
-      agent_cmd=$(ps -o args= -p "$agent_pid" 2>/dev/null || true)
+      agent_cmd=$(compat_get_cmdline "$agent_pid" 2>/dev/null || true)
       app_server=$(printf '%s\n' "$agent_cmd" \
         | sed -n 's/.*\(unix:\/\/[^[:space:]]*\).*/\1/p' \
         | head -1)

@@ -1,5 +1,9 @@
 # agmsg
 
+[![CI](https://img.shields.io/github/actions/workflow/status/fujibee/agmsg/tests.yml?branch=main&label=CI&logo=github)](https://github.com/fujibee/agmsg/actions/workflows/tests.yml)
+[![release](https://img.shields.io/github/v/release/fujibee/agmsg?label=release)](https://github.com/fujibee/agmsg/releases/latest)
+[![license](https://img.shields.io/github/license/fujibee/agmsg)](LICENSE)
+
 Cross-agent messaging for CLI AI agents. No daemon, no network, no complexity.
 
 > **For AI agents:** see [`/llms.txt`](llms.txt) for a quick, machine-friendly orientation.
@@ -180,13 +184,16 @@ Where `actas` switches *this* session to a different role, `spawn` brings up a *
 ```
 /agmsg spawn codex reviewer            # new codex agent, joins and becomes "reviewer"
 /agmsg spawn claude-code alice --window  # new claude-code agent in a fresh tmux window
+/agmsg spawn codex reviewer --boot-prompt "review the diff on this branch"  # joins AND starts the task
 ```
 
 `spawn <type> <name>` pre-joins `<name>`, then launches the target CLI with the actas slash command (`/<your-command> actas <name>`, matching your install command name) as its initial prompt. If the current session is inside **tmux**, it opens in a new pane (or `--window` for a new window, `--split h|v` for the direction); otherwise it opens a new **OS terminal** window.
 
+Pass `--boot-prompt <text>` to hand the new agent an initial task: the boot prompt becomes the actas slash command followed (newline-separated) by your text, so the agent claims its identity **and** acts on the task in the same first turn. This is the only way to give a one-shot goal to a **codex** peer, which has no Monitor and so never notices a message you `send` after it goes idle.
+
 By default `spawn` **blocks until the new agent is actually listening** — its watcher attaches and touches a readiness sentinel — then prints `status=ready`, so you can send work the moment `spawn` returns without losing it to the agent's cold start. Use `--no-wait` for fire-and-forget, or `--ready-timeout <secs>` to bound the wait (default 90; on timeout it prints `status=timeout` and exits 3 so a caller can re-spawn). Codex skips the wait (it has no Monitor).
 
-Options: `--project <path>` (default: current project), `--team <team>` (auto-resolved when the project has a single team), and `--terminal <tmpl>` / `$AGMSG_TERMINAL` / config `spawn.terminal` to override the terminal command on the non-tmux path (a `{cmd}` placeholder is replaced with the path to the generated boot script). On macOS the default opens whichever terminal you're currently in (iTerm or Terminal, via `$TERM_PROGRAM`) using `open -a` — a plain app launch, so it does **not** trigger the Automation/AppleScript permission prompts that scripting the terminal directly would.
+Options: `--boot-prompt <text>` (initial task; see above), `--project <path>` (default: current project), `--team <team>` (auto-resolved when the project has a single team), and `--terminal <tmpl>` / `$AGMSG_TERMINAL` / config `spawn.terminal` to override the terminal command on the non-tmux path (a `{cmd}` placeholder is replaced with the path to the generated boot script). On macOS the default opens whichever terminal you're currently in (iTerm or Terminal, via `$TERM_PROGRAM`) using `open -a` — a plain app launch, so it does **not** trigger the Automation/AppleScript permission prompts that scripting the terminal directly would.
 
 Only `claude-code` and `codex` are supported today. macOS is the primary target; Linux and Windows are best-effort (please open an issue/PR if your terminal isn't handled). Headless environments — no tmux **and** no usable terminal — error out, since the agent CLIs need an interactive terminal.
 
@@ -523,6 +530,24 @@ Full discovery order, the trust model, and authoring guidance:
 - **Product Hunt**: #5 Product of the Day, [2026-06-09 launch](https://www.producthunt.com/products/agmsg) — 219 upvotes, 39 comments
 - **Derivative projects**: `agmsg-shogi`, `agmsg-go`, `agmsg-mcp` (community-built)
 - **External contributors**: [@MiuraKatsu](https://github.com/MiuraKatsu) (Gemini support + whoami auto-detect), [@roundrop](https://github.com/roundrop) (Copilot CLI support), [@TOMONOSUKEJP](https://github.com/TOMONOSUKEJP) (native Windows / Git Bash), [@kenshin-yamada](https://github.com/kenshin-yamada) (watcher scoping fix), [@utenadev](https://github.com/utenadev) (OpenCode contribution), [@lucianlamp](https://github.com/lucianlamp) (native Windows PowerShell helpers), [@tatsuya6502](https://github.com/tatsuya6502) (sandboxed Bash tool support)
+
+## Project site (agmsg.cc)
+
+[agmsg.cc](https://agmsg.cc) is an Astro project under [`site/`](site/).
+
+- **Source of truth:** `site/` (Astro + Tailwind). The built output is **not** committed — CI builds it.
+- **Local preview:**
+  ```bash
+  cd site
+  npm install
+  npm run dev        # http://localhost:4321, live reload
+  # or, to serve the production build:
+  npm run build && npm run preview
+  ```
+- **Publish:** pushing to `main` with changes under `site/` runs [`.github/workflows/pages.yml`](.github/workflows/pages.yml), which builds the site and deploys it to GitHub Pages. The custom domain is set by `site/public/CNAME`.
+- The agent-types gallery is generated at build time from `scripts/drivers/types/*/type.conf`, so adding an agent type surfaces it on the site automatically.
+
+`docs/` is developer documentation (markdown, ADRs, spec) read on GitHub — it is **not** the published site.
 
 ## Contributing
 

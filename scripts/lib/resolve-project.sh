@@ -29,6 +29,9 @@
 
 : "${SKILL_DIR:?resolve-project.sh requires SKILL_DIR}"
 
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compat.sh"
+
 # agmsg_registered_projects() below reads team configs via readfile() and needs
 # agmsg_sql_readfile_path(). Not every caller that sources resolve-project.sh
 # also sources storage.sh (e.g. actas-claim.sh), so pull it in here. Re-sourcing
@@ -76,8 +79,8 @@ agmsg_pid_is_agent() {
   kill -0 "$pid" 2>/dev/null || return 1
   local binaries comm first base bin
   binaries=$(_agmsg_agent_binaries "$type")
-  comm=$(ps -o comm= -p "$pid" 2>/dev/null | xargs basename 2>/dev/null || true)
-  first=$(ps -o args= -p "$pid" 2>/dev/null | awk '{print $1}')
+  comm=$(compat_get_comm "$pid" 2>/dev/null || true)
+  first=$(compat_get_cmdline "$pid" 2>/dev/null | awk '{print $1}' || true)
   base=$(basename -- "${first:-}" 2>/dev/null || true)
   for bin in $binaries; do
     case "$comm" in "$bin"|"$bin"-*) return 0 ;; esac
@@ -109,7 +112,7 @@ agmsg_agent_pid() {
   fi
   local pid="$$" hops=0
   while [ "${pid:-0}" -gt 1 ] && [ "$hops" -lt 20 ]; do
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    pid=$(compat_get_ppid "$pid" 2>/dev/null || true)
     [ -z "$pid" ] && return 1
     [ "$pid" = "0" ] && return 1
     if agmsg_pid_is_agent "$pid" "$type"; then

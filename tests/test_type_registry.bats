@@ -29,11 +29,11 @@ write_node_launcher_fixtures() {
   printf '// stub node launcher fixture\n' > "$nd/nodetype-launcher.mjs"
 }
 
-@test "type-registry: known_types lists the eight built-ins" {
+@test "type-registry: known_types lists the nine built-ins" {
   run env -i PATH="$PATH" bash -c \
     "source '$SCRIPTS/lib/type-registry.sh'; agmsg_known_types | sort -u | paste -sd, -"
   [ "$status" -eq 0 ]
-  [ "$output" = "antigravity,claude-code,codex,copilot,cursor,gemini,hermes,opencode" ]
+  [ "$output" = "antigravity,claude-code,codex,copilot,cursor,gemini,grok-build,hermes,opencode" ]
 }
 
 @test "type-registry: is_known_type accepts a built-in and rejects a bogus type" {
@@ -64,7 +64,7 @@ write_node_launcher_fixtures() {
   [ "$status" -ne 0 ]
 }
 
-@test "type-registry: spawnable set is exactly claude-code, codex, cursor and hermes" {
+@test "type-registry: spawnable set is exactly claude-code, codex, cursor, grok-build and hermes" {
   run env -i PATH="$PATH" bash -c \
     "source '$SCRIPTS/lib/type-registry.sh'
      while IFS= read -r t; do
@@ -72,7 +72,7 @@ write_node_launcher_fixtures() {
        [ \"\$(agmsg_type_get \"\$t\" spawnable)\" = yes ] && echo \"\$t\"
      done <<< \"\$(agmsg_known_types | sort -u)\" | paste -sd, -"
   [ "$status" -eq 0 ]
-  [ "$output" = "claude-code,codex,cursor,hermes" ]
+  [ "$output" = "claude-code,codex,cursor,grok-build,hermes" ]
 }
 
 @test "type-registry: cursor manifest declares headless capability" {

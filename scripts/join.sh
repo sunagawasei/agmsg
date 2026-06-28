@@ -30,6 +30,7 @@ TEAMS_DIR="$SCRIPT_DIR/../teams"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/validate.sh"
 agmsg_validate_team_name "$TEAM" || exit 1
+agmsg_validate_agent_name "$AGENT_ID" || exit 1
 
 # Resolve the session's real project root from the passed pwd (see #92), so an
 # agent-driven join from a subdir/worktree registers under the project the
@@ -40,20 +41,23 @@ agmsg_validate_team_name "$TEAM" || exit 1
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/storage.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/registry-lock.sh"
 PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
 
 TEAM_CONFIG="$TEAMS_DIR/$TEAM/config.json"
 
-# --- Ensure team config exists ---
+# Serialize the create + read-modify-write below so concurrent joins to this team
+# can't clobber each other's registration (#141). Create the team dir first so the
+# lock dir has a parent, then hold the lock across the whole RMW.
 mkdir -p "$TEAMS_DIR/$TEAM"
+agmsg_lock_acquire "$TEAMS_DIR/$TEAM" || exit 1
+
+# --- Ensure team config exists ---
 if [ ! -f "$TEAM_CONFIG" ]; then
-  cat > "$TEAM_CONFIG" <<EOF
-{
-  "name": "$TEAM",
-  "agents": {},
-  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-EOF
+  INITIAL_CONFIG=$(printf '{\n  "name": "%s",\n  "agents": {},\n  "created_at": "%s"\n}' \
+    "$TEAM" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+  agmsg_write_atomic "$TEAM_CONFIG" "$INITIAL_CONFIG"
   echo "Created team: $TEAM"
 fi
 
@@ -129,6 +133,7 @@ UPDATED=$(agmsg_sqlite_mem \
     )
   )
   FROM cfg;")
-echo "$UPDATED" > "$TEAM_CONFIG"
+agmsg_write_atomic "$TEAM_CONFIG" "$UPDATED"
+agmsg_lock_release
 
 echo "Joined team $TEAM as $AGENT_ID"

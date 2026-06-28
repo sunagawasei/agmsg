@@ -42,6 +42,35 @@ teardown() {
   [[ "$output" =~ "+1 more" ]]
 }
 
+@test "join: concurrent joins to the same team do not lose registrations (#141)" {
+  # A fan-out of background joins spawning sqlite3.exe per call is slow and
+  # timing-sensitive on the Windows runner (the experimental full leg); the lock
+  # itself is exercised on Linux/macOS where the contention is reliable.
+  skip_on_windows "concurrency fan-out is too slow/timing-sensitive on the Windows runner"
+  # The registry config.json was read-modify-written with no serialization, so
+  # concurrent joins clobbered each other and silently dropped agents. Launch a
+  # fan-out of joins at once; every one must survive. This fails (count < N+1) if
+  # the per-team lock regresses.
+  local n=12
+  bash "$SCRIPTS/join.sh" race seed claude-code /tmp/seed
+  local pids=() i
+  for i in $(seq 1 "$n"); do
+    bash "$SCRIPTS/join.sh" race "agent$i" claude-code "/tmp/p$i" >/dev/null 2>&1 &
+    pids+=($!)
+  done
+  for i in "${pids[@]}"; do wait "$i"; done
+
+  local cfg="$TEST_SKILL_DIR/teams/race/config.json"
+  run sqlite_mem "SELECT count(*) FROM json_each(json_extract(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.agents'));"
+  [ "$status" -eq 0 ]
+  [ "$output" -eq $((n + 1)) ]
+}
+
+@test "join: releases its lock (no .config.lock left behind)" {
+  bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/proj
+  [ ! -e "$TEST_SKILL_DIR/teams/myteam/.config.lock" ]
+}
+
 # --- leave.sh ---
 
 @test "leave: removes agent from team" {
@@ -274,6 +303,19 @@ teardown() {
   [[ "$output" =~ "Team already exists: team-b" ]]
 }
 
+@test "rename-team: an inert empty target dir does not block the rename" {
+  # The target is reserved by holding teams/<new>/.config.lock, so an existing
+  # but config-less dir (e.g. left by an aborted rename) must not count as a team.
+  bash "$SCRIPTS/join.sh" oldteam alice claude-code /tmp/proj
+  mkdir -p "$TEST_SKILL_DIR/teams/newteam"
+  run bash "$SCRIPTS/rename-team.sh" oldteam newteam
+  [ "$status" -eq 0 ]
+  [ -f "$TEST_SKILL_DIR/teams/newteam/config.json" ]
+  [ ! -e "$TEST_SKILL_DIR/teams/newteam/.config.lock" ]
+  run bash "$SCRIPTS/team.sh" newteam
+  [[ "$output" =~ "alice" ]]
+}
+
 @test "rename-team: fails when old and new are identical" {
   bash "$SCRIPTS/join.sh" sameteam alice claude-code /tmp/proj
   run bash "$SCRIPTS/rename-team.sh" sameteam sameteam
@@ -382,6 +424,12 @@ teardown() {
 
 @test "join: accepts hermes" {
   run bash "$SCRIPTS/join.sh" myteam alice hermes /tmp/proj
+  [ "$status" -eq 0 ]
+  [ -f "$TEST_SKILL_DIR/teams/myteam/config.json" ]
+}
+
+@test "join: accepts grok-build" {
+  run bash "$SCRIPTS/join.sh" myteam alice grok-build /tmp/proj
   [ "$status" -eq 0 ]
   [ -f "$TEST_SKILL_DIR/teams/myteam/config.json" ]
 }

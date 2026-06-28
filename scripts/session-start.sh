@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 
 # SessionStart hook for delivery modes `monitor` and `both`.
 #
@@ -52,11 +54,18 @@ source "$SCRIPT_DIR/lib/session-team.sh"
 INPUT=$(cat 2>/dev/null || true)
 SESSION_ID=""
 if [ -n "$INPUT" ]; then
+  # The session id field name differs by vendor: Claude Code emits snake_case
+  # "session_id"; Grok Build (and Cursor) emit camelCase "sessionId". Try snake
+  # first (claude-code unaffected), then camel.
   SESSION_ID=$(printf '%s' "$INPUT" \
     | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
     | head -1)
+  [ -z "$SESSION_ID" ] && SESSION_ID=$(printf '%s' "$INPUT" \
+    | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -1)
 fi
 [ -z "$SESSION_ID" ] && SESSION_ID="${CLAUDE_CODE_SESSION_ID:-}"
+[ -z "$SESSION_ID" ] && SESSION_ID="${GROK_SESSION_ID:-}"
 
 # Session-team mode: a claude-code session belongs to its own team s-<uuid>,
 # resolved from the REAL session id (stdin/env) only — NOT the synthetic
@@ -149,7 +158,7 @@ for f in "$RUN_DIR"/cc-instance.*; do
         # Defensive: only kill if the pid's command line actually matches
         # our watch.sh. Defends against pid recycling — a stale pidfile
         # could point at an unrelated process that took the same pid.
-        cmd=$(ps -o args= -p "$orphan_pid" 2>/dev/null || true)
+        cmd=$(compat_get_cmdline "$orphan_pid" 2>/dev/null || true)
         case "$cmd" in
           *"$SKILL_DIR/scripts/watch.sh"*) kill "$orphan_pid" 2>/dev/null || true ;;
           *) ;;  # not our watcher anymore; leave it alone
@@ -281,21 +290,26 @@ if agmsg_session_team_enabled; then
 fi
 
 WATCH="$SKILL_DIR/scripts/watch.sh"
-WATCH_ARGS="$INSTANCE_ID $PROJECT $TYPE"
+# Shell-quote each argv so the host can paste the command into Monitor and run
+# it verbatim. A plain '...' wrap breaks on paths with an apostrophe
+# (/Users/o'brien/...); printf %q escapes spaces, quotes and other metacharacters
+# safely for shell re-execution (#188).
+WATCH_COMMAND="$(printf '%q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE")"
 if [ -n "$SESSION_TEAM" ]; then
   # session-team mode: register this Claude as `claude` in its own per-session
   # team and pin the watcher to it, so the monitor stream carries only this
   # session's traffic — no cross-session crosstalk. Idempotent; opt out of #92
-  # pwd-rewrite so the registration pins exactly this project.
+  # pwd-rewrite so the registration pins exactly this project. The extra argv are
+  # %q-quoted too so they paste into Monitor verbatim (#188).
   AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$SESSION_TEAM" claude "$TYPE" "$PROJECT" >/dev/null 2>&1 || true
-  WATCH_ARGS="$INSTANCE_ID $PROJECT $TYPE claude --team $SESSION_TEAM"
+  WATCH_COMMAND="$WATCH_COMMAND $(printf '%q %q %q' claude --team "$SESSION_TEAM")"
 fi
 
 cat <<EOF
 AGMSG monitor mode: invoke the Monitor tool now with the following parameters,
 before any other action in this session.
 
-  command: $WATCH $WATCH_ARGS
+  command: $WATCH_COMMAND
   description: agmsg inbox stream
   persistent: true
 

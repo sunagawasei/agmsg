@@ -162,7 +162,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --cmd <name>      Command & skill folder name (default: agmsg)"
       echo "                    Claude Code: /<cmd>, Codex/Gemini/Antigravity: \$<cmd>"
-      echo "  --agent-type <t>  Agent type: claude-code, codex, gemini, antigravity, opencode, hermes, cursor"
+      echo "  --agent-type <t>  Agent type: claude-code, codex, gemini, antigravity, opencode, hermes, cursor, grok-build"
       echo "                    Selects which template becomes SKILL.md (matches the"
       echo "                    <type> arg passed to join.sh / whoami.sh)"
       echo "  --update          Update skill scripts only (preserve DB and teams)"
@@ -232,6 +232,8 @@ if [ "$UPDATE_ONLY" = true ]; then
       AGENT_TYPE="antigravity"
     elif grep -q "whoami.sh.*gemini" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
       AGENT_TYPE="gemini"
+    elif grep -q "whoami.sh.*grok-build" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+      AGENT_TYPE="grok-build"
     else
       AGENT_TYPE="codex"
     fi
@@ -241,7 +243,7 @@ if [ "$UPDATE_ONLY" = true ]; then
   # shared SKILL.md; their dedicated copies are dropped separately below.)
   TPL_TYPE="codex"
   case "$AGENT_TYPE" in
-    gemini|antigravity|opencode|hermes|cursor) TPL_TYPE="$AGENT_TYPE" ;;
+    gemini|antigravity|opencode|hermes|cursor|grok-build) TPL_TYPE="$AGENT_TYPE" ;;
   esac
   sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path "$TPL_TYPE")" > "$SKILL_DIR/SKILL.md"
   # Recursive copy so nested helper dirs (scripts/lib/, scripts/drivers/types/)
@@ -279,6 +281,12 @@ if [ "$UPDATE_ONLY" = true ]; then
   if [ -d "$HOME/.hermes" ]; then
     mkdir -p "$HERMES_SKILL_DIR"
     sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path hermes)" > "$HERMES_SKILL_DIR/SKILL.md"
+  fi
+  # Refresh / install the Grok Build skill (same reasoning as Copilot above).
+  GROK_SKILL_DIR="$HOME/.grok/skills/$SKILL_NAME"
+  if [ -d "$HOME/.grok" ]; then
+    mkdir -p "$GROK_SKILL_DIR"
+    sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path grok-build)" > "$GROK_SKILL_DIR/SKILL.md"
   fi
   cp "$SCRIPT_DIR/openai.yaml" "$SKILL_DIR/agents/openai.yaml" 2>/dev/null || true
   chmod +x "$SKILL_DIR/scripts/"*.sh
@@ -338,7 +346,7 @@ mkdir -p "$SKILL_DIR"/{scripts,types,db,agents}
 # codex template by default; gemini/antigravity/opencode get their own.
 TPL_TYPE="codex"
 case "$AGENT_TYPE" in
-  gemini|antigravity|opencode|hermes|cursor) TPL_TYPE="$AGENT_TYPE" ;;
+  gemini|antigravity|opencode|hermes|cursor|grok-build) TPL_TYPE="$AGENT_TYPE" ;;
 esac
 sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path "$TPL_TYPE")" > "$SKILL_DIR/SKILL.md"
 # Recursive copy so nested helper dirs (scripts/lib/, scripts/drivers/types/) ship
@@ -423,6 +431,19 @@ if [ -d "$HOME/.hermes" ]; then
   mkdir -p "$HERMES_SKILL_DIR"
   sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path hermes)" > "$HERMES_SKILL_DIR/SKILL.md"
   echo "  + installed /$CMD_NAME skill to ~/.hermes/skills/"
+fi
+
+# --- Install Grok Build skill ---
+# Grok Build reads skills from ~/.grok/skills/<name>/SKILL.md (it also accepts
+# the cross-vendor ~/.agents/skills/ fallback, but the shared SKILL.md is
+# Codex-typed and would mis-identify a Grok session — keep the Grok copy
+# separate, same pattern as Copilot). Delivery (turn) registers a Stop hook under
+# ~/.grok/hooks/ via `delivery.sh set` per project.
+GROK_SKILL_DIR="$HOME/.grok/skills/$CMD_NAME"
+if [ -d "$HOME/.grok" ]; then
+  mkdir -p "$GROK_SKILL_DIR"
+  sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path grok-build)" > "$GROK_SKILL_DIR/SKILL.md"
+  echo "  + installed /$CMD_NAME skill to ~/.grok/skills/"
 fi
 
 # Codex sandbox writable_roots are configured by configure_codex_sandbox() at

@@ -55,6 +55,10 @@ done
 
 pidfile="$RUN_DIR/codex-bridge.$team.$name.pid"
 log="$RUN_DIR/codex-bridge.$team.$name.log"
+# Records the app-server URL the live bridge was launched against, so a later
+# launcher instance can tell a bridge bound to a stale app-server (old port,
+# from before a codex upgrade) from one bound to the current server. See #197/#237.
+appserver_file="$RUN_DIR/codex-bridge.$team.$name.appserver"
 # An explicit AGMSG_CODEX_BRIDGE_CMD is a complete runnable (tests, custom
 # wrappers) — run it as-is. Only the default codex-bridge.js is launched through
 # a resolved Node, since its env-node shebang fails where a version-manager Node
@@ -66,16 +70,10 @@ else
 fi
 
 while kill -0 "$PARENT_PID" 2>/dev/null; do
-  if [ -f "$pidfile" ]; then
-    bridge_pid="$(cat "$pidfile" 2>/dev/null || true)"
-    if [ -n "$bridge_pid" ] && kill -0 "$bridge_pid" 2>/dev/null; then
-      sleep 0.3
-      continue
-    fi
-  fi
-
-  # Thread source: a request file (older-codex hook) wins; otherwise discover the
-  # live TUI thread via thread/loaded/list.
+  # Resolve the app-server URL (and thread) this iteration would launch against
+  # FIRST, so the reuse check can compare a live bridge's bound server with the
+  # current one. Thread source: a request file (older-codex hook) wins; otherwise
+  # discover the live TUI thread via thread/loaded/list.
   thread_id="loaded"
   req_app_server="$APP_SERVER"
   if [ -f "$REQUEST_FILE" ]; then
@@ -89,6 +87,25 @@ EOF
     fi
   fi
 
+  if [ -f "$pidfile" ]; then
+    bridge_pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [ -n "$bridge_pid" ] && kill -0 "$bridge_pid" 2>/dev/null; then
+      # Reuse only when the live bridge is bound to the CURRENT app-server. A
+      # codex upgrade makes codex-monitor.sh kill the stale app-server and start a
+      # fresh one on a new port (#237); a bridge still bound to the old URL stays
+      # alive but delivers nothing. The bridge's own exit-on-close covers most of
+      # this, but guard the race where the old bridge has not exited yet by the
+      # time a new launcher re-checks: an app-server mismatch means tear it down.
+      bound_url="$(cat "$appserver_file" 2>/dev/null || true)"
+      if [ "$bound_url" = "$req_app_server" ]; then
+        sleep 0.3
+        continue
+      fi
+      kill "$bridge_pid" 2>/dev/null || true
+      rm -f "$pidfile" "$appserver_file"
+    fi
+  fi
+
   nohup "${bridge_run[@]}" \
     --project "$PROJECT" \
     --type "$TYPE" \
@@ -98,5 +115,7 @@ EOF
     --app-server "$req_app_server" \
     --inline-inbox \
     >>"$log" 2>&1 &
+  # Record what this bridge is bound to so a later launcher can detect staleness.
+  printf '%s' "$req_app_server" > "$appserver_file"
   sleep 1
 done

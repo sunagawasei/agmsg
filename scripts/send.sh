@@ -128,9 +128,12 @@ INSERT="INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('$T_ESC'
 # so its INSERT would hit "no such table". init-db.sh is idempotent + uses the
 # busy_timeout, so re-running it waits for the schema, then the INSERT lands.
 # See #114.
-if ! SENT_ID="$(agmsg_sqlite "$DB" "$INSERT" 2>/dev/null)"; then
+# Pipe the SQL via stdin (not as an argv) so a large body cannot overflow the
+# OS command-line limit (the "Argument list too long" crash). Capture the output
+# (last_insert_rowid) so --wait can scope the reply to messages after this send.
+if ! SENT_ID="$(printf '%s\n' "$INSERT" | agmsg_sqlite "$DB" 2>/dev/null)"; then
   bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
-  SENT_ID="$(agmsg_sqlite "$DB" "$INSERT")"
+  SENT_ID="$(printf '%s\n' "$INSERT" | agmsg_sqlite "$DB")"
 fi
 case "$SENT_ID" in ''|*[!0-9]*) SENT_ID=0 ;; esac
 

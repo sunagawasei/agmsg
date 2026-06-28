@@ -12,6 +12,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `delivery.sh default-mode <type>` (honored only where the type supports the
   mode; unset/invalid/unsupported falls back to asking).
 
+## [1.1.2] - 2026-06-26
+
+### Added
+- Add opt-in explicit-launch monitor delivery (#236)
+- Add MSYS2 compat shim (#88) (#211)
+
+### Fixed
+- Start the watcher when GROK_SESSION_ID is empty (#236 follow-up) (#238)
+- Keep Codex working across 0.142 upgrades (fail-open + stale app-server reuse) (#237)
+- Serialize team config writes behind a per-team lock (#141) (#227)
+- Open the message DB via a Windows-acceptable path (#197) (#226)
+- Handle whoami suggest= identity and anchor agent= match (#224)
+- Bound bridge app-server stalls (#209)
+
+## [1.1.1] - 2026-06-25
+
+### Added
+- Add --model to launch a spawned agent on a chosen model (#220)
+- Add grok-build agent type (xAI Grok Build CLI) (#216)
+
+### Fixed
+- Scope watcher teardown to (project, type), not project (#219)
+- Exit on originating-session death so a quiet watcher can't hang (#67, #388) (#215)
+- Quote Monitor command args so space-in-path survives (#188) (#200)
+- Use tasklist for native pid liveness in agmsg_instance_alive (#134)
+
 ## [1.1.0] - 2026-06-22
 
 ### Added
@@ -131,6 +157,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Handle empty TaskList explicitly to stop fresh-session loop (#71)
 - Storage driver pluginization design (epic #51) (#52)
 
+[1.1.2]: https://github.com/fujibee/agmsg/compare/v1.1.1...v1.1.2
+[1.1.1]: https://github.com/fujibee/agmsg/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/fujibee/agmsg/compare/v1.0.6...v1.1.0
 [1.0.6]: https://github.com/fujibee/agmsg/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/fujibee/agmsg/compare/v1.0.4...v1.0.5

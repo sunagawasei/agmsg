@@ -558,3 +558,36 @@ PY
   # The refresh is gated on an existing agmsg shim — it must not opt the user in.
   [ ! -e "$FAKE_HOME/.agents/bin/codex" ]
 }
+
+# --- grok-build skill (~/.grok/skills/<name>/SKILL.md) ---
+
+@test "install: drops a Grok Build SKILL.md when ~/.grok exists" {
+  mkdir -p "$FAKE_HOME/.grok"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  local grok_skill="$FAKE_HOME/.grok/skills/agmsg/SKILL.md"
+  [ -f "$grok_skill" ]
+  grep -q "whoami.sh \"\$(pwd)\" grok-build" "$grok_skill"
+  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$grok_skill"
+  grep -q "^name: agmsg" "$grok_skill"
+}
+
+@test "install: skips Grok Build skill when ~/.grok is absent" {
+  rm -rf "$FAKE_HOME/.grok"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  [ ! -d "$FAKE_HOME/.grok" ]
+}
+
+@test "install --update: installs Grok Build skill for upgraders without prior skill" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  [ ! -d "$FAKE_HOME/.grok/skills/agmsg" ]
+  mkdir -p "$FAKE_HOME/.grok"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ -f "$FAKE_HOME/.grok/skills/agmsg/SKILL.md" ]
+  grep -q "whoami.sh \"\$(pwd)\" grok-build" "$FAKE_HOME/.grok/skills/agmsg/SKILL.md"
+}
+
+@test "install: --agent-type grok-build makes shared SKILL.md Grok-typed" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type grok-build
+  grep -q "whoami.sh \"\$(pwd)\" grok-build" "$SK/SKILL.md"
+  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
+}

@@ -14,12 +14,20 @@ set -euo pipefail
 #
 # Usage:
 #   spawn.sh <agent-type> <name> [options]
+#   spawn.sh <agent-type> <name> --boot-prompt "<initial task>" [options]
 #
 #   <agent-type>   any registered type whose manifest is spawnable: a `cli=`
 #                  binary (direct-CLI launch) or a `spawn=` node launcher
 #   <name>         actas identity for the spawned agent
 #
 # Options:
+#   --boot-prompt <text>    an initial task for the spawned agent. When given, the
+#                      boot prompt becomes the actas slash command followed
+#                      (newline-separated) by <text>, so the new agent claims
+#                      its identity AND acts on the task in its first turn —
+#                      handy for a codex peer (no Monitor), where a message
+#                      sent after spawn would never reach the idle session.
+#                      An empty string (`--boot-prompt ""`) means no task.
 #   --project <path>   project to launch in (default: $PWD)
 #   --team <team>      team to join <name> into (default: auto-resolved from
 #                      the project's existing registrations; required when the
@@ -53,6 +61,10 @@ set -euo pipefail
 #                      modify the repo. --no-reviewer forces it off. Defaults from
 #                      config spawn.codex_reviewer. Without it, headless codex sits
 #                      in a neutral scratch cwd (read-anywhere, write only agmsg).
+#   --model <id>       launch the agent on a specific model. The id is passed
+#                      through to the CLI unchecked (the CLI rejects unknown
+#                      ids); the flag spelling comes from the type's manifest
+#                      `model_arg=`. Refused for a type with no model_arg.
 #
 # Readiness: by default spawn blocks until the new agent's watcher attaches and
 # is receiving (it prints `status=ready ...`), so a leader can safely send work
@@ -116,6 +128,9 @@ fi
 
 # --- Parse options ---
 PROJECT="$PWD"
+PROMPT=""            # --boot-prompt: optional initial task appended to the actas prompt
+                     # (empty string = no task, so the `[ -n "$PROMPT" ]` guard
+                     #  below leaves the boot prompt unchanged)
 TEAM=""
 TMUX_TARGET="pane"   # pane | window
 SPLIT="h"            # h | v
@@ -126,9 +141,15 @@ HEADLESS=0           # codex only: run a no-terminal bridge worker (resolved val
 HEADLESS_SET=0       # whether an explicit --headless/--interactive flag was given
 REVIEWER=0           # headless codex only: cwd=repo + read-only-repo profile (resolved)
 REVIEWER_SET=0       # whether an explicit --reviewer/--no-reviewer flag was given
+MODEL_ID=""          # --model: pass-through model id for the launched CLI
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    # `${2?...}` (not `:?`) errors only when the arg is MISSING; an explicit
+    # empty string (`--boot-prompt ""`) is allowed through and treated as "no task"
+    # by the `[ -n "$PROMPT" ]` guard, so a scripted `--boot-prompt "$VAR"` with an
+    # empty VAR degrades to a plain spawn instead of aborting.
+    --boot-prompt)  PROMPT="${2?--boot-prompt needs a task}"; shift 2 ;;
     --project) PROJECT="${2:?--project needs a path}"; shift 2 ;;
     --team)    TEAM="${2:?--team needs a name}"; shift 2 ;;
     --window)  TMUX_TARGET="window"; shift ;;
@@ -140,6 +161,7 @@ while [ $# -gt 0 ]; do
     --interactive|--no-headless) HEADLESS=0; HEADLESS_SET=1; shift ;;
     --reviewer)                  REVIEWER=1; REVIEWER_SET=1; shift ;;
     --no-reviewer)               REVIEWER=0; REVIEWER_SET=1; shift ;;
+    --model) MODEL_ID="${2:?--model needs a model id}"; shift 2 ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -219,6 +241,16 @@ if [ -n "$CLI_BIN" ]; then
   CLI_PATH="$(command -v "$CLI_BIN")"
 elif [ -z "$SPAWN_LAUNCHER" ]; then
   die "agent type '$AGENT_TYPE' manifest declares neither a 'cli' binary nor a 'spawn' launcher"
+fi
+
+# --model is pass-through: the model id is handed to the CLI unchecked (the CLI
+# rejects an unknown id), so agmsg never has to track each vendor's model list.
+# The flag SPELLING differs per CLI, so it comes from the manifest `model_arg=`
+# (e.g. claude-code/grok-build use --model, codex uses -m). A type with no
+# model_arg has no known flag, so --model is refused rather than guessed.
+MODEL_ARG="$(agmsg_type_get "$AGENT_TYPE" model_arg)"
+if [ -n "$MODEL_ID" ] && [ -z "$MODEL_ARG" ]; then
+  die "agent type '$AGENT_TYPE' does not support --model (no model_arg in its manifest)"
 fi
 # Resolve the node launcher path from the manifest (not hardcoded), if any.
 SPAWN_AGENT=""
@@ -335,8 +367,17 @@ AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$TEAM" "$NAME" "$AGENT_TYPE" "$PR
 # have customized at install time (install.sh --cmd). Derive it from the skill
 # dir basename so a custom install (e.g. `/m`) spawns `/m actas <name>` rather
 # than a nonexistent `/agmsg actas <name>`.
+#
+# When --boot-prompt is given, append the task newline-separated so the agent claims
+# its identity AND acts on the task in the same first turn. This is the only way
+# to hand a one-shot goal to a codex peer, which has no Monitor and so never
+# notices a message sent after it goes idle (see docs/codex-monitor-beta.md).
 CMD_NAME="$(basename "$SKILL_DIR")"
 ACTAS_PROMPT="/${CMD_NAME} actas ${NAME}"
+if [ -n "$PROMPT" ]; then
+  ACTAS_PROMPT="${ACTAS_PROMPT}
+${PROMPT}"
+fi
 
 BOOT_DIR="${TMPDIR:-/tmp}/agmsg-spawn"
 mkdir -p "$BOOT_DIR" 2>/dev/null || true
@@ -359,7 +400,12 @@ BOOT="$BOOT.command"
     printf '  --project %q \\\n' "$PROJECT"
     printf '  --initial-input %q\n' "$ACTAS_PROMPT"
   else
-    printf '%q %q\n' "$CLI_BIN" "$ACTAS_PROMPT"
+    # Direct-CLI launch: `<cli> [<model_arg> <model_id>] "/<cmd> actas <name>"`.
+    # model_arg is the manifest flag spelling (not %q-quoted — a bare flag like
+    # --model or -m); the model id is quoted.
+    printf '%q' "$CLI_BIN"
+    [ -n "$MODEL_ID" ] && printf ' %s %q' "$MODEL_ARG" "$MODEL_ID"
+    printf ' %q\n' "$ACTAS_PROMPT"
   fi
   echo 'rm -f "$0" 2>/dev/null'   # self-clean once the agent exits
   echo 'exec "${SHELL:-/bin/bash}" -i'
@@ -504,12 +550,15 @@ place_and_launch() {
 # receiving. Block until that appears so the leader doesn't send a job into the
 # cold-start window (before the watcher attaches) and lose it.
 #
-# Types without a Monitor (manifest `monitor=no`) never touch the readiness
-# sentinel, so skip the wait for them (their receive is poll-based anyway).
+# Types with `monitor=no` do not produce a spawn-awaitable readiness sentinel, so
+# skip the wait. That covers types with no Monitor at all (codex) AND types whose
+# watcher attaches via the agent's own launch rather than a spawn-time sentinel
+# (grok-build, whose monitor mode is real but not awaitable here) — receive there
+# is poll-based or agent-launched anyway.
 READY_PATH="$(agmsg_ready_path "$TEAM" "$NAME")"
 if [ "$(agmsg_type_get "$AGENT_TYPE" monitor)" = "no" ] && [ "$WAIT_READY" = "1" ]; then
   WAIT_READY=0
-  echo "spawn: '$AGENT_TYPE' has no Monitor — skipping readiness wait (--no-wait implied)" >&2
+  echo "spawn: '$AGENT_TYPE' has no spawn readiness handshake — skipping readiness wait (--no-wait implied)" >&2
 fi
 
 # Clear any stale sentinel before launching so we only observe THIS spawn's

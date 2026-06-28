@@ -38,9 +38,21 @@ agmsg_storage_dir() {
   printf '%s\n' "$skill_dir/db"
 }
 
-# Echo the full path to messages.db.
+# Echo the full path to messages.db, in a form the sqlite3 binary can open.
+# On Windows, sqlite3.exe is a native binary that cannot open a Git Bash path
+# like /c/Users/.../db/messages.db: open() fails, so inbox/send/watch all fail
+# to reach the store and the team goes silent (#197, reported by vhsvhafmwf).
+# cygpath -m converts to the mixed C:/Users/.../db/messages.db form that BOTH
+# the shell's `[ -f "$db" ]` test AND sqlite3.exe accept — unlike -w's backslash
+# form (C:\Users\...), which the surrounding shell quoting/tests mishandle.
+# No-op off Windows (cygpath absent). Mirrors agmsg_sql_readfile_path's pattern.
 agmsg_db_path() {
-  printf '%s/messages.db\n' "$(agmsg_storage_dir)"
+  local db
+  db="$(agmsg_storage_dir)/messages.db"
+  if command -v cygpath >/dev/null 2>&1; then
+    db=$(cygpath -m "$db" 2>/dev/null || printf '%s' "$db")
+  fi
+  printf '%s\n' "$db"
 }
 
 # Run sqlite3 against the message store with a busy_timeout, so a writer that

@@ -14,6 +14,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/type-registry.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/compat.sh"
 
 # Auto-detect CLI type from environment variables and the process tree, driven by
 # the per-type manifests' `detect=` (env-var names) and `detect_proc=` (process
@@ -52,7 +54,7 @@ EOF
   # (the globs are disjoint, so order within a level is irrelevant).
   local pid=$$ max_depth=10 depth=0 proc_name _pats _pat
   while [ $depth -lt $max_depth ] && [ "$pid" != "1" ] && [ -n "$pid" ]; do
-    proc_name=$(ps -p "$pid" -o comm= 2>/dev/null | xargs basename 2>/dev/null || true)
+    proc_name=$(compat_get_comm "$pid" 2>/dev/null || true)
     if [ -n "$proc_name" ]; then
       while IFS= read -r _t; do
         [ -n "$_t" ] || continue
@@ -73,7 +75,7 @@ EOF
     fi
 
     # Move to parent process
-    pid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
+    pid=$(compat_get_ppid "$pid" 2>/dev/null || true)
     depth=$((depth + 1))
   done
 

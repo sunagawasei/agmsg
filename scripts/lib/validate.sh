@@ -45,3 +45,26 @@ agmsg_validate_team_name() {
   esac
   return 0
 }
+
+# Agent names are interpolated into a SQLite JSON path ($.agents.<name>); '.',
+# '[', ']', '"' would misroute the path (silent wrong-key / array index), and
+# '/' '\' / control chars are path/format hazards. UTF-8 (>= 0x80) is fine.
+agmsg_validate_agent_name() {
+  local name="$1"
+  if [ -z "$name" ]; then
+    echo "agmsg: invalid agent name: must not be empty" >&2
+    return 1
+  fi
+  case "$name" in
+    .|..)
+      echo "agmsg: invalid agent name '$name': '.' and '..' are not allowed" >&2
+      return 1 ;;
+    -*)
+      echo "agmsg: invalid agent name '$name': must not start with '-'" >&2
+      return 1 ;;
+    *[./\\\"]* | *[][]* | *[[:cntrl:]]*)
+      echo "agmsg: invalid agent name '$name': must not contain . / \ \" [ ] or control characters" >&2
+      return 1 ;;
+  esac
+  return 0
+}

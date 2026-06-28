@@ -30,6 +30,34 @@ teardown() {
   [ "$(agmsg_db_path)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
 }
 
+# --- agmsg_db_path() Windows path conversion (#197) ---
+
+@test "storage: agmsg_db_path applies cygpath -m on Windows so sqlite3.exe can open it (#197)" {
+  # The native sqlite3.exe cannot open a Git Bash /c/... path; cygpath -m maps it
+  # to the mixed C:/... form both the shell and sqlite3.exe accept. cygpath is
+  # absent off Windows, so inject a shim on PATH to exercise the branch.
+  local bindir="$BATS_TEST_TMPDIR/bin"
+  mkdir -p "$bindir"
+  cat > "$bindir/cygpath" <<'SH'
+#!/usr/bin/env bash
+# Minimal stand-in: `cygpath -m /c/x` -> C:/x (BSD- and GNU-sed portable).
+shift  # drop the -m flag
+printf '%s\n' "$1" | sed -E 's#^/c/#C:/#'
+SH
+  chmod +x "$bindir/cygpath"
+  run env PATH="$bindir:$PATH" AGMSG_STORAGE_PATH="/c/Users/test/db" \
+    bash -c 'source "'"$SCRIPTS"'/lib/storage.sh"; agmsg_db_path'
+  [ "$status" -eq 0 ]
+  [ "$output" = "C:/Users/test/db/messages.db" ]
+}
+
+@test "storage: agmsg_db_path is a no-op without cygpath (off Windows)" {
+  source "$SCRIPTS/lib/storage.sh"
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store"
+  # cygpath is absent on the test host, so the path is returned unchanged.
+  [ "$(agmsg_db_path)" = "$BATS_TEST_TMPDIR/store/messages.db" ]
+}
+
 # --- init-db.sh honoring the override ---
 
 @test "storage: init-db creates the db at the overridden path (and makes the dir)" {

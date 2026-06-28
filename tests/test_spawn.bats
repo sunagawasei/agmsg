@@ -29,6 +29,11 @@ if [ "$1" = sandbox ]; then
 fi
 exit 0
 CODEX_STUB
+  # grok-build and hermes need only a trivial success stub.
+  for bin in grok hermes; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/$bin"
+    chmod +x "$STUB_BIN/$bin"
+  done
   chmod +x "$STUB_BIN/claude" "$STUB_BIN/codex"
   export CAPTURE="$TEST_SKILL_DIR/launch-capture.txt"
   cat > "$STUB_BIN/record.sh" <<EOF
@@ -167,6 +172,67 @@ teardown() {
   [[ "$output" == *"$PROJ"* ]]
 }
 
+@test "spawn: grok-build launches the plain grok CLI with the actas prompt" {
+  # grok-build is spawnable and monitor=no, so spawn skips the readiness wait.
+  # Delivery is a rule file (no hook), so no folder-trust flag is needed —
+  # the launch is the bare `grok "/<cmd> actas <name>"`, like claude-code.
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" grok-build alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  [ -f "$boot" ]
+  run cat "$boot"
+  [[ "$output" == *"grok"* ]]
+  [[ "$output" == *"actas"* ]]
+  [[ "$output" == *"alice"* ]]
+  [[ "$output" != *"--trust"* ]]
+}
+
+# --- --model (#135): per-type model flag, pass-through id ---
+
+@test "spawn --model: claude-code launch includes its --model flag + id" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --model claude-opus-4-8 --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"claude --model claude-opus-4-8"* ]]
+  [[ "$output" == *"actas"* ]]
+}
+
+@test "spawn --model: codex launch uses its -m model flag" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" codex alice --project "$PROJ" --model gpt-5 --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"codex -m gpt-5"* ]]
+}
+
+@test "spawn --model: grok-build launch uses its --model flag" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" grok-build alice --project "$PROJ" --model grok-build --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"grok --model grok-build"* ]]
+}
+
+@test "spawn --model: refused for a type with no model_arg in its manifest" {
+  run bash "$SCRIPTS/spawn.sh" hermes foo --project "$PROJ" --model whatever --no-wait
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "does not support --model" ]]
+}
+
+@test "spawn: no --model leaves the launch flag-free" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" != *"--model"* ]]
+}
+
 @test "spawn: actas prompt uses the install command name (not hardcoded agmsg)" {
   # Rename the skill dir to a custom command name and re-point SCRIPTS so the
   # script resolves SKILL_DIR basename = the custom name.
@@ -181,6 +247,38 @@ teardown() {
   [[ "$output" == *"/m-$$"* ]]
   [[ "$output" != *"/agmsg actas"* ]]
   rm -rf "$custom"
+}
+
+@test "spawn: --boot-prompt appends an initial task to the actas prompt" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait \
+    --boot-prompt "review the diff"
+  [ "$status" -eq 0 ]
+
+  # The boot script still carries the actas slash command, and now ALSO the
+  # task text, so the spawned agent claims its identity AND acts on the task in
+  # its first turn. (printf %q escapes spaces, so assert on tokens.)
+  boot="$(cat "$CAPTURE")"
+  [ -f "$boot" ]
+  run cat "$boot"
+  [[ "$output" == *"actas"* ]]
+  [[ "$output" == *"alice"* ]]
+  [[ "$output" == *"review"* ]]
+  [[ "$output" == *"diff"* ]]
+}
+
+@test "spawn: without --boot-prompt the boot script carries no extra task text" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+
+  # Guards the byte-identical claim: with no --boot-prompt, only the actas command
+  # is passed — no task text leaks into the boot script.
+  boot="$(cat "$CAPTURE")"
+  [ -f "$boot" ]
+  run cat "$boot"
+  [[ "$output" == *"actas"* ]]
+  [[ "$output" != *"review the diff"* ]]
 }
 
 @test "spawn: errors when \$TMUX is set but tmux is not on PATH" {
@@ -541,4 +639,60 @@ CODEX_STUB
   for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
   run cat "$CAPTURE"
   [[ "$output" != *"\"$PROJ\"=\"read\""* ]]   # already :workspace_roots — not re-granted
+}
+
+@test "spawn: grok-build skips the readiness wait even without --no-wait (monitor=no)" {
+  # Regression guard: grok-build's monitor watcher attaches via the agent's
+  # actas/rule launch (no SessionStart hook) and only in monitor mode, so there
+  # is no ready sentinel for spawn to await. With monitor=no, spawn must skip the
+  # wait and return immediately instead of hanging a default turn/off-mode spawn
+  # until --ready-timeout. (Without this, monitor=yes made the wait fire.)
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run env -u TMUX bash "$SCRIPTS/spawn.sh" grok-build alice --project "$PROJ" \
+    --terminal "true # {cmd}"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skipping readiness wait"* ]]
+  [[ "$output" != *"status=timeout"* ]]
+  [[ "$output" != *"status=ready"* ]]
+}
+
+# --- initial prompt (--boot-prompt) ---
+# spawn folds an optional initial task into the agent's first prompt: the boot
+# prompt becomes the actas slash command followed (newline-separated) by the
+# task, so the new agent claims its identity AND starts the task in one turn —
+# the only way to hand a one-shot goal to a no-Monitor peer (codex). These tests
+# assert on the generated boot script the terminal template is handed (captured
+# via record.sh), the same way the actas-prompt tests above do.
+
+@test "spawn: --boot-prompt requires a task (missing arg errors)" {
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --boot-prompt
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--boot-prompt needs a task"* ]]
+}
+
+@test "spawn: --boot-prompt \"\" is treated as no task (no-op, not an error)" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  # An explicit empty string must NOT abort the spawn — it degrades to a plain
+  # spawn (so a scripted `--boot-prompt "$VAR"` with an empty VAR still works).
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait --boot-prompt ""
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"actas"* ]]
+  [[ "$output" == *"alice"* ]]
+  # No task appended → no newline-join → boot prompt unchanged.
+  [[ "$output" != *'\n'* ]]
+}
+
+@test "spawn: --boot-prompt folds the initial task into the boot prompt (codex)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" \
+    --boot-prompt "REVIEW_THE_DIFF"
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  [ -f "$boot" ]
+  run cat "$boot"
+  [[ "$output" == *"actas"* ]]
+  [[ "$output" == *"reviewer"* ]]
+  [[ "$output" == *"REVIEW_THE_DIFF"* ]]
 }

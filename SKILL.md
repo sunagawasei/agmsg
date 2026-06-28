@@ -141,6 +141,12 @@ Do NOT manually edit config files. Always use join.sh.
 #   --ready-timeout N    seconds to wait for readiness (default 90; on timeout
 #                        prints status=timeout and exits 3). Codex skips the
 #                        wait (it has no Monitor).
+#   --boot-prompt <text>      hand the new agent an initial task: the boot prompt
+#                        becomes the actas command followed (newline-separated)
+#                        by <text>, so it claims its identity AND starts the task
+#                        in its first turn. The only way to give a one-shot goal
+#                        to a codex peer (no Monitor → a post-spawn send to its
+#                        idle session is never noticed).
 #   --headless           (codex only) run a no-terminal bridge worker instead of
 #                        a TUI — codex talks over the bus with no window, cwd is a
 #                        neutral scratch under run/, sandboxed to read anywhere but

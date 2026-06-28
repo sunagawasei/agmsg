@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -u
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 
 # Stream new agmsg messages for the current session as they arrive.
 #
@@ -30,7 +32,14 @@ set -u
 #   - Writes a pidfile at ~/.agents/agmsg/run/watch.<session_id>.pid and
 #     removes it on EXIT / SIGTERM / SIGINT.
 
-SESSION_ID="${1:?Usage: watch.sh <session_id> <project_path> <agent_type> [active_name] [--team <team>]}"
+# session_id is normally baked into the launch command (CLAUDE_CODE_SESSION_ID /
+# GROK_SESSION_ID). An empty first arg is tolerated and resolved below (after the
+# libs are sourced) rather than failing hard, so a runtime that cannot bake one
+# in — notably Grok Build's `monitor` tool, where "$GROK_SESSION_ID" expands to
+# empty — still starts the watcher. project_path and agent_type are required.
+# [--team <team>] (parsed below) pins the subscription to one team for
+# session-team mode.
+SESSION_ID="${1:-}"
 PROJECT_PATH="${2:?Missing project_path}"
 AGENT_TYPE="${3:?Missing agent_type}"
 shift 3
@@ -59,6 +68,30 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
+
+# Resolve a session id when the launcher could not bake one in (empty first arg).
+# Grok Build's `monitor` tool runs the watcher with $GROK_SESSION_ID unset, so
+# neither the env var nor the instance-id ppid walk (it keys on the claude/codex
+# agent binaries) yields grok's session. Bind to a composite "<session_id>.<grok
+# _pid>" instead — keyed this way the watermark/pidfile are stable across watcher
+# relaunches (no replay gap) and liveness-gated on the grok pid, so the watcher
+# self-exits once grok dies rather than lingering as a bare-id orphan (#245).
+# agmsg_grok_instance_id handles both `grok --resume <id>` and a fresh `grok`
+# (no --resume). Fall back to a throwaway id only if no live grok is found, so the
+# watcher still starts (#238). Uses the raw project path the watcher was launched
+# with, before agmsg_resolve_project rewrites it, to match grok's session dir.
+if [ -z "$SESSION_ID" ]; then
+  case "$AGENT_TYPE" in
+    grok-build)
+      SESSION_ID="$(agmsg_grok_instance_id "$PROJECT_PATH" 2>/dev/null || true)"
+      # A fresh grok watcher reaps bare-id grok watchers left behind by older
+      # (pre-composite) versions whose grok has since exited (#245). Specific-PID
+      # kill only — never a pattern kill.
+      agmsg_reap_orphan_grok_watchers "$PROJECT_PATH" "$$" 2>/dev/null || true
+      ;;
+  esac
+  [ -z "$SESSION_ID" ] && SESSION_ID="agmsg-$(compat_uuidgen | tr 'A-Z' 'a-z')"
+fi
 
 # Resolve the session's real project root (see #92). The actas/drop/ensure-
 # monitor flows relaunch this watcher with a raw "$(pwd)"; without resolution a
@@ -102,7 +135,7 @@ mkdir -p "$RUN_DIR" 2>/dev/null || true
 if [ -f "$PIDFILE" ]; then
   prev_pid=$(cat "$PIDFILE" 2>/dev/null || true)
   if [ -n "$prev_pid" ] && [ "$prev_pid" != "$$" ] && kill -0 "$prev_pid" 2>/dev/null; then
-    prev_cmd=$(ps -o args= -p "$prev_pid" 2>/dev/null || true)
+    prev_cmd=$(compat_get_cmdline "$prev_pid" 2>/dev/null || true)
     if [ -n "$prev_cmd" ]; then
       case "$prev_cmd" in
         *"$SKILL_DIR/scripts/watch.sh"*) kill "$prev_pid" 2>/dev/null || true ;;
@@ -265,6 +298,21 @@ if [ -z "$LAST" ]; then
   persist_watermark
 fi
 
+# DB-open healthcheck (#197). The main loop guards every query with
+# `2>/dev/null || true`, so when sqlite3 cannot open the store the watcher keeps
+# spinning and silently delivers nothing — a silent outage. The native
+# sqlite3.exe / Git Bash path mismatch behind #197 is one trigger (now fixed in
+# agmsg_db_path), but permissions, a missing binary, or a corrupt file fail the
+# same way. A *missing* DB file is normal (no messages sent yet), so only flag
+# the case where the file exists but a trivial query cannot run: emit one line
+# on stdout (the Monitor event stream) and exit, turning the silent failure into
+# a visible one. Done before the ready sentinel so we never signal "ready" for a
+# watcher that cannot read the store.
+if [ -f "$DB" ] && ! agmsg_sqlite "$DB" "SELECT 1;" >/dev/null 2>&1; then
+  echo "ERROR: cannot open message DB $DB"
+  exit 1
+fi
+
 # Signal readiness. Once the subscription is resolved and the watermark is set,
 # this watcher will deliver anything that arrives from here on, so it is safe
 # for a leader to start sending. Only exclusive (actas) watchers signal — a
@@ -284,6 +332,18 @@ if [ -n "$ACTIVE_NAME" ]; then
 fi
 
 while true; do
+  # Liveness guard (#67): exit promptly once the originating agent session is
+  # gone. A plain pipe gives no portable way to notice a *downstream* consumer
+  # that closed silently — printf '' raises no EPIPE, and macOS buffers a final
+  # write into an already-dead reader — so a quiet watcher whose session died
+  # would otherwise spin forever (the macOS-runner 33-min stall; #210's job
+  # timeout only caps the symptom). `kill -0` on the agent pid embedded in the
+  # composite instance id is portable (Git Bash falls back to tasklist; see
+  # _agmsg_pid_alive). Gated on a composite id only: a bare id (degraded, no
+  # resolved agent pid) keeps the prior behavior and is not liveness-gated.
+  if agmsg_instance_is_composite "$SESSION_ID" && ! agmsg_instance_alive "$SESSION_ID"; then
+    exit 0
+  fi
   if [ -f "$DB" ]; then
     ROWS="$(agmsg_sqlite -separator $'\x1f' "$DB" "
       SELECT id, created_at, team, from_agent, to_agent,
