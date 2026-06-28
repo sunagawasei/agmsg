@@ -41,6 +41,13 @@ Headless read-only Cursor reviewer worker for agmsg.
   --name <agent>     this worker's agmsg identity.
   --chat-id <id>     Cursor chat id to --resume each turn (from create-chat).
   --interval <sec>   inbox poll interval (default 2).
+  --readonly         enforce read-only: write a scratch-cwd .cursor/cli.json that
+                     denies Write/Shell (+ a secret-path Read denylist) and run
+                     with --workspace <project>. Deny survives the user's global
+                     approvalMode under --trust (verified). Without it, a global
+                     approvalMode:"unrestricted" lets a --trust cursor write/shell.
+  --add-dirs-file <path>  newline-listed extra readable directories (the asking
+                     Claude session's /add-dir roots) to advertise in the prompt.
   --once             drain the inbox a single time, then exit (for tests).
   --help             show this help.
 
@@ -56,6 +63,8 @@ PROJECT="" TEAM="" NAME="" CHAT_ID=""
 INTERVAL="${AGMSG_CURSOR_BRIDGE_INTERVAL:-2}"
 ONCE=0
 TURN_TIMEOUT="${AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT:-180}"
+READONLY=0          # --readonly: enforce read-only via a scratch-cwd .cursor/cli.json
+ADD_DIRS_FILE=""    # --add-dirs-file: newline-listed extra readable dirs to advertise
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -64,6 +73,8 @@ while [ "$#" -gt 0 ]; do
     --name)    NAME="${2:?--name needs a name}"; shift 2 ;;
     --chat-id) CHAT_ID="${2:?--chat-id needs an id}"; shift 2 ;;
     --interval) INTERVAL="${2:?--interval needs seconds}"; shift 2 ;;
+    --readonly) READONLY=1; shift ;;
+    --add-dirs-file) ADD_DIRS_FILE="${2:?--add-dirs-file needs a path}"; shift 2 ;;
     --once)    ONCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "cursor-bridge: unknown option: $1" >&2; exit 1 ;;
@@ -85,6 +96,14 @@ SCRIPTS_DIR="$SKILL_DIR/scripts"
 RUN_DIR="$SKILL_DIR/run"
 # shellcheck disable=SC1091
 source "$SCRIPTS_DIR/lib/storage.sh"
+# Defense-in-depth (the parent _spawn.sh validates too): TEAM/NAME compose the
+# pidfile/meta/log AND the rm -rf'd scratch CFGDIR. Reuse the same UTF-8-safe
+# path-segment deny-list as join.sh (rejects '/','\\','.'/'..', leading '-',
+# control chars) — NOT an ASCII allow-list, so legal UTF-8 identities still work.
+# shellcheck disable=SC1091
+source "$SCRIPTS_DIR/lib/validate.sh"
+agmsg_validate_team_name "$TEAM" >/dev/null 2>&1 || { echo "cursor-bridge: team name '$TEAM' is not a path-safe segment" >&2; exit 1; }
+agmsg_validate_team_name "$NAME" >/dev/null 2>&1 || { echo "cursor-bridge: agent name '$NAME' is not a path-safe segment (no '/', '\\', '.', '..', leading '-', or control chars)" >&2; exit 1; }
 
 CURSOR_BIN="${AGMSG_CURSOR_AGENT_CMD:-cursor-agent}"
 # perl gives us a robust per-turn timeout that kills the WHOLE process group
@@ -118,6 +137,12 @@ printf 'pid=%s\nproject=%s\nteam=%s\nname=%s\ntype=cursor\n' "$$" "$PROJECT" "$T
 # down cleanly. run_with_timeout maintains this.
 CHILD_PID=""
 
+# Read-only scaffolding (populated below when --readonly is set). Initialized here
+# so the EXIT trap and `set -u` are safe even on an early exit before setup.
+CFGDIR=""            # scratch cwd holding .cursor/cli.json (the deny rules)
+ADD_DIRS_NOTE=""     # prompt fragment advertising extra readable dirs
+WORKSPACE_ARGS=()    # (--workspace <project>) when read-only is enforced
+
 # Kill the in-flight turn: SIGTERM (perl forwards it to the whole cursor process
 # group), wait out a grace longer than perl's own 2s group-kill window, then
 # SIGKILL the wrapper and its children as a backstop. So a despawn during an
@@ -143,7 +168,10 @@ cleanup() {
   if [ "$(cat "$PIDFILE" 2>/dev/null || true)" = "$$" ]; then
     rm -f "$PIDFILE" "$METAFILE" "$OUTFILE" "$PROMPTFILE" \
           "$OUTFILE.one" "$OUTFILE.cand" \
-          "$RUN_DIR/cursor-bridge.$TEAM.$NAME.chat" 2>/dev/null || true
+          "$RUN_DIR/cursor-bridge.$TEAM.$NAME.chat" \
+          "${ADD_DIRS_FILE:-}" 2>/dev/null || true
+    # The scratch cwd holds our generated .cursor/cli.json — drop the whole dir.
+    [ -n "${CFGDIR:-}" ] && rm -rf "$CFGDIR" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -236,7 +264,7 @@ run_cursor_turn() {
   printf '%s' "$prompt" > "$PROMPTFILE"
   local rc=0
   run_with_timeout "$TURN_TIMEOUT" \
-    "$CURSOR_BIN" -p --trust --output-format json --resume "$CHAT_ID" \
+    "$CURSOR_BIN" -p --trust ${WORKSPACE_ARGS[@]+"${WORKSPACE_ARGS[@]}"} --output-format json --resume "$CHAT_ID" \
     <"$PROMPTFILE" >"$OUTFILE" 2>>"$LOG" || rc=$?
   rm -f "$PROMPTFILE" 2>/dev/null || true
 
@@ -332,7 +360,7 @@ process_cycle() {
     # No size cap needed: the prompt is fed to cursor-agent via stdin (a file) in
     # run_cursor_turn, not argv, so a large batch cannot hit ARG_MAX.
     local prompt
-    prompt="You are a headless agmsg reviewer (team '$TEAM', acting as '$NAME'), running read-only in $PROJECT. The following agmsg message(s) were sent to you by '$sender':
+    prompt="You are a headless agmsg reviewer (team '$TEAM', acting as '$NAME'), running read-only in $PROJECT$ADD_DIRS_NOTE. The following agmsg message(s) were sent to you by '$sender':
 
 $body_block
 Reply with ONLY your final answer for '$sender'. Do NOT run agmsg, send.sh, or any shell command to deliver it — the bridge delivers your reply automatically."
@@ -351,6 +379,79 @@ Reply with ONLY your final answer for '$sender'. Do NOT run agmsg, send.sh, or a
   done <<< "$senders"
   return 0
 }
+
+# Write the read-only .cursor/cli.json into the scratch cwd $1. cursor merges this
+# project-level config over the user's global one and DENY takes precedence — even
+# under --trust and a global approvalMode:"unrestricted" (verified). Enforces
+# deny Write(**)/Shell(**) plus a Read() denylist of common credential paths. This
+# is a denylist, not codex-style allowlist scoping: --trust permits every read not
+# explicitly denied, so reads stay broad minus these entries.
+# Returns non-zero (fail-closed) if the deny config can't be written — the caller
+# then refuses to start, so cursor never runs under the user's (possibly
+# unrestricted) global config. WARNs to stderr (→ log) for each credential path
+# left UNdenied because it sits inside the workspace, so the reduced denylist (e.g.
+# PROJECT=$HOME or a dotfiles repo at ~/.config) is visible, not silent.
+write_readonly_config() {
+  local cfgdir="$1"
+  mkdir -p "$cfgdir/.cursor" 2>/dev/null || return 1
+  local proj_real; proj_real="$(cd "$PROJECT" 2>/dev/null && pwd -P || printf '%s' "$PROJECT")"
+  local deny='"Write(**)", "Shell(**)"'
+  local p base_real
+  # Credential DIRECTORIES → deny Read(<dir>/**). Skip any that resolve inside the
+  # workspace (a deny there would blind the reviewer to project content) or carry a
+  # " or \ that would break the JSON string we splice into.
+  for p in "$HOME/.ssh" "$HOME/.aws" "$HOME/.gnupg" "$HOME/.kube" \
+           "$HOME/.config/gh" "$HOME/.config/gcloud" \
+           "$HOME/.config/cursor" "$HOME/.config/codex"; do
+    case "$p" in *'"'*|*'\'*) continue ;; esac
+    base_real="$(cd "$p" 2>/dev/null && pwd -P || printf '%s' "$p")"
+    case "$base_real/" in "$proj_real"/*)
+      echo "cursor-bridge: WARNING: '$p' is inside the workspace ($proj_real); NOT denied — the reviewer can read it" >&2
+      continue ;;
+    esac
+    deny="$deny, \"Read($p/**)\""
+  done
+  # Credential FILES → deny Read(<file>).
+  for p in "$HOME/.netrc" "$HOME/.npmrc" "$HOME/.pypirc" \
+           "$HOME/.git-credentials" "$HOME/.docker/config.json"; do
+    case "$p" in *'"'*|*'\'*) continue ;; esac
+    case "$p/" in "$proj_real"/*)
+      echo "cursor-bridge: WARNING: '$p' is inside the workspace ($proj_real); NOT denied — the reviewer can read it" >&2
+      continue ;;
+    esac
+    deny="$deny, \"Read($p)\""
+  done
+  printf '{ "permissions": { "allow": [], "deny": [ %s ] } }\n' "$deny" > "$cfgdir/.cursor/cli.json" || return 1
+  return 0
+}
+
+if [ "$READONLY" = 1 ]; then
+  CFGDIR="$RUN_DIR/cursor-cfg.$TEAM.$NAME"
+  rm -rf "$CFGDIR" 2>/dev/null || true
+  # Fail closed: if the deny config can't be generated, refuse to start. Running
+  # cursor without it would fall back to the user's global config (possibly
+  # approvalMode:"unrestricted") — the exact write/shell/read-anything hole this
+  # feature exists to close.
+  if ! write_readonly_config "$CFGDIR" \
+     || [ ! -f "$CFGDIR/.cursor/cli.json" ] \
+     || ! json_valid_file "$CFGDIR/.cursor/cli.json"; then
+    echo "cursor-bridge: FATAL: could not generate a valid read-only .cursor/cli.json in $CFGDIR; refusing to start (would run cursor unrestricted)" >&2
+    exit 1
+  fi
+  # cwd = scratch config dir (so cursor reads OUR .cursor/cli.json); workspace = the
+  # real repo (so the reviewer still explores it). Every other bridge path is
+  # absolute, so changing cwd here is safe.
+  cd "$CFGDIR" || { echo "cursor-bridge: FATAL: cannot cd to scratch cfg dir $CFGDIR" >&2; exit 1; }
+  WORKSPACE_ARGS=(--workspace "$PROJECT")
+  echo "cursor-bridge: read-only enforced (cwd=$CFGDIR, workspace=$PROJECT)" >&2
+fi
+
+# Advertise inherited /add-dir read roots in every prompt (cursor can already read
+# them under --trust; this just tells the model they are in scope).
+if [ -n "$ADD_DIRS_FILE" ] && [ -s "$ADD_DIRS_FILE" ]; then
+  _ad_list="$(tr '\n' ' ' < "$ADD_DIRS_FILE" | sed 's/  */ /g; s/^ //; s/ $//')"
+  [ -n "$_ad_list" ] && ADD_DIRS_NOTE=" (you may also read these directories granted to the requesting Claude session: $_ad_list)"
+fi
 
 echo "cursor-bridge: started for $TEAM/$NAME (chat $CHAT_ID, project $PROJECT)" >&2
 

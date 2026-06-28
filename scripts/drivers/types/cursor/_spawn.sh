@@ -17,19 +17,35 @@
 # apparatus (seatbelt nesting probes, writable_roots, reviewer permission
 # profiles) is unnecessary. The whole worker is a small bash loop, cursor-bridge.sh.
 #
-# Security model (D2): the read-only boundary is "the bridge never passes
-# --force", so cursor's own tool-approval gate denies writes/shell in headless
-# mode. This is product behavior, not an OS sandbox. We deliberately do NOT run a
-# live "try to write the repo, refuse if it succeeds" probe at spawn: it would be
-# a full ~10s agent turn (plus tokens) on every spawn AND is model-dependent and
-# flaky (the model may simply decline to attempt the write), so a green probe
-# would not actually prove the boundary — security theater. The deterministic,
-# fast guard is "never pass --force", and the bats suite pins the bridge flag set
-# (--trust present, --force/--yolo absent) as the regression guard. If cursor-agent
-# ever changes so --trust alone permits writes, that test is where it must be
-# caught — and the fix is a flag/config change here, not a per-spawn probe.
+# Security model (D2): read-only is enforced by a project-level .cursor/cli.json
+# the bridge writes in its OWN scratch cwd, denying Write(**)/Shell(**) plus a
+# secret-path Read() denylist. cursor merges that over the user's global config and
+# deny takes precedence even under --trust — VERIFIED on a live host. Never passing
+# --force is necessary but NOT sufficient on its own: with a global
+# approvalMode:"unrestricted", a headless `--trust` cursor otherwise writes, runs
+# shell, and reads anything (e.g. ~/.ssh). True allowlist read-scoping (codex
+# parity) is NOT achievable here — headless cursor requires --trust and --trust
+# permits all reads except explicit Read() denies, so reads stay broad minus the
+# denylist. Enforcement is gated by spawn.cursor_readonly (default on). The bats
+# suite pins the generated cli.json (deny Write/Shell present) and the bridge flag
+# set (--trust present, --force/--yolo absent) as the regression guards. A live
+# "try to write, refuse if it succeeds" probe is deliberately avoided: a ~10s,
+# model-dependent, flaky agent turn per spawn that would not actually prove the
+# boundary (the model may simply decline to attempt the write).
 
 CURSOR_BIN="${AGMSG_CURSOR_AGENT_CMD:-cursor-agent}"
+
+# Shared /add-dir harvest (agmsg_collect_add_dir_roots), used when the optional
+# spawn.cursor_inherit_add_dirs gate is on. Sourced in spawn.sh's global context
+# where config.sh + lib/storage.sh helpers are already available.
+# shellcheck source=../../lib/reviewer-add-dirs.sh
+. "$SCRIPT_DIR/lib/reviewer-add-dirs.sh"
+# agmsg_validate_team_name — the same UTF-8-safe path-segment deny-list join.sh
+# uses (rejects '/','\\','.'/'..', leading '-', control chars). Applied to the
+# agent NAME too, BEFORE any run/ artifact is created from it (the bridge's
+# scratch CFGDIR is rm -rf'd, so a path-unsafe name must never reach it).
+# shellcheck source=../../lib/validate.sh
+. "$SCRIPT_DIR/lib/validate.sh"
 
 # Resolve the headless default from config when no explicit flag was given.
 #   precedence: --headless / --interactive  >  config spawn.cursor_headless  >  TUI
@@ -54,6 +70,11 @@ agmsg_spawn_resolve_modes() {
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run"
   mkdir -p "$run_dir"
+
+  # Fail closed BEFORE any run/ artifact (.chat/.adddirs/log) or the rm -rf'd
+  # scratch CFGDIR is composed from TEAM/NAME. UTF-8-safe (deny-list, not ASCII).
+  agmsg_validate_team_name "$TEAM" >/dev/null 2>&1 || die "spawn: team name '$TEAM' is not a path-safe segment"
+  agmsg_validate_team_name "$NAME" >/dev/null 2>&1 || die "spawn: agent name '$NAME' is not a path-safe segment (no '/', '\\', '.', '..', leading '-', or control chars)"
 
   # Establish a persistent Cursor chat up-front so the bridge can --resume it on
   # every turn (server-side conversation memory). create-chat is cwd-independent
@@ -111,9 +132,32 @@ agmsg_spawn_headless() {
   # Persist the chat id for the bridge to --resume (and for despawn cleanup).
   printf '%s\n' "$chat_id" > "$run_dir/cursor-bridge.$TEAM.$NAME.chat"
 
+  # Read-only enforcement (default ON; opt out with spawn.cursor_readonly=false).
+  # Passed to the bridge, which materializes the deny rules in its scratch cwd.
+  local readonly_on=1
+  case "$("$SCRIPT_DIR/config.sh" get spawn.cursor_readonly true 2>/dev/null || true)" in
+    false|0|no|off) readonly_on=0 ;;
+  esac
+
+  # Inherit the Claude session's /add-dir READ roots (opt-in, default off — same
+  # gate semantics as codex's spawn.codex_inherit_add_dirs). cursor can already
+  # read them, so this only advertises them to the reviewer via the bridge prompt.
+  local adddirs_file="$run_dir/cursor-bridge.$TEAM.$NAME.adddirs"
+  rm -f "$adddirs_file" 2>/dev/null || true
+  local add_dir_list=""
+  add_dir_list="$(agmsg_collect_add_dir_roots "$PROJECT" "spawn.cursor_inherit_add_dirs")"
+
+  local -a extra_args=()
+  [ "$readonly_on" = 1 ] && extra_args+=(--readonly)
+  if [ -n "$add_dir_list" ]; then
+    printf '%s\n' "$add_dir_list" > "$adddirs_file"
+    extra_args+=(--add-dirs-file "$adddirs_file")
+  fi
+
   local log="$run_dir/cursor-bridge.$TEAM.$NAME.log"
   nohup "${bridge_run[@]}" \
     --project "$PROJECT" --team "$TEAM" --name "$NAME" --chat-id "$chat_id" \
+    ${extra_args[@]+"${extra_args[@]}"} \
     >> "$log" 2>&1 &
   local bpid=$!
   # Record placement as pid:<n> with type=cursor so despawn --force tears it down
@@ -121,7 +165,13 @@ agmsg_spawn_headless() {
   printf '%s\t%s\t%s\n' "pid:$bpid" "$PROJECT" "cursor" \
     > "$(agmsg_spawn_path "$TEAM" "$NAME")" 2>/dev/null || true
   echo "spawned headless cursor reviewer '$NAME' in team '$TEAM' (pid $bpid)"
-  echo "  cwd (repo, read-only): $PROJECT"
+  if [ "$readonly_on" = 1 ]; then
+    echo "  read-only: ENFORCED (deny Write/Shell + credential-path Read denylist via scratch .cursor/cli.json; paths inside the workspace are exempt — see bridge log)"
+  else
+    echo "  read-only: DISABLED (spawn.cursor_readonly=false) — cursor can write & run shell"
+  fi
+  echo "  workspace (read): $PROJECT"
+  [ -n "$add_dir_list" ] && echo "  add-dir reads: $(printf '%s' "$add_dir_list" | tr '\n' ' ')"
   echo "  chat: $chat_id"
   echo "  log: $log"
 }

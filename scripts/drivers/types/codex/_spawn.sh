@@ -93,35 +93,17 @@ preflight_seatbelt_nesting() {
 # value is spliced into — see the filter below) and the project root itself
 # (already :workspace_roots), and dedups by resolved path. A malformed settings
 # file yields no roots (the sqlite error is swallowed) — fail-safe, never fatal.
+# shellcheck source=../../lib/reviewer-add-dirs.sh
+. "$SCRIPT_DIR/lib/reviewer-add-dirs.sh"
 agmsg_reviewer_add_dir_roots() {
-  local project="$1"
-  case "$("$SCRIPT_DIR/config.sh" get spawn.codex_inherit_add_dirs false 2>/dev/null || true)" in
-    true|1|yes|on) ;;
-    *) return 0 ;;
-  esac
-  command -v sqlite3 >/dev/null 2>&1 || return 0
-  local project_real; project_real="$(cd "$project" 2>/dev/null && pwd -P || printf '%s' "$project")"
-  local out="" seen=" " f sqlp d dreal
-  for f in "$project/.claude/settings.json" "$project/.claude/settings.local.json"; do
-    [ -f "$f" ] || continue
-    sqlp="$(agmsg_sql_readfile_path "$f")"
-    while IFS= read -r d; do
-      [ -n "$d" ] || continue
-      case "$d" in "~") d="$HOME" ;; "~/"*) d="$HOME/${d#\~/}" ;; esac
-      # Skip any path bearing a single quote, double quote, or backslash. The
-      # value is spliced into the single-quoted `-c 'permissions…filesystem=…'`
-      # of appcmd, which the bridge re-parses via `/bin/sh -lc` (codex-bridge.js):
-      # a ' would break out of that wrapper (shell command injection from a repo-
-      # supplied settings file), and " / \ would break codex's quoted TOML table.
-      case "$d" in *"'"*|*'"'*|*'\'*) continue ;; esac
-      [ -d "$d" ] || continue                              # skip non-existent / non-directory
-      dreal="$(cd "$d" 2>/dev/null && pwd -P || printf '%s' "$d")"
-      [ "$dreal" = "$project_real" ] && continue           # project root already = :workspace_roots
-      case "$seen" in *" $dreal "*) continue ;; esac        # dedup by resolved path
-      seen="$seen$dreal "
-      out="$out, \"$d\"=\"read\""
-    done < <(agmsg_sqlite_mem "SELECT value FROM json_each(readfile('$sqlp'), '\$.permissions.additionalDirectories')" 2>/dev/null || true)
-  done
+  # Wrap the shared harvest: format each collected dir as a codex filesystem-table
+  # read entry (`, "<dir>"="read"`) to splice into the reviewer profile body. The
+  # harvest's quote/backslash filter keeps the value safe for that splice.
+  local d out=""
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    out="$out, \"$d\"=\"read\""
+  done < <(agmsg_collect_add_dir_roots "$1" "spawn.codex_inherit_add_dirs")
   printf '%s' "$out"
 }
 
