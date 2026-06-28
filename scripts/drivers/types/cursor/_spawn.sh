@@ -74,7 +74,7 @@ agmsg_spawn_headless() {
   # Fail closed BEFORE any run/ artifact (.chat/.adddirs/log) or the rm -rf'd
   # scratch CFGDIR is composed from TEAM/NAME. UTF-8-safe (deny-list, not ASCII).
   agmsg_validate_team_name "$TEAM" >/dev/null 2>&1 || die "spawn: team name '$TEAM' is not a path-safe segment"
-  agmsg_validate_team_name "$NAME" >/dev/null 2>&1 || die "spawn: agent name '$NAME' is not a path-safe segment (no '/', '\\', '.', '..', leading '-', or control chars)"
+  agmsg_validate_agent_name "$NAME" >/dev/null 2>&1 || die "spawn: agent name '$NAME' is not valid (same rule join.sh applies: no '.', '..', '/', '\\', '\"', '[', ']', leading '-', or control chars)"
 
   # Establish a persistent Cursor chat up-front so the bridge can --resume it on
   # every turn (server-side conversation memory). create-chat is cwd-independent
@@ -110,24 +110,57 @@ agmsg_spawn_headless() {
   agmsg_placement_lock_acquire "$TEAM" "$NAME" 10 || true
   _lk_held=1
 
-  # Register cursor on the team (pin the path; opt out of #92 rewrite) so the
-  # bridge's subscription resolves.
-  AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$TEAM" "$NAME" cursor "$PROJECT" >/dev/null
+  # Opaque per-identity marker handed to the bridge below; the dup-check fallback
+  # matches on THIS, so team/name content (spaces, regex metachars, flag-like
+  # substrings) can never create argv-boundary or regex ambiguity in the scan.
+  # base64url(team\tname) — no spaces, no metachars, no '/'.
+  local _idkey
+  _idkey="$(printf '%s\t%s' "$TEAM" "$NAME" | base64 | tr -d '\n' | tr '+/' '-_')"
 
-  # Refuse a second bridge for the same (team,name) — two bridges on one identity
-  # produce duplicate replies. pidfile first, then a pgrep fallback (the bridge can
-  # remove its pidfile during its own cleanup while still alive).
+  # Refuse a second bridge for the same (team,name) BEFORE registering or staging
+  # anything — two bridges on one identity produce duplicate replies, and an early
+  # return here must have NO side effects (no role overwrite, no fresh
+  # registration). pidfile first, then a fallback scan (the bridge can remove its
+  # pidfile during its own cleanup while still alive).
   local pidfile="$run_dir/cursor-bridge.$TEAM.$NAME.pid"
   local running=""
   if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
     running="$(cat "$pidfile" 2>/dev/null)"
   else
-    running="$(pgrep -f "cursor-bridge\.sh .*--team $TEAM --name $NAME" 2>/dev/null | head -1 || true)"
+    # Fallback: list cursor-bridge candidates, then confirm identity by the opaque
+    # --identity-key via grep -F (-- guards the leading dashes). ps -ww avoids argv
+    # truncation. No regex escaping / argv-boundary trick needed.
+    local _p
+    for _p in $(pgrep -f "cursor-bridge\.sh" 2>/dev/null || true); do
+      if ps -ww -o args= -p "$_p" 2>/dev/null | grep -qF -- "--identity-key $_idkey"; then
+        running="$_p"; break
+      fi
+    done
   fi
   if [ -n "$running" ]; then
     echo "spawn: headless cursor '$NAME' already running in '$TEAM' (pid $running)"
     return 0
   fi
+
+  # Snapshot the role file: AFTER the dup check (so an already-running worker is
+  # never silently re-roled) and BEFORE registration (so a cp failure releases the
+  # lock and dies with nothing registered to unwind). ROLE_FILE is a readable
+  # regular file (resolver-guaranteed); `--` guards a '-' path. The snapshot pins
+  # the role so a later edit/delete of the source can't change this live worker.
+  local rolefile=""
+  if [ -n "${ROLE_FILE:-}" ]; then
+    rolefile="$run_dir/cursor-bridge.$TEAM.$NAME.role"
+    rm -f "$rolefile" 2>/dev/null || true
+    cp -- "$ROLE_FILE" "$rolefile" 2>/dev/null \
+      || { _agmsg_cursor_spawn_lk_release; die "failed to stage role file ($ROLE_FILE) for cursor '$NAME'; refusing to start role-less"; }
+  fi
+
+  # Register cursor on the team (pin the path; opt out of #92 rewrite) so the
+  # bridge's subscription resolves. On failure, unwind the just-staged role
+  # snapshot and release the lock before dying (the RETURN trap does not run on a
+  # die/exit), so a rejected registration leaves no lock or run/ role behind.
+  AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$TEAM" "$NAME" cursor "$PROJECT" >/dev/null \
+    || { [ -n "$rolefile" ] && rm -f "$rolefile" 2>/dev/null; _agmsg_cursor_spawn_lk_release; die "join failed for cursor '$NAME' in team '$TEAM'"; }
 
   # Persist the chat id for the bridge to --resume (and for despawn cleanup).
   printf '%s\n' "$chat_id" > "$run_dir/cursor-bridge.$TEAM.$NAME.chat"
@@ -154,9 +187,13 @@ agmsg_spawn_headless() {
     extra_args+=(--add-dirs-file "$adddirs_file")
   fi
 
+  # Hand the bridge the run/ snapshot staged above (pre-registration).
+  [ -n "$rolefile" ] && extra_args+=(--role-file "$rolefile")
+
   local log="$run_dir/cursor-bridge.$TEAM.$NAME.log"
   nohup "${bridge_run[@]}" \
     --project "$PROJECT" --team "$TEAM" --name "$NAME" --chat-id "$chat_id" \
+    --identity-key "$_idkey" \
     ${extra_args[@]+"${extra_args[@]}"} \
     >> "$log" 2>&1 &
   local bpid=$!
@@ -172,6 +209,7 @@ agmsg_spawn_headless() {
   fi
   echo "  workspace (read): $PROJECT"
   [ -n "$add_dir_list" ] && echo "  add-dir reads: $(printf '%s' "$add_dir_list" | tr '\n' ' ')"
+  [ -n "$rolefile" ] && echo "  role: $ROLE_FILE"
   echo "  chat: $chat_id"
   echo "  log: $log"
 }

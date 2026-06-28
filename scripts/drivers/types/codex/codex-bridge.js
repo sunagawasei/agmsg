@@ -108,6 +108,10 @@ function parseArgs(argv) {
       opts.threadId = argv[++i];
     } else if (arg === "--loaded-timeout") {
       opts.loadedTimeout = Number(argv[++i]);
+    } else if (arg === "--role-file") {
+      opts.roleFile = argv[++i];
+    } else if (arg === "--identity-key") {
+      i++; // opaque dup-detection marker (spawn-side only); ignored by the bridge
     } else if (arg === "--inline-inbox") {
       opts.inlineInbox = true;
     } else {
@@ -1007,8 +1011,22 @@ class CodexBridge {
   buildPrompt() {
     const inbox = path.join(SCRIPTS_DIR, "inbox.sh");
     const send = path.join(SCRIPTS_DIR, "send.sh");
+    // Standing role prompt (optional; --role-file resolved by spawn). Prepended to
+    // every turn so the worker keeps its role without it being repeated in each
+    // message — same approach as the cursor bridge. fail-safe: a missing/unreadable
+    // role file yields no prefix, i.e. byte-identical to the pre-feature prompt.
+    const rolePrefix = [];
+    if (this.opts.roleFile) {
+      try {
+        const roleText = fs.readFileSync(this.opts.roleFile, "utf8").trim();
+        if (roleText) rolePrefix.push(roleText, "");
+      } catch (e) {
+        console.error(`codex-bridge: WARNING: role file unreadable (${this.opts.roleFile}); this turn runs WITHOUT the role: ${e.message}`);
+      }
+    }
     if (this.opts.inlineInbox) {
       return [
+        ...rolePrefix,
         `agmsg delivered the following unread messages for ${this.identity.team}/${this.identity.name}:`,
         "",
         this.inlineInboxText.trim(),
@@ -1018,6 +1036,7 @@ class CodexBridge {
       ].join("\n");
     }
     return [
+      ...rolePrefix,
       `agmsg has unread messages for ${this.identity.team}/${this.identity.name}.`,
       `Run: ${inbox} ${this.identity.team} ${this.identity.name}`,
       "Read the messages and continue the conversation. If a reply is needed, send it with:",
@@ -1077,7 +1096,10 @@ class CodexBridge {
       return;
     }
 
-    for (const file of [this.pidfile, this.metafile]) {
+    // The role snapshot (codex-bridge.<team>.<name>.role, staged by _spawn.sh) is
+    // ours too — derive it from the pidfile path so it doesn't accumulate in run/.
+    const roleSnapshot = this.pidfile.replace(/\.pid$/, ".role");
+    for (const file of [this.pidfile, this.metafile, roleSnapshot]) {
       try {
         if (fs.existsSync(file)) fs.unlinkSync(file);
       } catch (_) {

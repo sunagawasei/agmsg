@@ -301,3 +301,24 @@ bridge_ro() {  # run the bridge for cur, READ-ONLY, one drain; $1 = optional add
   [[ "$output" == *"/tmp/extra-one"* ]]
   [[ "$output" == *"/tmp/extra-two"* ]]
 }
+
+@test "cursor-bridge: --role-file prepends the standing role to the prompt" {
+  local rf="$TEST_SKILL_DIR/role.md"
+  printf '%s\n' "You are the planner. unique-role-marker-xyz." > "$rf"
+  bash "$SCRIPTS/send.sh" team alice cur "do a thing" >/dev/null
+  run bash "$TYPES/cursor/cursor-bridge.sh" \
+    --once --readonly --project "$PROJ" --team team --name cur \
+    --chat-id testchat-1234-1234-1234-123456789012 \
+    --role-file "$rf"
+  [ "$status" -eq 0 ]
+  run cat "$FAKE_CURSOR_PROMPT"
+  [[ "$output" == *"unique-role-marker-xyz"* ]]
+}
+
+@test "cursor-bridge: no --role-file keeps the generic reviewer intro (back-compat)" {
+  bash "$SCRIPTS/send.sh" team alice cur "do a thing" >/dev/null
+  bridge_ro
+  [ "$status" -eq 0 ]
+  run cat "$FAKE_CURSOR_PROMPT"
+  [[ "$output" == *"headless agmsg reviewer"* ]]
+}

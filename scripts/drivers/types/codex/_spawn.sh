@@ -95,6 +95,10 @@ preflight_seatbelt_nesting() {
 # file yields no roots (the sqlite error is swallowed) — fail-safe, never fatal.
 # shellcheck source=../../lib/reviewer-add-dirs.sh
 . "$SCRIPT_DIR/lib/reviewer-add-dirs.sh"
+# agmsg_validate_team_name — the path-segment guard join.sh and cursor/_spawn.sh
+# use; applied below before any run/ artifact is composed from TEAM/NAME.
+# shellcheck source=../../lib/validate.sh
+. "$SCRIPT_DIR/lib/validate.sh"
 agmsg_reviewer_add_dir_roots() {
   # Wrap the shared harvest: format each collected dir as a codex filesystem-table
   # read entry (`, "<dir>"="read"`) to splice into the reviewer profile body. The
@@ -111,6 +115,11 @@ agmsg_reviewer_add_dir_roots() {
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run"
   mkdir -p "$run_dir"   # reviewer mode's cwd is the repo, so nothing else creates run/
+  # Fail closed on a path-unsafe team/name BEFORE any run/ artifact (role snapshot,
+  # pidfile, log) or registration is composed from them — the same guard cursor
+  # applies, and required now that role staging runs before join.sh validates.
+  agmsg_validate_team_name "$TEAM" >/dev/null 2>&1 || die "spawn: team name '$TEAM' is not a path-safe segment"
+  agmsg_validate_agent_name "$NAME" >/dev/null 2>&1 || die "spawn: agent name '$NAME' is not valid (same rule join.sh applies: no '.', '..', '/', '\\', '\"', '[', ']', leading '-', or control chars)"
   local bridge="${AGMSG_CODEX_BRIDGE_CMD:-$SCRIPT_DIR/drivers/types/codex/codex-bridge.js}"
 
   # Resolve the working dir + app-server sandbox for the selected mode.
@@ -221,27 +230,69 @@ agmsg_spawn_headless() {
   agmsg_placement_lock_acquire "$TEAM" "$NAME" 10 || true
   _lk_held=1
 
-  # Register codex on the team (pin the path; opt out of #92 rewrite) so the
-  # bridge has a subscription — otherwise it loops on "no available subscription".
-  AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$TEAM" "$NAME" codex "$cwd" >/dev/null
-  # Refuse to start a second bridge for the same (team,name) — two bridges on one
-  # identity produce duplicate replies. The bridge writes its own pidfile, but it
-  # can remove that file during its own cleanup while still running, so fall back
-  # to scanning for a live codex-bridge.js bound to this team+name.
+  # Refuse to start a second bridge for the same (team,name) BEFORE registering or
+  # staging anything — two bridges on one identity produce duplicate replies, and
+  # an early return here must have NO side effects (no role overwrite, no fresh
+  # registration). The bridge writes its own pidfile, but it can remove that file
+  # during its own cleanup while still running, so fall back to scanning for a live
+  # codex-bridge.js bound to this team+name.
+  # Opaque per-identity marker handed to the bridge below; the dup-check fallback
+  # matches on THIS, so team/name content (spaces, regex metachars, flag-like
+  # substrings) can never create argv-boundary or regex ambiguity. base64url(team\tname).
+  local _idkey
+  _idkey="$(printf '%s\t%s' "$TEAM" "$NAME" | base64 | tr -d '\n' | tr '+/' '-_')"
+
   local pidfile="$run_dir/codex-bridge.$TEAM.$NAME.pid"
   local running=""
   if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
     running="$(cat "$pidfile" 2>/dev/null)"
   else
-    running="$(pgrep -f "codex-bridge\.js .*--team $TEAM --name $NAME --inline-inbox" 2>/dev/null | head -1 || true)"
+    # Fallback: list codex-bridge candidates, then confirm identity by the opaque
+    # --identity-key via grep -F (-- guards the leading dashes). ps -ww avoids argv
+    # truncation. No regex escaping / argv-boundary trick needed.
+    local _p
+    for _p in $(pgrep -f "codex-bridge\.js" 2>/dev/null || true); do
+      if ps -ww -o args= -p "$_p" 2>/dev/null | grep -qF -- "--identity-key $_idkey"; then
+        running="$_p"; break
+      fi
+    done
   fi
   if [ -n "$running" ]; then
     echo "spawn: headless codex '$NAME' already running in '$TEAM' (pid $running)"
     return 0
   fi
+
+  # Snapshot the role file: AFTER the dup check (so an already-running worker is
+  # never silently re-roled) and BEFORE registration (so a cp failure releases the
+  # lock and dies with nothing registered to unwind). ROLE_FILE is a readable
+  # regular file (resolver-guaranteed); `--` guards a '-' path. The snapshot pins
+  # the role so a later edit/delete of the source can't change this live worker.
+  local rolefile=""
+  if [ -n "${ROLE_FILE:-}" ]; then
+    rolefile="$run_dir/codex-bridge.$TEAM.$NAME.role"
+    rm -f "$rolefile" 2>/dev/null || true
+    cp -- "$ROLE_FILE" "$rolefile" 2>/dev/null \
+      || { _agmsg_spawn_lk_release; die "failed to stage role file ($ROLE_FILE) for codex '$NAME'; refusing to start role-less"; }
+  fi
+
+  # Register codex on the team (pin the path; opt out of #92 rewrite) so the
+  # bridge has a subscription — otherwise it loops on "no available subscription".
+  # On failure, unwind the just-staged role snapshot and release the lock before
+  # dying (the RETURN trap does not run on a die/exit), so a rejected registration
+  # leaves no lock or run/ role behind.
+  AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$TEAM" "$NAME" codex "$cwd" >/dev/null \
+    || { [ -n "$rolefile" ] && rm -f "$rolefile" 2>/dev/null; _agmsg_spawn_lk_release; die "join failed for codex '$NAME' in team '$TEAM'"; }
+  # Hand the bridge the run/ snapshot staged before registration. The app-server
+  # command is left UNTOUCHED, so role injection can never break the sandbox/-c
+  # quoting or the worker's subscription (a broken appcmd loops on "no available
+  # subscription").
+  local -a role_args=()
+  [ -n "$rolefile" ] && role_args+=(--role-file "$rolefile")
   local log="$run_dir/codex-bridge.$TEAM.$NAME.log"
   AGMSG_CODEX_APP_SERVER_CMD="$appcmd" nohup "$bridge" \
     --project "$cwd" --type codex --team "$TEAM" --name "$NAME" --inline-inbox \
+    --identity-key "$_idkey" \
+    ${role_args[@]+"${role_args[@]}"} \
     >> "$log" 2>&1 &
   local bpid=$!
   # Record placement as pid:<n> so despawn tears it down by pid (not a tmux id).
@@ -254,5 +305,6 @@ agmsg_spawn_headless() {
   [ "$REVIEWER" = 1 ] && echo "  cwd (repo, read-only): $cwd"
   [ "$REVIEWER" = 1 ] && [ -n "$add_dir_roots" ] && \
     echo "  add-dir reads (read-only):$(printf '%s' "$add_dir_roots" | sed 's/="read"//g; s/[",]/ /g')"
+  [ -n "$rolefile" ] && echo "  role: $ROLE_FILE"
   echo "  log: $log"
 }

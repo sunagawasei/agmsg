@@ -88,6 +88,8 @@ source "$SCRIPT_DIR/lib/type-registry.sh"
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/session-team.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/spawn-role.sh"
 
 die() { echo "spawn: $*" >&2; exit 1; }
 
@@ -142,6 +144,9 @@ HEADLESS_SET=0       # whether an explicit --headless/--interactive flag was giv
 REVIEWER=0           # headless codex only: cwd=repo + read-only-repo profile (resolved)
 REVIEWER_SET=0       # whether an explicit --reviewer/--no-reviewer flag was given
 MODEL_ID=""          # --model: pass-through model id for the launched CLI
+ROLE_FILE=""          # resolved standing role-prompt file (empty = none); see lib/spawn-role.sh
+ROLE_FILE_EXPLICIT="" # --role-file override (highest precedence)
+ROLE_DISABLE=0        # --no-role: force no role injection even if a role file exists
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -162,6 +167,8 @@ while [ $# -gt 0 ]; do
     --reviewer)                  REVIEWER=1; REVIEWER_SET=1; shift ;;
     --no-reviewer)               REVIEWER=0; REVIEWER_SET=1; shift ;;
     --model) MODEL_ID="${2:?--model needs a model id}"; shift 2 ;;
+    --role-file) ROLE_FILE_EXPLICIT="${2:?--role-file needs a path}"; shift 2 ;;
+    --no-role)   ROLE_DISABLE=1; shift ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -332,6 +339,24 @@ case "$STATE" in
   other:*)
     die "actas '$NAME' in team '$TEAM' is held by a live session (${STATE#other:}); drop it there first" ;;
 esac
+
+# Resolve an optional standing role-prompt for headless workers — a no-op unless
+# db/spawn-roles/<name>.<type>.md exists (or --role-file was given). The type's
+# _spawn.sh hands ROLE_FILE to its bridge; an empty ROLE_FILE means no injection,
+# i.e. byte-identical to the pre-feature behaviour. Gate: config spawn.roles_enabled.
+ROLE_FILE="$(agmsg_spawn_role_resolve "$NAME" "$AGENT_TYPE" "$ROLE_FILE_EXPLICIT" "$ROLE_DISABLE" 2>/dev/null || true)"
+# An explicit --role-file that does not resolve (missing/unreadable) is a caller
+# error: fail closed rather than silently launching the worker role-less.
+if [ -n "$ROLE_FILE_EXPLICIT" ] && [ "$ROLE_DISABLE" != 1 ] && [ -z "$ROLE_FILE" ]; then
+  # An empty resolve with an explicit --role-file is either "roles globally
+  # disabled" (the gate wins → silently ignore, not an error) or "unreadable
+  # file" (a caller error → fail closed). Distinguish so a disabled gate is a
+  # no-op, not a misleading "unreadable" failure.
+  case "$("$SCRIPT_DIR/config.sh" get spawn.roles_enabled true 2>/dev/null || true)" in
+    false|0|no|off) : ;;  # roles disabled: --role-file is ignored, not an error
+    *) die "--role-file '$ROLE_FILE_EXPLICIT' is not a readable file" ;;
+  esac
+fi
 
 # --- Headless worker dispatch -------------------------------------------------
 # Headless-capable types (manifest headless=yes) launch a no-terminal worker via

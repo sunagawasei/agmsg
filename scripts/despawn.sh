@@ -167,7 +167,9 @@ if [ "$FORCE" = "1" ]; then
   fi
   owner="$(actas_lock_owner "$TEAM" "$NAME")"
   [ -n "$owner" ] && actas_lock_release "$TEAM" "$NAME" "$owner" 2>/dev/null || true
-  rm -f "$SPAWN_REC" 2>/dev/null || true
+  # Also drop the role snapshot: a forced teardown may SIGKILL the bridge before
+  # its own cleanup runs, so remove run/<type>-bridge.<team>.<name>.role here too.
+  rm -f "$SPAWN_REC" "$SKILL_DIR/run/${_type:-codex}-bridge.$TEAM.$NAME.role" 2>/dev/null || true
   agmsg_placement_lock_release "$TEAM" "$NAME"
   echo "status=forced name=$NAME team=$TEAM"
   exit 0

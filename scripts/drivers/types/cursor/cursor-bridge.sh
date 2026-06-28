@@ -65,6 +65,7 @@ ONCE=0
 TURN_TIMEOUT="${AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT:-180}"
 READONLY=0          # --readonly: enforce read-only via a scratch-cwd .cursor/cli.json
 ADD_DIRS_FILE=""    # --add-dirs-file: newline-listed extra readable dirs to advertise
+ROLE_FILE=""        # --role-file: standing role prompt prepended to each turn (empty = generic reviewer intro)
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -75,6 +76,8 @@ while [ "$#" -gt 0 ]; do
     --interval) INTERVAL="${2:?--interval needs seconds}"; shift 2 ;;
     --readonly) READONLY=1; shift ;;
     --add-dirs-file) ADD_DIRS_FILE="${2:?--add-dirs-file needs a path}"; shift 2 ;;
+    --role-file) ROLE_FILE="${2:?--role-file needs a path}"; shift 2 ;;
+    --identity-key) shift 2 ;;   # opaque dup-detection marker (spawn-side only); bridge ignores it
     --once)    ONCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "cursor-bridge: unknown option: $1" >&2; exit 1 ;;
@@ -169,6 +172,7 @@ cleanup() {
     rm -f "$PIDFILE" "$METAFILE" "$OUTFILE" "$PROMPTFILE" \
           "$OUTFILE.one" "$OUTFILE.cand" \
           "$RUN_DIR/cursor-bridge.$TEAM.$NAME.chat" \
+          "$RUN_DIR/cursor-bridge.$TEAM.$NAME.role" \
           "${ADD_DIRS_FILE:-}" 2>/dev/null || true
     # The scratch cwd holds our generated .cursor/cli.json — drop the whole dir.
     [ -n "${CFGDIR:-}" ] && rm -rf "$CFGDIR" 2>/dev/null || true
@@ -359,11 +363,23 @@ process_cycle() {
 
     # No size cap needed: the prompt is fed to cursor-agent via stdin (a file) in
     # run_cursor_turn, not argv, so a large batch cannot hit ARG_MAX.
+    # Role injection: a --role-file (spawn resolved db/spawn-roles/<name>.<type>.md)
+    # becomes the standing role and replaces the generic "reviewer" intro; the
+    # READ-ONLY + delivery meta is always appended. No role file => byte-identical.
     local prompt
-    prompt="You are a headless agmsg reviewer (team '$TEAM', acting as '$NAME'), running read-only in $PROJECT$ADD_DIRS_NOTE. The following agmsg message(s) were sent to you by '$sender':
+    if [ -n "$ROLE_FILE" ] && [ -r "$ROLE_FILE" ]; then
+      prompt="$(cat "$ROLE_FILE")
+
+You are acting as '$NAME' in team '$TEAM', running READ-ONLY in $PROJECT$ADD_DIRS_NOTE. The following agmsg message(s) were sent to you by '$sender':
 
 $body_block
 Reply with ONLY your final answer for '$sender'. Do NOT run agmsg, send.sh, or any shell command to deliver it — the bridge delivers your reply automatically."
+    else
+      prompt="You are a headless agmsg reviewer (team '$TEAM', acting as '$NAME'), running read-only in $PROJECT$ADD_DIRS_NOTE. The following agmsg message(s) were sent to you by '$sender':
+
+$body_block
+Reply with ONLY your final answer for '$sender'. Do NOT run agmsg, send.sh, or any shell command to deliver it — the bridge delivers your reply automatically."
+    fi
 
     if run_cursor_turn "$prompt"; then
       if printf '%s' "$REPLY_TEXT" | "$SCRIPTS_DIR/send.sh" "$TEAM" "$NAME" "$sender" --stdin >/dev/null 2>&1; then

@@ -255,6 +255,10 @@ if [ "$UPDATE_ONLY" = true ]; then
   # user dropped in and their db/trusted-plugins opt-ins.
   mkdir -p "$SKILL_DIR/plugins"
   cp "$SCRIPT_DIR/plugins/README.md" "$SKILL_DIR/plugins/README.md" 2>/dev/null || true
+  # Ensure the spawn-roles dir exists on update too. Role files there are user data
+  # (gitignored, never shipped), so this only guarantees the directory — it never
+  # creates or overwrites a role file.
+  mkdir -p "$SKILL_DIR/db/spawn-roles"
   # Refresh the Claude Code slash command file (was missed in earlier --update flows).
   CC_COMMANDS_DIR="$HOME/.claude/commands"
   if [ -d "$CC_COMMANDS_DIR" ] && [ -f "$CC_COMMANDS_DIR/$SKILL_NAME.md" ]; then
@@ -339,7 +343,7 @@ SKILL_DIR="$AGENTS_DIR/skills/$CMD_NAME"
 
 # --- Install skill ---
 echo "  Installing to ~/.agents/skills/$CMD_NAME/ ..."
-mkdir -p "$SKILL_DIR"/{scripts,types,db,agents}
+mkdir -p "$SKILL_DIR"/{scripts,types,db,db/spawn-roles,agents}
 
 # SKILL.md is generated from the agent-specific command template, resolved from
 # the type manifest (scripts/drivers/types/<type>/template.md). The shared SKILL.md uses the
