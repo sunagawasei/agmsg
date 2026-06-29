@@ -45,7 +45,20 @@ _agmsg_pid_alive() {
       return $?
       ;;
   esac
-  kill -0 "$pid" 2>/dev/null
+  # kill -0 exits 0 when the process exists and is signalable. A non-zero exit
+  # is ambiguous: ESRCH ("No such process") means the process is gone, but EPERM
+  # ("Operation not permitted") means the process exists yet we may not signal
+  # it — exactly what a sandbox (e.g. Claude Code) does to the parent agent
+  # process. Judging on exit code alone treated EPERM as dead, so the watcher's
+  # liveness guard self-exited immediately under the sandbox and real-time
+  # delivery silently never started. Treat only the unambiguous ESRCH case as
+  # dead so a sandboxed-but-alive session keeps its watcher running.
+  local _err
+  _err=$(kill -0 "$pid" 2>&1) && return 0
+  case "$_err" in
+    *"No such process"*|*"no such process"*|*"NO SUCH PROCESS"*) return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
 # Compose from an explicit pid. Bare sid when pid is empty/non-numeric.
