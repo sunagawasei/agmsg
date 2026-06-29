@@ -45,15 +45,16 @@ set -euo pipefail
 #                      as the agent is launched (fire-and-forget)
 #   --ready-timeout N  seconds to wait for readiness before giving up
 #                      (default 90; on timeout, prints status=timeout, exit 3)
-#   --headless         (codex only) run a no-terminal bridge worker instead of
-#                      opening a TUI — codex talks over the agmsg bus with no
-#                      window. Its cwd is a neutral scratch dir under run/ and it
-#                      is sandboxed to read anywhere but write only agmsg's
-#                      db/teams/run. --project here selects the team/subscription,
-#                      not codex's working dir. Tear down with `despawn`.
-#   --interactive      (codex only; alias --no-headless) force the TUI even when
-#                      config spawn.codex_headless=true makes codex default to
-#                      headless. Set that key to run every codex spawn headless.
+#   --headless         (codex/cursor; types with `headless=yes`) run a no-terminal
+#                      bridge worker instead of opening a TUI — the agent talks over
+#                      the agmsg bus with no window. codex: neutral scratch cwd under
+#                      run/ (read anywhere, write only agmsg's db/teams/run), or the
+#                      repo read-only with --reviewer; --project selects the
+#                      team/subscription. cursor: always a read-only reviewer in
+#                      --project. Tear down with `despawn --force`.
+#   --interactive      (codex/cursor; alias --no-headless) force the non-headless
+#                      path even when the type's headless default is on (config
+#                      spawn.codex_headless / spawn.cursor_headless).
 #   --reviewer         (headless codex only) cwd = the target repo (so codex can
 #                      autonomously explore it) under a permission profile that
 #                      grants the repo READ-only and confines writes to agmsg's
@@ -68,8 +69,9 @@ set -euo pipefail
 #
 # Readiness: by default spawn blocks until the new agent's watcher attaches and
 # is receiving (it prints `status=ready ...`), so a leader can safely send work
-# right after spawn returns without racing the agent's cold start. Codex has no
-# Monitor, so the wait is skipped for codex.
+# right after spawn returns without racing the agent's cold start. Types with
+# `monitor=no` (codex, cursor, …) have no awaitable readiness sentinel, so the
+# wait is skipped for them.
 #
 # Scope note: spawnable types are those whose manifest declares `spawnable=yes`;
 # macOS is the primary target, Linux and
@@ -93,13 +95,6 @@ source "$SCRIPT_DIR/lib/spawn-role.sh"
 
 die() { echo "spawn: $*" >&2; exit 1; }
 
-# --- Parse positional args ---
-AGENT_TYPE="${1:-}"
-NAME="${2:-}"
-[ -n "$AGENT_TYPE" ] || die "Usage: spawn.sh <agent-type> <name> [options]"
-[ -n "$NAME" ] || die "Usage: spawn.sh <agent-type> <name> [options]"
-shift 2 || true
-
 # A type is spawnable iff its manifest declares `spawnable=yes` (direct-CLI) OR a
 # `spawn=` node launcher. The error lists the computed spawnable set from the
 # registry — no type name is hardcoded here.
@@ -119,6 +114,16 @@ EOF
   return 0
 }
 SUPPORTED_LIST="$(spawnable_types | paste -sd, - | sed 's/,/, /g')"
+
+# --- Parse positional args ---
+# Deferred until after SUPPORTED_LIST so the usage error can name spawnable types.
+AGENT_TYPE="${1:-}"
+NAME="${2:-}"
+if [ -z "$AGENT_TYPE" ] || [ -z "$NAME" ]; then
+  die "Usage: spawn.sh <agent-type> <name> [options] (supported agent types: ${SUPPORTED_LIST})"
+fi
+shift 2 || true
+
 if ! agmsg_is_known_type "$AGENT_TYPE"; then
   die "unknown agent type '$AGENT_TYPE' (supported: ${SUPPORTED_LIST})"
 elif [ "$(agmsg_type_get "$AGENT_TYPE" spawnable)" != "yes" ] && [ -z "$(agmsg_type_get "$AGENT_TYPE" spawn)" ]; then

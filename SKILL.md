@@ -126,8 +126,9 @@ Do NOT manually edit config files. Always use join.sh.
 # (when run inside tmux) or a new OS terminal, with `/agmsg actas <name>` as the
 # initial prompt. By default it BLOCKS until the new agent's watcher attaches
 # (prints `status=ready`), so a leader can send work right after spawn returns
-# without losing it to the agent's cold start. claude-code/codex only; macOS
-# primary, Linux/Windows best-effort. Non-tmux + no usable terminal (headless)
+# without losing it to the agent's cold start. Spawnable types are registry-driven
+# (manifest `spawnable=yes` or a `spawn=` launcher; run `spawn.sh` with no args to
+# list them). macOS primary, Linux/Windows best-effort. Non-tmux + no usable terminal (headless)
 # errors out.
 #   --project <path>     project to launch in (default: $PWD)
 #   --team <team>        team to join into (default: auto-resolved from project)
@@ -139,23 +140,23 @@ Do NOT manually edit config files. Always use join.sh.
 #                        (no Automation/TCC permission prompt).
 #   --no-wait            don't block on readiness (fire-and-forget)
 #   --ready-timeout N    seconds to wait for readiness (default 90; on timeout
-#                        prints status=timeout and exits 3). Codex skips the
-#                        wait (it has no Monitor).
+#                        prints status=timeout and exits 3). Types with
+#                        `monitor=no` (codex, cursor, …) skip the wait.
 #   --boot-prompt <text>      hand the new agent an initial task: the boot prompt
 #                        becomes the actas command followed (newline-separated)
 #                        by <text>, so it claims its identity AND starts the task
 #                        in its first turn. The only way to give a one-shot goal
 #                        to a codex peer (no Monitor → a post-spawn send to its
 #                        idle session is never noticed).
-#   --headless           (codex only) run a no-terminal bridge worker instead of
-#                        a TUI — codex talks over the bus with no window, cwd is a
-#                        neutral scratch under run/, sandboxed to read anywhere but
-#                        write only agmsg's db/teams/run. --project selects the
-#                        team/subscription, not codex's cwd. Tear down with despawn.
-#   --interactive        (codex only; alias --no-headless) force the TUI even when
-#                        config spawn.codex_headless=true makes codex headless by
-#                        default. Set that key to run every codex spawn headless.
-~/.agents/skills/agmsg/scripts/spawn.sh <claude-code|codex> <name> [options]
+#   --headless           (codex/cursor; types with `headless=yes`) run a no-terminal
+#                        bridge worker instead of a TUI. codex: scratch cwd under
+#                        `run/`, optional `--reviewer` for repo read-only. cursor:
+#                        always a read-only reviewer in `--project`. Tear down with
+#                        `despawn --force` (neither has a Monitor watcher).
+#   --interactive        (codex/cursor; alias --no-headless) force the non-headless
+#                        path even when the type's headless default is on (config
+#                        spawn.codex_headless / spawn.cursor_headless).
+~/.agents/skills/agmsg/scripts/spawn.sh <agent-type> <name> [options]
 
 # Tear down a spawned member — the inverse of spawn.
 # Default (graceful): sends a `ctrl:despawn` control message to <name>; the
