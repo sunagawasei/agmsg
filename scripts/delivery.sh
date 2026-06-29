@@ -229,7 +229,13 @@ agmsg_delivery_runtime_status_default() {
       [ -f "$f" ] || continue
       local pid
       pid=$(cat "$f" 2>/dev/null || echo "")
-      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      # _agmsg_pid_alive, not bare kill -0: a watcher from another session runs
+      # under a different sandbox, where kill -0 returns EPERM and would be
+      # miscounted as a stale pidfile. Treat EPERM as alive (see instance-id.sh).
+      # Status only reads liveness (no kill), so fail-open is safe here; the
+      # kill-bearing teardown paths keep bare kill -0 because a cross-sandbox
+      # kill cannot signal the target anyway.
+      if [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
         alive=$((alive + 1))
       else
         dead=$((dead + 1))
