@@ -37,6 +37,26 @@ compat_get_ppid() {
   esac
 }
 
+# Get Windows PID (WINPID) for an MSYS2 process.  Internal helper.
+_compat_get_winpid() {
+  local pid="$1"
+  ps -l -p "$pid" 2>/dev/null | awk '
+    NR==1 { for (i = 1; i <= NF; i++) if ($i == "WINPID") col = i; next }
+    NR==2 && col { print $col }
+  '
+}
+
+# Query Windows CIM for the full command line of a process by WINPID.
+_compat_cim_cmdline() {
+  local winpid="$1"
+  [ -n "$winpid" ] || return 1
+  case "$winpid" in *[!0-9]*) return 1 ;; esac
+  [ -z "${_AGMSG_COMPAT_NO_CIM:-}" ] || return 1
+  powershell.exe -NoProfile -Command \
+    "(Get-CimInstance Win32_Process -Filter \"ProcessId=$winpid\").CommandLine" 2>/dev/null \
+    | tr -d '\r' | tr '\\' '/'
+}
+
 # Get full command line of a process.  Replaces: ps -o args= -p <pid>
 compat_get_cmdline() {
   local pid="$1"
@@ -44,9 +64,18 @@ compat_get_cmdline() {
   _agmsg_detect_platform
   case "$_agmsg_platform" in
     msys)
-      if [ -r "/proc/$pid/cmdline" ]; then
+      if [ -z "${_AGMSG_COMPAT_NO_PROC:-}" ] && [ -r "/proc/$pid/cmdline" ]; then
         tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null
       else
+        local winpid cim_result
+        winpid=$(_compat_get_winpid "$pid")
+        if [ -n "$winpid" ]; then
+          cim_result=$(_compat_cim_cmdline "$winpid" || true)
+          if [ -n "$cim_result" ]; then
+            printf '%s' "$cim_result"
+            return
+          fi
+        fi
         ps -l -p "$pid" 2>/dev/null | awk 'NR==2{print $NF}'
       fi
       ;;
@@ -63,9 +92,20 @@ compat_get_comm() {
   _agmsg_detect_platform
   case "$_agmsg_platform" in
     msys)
-      if [ -r "/proc/$pid/cmdline" ]; then
+      if [ -z "${_AGMSG_COMPAT_NO_PROC:-}" ] && [ -r "/proc/$pid/cmdline" ]; then
         tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -1 | xargs basename 2>/dev/null
       else
+        local winpid cim_result
+        winpid=$(_compat_get_winpid "$pid")
+        if [ -n "$winpid" ]; then
+          cim_result=$(_compat_cim_cmdline "$winpid" || true)
+          if [ -n "$cim_result" ]; then
+            local _exe
+            _exe=$(printf '%s\n' "$cim_result" | head -1 | sed 's/^"\([^"]*\)".*/\1/; t; s/ .*//')
+            basename "$_exe" 2>/dev/null | sed 's/\.exe$//'
+            return
+          fi
+        fi
         ps -l -p "$pid" 2>/dev/null | awk 'NR==2{print $NF}' | xargs basename 2>/dev/null
       fi
       ;;

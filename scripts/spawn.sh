@@ -67,6 +67,13 @@ set -euo pipefail
 #                      ids); the flag spelling comes from the type's manifest
 #                      `model_arg=`. Refused for a type with no model_arg.
 #
+# Spawn options: extra CLI args to always pass a given type's launched
+# binary (e.g. a default permission mode or sandbox policy), configured
+# per-type in a YAML file rather than hardcoded — see
+# scripts/lib/spawn-options.sh. File: $AGMSG_SPAWN_OPTIONS_FILE, else
+# ~/.agmsg/config/spawn_options.yaml. Optional; a missing file/section is a
+# no-op.
+#
 # Readiness: by default spawn blocks until the new agent's watcher attaches and
 # is receiving (it prints `status=ready ...`), so a leader can safely send work
 # right after spawn returns without racing the agent's cold start. Types with
@@ -92,6 +99,8 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/session-team.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/spawn-role.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/spawn-options.sh"
 
 die() { echo "spawn: $*" >&2; exit 1; }
 
@@ -244,13 +253,21 @@ PROJECT="$(cd "$PROJECT" && pwd)"
 # external add-on); otherwise it is a direct-CLI launch. The `cli=` binary is
 # REQUIRED for direct-CLI types and OPTIONAL for node launchers (which resolve
 # their own runtime). No per-type case — all data-driven from the manifest.
+#
+# `cli=` is trusted manifest data (agmsg ships it, not runtime user input), so
+# it may be a single binary name OR a fixed command-line prefix of several
+# space-separated tokens — a subcommand and/or fixed flags a CLI needs before
+# its own options (e.g. `opencode run --interactive`, whose message is not a
+# top-level argument). Only the first word names the actual executable to
+# resolve/check; the rest are passed through as-is in the boot script below.
 SPAWN_LAUNCHER="$(agmsg_type_get "$AGENT_TYPE" spawn)"
 CLI_BIN="$(agmsg_type_get "$AGENT_TYPE" cli)"
+CLI_BIN_EXE="${CLI_BIN%% *}"
 CLI_PATH=""
 if [ -n "$CLI_BIN" ]; then
-  command -v "$CLI_BIN" >/dev/null 2>&1 \
-    || die "'$CLI_BIN' not found on PATH — install the ${AGENT_TYPE} CLI first"
-  CLI_PATH="$(command -v "$CLI_BIN")"
+  command -v "$CLI_BIN_EXE" >/dev/null 2>&1 \
+    || die "'$CLI_BIN_EXE' not found on PATH — install the ${AGENT_TYPE} CLI first"
+  CLI_PATH="$(command -v "$CLI_BIN_EXE")"
 elif [ -z "$SPAWN_LAUNCHER" ]; then
   die "agent type '$AGENT_TYPE' manifest declares neither a 'cli' binary nor a 'spawn' launcher"
 fi
@@ -264,6 +281,23 @@ MODEL_ARG="$(agmsg_type_get "$AGENT_TYPE" model_arg)"
 if [ -n "$MODEL_ID" ] && [ -z "$MODEL_ARG" ]; then
   die "agent type '$AGENT_TYPE' does not support --model (no model_arg in its manifest)"
 fi
+
+# Some CLIs don't accept the actas prompt as a bare positional argument — they
+# require it as the value of a named flag instead (e.g. antigravity's
+# `--prompt-interactive <text>`, copilot's `-i/--interactive <text>`; their
+# `-p/--prompt` equivalents are a DIFFERENT one-shot, non-interactive mode and
+# would not work here). `prompt_arg=` in the manifest names that flag; unset
+# (the default) keeps today's bare-positional behavior.
+PROMPT_ARG="$(agmsg_type_get "$AGENT_TYPE" prompt_arg)"
+
+# Extra CLI args for this type from the spawn options file (opt-in, see
+# scripts/lib/spawn-options.sh). Read line-by-line — never word-split — so a
+# value containing spaces stays a single token.
+SPAWN_OPT_TOKENS=()
+while IFS= read -r _spawn_opt_tok; do
+  SPAWN_OPT_TOKENS+=("$_spawn_opt_tok")
+done < <(agmsg_spawn_options_tokens "$AGENT_TYPE")
+
 # Resolve the node launcher path from the manifest (not hardcoded), if any.
 SPAWN_AGENT=""
 if [ -n "$SPAWN_LAUNCHER" ]; then
@@ -423,18 +457,31 @@ BOOT="$BOOT.command"
   if [ -n "$SPAWN_AGENT" ]; then
     # Node-launcher path: pass the universal agmsg context + the actas prompt.
     # Type-specific config is the launcher's own default/env, so core stays
-    # generic and names no add-on.
+    # generic and names no add-on. Spawn-options tokens (if any) land before
+    # --initial-input, same relative position as the direct-CLI path below.
     printf '%q %q \\\n' "$NODE_BIN" "$SPAWN_AGENT"
     printf '  --name %q \\\n' "$NAME"
     printf '  --team %q \\\n' "$TEAM"
     printf '  --project %q \\\n' "$PROJECT"
+    for _tok in ${SPAWN_OPT_TOKENS[@]+"${SPAWN_OPT_TOKENS[@]}"}; do
+      printf '  %q \\\n' "$_tok"
+    done
     printf '  --initial-input %q\n' "$ACTAS_PROMPT"
   else
-    # Direct-CLI launch: `<cli> [<model_arg> <model_id>] "/<cmd> actas <name>"`.
-    # model_arg is the manifest flag spelling (not %q-quoted — a bare flag like
-    # --model or -m); the model id is quoted.
-    printf '%q' "$CLI_BIN"
+    # Direct-CLI launch:
+    # `<cli> [<model_arg> <model_id>] [spawn-options...] [<prompt_arg>] "/<cmd> actas <name>"`.
+    # cli is emitted unquoted — it is trusted fixed-prefix manifest data (see
+    # above) that may itself be several tokens (e.g. `opencode run --interactive`).
+    # model_arg/prompt_arg are the manifest flag spellings (not %q-quoted — bare
+    # flags like --model or -i); the model id, every spawn-options token, and the
+    # actas prompt are quoted. prompt_arg (when set) lands immediately before the
+    # prompt so there is no ambiguity about which token is its value.
+    printf '%s' "$CLI_BIN"
     [ -n "$MODEL_ID" ] && printf ' %s %q' "$MODEL_ARG" "$MODEL_ID"
+    for _tok in ${SPAWN_OPT_TOKENS[@]+"${SPAWN_OPT_TOKENS[@]}"}; do
+      printf ' %q' "$_tok"
+    done
+    [ -n "$PROMPT_ARG" ] && printf ' %s' "$PROMPT_ARG"
     printf ' %q\n' "$ACTAS_PROMPT"
   fi
   echo 'rm -f "$0" 2>/dev/null'   # self-clean once the agent exits

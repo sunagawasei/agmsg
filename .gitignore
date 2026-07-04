@@ -9,3 +9,12 @@ teams/
 # Nix devShell: direnv が allow 時に生成するローカルcache。
 # flake.nix/.envrc/flake.lock はコミット済みで、生成物だけ除外する。
 .direnv/
+
+/.omc/
+/.omx/
+/backlog/
+
+# Local secrets (notarization credentials, updater signing key, etc.) — never commit
+.env
+.env.*
+/.secrets/

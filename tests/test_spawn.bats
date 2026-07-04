@@ -29,8 +29,8 @@ if [ "$1" = sandbox ]; then
 fi
 exit 0
 CODEX_STUB
-  # grok-build and hermes need only a trivial success stub.
-  for bin in grok hermes; do
+  # Other types need only a trivial success stub.
+  for bin in grok hermes cursor-agent gemini agy copilot opencode; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/$bin"
     chmod +x "$STUB_BIN/$bin"
   done
@@ -58,14 +58,14 @@ teardown() {
 
 # --- argument validation ---
 
-@test "spawn: rejects unsupported agent type (gemini)" {
-  run bash "$SCRIPTS/spawn.sh" gemini foo --project "$PROJ"
-  [ "$status" -ne 0 ]
-  [[ "$output" =~ "not supported by spawn yet" ]]
-}
-
-@test "spawn: rejects unsupported agent type (opencode)" {
-  run bash "$SCRIPTS/spawn.sh" opencode foo --project "$PROJ"
+@test "spawn: rejects a known type with neither cli= nor spawn= (#277)" {
+  # All nine built-ins are spawnable now, so the 'not supported by spawn yet'
+  # gate (a known type missing both cli= and spawn=) needs a fixture — no
+  # real built-in demonstrates it any more.
+  local nd="$TEST_SKILL_DIR/scripts/drivers/types/noclitype"
+  mkdir -p "$nd"
+  printf 'name=noclitype\ntemplate=template.md\n' > "$nd/type.conf"
+  run bash "$SCRIPTS/spawn.sh" noclitype foo --project "$PROJ"
   [ "$status" -ne 0 ]
   [[ "$output" =~ "not supported by spawn yet" ]]
 }
@@ -102,6 +102,16 @@ teardown() {
   run env PATH="$STUB_BIN:/usr/bin:/bin" bash "$SCRIPTS/spawn.sh" codex foo --project "$PROJ"
   [ "$status" -ne 0 ]
   [[ "$output" =~ "not found on PATH" ]]
+}
+
+@test "spawn: a multi-word cli= (opencode) checks only its first word's existence (#277)" {
+  rm -f "$STUB_BIN/opencode"
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run env PATH="$STUB_BIN:/usr/bin:/bin" bash "$SCRIPTS/spawn.sh" opencode foo --project "$PROJ"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "'opencode' not found on PATH" ]]
+  # never searches for the literal multi-word string as one executable name
+  [[ "$output" != *"'opencode run --interactive' not found"* ]]
 }
 
 # --- team resolution ---
@@ -219,7 +229,13 @@ teardown() {
 }
 
 @test "spawn --model: refused for a type with no model_arg in its manifest" {
-  run bash "$SCRIPTS/spawn.sh" hermes foo --project "$PROJ" --model whatever --no-wait
+  # No real built-in is spawnable without a model_arg (#279 dropped hermes'
+  # spawnable=yes, its only remaining example) — fixture a minimal one,
+  # reusing the already-stubbed `claude` binary as its cli=.
+  local nd="$TEST_SKILL_DIR/scripts/drivers/types/nomodeltype"
+  mkdir -p "$nd"
+  printf 'name=nomodeltype\ntemplate=template.md\ncli=claude\nspawnable=yes\n' > "$nd/type.conf"
+  run bash "$SCRIPTS/spawn.sh" nomodeltype foo --project "$PROJ" --model whatever --no-wait
   [ "$status" -ne 0 ]
   [[ "$output" =~ "does not support --model" ]]
 }
@@ -231,6 +247,164 @@ teardown() {
   boot="$(cat "$CAPTURE")"
   run cat "$boot"
   [[ "$output" != *"--model"* ]]
+}
+
+# --- newly spawnable types (#277): cursor, gemini, antigravity, copilot, opencode ---
+
+@test "spawn: cursor launches cursor-agent with a bare positional prompt" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" cursor alice --project "$PROJ" --model sonnet-4-thinking --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"cursor-agent --model sonnet-4-thinking"* ]]
+  [[ "$output" == *"actas"* ]]
+}
+
+@test "spawn: gemini launches gemini with a bare positional prompt" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" gemini alice --project "$PROJ" --model gemini-3-pro --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"gemini --model gemini-3-pro"* ]]
+  [[ "$output" == *"actas"* ]]
+}
+
+@test "spawn: antigravity launches agy with --prompt-interactive (not a bare positional)" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" antigravity alice --project "$PROJ" --model gemini-3-pro --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"agy --model gemini-3-pro --prompt-interactive"* ]]
+  [[ "$output" == *"actas"* ]]
+}
+
+@test "spawn: copilot launches copilot with --interactive (not a bare positional)" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" copilot alice --project "$PROJ" --model gpt-5.4 --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"copilot --model gpt-5.4 --interactive"* ]]
+  [[ "$output" == *"actas"* ]]
+}
+
+@test "spawn: opencode launches its 'run --interactive' fixed subcommand prefix" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" opencode alice --project "$PROJ" --model anthropic/claude-opus-4-8 --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"opencode run --interactive --model anthropic/claude-opus-4-8"* ]]
+  [[ "$output" == *"actas"* ]]
+  # no bare 'opencode' invocation without the fixed prefix
+  [[ "$output" != *$'\n''opencode --model'* ]]
+}
+
+@test "spawn: prompt_arg lands after spawn-options, immediately before the prompt" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  local opts="$TEST_SKILL_DIR/spawn_options.yaml"
+  cat > "$opts" <<'YAML'
+antigravity:
+  --sandbox: true
+YAML
+  run env AGMSG_SPAWN_OPTIONS_FILE="$opts" \
+    bash "$SCRIPTS/spawn.sh" antigravity alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"agy --sandbox --prompt-interactive"* ]]
+}
+
+# --- spawn options (#273): per-type extra CLI args from a YAML file ---
+
+@test "spawn: injects spawn-options flags from AGMSG_SPAWN_OPTIONS_FILE" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  local opts="$TEST_SKILL_DIR/spawn_options.yaml"
+  cat > "$opts" <<'YAML'
+claude-code:
+  --permission-mode: acceptEdits
+  --dangerously-skip-permissions: true
+YAML
+  run env AGMSG_SPAWN_OPTIONS_FILE="$opts" \
+    bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"claude --permission-mode acceptEdits --dangerously-skip-permissions"* ]]
+  [[ "$output" == *"actas"* ]]
+}
+
+@test "spawn: spawn-options flags land after --model, before the actas prompt" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  local opts="$TEST_SKILL_DIR/spawn_options.yaml"
+  cat > "$opts" <<'YAML'
+claude-code:
+  --permission-mode: acceptEdits
+YAML
+  run env AGMSG_SPAWN_OPTIONS_FILE="$opts" \
+    bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --model claude-opus-4-8 --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"claude --model claude-opus-4-8 --permission-mode acceptEdits"* ]]
+}
+
+@test "spawn: a false spawn-options value suppresses that flag" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  local opts="$TEST_SKILL_DIR/spawn_options.yaml"
+  cat > "$opts" <<'YAML'
+claude-code:
+  --dangerously-skip-permissions: false
+YAML
+  run env AGMSG_SPAWN_OPTIONS_FILE="$opts" \
+    bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" != *"--dangerously-skip-permissions"* ]]
+}
+
+@test "spawn: only the spawned type's section applies, not another type's" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  local opts="$TEST_SKILL_DIR/spawn_options.yaml"
+  cat > "$opts" <<'YAML'
+codex:
+  --sandbox: workspace-write
+YAML
+  run env AGMSG_SPAWN_OPTIONS_FILE="$opts" \
+    bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" != *"--sandbox"* ]]
+}
+
+@test "spawn: no spawn-options file leaves the launch unchanged" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run env AGMSG_SPAWN_OPTIONS_FILE="$TEST_SKILL_DIR/no-such-file.yaml" \
+    bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"claude"*"actas"* ]]
+}
+
+@test "spawn: falls back to ~/.agmsg/config/spawn_options.yaml when the env var is unset" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  mkdir -p "$HOME/.agmsg/config"
+  cat > "$HOME/.agmsg/config/spawn_options.yaml" <<'YAML'
+claude-code:
+  --permission-mode: acceptEdits
+YAML
+  unset AGMSG_SPAWN_OPTIONS_FILE
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"--permission-mode acceptEdits"* ]]
 }
 
 @test "spawn: actas prompt uses the install command name (not hardcoded agmsg)" {

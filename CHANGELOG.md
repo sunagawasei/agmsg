@@ -12,7 +12,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `delivery.sh default-mode <type>` (honored only where the type supports the
   mode; unset/invalid/unsupported falls back to asking).
 
-## [1.1.2] - 2026-06-26
+## [app-v0.1.0] - 2026-07-03
+
+### Added
+- Official agmsg desktop app (#298)
+
+## [1.1.4] - 2026-07-03
+
+### Added
+- Add scripts/api.sh — read-only JSON entry point for non-bash consumers (#289)
+- Enable spawn for antigravity, copilot, cursor, gemini, opencode (#278)
+- Per-type spawn options via a configurable YAML file (#274)
+
+### Fixed
+- Fall back to a tarball download when git is unavailable (#296)
+- Gate actas/drop's fresh Monitor on delivery mode (#280) (#281)
+- Escape team/agent SQL values in history/inbox/check-inbox (#87) (#272)
+
+### Documentation
+- Add Japanese translations for Tier 1 contributor-facing docs (#291)
+- AGMSG_HOME data-root override, env-var naming convention (#284)
+
+## [1.1.3] - 2026-06-30
+
+### Added
+- Use brand logo mark + favicon set (#257)
+- Redesign agmsg.cc landing with Astro + Tailwind (#213) (#249)
+- Allow passing an initial prompt to the spawned agent (#212)
+
+### Fixed
+- Run watch-once.sh via bash so the codex bridge arms on Windows
+- Prefer shell function monitor shim; skip agmsg wrapper when resolving real codex (#193)
+- Drop monitor/both — Gemini has no Monitor tool (#258)
+- Skip Monitor directive when watcher already alive (#246)
+- Escape interpolated values as SQL string literals (#223)
+- Add CIM fallback for /proc-less cmdline/comm (#225) (#234)
+- Robust monitor — session-bind, orphan reaper, foolproof launch (#245)
+- Report bridge liveness in delivery status (#232)
+- Reject agent names that break JSON paths
+- Pipe SQL via stdin to avoid ARG_MAX on large bodies
+
+### Documentation
+- Add agmsg logo asset kit (#255)
+
+## [1.1.2] - 2026-06-27
 
 ### Added
 - Add opt-in explicit-launch monitor delivery (#236)
@@ -157,6 +200,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Handle empty TaskList explicitly to stop fresh-session loop (#71)
 - Storage driver pluginization design (epic #51) (#52)
 
+[app-v0.1.0]: https://github.com/fujibee/agmsg/compare/v1.1.4...app-v0.1.0
+[1.1.4]: https://github.com/fujibee/agmsg/compare/v1.1.3...v1.1.4
+[1.1.3]: https://github.com/fujibee/agmsg/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/fujibee/agmsg/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/fujibee/agmsg/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/fujibee/agmsg/compare/v1.0.6...v1.1.0

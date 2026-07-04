@@ -19,6 +19,9 @@ source "$SCRIPT_DIR/lib/validate.sh"
 agmsg_validate_team_name "$TEAM" || exit 1
 TEAMS_DIR="$SCRIPT_DIR/../teams"
 DB="$(agmsg_db_path)"
+# Escape interpolated identifiers as SQL string literals (parity with
+# send.sh): a team/agent name with a single quote would break the UPDATE.
+_agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
 TEAM_CONFIG="$TEAMS_DIR/$TEAM/config.json"
 
 if [ ! -f "$TEAM_CONFIG" ]; then
@@ -56,8 +59,8 @@ agmsg_write_atomic "$TEAM_CONFIG" "$UPDATED"
 
 # --- Update messages in DB ---
 if [ -f "$DB" ]; then
-  agmsg_sqlite "$DB" "UPDATE messages SET from_agent='$NEW_NAME' WHERE team='$TEAM' AND from_agent='$OLD_NAME';"
-  agmsg_sqlite "$DB" "UPDATE messages SET to_agent='$NEW_NAME' WHERE team='$TEAM' AND to_agent='$OLD_NAME';"
+  agmsg_sqlite "$DB" "UPDATE messages SET from_agent='$(_agmsg_sqlesc "$NEW_NAME")' WHERE team='$(_agmsg_sqlesc "$TEAM")' AND from_agent='$(_agmsg_sqlesc "$OLD_NAME")';"
+  agmsg_sqlite "$DB" "UPDATE messages SET to_agent='$(_agmsg_sqlesc "$NEW_NAME")' WHERE team='$(_agmsg_sqlesc "$TEAM")' AND to_agent='$(_agmsg_sqlesc "$OLD_NAME")';"
 fi
 
 agmsg_lock_release

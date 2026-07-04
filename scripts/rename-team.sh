@@ -28,6 +28,9 @@ agmsg_validate_team_name "$OLD_TEAM" || exit 1
 agmsg_validate_team_name "$NEW_TEAM" || exit 1
 TEAMS_DIR="$SCRIPT_DIR/../teams"
 DB="$(agmsg_db_path)"
+# Escape interpolated identifiers as SQL string literals (parity with
+# send.sh): a team/agent name with a single quote would break the UPDATE.
+_agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
 OLD_DIR="$TEAMS_DIR/$OLD_TEAM"
 NEW_DIR="$TEAMS_DIR/$NEW_TEAM"
 
@@ -78,7 +81,7 @@ fi
 
 # --- Update messages in DB ---
 if [ -f "$DB" ]; then
-  agmsg_sqlite "$DB" "UPDATE messages SET team='$NEW_TEAM' WHERE team='$OLD_TEAM';"
+  agmsg_sqlite "$DB" "UPDATE messages SET team='$(_agmsg_sqlesc "$NEW_TEAM")' WHERE team='$(_agmsg_sqlesc "$OLD_TEAM")';"
 fi
 
 agmsg_lock_release

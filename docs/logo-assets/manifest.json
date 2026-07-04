@@ -1,0 +1,38 @@
+{
+  "source": "/Users/koichi/Downloads/Generated Image June 28, 2026 - 3_21PM.jpg",
+  "source_size": [
+    1024,
+    1024
+  ],
+  "detected_full_bbox": [
+    108,
+    392,
+    916,
+    633
+  ],
+  "revision": "added dark-background lockups with white wordmark; removed cast shadows and transparent wordmark counters; retained white ag inside the icon mark",
+  "usage_notes": [
+    "Use the original navy logo on white or light backgrounds.",
+    "Cast shadows outside the logo have been removed.",
+    "Wordmark counters are transparent cutouts.",
+    "SVG files are convenience wrappers around embedded raster PNG artwork, not redrawn vector paths.",
+    "Use logo-full-dark-transparent.png or logo-wordmark-white-transparent.png on black and dark backgrounds.",
+    "logo-full-on-dark.png now uses the white wordmark for proper contrast."
+  ],
+  "dark_background_exports": [
+    "logo-full-dark-transparent.png",
+    "logo-full-on-black.png",
+    "logo-wordmark-white-transparent.png",
+    "logo-wordmark-white-on-black.png",
+    "logo-full-dark.svg",
+    "logo-wordmark-white.svg",
+    "web/logo-full-dark-320.png",
+    "web/logo-full-dark-640.png",
+    "web/logo-full-dark-1280.png",
+    "web/logo-full-dark-1920.png",
+    "web/logo-wordmark-white-240.png",
+    "web/logo-wordmark-white-480.png",
+    "web/logo-wordmark-white-960.png",
+    "social/og-image-dark-1200x630.jpg"
+  ]
+}
