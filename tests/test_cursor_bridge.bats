@@ -33,8 +33,12 @@ fi
 [ -n "${FAKE_CURSOR_PWD:-}" ] && printf '%s\n' "$PWD" > "$FAKE_CURSOR_PWD"
 [ -n "${FAKE_CURSOR_CLIJSON:-}" ] && [ -f "$PWD/.cursor/cli.json" ] && cp "$PWD/.cursor/cli.json" "$FAKE_CURSOR_CLIJSON"
 [ -n "${FAKE_CURSOR_PROMPT:-}" ] && cat > "$FAKE_CURSOR_PROMPT" 2>/dev/null || true
-resume=""; prev=""
-for a in "$@"; do [ "$prev" = "--resume" ] && resume="$a"; prev="$a"; done
+resume=""; model=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "--resume" ] && resume="$a"
+  [ "$prev" = "--model" ] && model="$a"
+  prev="$a"
+done
 result="STUB_REPLY"; iserr="false"
 case "${FAKE_CURSOR_MODE:-ok}" in
   error)       iserr="true" ;;
@@ -44,6 +48,11 @@ case "${FAKE_CURSOR_MODE:-ok}" in
   hang)        sleep 30 ;;   # outlive the test's short TURN_TIMEOUT, then get killed
   exitnonzero) printf '{"is_error":false,"result":"LEAK","session_id":"%s"}\n' "$resume"; exit 3 ;;
   signaldeath) printf '{"is_error":false,"result":"GHOST","session_id":"%s"}\n' "$resume"; kill -KILL $$ ;;
+  nonretriable) echo "NonRetriableError: Agent Looping Detected" >&2; exit 1 ;;
+  actionrequired) echo "ActionRequiredError: You're out of usage. Switch to auto to continue." >&2; exit 1 ;;
+  transientfail) echo "some transient network hiccup" >&2; exit 1 ;;
+  # terminal on the default model, healthy on a forced --model (per-model outage)
+  fallbackok)  if [ -n "$model" ]; then result="FALLBACK_REPLY"; else echo "NonRetriableError: Agent Looping Detected" >&2; exit 1; fi ;;
 esac
 printf '{"is_error":%s,"result":"%s","session_id":"%s"}\n' "$iserr" "$result" "$resume"
 EOF
@@ -63,6 +72,23 @@ teardown() {
 bridge() {  # run the bridge for cur, one drain
   run bash "$TYPES/cursor/cursor-bridge.sh" \
     --once --project "$PROJ" --team team --name cur --chat-id testchat-1234-1234-1234-123456789012
+}
+
+# Simulate a persistent send-path outage (e.g. a sandbox EPERM): the bridge calls
+# $SCRIPTS_DIR/send.sh — this test's isolated copy — so swap it for an
+# always-failing stub, and restore the real one to model the path recovering.
+break_send() {
+  cp "$SCRIPTS/send.sh" "$SCRIPTS/send.sh.orig"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$SCRIPTS/send.sh"
+  chmod +x "$SCRIPTS/send.sh"
+}
+restore_send() {
+  mv "$SCRIPTS/send.sh.orig" "$SCRIPTS/send.sh"
+  chmod +x "$SCRIPTS/send.sh"
+}
+
+turns_run() {  # number of -p cursor turns the stub has recorded so far
+  grep -c -- "--resume" "$FAKE_CURSOR_LOG" || true
 }
 
 @test "cursor-bridge: help exits successfully" {
@@ -87,6 +113,8 @@ bridge() {  # run the bridge for cur, one drain
   # cur's inbox is now drained (message marked read on success)
   run bash "$SCRIPTS/inbox.sh" team cur --format ids
   [ -z "$output" ]
+  # a normal (non-fallback) turn never forces --model (global config inheritance)
+  ! grep -q -- "--model" "$FAKE_CURSOR_LOG"
 }
 
 @test "cursor-bridge: runs cursor read-only (--trust, never --force)" {
@@ -194,6 +222,201 @@ bridge() {  # run the bridge for cur, one drain
   [[ "$output" != *"GHOST"* ]]
   run bash "$SCRIPTS/inbox.sh" team cur --format ids
   [ -n "$output" ]
+}
+
+# --- dead-letter: terminal errors, fallback-model retry, failure ceiling -----
+# The default fallback model (composer-2.5) is active in these tests unless a
+# test exports AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL= (empty = disabled), so a
+# terminal failure first retries once with --model before dead-lettering.
+
+@test "cursor-bridge: a transient (non-terminal) failure still leaves the message unread" {
+  export FAKE_CURSOR_MODE=transientfail
+  bash "$SCRIPTS/send.sh" team alice cur "boom" >/dev/null
+  bridge
+  [ "$status" -eq 0 ]
+  # no bridge-error notice — this is an ordinary retry-later failure
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [ -z "$output" ]
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [[ "$output" == *"boom"* ]]
+}
+
+@test "cursor-bridge: NonRetriableError dead-letters when the fallback also fails" {
+  export FAKE_CURSOR_MODE=nonretriable    # fails on EVERY model, fallback included
+  bash "$SCRIPTS/send.sh" team alice cur "boom" >/dev/null
+  bridge
+  [ "$status" -eq 0 ]
+  # the fallback retry was attempted (--model on the second call) before dead-letter
+  grep -q -- "--model composer-2.5" "$FAKE_CURSOR_LOG"
+  # alice got a [bridge-error] notice quoting the terminal error line
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [[ "$output" == *"[bridge-error]"* ]]
+  [[ "$output" == *"NonRetriableError: Agent Looping Detected"* ]]
+  # cur's inbox is drained (dead-lettered ids are marked read, like a success)
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [ -z "$output" ]
+  # a second drain runs no further cursor turn for this (already-read) message
+  local before after
+  before="$(grep -c -- "--resume" "$FAKE_CURSOR_LOG")"
+  bridge
+  after="$(grep -c -- "--resume" "$FAKE_CURSOR_LOG")"
+  [ "$before" -eq "$after" ]
+}
+
+@test "cursor-bridge: ActionRequiredError dead-letters when the fallback also fails" {
+  export FAKE_CURSOR_MODE=actionrequired
+  bash "$SCRIPTS/send.sh" team alice cur "boom" >/dev/null
+  bridge
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [[ "$output" == *"[bridge-error]"* ]]
+  [[ "$output" == *"ActionRequiredError:"* ]]
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [ -z "$output" ]
+}
+
+@test "cursor-bridge: a terminal error salvaged by the fallback model replies normally" {
+  export FAKE_CURSOR_MODE=fallbackok   # terminal without --model, healthy with it
+  bash "$SCRIPTS/send.sh" team alice cur "boom" >/dev/null
+  bridge
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"fallback model used (composer-2.5)"* ]]
+  # alice got the REAL reply from the fallback turn, not a bridge-error notice
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [[ "$output" == *"FALLBACK_REPLY"* ]]
+  [[ "$output" != *"[bridge-error]"* ]]
+  # ids were marked read via the normal success path
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [ -z "$output" ]
+}
+
+@test "cursor-bridge: an empty fallback-model env dead-letters without a retry" {
+  export FAKE_CURSOR_MODE=nonretriable
+  export AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL=""
+  bash "$SCRIPTS/send.sh" team alice cur "boom" >/dev/null
+  bridge
+  [ "$status" -eq 0 ]
+  # no fallback attempt at all — dead-letter fires on the first terminal failure
+  ! grep -q -- "--model" "$FAKE_CURSOR_LOG"
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [[ "$output" == *"[bridge-error]"* ]]
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [ -z "$output" ]
+}
+
+@test "cursor-bridge: N consecutive non-matching failures dead-letter too" {
+  export FAKE_CURSOR_MODE=transientfail
+  export AGMSG_CURSOR_BRIDGE_MAX_CONSEC_FAILURES=3
+  bash "$SCRIPTS/send.sh" team alice cur "boom" >/dev/null
+  bridge   # failure 1/3 — still unread, no notice
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [ -z "$output" ]
+  bridge   # failure 2/3 — still unread, no notice
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [ -z "$output" ]
+  bridge   # failure 3/3 — ceiling reached, dead-letter fires
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [[ "$output" == *"[bridge-error]"* ]]
+  [[ "$output" == *"3 consecutive failures"* ]]
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [ -z "$output" ]
+}
+
+@test "cursor-bridge: a new message resets the consecutive-failure count" {
+  export FAKE_CURSOR_MODE=transientfail
+  export AGMSG_CURSOR_BRIDGE_MAX_CONSEC_FAILURES=2
+  bash "$SCRIPTS/send.sh" team alice cur "first" >/dev/null
+  bridge   # failure 1/2 for ids={first}
+  # a second message changes the ids group for alice → the streak resets to 1
+  bash "$SCRIPTS/send.sh" team alice cur "second" >/dev/null
+  bridge   # failure 1/2 for ids={first,second} — must NOT dead-letter yet
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [ -z "$output" ]
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [[ "$output" == *"first"* ]]
+  [[ "$output" == *"second"* ]]
+}
+
+# --- outbound spool: a broken send path must not re-burn turns ----------------
+
+@test "cursor-bridge: a spooled dead-letter notice retries only the send, never the turn" {
+  export FAKE_CURSOR_MODE=nonretriable
+  bash "$SCRIPTS/send.sh" team alice cur "boom" >/dev/null
+  break_send
+  bridge   # turn + fallback fail, notice send fails → notice spooled to outbound
+  [ "$status" -eq 0 ]
+  local burned
+  burned="$(turns_run)"
+  bridge   # outbound present → zero cursor calls, send retried (and fails) only
+  bridge
+  [ "$(turns_run)" -eq "$burned" ]
+  restore_send
+  bridge   # send path recovered → notice delivered, ids read — still no new turn
+  [ "$(turns_run)" -eq "$burned" ]
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [[ "$output" == *"[bridge-error]"* ]]
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [ -z "$output" ]
+}
+
+@test "cursor-bridge: a spooled fallback reply is resent verbatim without re-burning the fallback" {
+  export FAKE_CURSOR_MODE=fallbackok
+  bash "$SCRIPTS/send.sh" team alice cur "boom" >/dev/null
+  break_send
+  bridge   # normal turn terminal, fallback succeeds, reply send fails → reply spooled
+  [ "$status" -eq 0 ]
+  local burned
+  burned="$(turns_run)"
+  [ "$burned" -eq 2 ]   # exactly one normal + one fallback turn ran
+  bridge   # spool present → no further turns of either kind
+  [ "$(turns_run)" -eq "$burned" ]
+  restore_send
+  bridge   # cached reply goes out as-is; still no new turns
+  [ "$(turns_run)" -eq "$burned" ]
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [[ "$output" == *"FALLBACK_REPLY"* ]]
+  [[ "$output" != *"[bridge-error]"* ]]
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [ -z "$output" ]
+}
+
+# --- failstate robustness ------------------------------------------------------
+
+@test "cursor-bridge: corrupt failstate lines read as 0 and the bridge survives" {
+  export FAKE_CURSOR_MODE=transientfail
+  bash "$SCRIPTS/send.sh" team alice cur "x" >/dev/null
+  # find the real unread id so the corrupt count sits on the row the bridge reads
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  local id="${output%%$'\x1f'*}"
+  local fs="$TEST_SKILL_DIR/run/cursor-bridge.team.cur.failstate"
+  printf 'zzz\n' > "$fs"                            # partial line (sender only)
+  printf 'bob\x1f%s\x1f\n' "$id" >> "$fs"           # empty count
+  printf 'alice\x1f%s\x1fbanana\n' "$id" >> "$fs"   # non-numeric count
+  bridge
+  [ "$status" -eq 0 ]
+  # count read as 0 (not a crash, not a dead-letter): message still unread
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [ -n "$output" ]
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [ -z "$output" ]
+}
+
+@test "cursor-bridge: a zero-padded failstate count is read as decimal (08 -> 8)" {
+  export FAKE_CURSOR_MODE=transientfail
+  export AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL=""   # keep the ceiling path pure
+  export AGMSG_CURSOR_BRIDGE_MAX_CONSEC_FAILURES=9
+  bash "$SCRIPTS/send.sh" team alice cur "x" >/dev/null
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  local id="${output%%$'\x1f'*}"
+  printf 'alice\x1f%s\x1f08\n' "$id" > "$TEST_SKILL_DIR/run/cursor-bridge.team.cur.failstate"
+  bridge
+  [ "$status" -eq 0 ]
+  # 08 → 8 (not invalid octal), this failure is the 9th → ceiling → dead-letter
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [[ "$output" == *"9 consecutive failures"* ]]
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [ -z "$output" ]
 }
 
 # --- read-only enforcement + add-dir advertising ------------------------------

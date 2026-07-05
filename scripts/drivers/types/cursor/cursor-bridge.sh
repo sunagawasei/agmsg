@@ -25,6 +25,25 @@ set -uo pipefail
 # timed-out turn leaves the messages unread so the next cycle retries, instead of
 # silently consuming them (the hole codex/inbox.sh's fetch-marks-read path has).
 #
+# Dead-letter exception (added after an incident: a NonRetriableError kept the
+# same message unread, so loss-safe retried it ~1,860 times over 3 days at real
+# $ cost): a failed turn is normally retried forever, but a TERMINAL failure —
+# cursor-agent's stderr starts a line with "NonRetriableError:"/"ActionRequiredError:",
+# or the same unread ids group has failed AGMSG_CURSOR_BRIDGE_MAX_CONSEC_FAILURES
+# times in a row — first gets ONE retry of the same turn with `--model
+# $AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL` (a per-model outage — e.g. the fast tier
+# out of usage — often clears on another model; set empty to disable). If that
+# also fails, the ids are dead-lettered: the bridge sends the sender a
+# `[bridge-error]` notice via the normal reply path, then marks the ids read (same
+# as success) so the loop stops retrying. Normal turns never pass --model, so the
+# user's global cursor model config applies outside the fallback.
+#
+# Once a payload is DETERMINED (a successful fallback reply, or the dead-letter
+# notice) but its SEND fails, the ids stay unread (loss-safe) and the payload is
+# spooled to run/…outbound.<sender>; from then on the bridge retries ONLY the
+# send and never re-runs a turn for those ids — a broken send path (e.g. a
+# nested-sandbox EPERM on send.sh) costs zero further cursor turns.
+#
 # Chat continuity: --resume <chatId> replays the server-side Cursor conversation,
 # so the worker keeps context across turns. The chat id is created at spawn time
 # (_spawn.sh) and passed in via --chat-id.
@@ -56,6 +75,12 @@ Env:
   AGMSG_CURSOR_BRIDGE_INTERVAL  default poll interval.
   AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT  seconds to wait for one cursor turn before
                                 killing it and retrying (default 180; 0 disables).
+  AGMSG_CURSOR_BRIDGE_MAX_CONSEC_FAILURES  consecutive failed turns for the SAME
+                                unread ids group before giving up and dead-lettering
+                                them (default 10; see the dead-letter note above).
+  AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL  model to retry a terminal failure with, ONCE,
+                                before dead-lettering (default composer-2.5; set to
+                                an empty string to disable the fallback retry).
 EOF
 }
 
@@ -92,6 +117,11 @@ done
 case "$INTERVAL" in ''|*[!0-9]*) echo "cursor-bridge: --interval must be a whole number of seconds" >&2; exit 1 ;; esac
 [ "$INTERVAL" -gt 0 ] || INTERVAL=1
 case "$TURN_TIMEOUT" in ''|*[!0-9]*) echo "cursor-bridge: AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT must be a whole number of seconds" >&2; exit 1 ;; esac
+MAX_CONSEC_FAILURES="${AGMSG_CURSOR_BRIDGE_MAX_CONSEC_FAILURES:-10}"
+case "$MAX_CONSEC_FAILURES" in ''|*[!0-9]*) echo "cursor-bridge: AGMSG_CURSOR_BRIDGE_MAX_CONSEC_FAILURES must be a whole number" >&2; exit 1 ;; esac
+# Unset-only default (${VAR-...}, not ${VAR:-...}): an explicitly EMPTY value
+# means "no fallback retry, dead-letter terminal failures immediately".
+FALLBACK_MODEL="${AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL-composer-2.5}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
@@ -122,6 +152,12 @@ METAFILE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.meta"
 LOG="$RUN_DIR/cursor-bridge.$TEAM.$NAME.log"
 OUTFILE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.last.json"
 PROMPTFILE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.prompt"
+# Per-sender consecutive-failure counters for the dead-letter gate, keyed by
+# (sender, ids-group). Deliberately NOT cleaned up in cleanup() below (like the
+# .log) so a streak survives a despawn/respawn of the same TEAM/NAME identity —
+# the exact restart that let the incident this feature guards against keep
+# retrying a permanently-broken message forever.
+FAILSTATE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.failstate"
 
 # --- single instance: refuse a second bridge for the same identity ------------
 if [ -f "$PIDFILE" ]; then
@@ -170,7 +206,7 @@ cleanup() {
   # .chat here is safe.
   if [ "$(cat "$PIDFILE" 2>/dev/null || true)" = "$$" ]; then
     rm -f "$PIDFILE" "$METAFILE" "$OUTFILE" "$PROMPTFILE" \
-          "$OUTFILE.one" "$OUTFILE.cand" \
+          "$OUTFILE.one" "$OUTFILE.cand" "$OUTFILE.err" \
           "$RUN_DIR/cursor-bridge.$TEAM.$NAME.chat" \
           "$RUN_DIR/cursor-bridge.$TEAM.$NAME.role" \
           "${ADD_DIRS_FILE:-}" 2>/dev/null || true
@@ -253,33 +289,147 @@ json_valid_file() {
   [ "$v" = 1 ]
 }
 
-# Run one read-only cursor turn for $1=prompt. On a valid, non-error result with
-# a matching session id and non-empty text, set REPLY_TEXT and return 0; else
-# return 1 (caller leaves the messages unread for a retry). NEVER passes --force,
-# so cursor cannot write/run shell — it is a pure reviewer (see _spawn.sh D2 note).
-# The prompt goes in via STDIN (a file), never argv, so an arbitrarily large
-# inbound batch can't hit ARG_MAX. The call is bounded by TURN_TIMEOUT so a hung
-# cursor-agent can't wedge the loop — on timeout the turn fails and the message
-# stays unread for the next cycle (the retry half of the loss-safe contract).
+# --- dead-letter state: consecutive failures per (sender, ids-group) ---------
+# One line per sender in FAILSTATE: "<sender><US><ids><US><count>". Rewritten
+# (not appended) on every update — PIDFILE already serializes one bridge process
+# per identity, so there is no concurrent writer to race.
+
+# Echo the persisted failure count for sender $1 when its stored ids match $2
+# (the current cycle's ids group); 0 if absent or the ids group has changed
+# (a changed group is a fresh streak, per the reset-on-ids-change contract).
+failstate_get() {
+  local sender="$1" ids="$2" s_sender s_ids s_count
+  [ -f "$FAILSTATE" ] || { echo 0; return 0; }
+  while IFS="$US" read -r s_sender s_ids s_count; do
+    if [ "$s_sender" = "$sender" ]; then
+      # Harden against a corrupt/partial line: a non-numeric count fed to the
+      # caller's $(( )) would be expanded as a VARIABLE NAME and kill the bridge
+      # under set -u. Pure digits only; 10# normalizes a zero-padded "08" that
+      # bare arithmetic would reject as invalid octal. Anything else reads as 0.
+      if [ "$s_ids" = "$ids" ]; then
+        case "$s_count" in
+          ''|*[!0-9]*) echo 0 ;;
+          *) echo "$((10#$s_count))" ;;
+        esac
+      else
+        echo 0
+      fi
+      return 0
+    fi
+  done < "$FAILSTATE"
+  echo 0
+}
+
+# Replace sender $1's entry with ids=$2 count=$3 (count<=0 drops the entry —
+# used on success and after a dead-letter to reset the streak to zero).
+failstate_set() {
+  local sender="$1" ids="$2" count="$3" tmp s_sender s_ids s_count
+  tmp="$FAILSTATE.tmp.$$"
+  : > "$tmp"
+  if [ -f "$FAILSTATE" ]; then
+    while IFS="$US" read -r s_sender s_ids s_count; do
+      [ "$s_sender" = "$sender" ] && continue
+      printf '%s%s%s%s%s\n' "$s_sender" "$US" "$s_ids" "$US" "$s_count" >> "$tmp"
+    done < "$FAILSTATE"
+  fi
+  if [ "$count" -gt 0 ] 2>/dev/null; then
+    printf '%s%s%s%s%s\n' "$sender" "$US" "$ids" "$US" "$count" >> "$tmp"
+  fi
+  mv "$tmp" "$FAILSTATE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+}
+
+# --- outbound spool: determined payloads whose SEND failed --------------------
+# Once a payload for a sender is DETERMINED (a successful fallback reply, or a
+# dead-letter notice), a broken send path must not re-burn cursor turns every
+# cycle (real risk: a nested-sandbox EPERM makes send.sh fail permanently). The
+# payload is spooled per sender (line 1 = the ids it answers, rest = the exact
+# body) and later cycles retry ONLY the send. Like .failstate, spool files
+# survive despawn/respawn on purpose and are not removed by cleanup().
+
+# Map sender $1 to its spool path. Senders are agmsg-validated names, but
+# sanitize for the filename anyway; the cksum suffix keeps two senders that
+# sanitize to the same text from colliding.
+outbound_file() {
+  local sender="$1" safe sum
+  safe="$(printf '%s' "$sender" | tr -c 'A-Za-z0-9_.-' '_')"
+  sum="$(printf '%s' "$sender" | cksum | awk '{print $1}')"
+  printf '%s\n' "$RUN_DIR/cursor-bridge.$TEAM.$NAME.outbound.$safe.$sum"
+}
+
+# Spool body $3 answering ids $2 for sender $1 (atomic tmp+mv, best-effort:
+# on failure the caller just falls back to the old retry-the-turn behavior).
+outbound_put() {
+  local sender="$1" ids="$2" body="$3" ofile tmp
+  ofile="$(outbound_file "$sender")"
+  tmp="$ofile.tmp.$$"
+  if { printf '%s\n' "$ids"; printf '%s' "$body"; } > "$tmp" 2>/dev/null \
+     && mv "$tmp" "$ofile" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
+# 0 if every id in comma-list $1 is also present in comma-list $2.
+ids_subset() {
+  local want="$1" have="$2" w
+  local IFS=','
+  for w in $want; do
+    case ",$have," in *",$w,"*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
+# Run one read-only cursor turn for $1=prompt, optionally forcing $2=model via
+# --model (the fallback retry; omitted on normal turns so the user's global cursor
+# model config keeps applying). On a valid, non-error result with a matching
+# session id and non-empty text, set REPLY_TEXT and return 0; else return 1
+# (caller leaves the messages unread for a retry, UNLESS TURN_ERR_LINE got set —
+# see below). NEVER passes --force, so cursor cannot write/run shell — it is a
+# pure reviewer (see _spawn.sh D2 note). The prompt goes in via STDIN (a file),
+# never argv, so an arbitrarily large inbound batch can't hit ARG_MAX. The call is
+# bounded by TURN_TIMEOUT so a hung cursor-agent can't wedge the loop — on timeout
+# the turn fails and the message stays unread for the next cycle (the retry half
+# of the loss-safe contract).
 REPLY_TEXT=""
+# First line matching /^(NonRetriableError|ActionRequiredError):/ found in this
+# turn's cursor-agent output (stderr, then stdout), set only on a failed ("$rc"
+# -ne 0) turn. Empty means no terminal pattern was seen this turn. The caller
+# (process_cycle) dead-letters instead of retrying when this is non-empty.
+TURN_ERR_LINE=""
 run_cursor_turn() {
-  local prompt="$1"
+  local prompt="$1" model="${2:-}"
+  local model_args=()
+  [ -n "$model" ] && model_args=(--model "$model")
   : > "$OUTFILE"
   printf '%s' "$prompt" > "$PROMPTFILE"
+  local errfile="$OUTFILE.err"
+  : > "$errfile"
+  TURN_ERR_LINE=""
   local rc=0
+  # cursor-agent's stderr is captured to a PER-TURN file (not appended straight to
+  # $LOG) so a terminal-error scan below sees only THIS turn's output, never a
+  # prior turn's leftover text. It is still appended to $LOG right after, so the
+  # cumulative debug log is unchanged.
   run_with_timeout "$TURN_TIMEOUT" \
-    "$CURSOR_BIN" -p --trust ${WORKSPACE_ARGS[@]+"${WORKSPACE_ARGS[@]}"} --output-format json --resume "$CHAT_ID" \
-    <"$PROMPTFILE" >"$OUTFILE" 2>>"$LOG" || rc=$?
+    "$CURSOR_BIN" -p --trust ${WORKSPACE_ARGS[@]+"${WORKSPACE_ARGS[@]}"} ${model_args[@]+"${model_args[@]}"} --output-format json --resume "$CHAT_ID" \
+    <"$PROMPTFILE" >"$OUTFILE" 2>"$errfile" || rc=$?
   rm -f "$PROMPTFILE" 2>/dev/null || true
+  cat "$errfile" >> "$LOG" 2>/dev/null || true
 
   # A non-zero exit means cursor-agent failed or was killed by the watchdog. Even
   # if a complete-looking JSON happened to land in $OUTFILE, treat the turn as
   # failed and leave the message unread for the next cycle — never reply/ack off a
-  # process that didn't exit cleanly (the loss-safe retry contract).
+  # process that didn't exit cleanly (the loss-safe retry contract). Scan stderr
+  # then stdout for a terminal, non-retriable error line (checked at line-start,
+  # so it never matches the string appearing mid-sentence in ordinary text).
   if [ "$rc" -ne 0 ]; then
+    TURN_ERR_LINE="$(awk '/^(NonRetriableError|ActionRequiredError):/ { print; exit }' "$errfile" "$OUTFILE" 2>/dev/null || true)"
+    rm -f "$errfile" 2>/dev/null || true
     echo "cursor-bridge: cursor-agent exited non-zero or timed out (rc=$rc); leaving message unread" >&2
     return 1
   fi
+  rm -f "$errfile" 2>/dev/null || true
 
   # Resolve a SINGLE JSON document from stdout. The whole file must be one valid
   # JSON object; if not (e.g. a warning line precedes it) accept ONLY when exactly
@@ -361,6 +511,32 @@ process_cycle() {
     done <<< "$rows"
     [ -n "$ids" ] || continue
 
+    # Outbound-first: a payload already determined for this sender (spooled when
+    # its send failed) is resent as-is — NO cursor turn runs while it exists, so
+    # a broken send path costs zero turns per cycle. Delivered => same ack path
+    # as a successful turn. Still failing => retry next cycle (the had-work-no-ack
+    # backoff applies). Stale (its ids are no longer all unread, e.g. consumed
+    # elsewhere) => discard loudly and fall through to a normal turn.
+    local ofile o_ids
+    ofile="$(outbound_file "$sender")"
+    if [ -f "$ofile" ]; then
+      o_ids="$(head -n 1 "$ofile" 2>/dev/null || true)"
+      if [ -n "$o_ids" ] && ids_subset "$o_ids" "$ids"; then
+        if tail -n +2 "$ofile" | "$SCRIPTS_DIR/send.sh" "$TEAM" "$NAME" "$sender" --stdin >/dev/null 2>&1; then
+          "$SCRIPTS_DIR/inbox.sh" "$TEAM" "$NAME" --mark-read-ids "$o_ids" >/dev/null 2>&1 || true
+          rm -f "$ofile" 2>/dev/null || true
+          failstate_set "$sender" "$o_ids" 0
+          CYCLE_ACKED=1
+          echo "cursor-bridge: delivered spooled outbound to $sender (ids $o_ids)" >&2
+        else
+          echo "cursor-bridge: spooled outbound for $sender still undeliverable (ids $o_ids); no turn run, retrying next cycle" >&2
+        fi
+        continue
+      fi
+      rm -f "$ofile" 2>/dev/null || true
+      echo "cursor-bridge: discarded stale outbound for $sender (spooled ids ${o_ids:-?} are no longer all unread)" >&2
+    fi
+
     # No size cap needed: the prompt is fed to cursor-agent via stdin (a file) in
     # run_cursor_turn, not argv, so a large batch cannot hit ARG_MAX.
     # Role injection: a --role-file (spawn resolved db/spawn-roles/<name>.<type>.md)
@@ -384,13 +560,67 @@ Reply with ONLY your final answer for '$sender'. Do NOT run agmsg, send.sh, or a
     if run_cursor_turn "$prompt"; then
       if printf '%s' "$REPLY_TEXT" | "$SCRIPTS_DIR/send.sh" "$TEAM" "$NAME" "$sender" --stdin >/dev/null 2>&1; then
         "$SCRIPTS_DIR/inbox.sh" "$TEAM" "$NAME" --mark-read-ids "$ids" >/dev/null 2>&1 || true
+        failstate_set "$sender" "$ids" 0
         CYCLE_ACKED=1
         echo "cursor-bridge: replied to $sender (ids $ids)" >&2
       else
         echo "cursor-bridge: send to $sender failed; leaving ids $ids unread for retry" >&2
       fi
     else
-      echo "cursor-bridge: turn failed for $sender; leaving ids $ids unread for retry" >&2
+      # Terminal failure: either THIS turn's output matched a known non-retriable
+      # pattern, or this exact (sender, ids) group has now failed
+      # MAX_CONSEC_FAILURES times in a row regardless of error shape. Either way,
+      # retrying forever would just keep burning cursor-agent calls on a message
+      # that can never succeed — dead-letter it instead of leaving it unread.
+      local fail_count reason=""
+      fail_count=$(( $(failstate_get "$sender" "$ids") + 1 ))
+      if [ -n "$TURN_ERR_LINE" ]; then
+        reason="$TURN_ERR_LINE"
+      elif [ "$fail_count" -ge "$MAX_CONSEC_FAILURES" ]; then
+        reason="$fail_count consecutive failures"
+      fi
+      # Before dead-lettering, retry the SAME turn once on the fallback model —
+      # a terminal error is often per-model (e.g. only the fast tier is out of
+      # usage), so one forced-model attempt can still salvage the reply.
+      if [ -n "$reason" ] && [ -n "$FALLBACK_MODEL" ]; then
+        echo "cursor-bridge: terminal failure for $sender ($reason); retrying once with fallback model $FALLBACK_MODEL" >&2
+        if run_cursor_turn "$prompt" "$FALLBACK_MODEL"; then
+          if printf '%s' "$REPLY_TEXT" | "$SCRIPTS_DIR/send.sh" "$TEAM" "$NAME" "$sender" --stdin >/dev/null 2>&1; then
+            "$SCRIPTS_DIR/inbox.sh" "$TEAM" "$NAME" --mark-read-ids "$ids" >/dev/null 2>&1 || true
+            failstate_set "$sender" "$ids" 0
+            CYCLE_ACKED=1
+            echo "cursor-bridge: fallback model used ($FALLBACK_MODEL); replied to $sender (ids $ids)" >&2
+            continue
+          fi
+          # Fallback turn succeeded but the reply couldn't be delivered. Spool
+          # the good reply so later cycles retry only the SEND — never re-burn
+          # the turn (or the fallback) for an answer we already have. ids stay
+          # unread (loss-safe) until the spooled send goes through.
+          outbound_put "$sender" "$ids" "$REPLY_TEXT" || true
+          failstate_set "$sender" "$ids" "$fail_count"
+          echo "cursor-bridge: fallback turn ($FALLBACK_MODEL) succeeded but send to $sender failed; reply spooled to outbound (ids $ids stay unread)" >&2
+          continue
+        fi
+        echo "cursor-bridge: fallback model $FALLBACK_MODEL also failed for $sender; dead-lettering" >&2
+      fi
+      if [ -n "$reason" ]; then
+        local notice="[bridge-error] cursor turn failed permanently (ids $ids): $reason. Messages marked read; resend to retry."
+        if printf '%s' "$notice" | "$SCRIPTS_DIR/send.sh" "$TEAM" "$NAME" "$sender" --stdin >/dev/null 2>&1; then
+          "$SCRIPTS_DIR/inbox.sh" "$TEAM" "$NAME" --mark-read-ids "$ids" >/dev/null 2>&1 || true
+          failstate_set "$sender" "$ids" 0
+          CYCLE_ACKED=1
+          echo "cursor-bridge: dead-lettered ids $ids for $sender ($reason)" >&2
+        else
+          # Notice couldn't be delivered — loss-safe: ids stay unread. Spool the
+          # notice so later cycles retry only the SEND, never the terminal turn.
+          outbound_put "$sender" "$ids" "$notice" || true
+          failstate_set "$sender" "$ids" "$fail_count"
+          echo "cursor-bridge: turn failed for $sender ($reason); dead-letter notice send failed, spooled to outbound (ids $ids stay unread)" >&2
+        fi
+      else
+        failstate_set "$sender" "$ids" "$fail_count"
+        echo "cursor-bridge: turn failed for $sender; leaving ids $ids unread for retry" >&2
+      fi
     fi
   done <<< "$senders"
   return 0
