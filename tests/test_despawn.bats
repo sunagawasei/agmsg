@@ -151,14 +151,72 @@ teardown() {
   sleep 300 & local survivor=$!
   printf 'pid:%s\t%s\tcodex\n' "$survivor" "$PROJ" > "$RUN/spawn.team__codex"  # fresh respawn record
   local stale; stale="$(printf 'pid:%s\t%s\tcodex' 999999 /old/cwd)"           # caller's stale snapshot
+  # The fresh worker's persistent bridge state must survive the skipped teardown.
+  printf 'x\n' > "$RUN/codex-bridge.team.codex.outbound.json"
 
   run bash "$SCRIPTS/despawn.sh" team leader codex --force --expect-record "$stale"
   [ "$status" -eq 0 ]
   [[ "$output" == *"status=skipped"* ]]
   [[ "$output" == *"reason=record-changed"* ]]
   [ -f "$RUN/spawn.team__codex" ]                    # fresh record retained
+  [ -f "$RUN/codex-bridge.team.codex.outbound.json" ]  # bridge state retained too
   kill -0 "$survivor" 2>/dev/null                    # fresh worker NOT killed
   kill "$survivor" 2>/dev/null || true; wait "$survivor" 2>/dev/null || true
+}
+
+# --- permanent-teardown GC of persistent bridge state (failstate / outbound) ---
+# The bridges deliberately keep run/<type>-bridge.<team>.<name>.failstate and
+# .outbound.* across their own exit (crash/lazy-respawn keeps the streak and any
+# undelivered payload); despawn — the sanctioned permanent teardown, also called
+# by session-end's worker — must retire them.
+
+@test "despawn --force: retires the bridge's failstate and outbound spool" {
+  bash "$SCRIPTS/join.sh" team rev cursor "$PROJ" >/dev/null
+  printf 'pid:%s\t%s\t%s\n' 999999 "$PROJ" cursor > "$RUN/spawn.team__rev"   # long-dead pid
+  printf 'claude\x1f12\x1f3\n' > "$RUN/cursor-bridge.team.rev.failstate"
+  printf '12\nspooled reply\n' > "$RUN/cursor-bridge.team.rev.outbound.claude.12345"
+  printf '[]\n' > "$RUN/codex-bridge.team.rev.outbound.json"                 # historical type variant
+
+  run bash "$SCRIPTS/despawn.sh" team leader rev --force
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"status=forced"* ]]
+  [ ! -f "$RUN/cursor-bridge.team.rev.failstate" ]
+  [ ! -f "$RUN/cursor-bridge.team.rev.outbound.claude.12345" ]
+  [ ! -f "$RUN/codex-bridge.team.rev.outbound.json" ]
+}
+
+@test "despawn graceful (no live lock): also retires failstate and outbound spool" {
+  bash "$SCRIPTS/join.sh" team rev codex "$PROJ" >/dev/null
+  printf 'claude\x1f7\x1f2\n' > "$RUN/codex-bridge.team.rev.failstate"
+  printf '[]\n' > "$RUN/codex-bridge.team.rev.outbound.json"
+
+  run bash "$SCRIPTS/despawn.sh" team leader rev
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no-live-lock"* ]]
+  [ ! -f "$RUN/codex-bridge.team.rev.failstate" ]
+  [ ! -f "$RUN/codex-bridge.team.rev.outbound.json" ]
+}
+
+@test "despawn: bridge-state GC treats the member name literally (no glob expansion)" {
+  # Regression guard for gc_bridge_state's quoting: a name containing '*' must
+  # only remove ITS OWN literal state — bash does not glob-expand a variable
+  # inside double quotes, and a future unquoting refactor must not change that.
+  printf 'c\x1f1\x1f2\n' > "$RUN/cursor-bridge.team.rev1.failstate"
+  printf '1\nspooled\n'  > "$RUN/cursor-bridge.team.rev1.outbound.claude.111"
+  printf 'c\x1f1\x1f2\n' > "$RUN/cursor-bridge.team.revX.failstate"
+  printf 'c\x1f1\x1f2\n' > "$RUN/cursor-bridge.team.rev*.failstate"
+  printf '[]\n'          > "$RUN/codex-bridge.team.rev*.outbound.json"
+
+  run bash "$SCRIPTS/despawn.sh" team leader 'rev*'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no-live-lock"* ]]
+  # the literal 'rev*' identity's state is gone…
+  [ ! -f "$RUN/cursor-bridge.team.rev*.failstate" ]
+  [ ! -f "$RUN/codex-bridge.team.rev*.outbound.json" ]
+  # …and similarly-named identities are untouched
+  [ -f "$RUN/cursor-bridge.team.rev1.failstate" ]
+  [ -f "$RUN/cursor-bridge.team.rev1.outbound.claude.111" ]
+  [ -f "$RUN/cursor-bridge.team.revX.failstate" ]
 }
 
 @test "despawn --force --expect-record: proceeds when the live record matches the snapshot" {

@@ -154,9 +154,10 @@ OUTFILE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.last.json"
 PROMPTFILE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.prompt"
 # Per-sender consecutive-failure counters for the dead-letter gate, keyed by
 # (sender, ids-group). Deliberately NOT cleaned up in cleanup() below (like the
-# .log) so a streak survives a despawn/respawn of the same TEAM/NAME identity —
+# .log) so a streak survives a crash/lazy-respawn of the same TEAM/NAME identity —
 # the exact restart that let the incident this feature guards against keep
-# retrying a permanently-broken message forever.
+# retrying a permanently-broken message forever. A sanctioned permanent teardown
+# (despawn.sh, incl. session-end's worker) retires it.
 FAILSTATE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.failstate"
 
 # --- single instance: refuse a second bridge for the same identity ------------
@@ -344,7 +345,8 @@ failstate_set() {
 # cycle (real risk: a nested-sandbox EPERM makes send.sh fail permanently). The
 # payload is spooled per sender (line 1 = the ids it answers, rest = the exact
 # body) and later cycles retry ONLY the send. Like .failstate, spool files
-# survive despawn/respawn on purpose and are not removed by cleanup().
+# are not removed by cleanup() (they survive a crash/lazy-respawn on purpose);
+# despawn.sh retires them on a permanent teardown.
 
 # Map sender $1 to its spool path. Senders are agmsg-validated names, but
 # sanitize for the filename anyway; the cksum suffix keeps two senders that

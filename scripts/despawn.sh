@@ -111,6 +111,18 @@ kill_headless_pid() {
   fi
 }
 
+# Retire the bridge's persistent per-identity state: failstate streak counters
+# and spooled outbound payloads. These deliberately survive the bridge's own EXIT
+# cleanup and a crash/lazy-respawn (so a broken-message streak or an undelivered
+# payload is not forgotten); only a sanctioned permanent teardown — this script,
+# which session-end's worker also calls with --force — retires them. Glob over
+# the type prefix (cursor-bridge/codex-bridge/…) so the state cannot strand if
+# the member's type changed across respawns.
+gc_bridge_state() {
+  rm -f "$SKILL_DIR/run/"*"-bridge.$TEAM.$NAME.failstate" \
+        "$SKILL_DIR/run/"*"-bridge.$TEAM.$NAME.outbound."* 2>/dev/null || true
+}
+
 # Kill the placement described by a record LINE ("<id>\t<proj>\t<type>"). ids are
 # self-describing: %N pane, @N window, pid:<n> headless bridge worker. Operates on
 # the LINE passed in, never a re-read of the file, so a caller that snapshotted
@@ -170,6 +182,7 @@ if [ "$FORCE" = "1" ]; then
   # Also drop the role snapshot: a forced teardown may SIGKILL the bridge before
   # its own cleanup runs, so remove run/<type>-bridge.<team>.<name>.role here too.
   rm -f "$SPAWN_REC" "$SKILL_DIR/run/${_type:-codex}-bridge.$TEAM.$NAME.role" 2>/dev/null || true
+  gc_bridge_state
   agmsg_placement_lock_release "$TEAM" "$NAME"
   echo "status=forced name=$NAME team=$TEAM"
   exit 0
@@ -181,6 +194,7 @@ case "$state" in
   free)
     echo "despawn: '$NAME' holds no live actas lock — nothing to confirm a teardown against (a codex member has no watcher; a tmux member may already be gone). If a window remains, use --force." >&2
     rm -f "$SPAWN_REC" 2>/dev/null || true
+    gc_bridge_state
     echo "status=ok name=$NAME team=$TEAM note=no-live-lock"
     exit 0
     ;;
@@ -202,4 +216,5 @@ while true; do
 done
 
 rm -f "$SPAWN_REC" 2>/dev/null || true
+gc_bridge_state
 echo "status=ok name=$NAME team=$TEAM after=${waited}s"

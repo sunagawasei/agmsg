@@ -792,6 +792,337 @@ EOF
 
   [ "$status" -eq 0 ]
   [[ "$output" =~ "started turn" ]]
+  # completed turn → no compensation notice back to the sender
+  run bash "$SCRIPTS/inbox.sh" team bob
+  [[ "$output" != *"[bridge-error]"* ]]
+}
+
+# Fake app-server whose turn/start is ACKed and then FAILS (turn/failed with an
+# error payload) — drives the dead-letter compensation path. Shared by the
+# turn/failed tests below.
+write_turn_failed_fake() {
+  local fake="$TEST_SKILL_DIR/fake-app-server-turnfail.js"
+  cat >"$fake" <<'EOF'
+const readline = require("readline");
+const rl = readline.createInterface({ input: process.stdin });
+
+function send(value) {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  } else if (message.method === "thread/start") {
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: { thread: { id: "thread-1", status: { type: "idle" } } },
+    });
+  } else if (message.method === "process/spawn") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+    setTimeout(() => {
+      send({
+        jsonrpc: "2.0",
+        method: "process/exited",
+        params: {
+          processHandle: message.params.processHandle,
+          exitCode: 0,
+          stdout: "status=pending count=1 max_id=1\n",
+          stderr: "",
+        },
+      });
+    }, 10);
+  } else if (message.method === "turn/start") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+    setTimeout(() => {
+      send({
+        jsonrpc: "2.0",
+        method: "turn/failed",
+        params: { threadId: message.params.threadId, turn: { error: { message: "model exploded" } } },
+      });
+    }, 10);
+  } else if (message.method === "process/kill") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  }
+});
+EOF
+  printf '%s\n' "$fake"
+}
+
+@test "codex-bridge: inline-inbox turn/failed notifies the sender instead of losing the message" {
+  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
+  if [ "$status" -ne 0 ]; then
+    skip "node child_process.spawn is not available in this sandbox"
+  fi
+
+  bash "$SCRIPTS/send.sh" team bob alice "doomed body" >/dev/null
+  # capture the message id before the bridge consumes it
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  local mid="${output%%$'\x1f'*}"
+  [ -n "$mid" ]
+
+  local fake
+  fake="$(write_turn_failed_fake)"
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake" run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --max-wakes 1 --inline-inbox
+
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "turn failed" ]]
+  # bob got the compensation notice naming the consumed ids and the reason
+  run bash "$SCRIPTS/inbox.sh" team bob
+  [[ "$output" == *"[bridge-error] codex turn failed (ids $mid)"* ]]
+  [[ "$output" == *"model exploded"* ]]
+  [[ "$output" == *"resend to retry"* ]]
+  # the message stays consumed — no unread-retry loop (the cursor incident)
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [ -z "$output" ]
+}
+
+@test "codex-bridge: a turn-failed notice that cannot be sent is spooled and delivered on the next run" {
+  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
+  if [ "$status" -ne 0 ]; then
+    skip "node child_process.spawn is not available in this sandbox"
+  fi
+
+  bash "$SCRIPTS/send.sh" team bob alice "doomed" >/dev/null
+  local fake
+  fake="$(write_turn_failed_fake)"
+
+  # Break the send path (as a persistent outage would) AFTER the inbound message
+  # is already stored, then let the turn fail.
+  cp "$SCRIPTS/send.sh" "$SCRIPTS/send.sh.orig"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$SCRIPTS/send.sh"
+  chmod +x "$SCRIPTS/send.sh"
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake" run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --max-wakes 1 --inline-inbox
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"notice spooled"* ]]
+  [ -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.outbound.json" ]
+  grep -q "bridge-error" "$TEST_SKILL_DIR/run/codex-bridge.team.alice.outbound.json"
+
+  # Send path recovers; a fresh bridge run flushes the spool at startup (this run
+  # then stops on the stale-wake guard — no unread left — which is fine).
+  mv "$SCRIPTS/send.sh.orig" "$SCRIPTS/send.sh"
+  chmod +x "$SCRIPTS/send.sh"
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake" run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --max-wakes 1 --inline-inbox
+  [[ "$output" == *"delivered spooled notice to bob"* ]]
+  [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.outbound.json" ]
+  run bash "$SCRIPTS/inbox.sh" team bob
+  [[ "$output" == *"[bridge-error] codex turn failed"* ]]
+}
+
+# Fake app-server driving the LATE turn/failed race: turn1 gets turn/started
+# (id t1) and a second-wave message from carol is injected while turn1 is still
+# active; turn1 then ends WITHOUT a terminal event (mode=idle/nostarted2 →
+# thread idle, mode=watchdog → nothing, the bridge's --turn-timeout fires).
+# turn2 starts (consuming carol's message; its turn/started carries id t2 —
+# except mode=nostarted2, which never sends it) and only THEN does turn1's
+# turn/failed arrive. The bridge must not attribute t1's failure to turn2's
+# snapshot — not even when turn2's epoch has no bound id yet.
+write_late_failed_fake() {
+  local mode="$1"
+  local fake="$TEST_SKILL_DIR/fake-app-server-late-failed-$mode.js"
+  cat >"$fake" <<'EOF'
+const { spawnSync } = require("child_process");
+const readline = require("readline");
+const scripts = process.argv[2];
+const mode = process.argv[3];
+const rl = readline.createInterface({ input: process.stdin });
+let spawns = 0;
+let turns = 0;
+
+function send(value) {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  } else if (message.method === "thread/start") {
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: { thread: { id: "thread-1", status: { type: "idle" } } },
+    });
+  } else if (message.method === "process/spawn") {
+    spawns += 1;
+    const maxId = spawns;   // fresh unread max_id per wake (not stale)
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+    setTimeout(() => {
+      send({
+        jsonrpc: "2.0",
+        method: "process/exited",
+        params: {
+          processHandle: message.params.processHandle,
+          exitCode: 0,
+          stdout: `status=pending count=1 max_id=${maxId}\n`,
+          stderr: "",
+        },
+      });
+    }, 10);
+  } else if (message.method === "turn/start") {
+    turns += 1;
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+    if (turns === 1) {
+      send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: message.params.threadId, turn: { id: "t1" } } });
+      // second-wave message lands while turn1 is active (fetched by turn2)
+      spawnSync("bash", [`${scripts}/send.sh`, "team", "carol", "alice", "second wave"], { encoding: "utf8" });
+      if (mode === "idle" || mode === "nostarted2") {
+        // turn1 ends via idle only — no turn/completed, no turn/failed yet
+        setTimeout(() => {
+          send({ jsonrpc: "2.0", method: "thread/status/changed", params: { threadId: message.params.threadId, status: { type: "idle" } } });
+        }, 30);
+      }
+      // mode=watchdog: emit nothing — the bridge's --turn-timeout ends the turn
+    } else {
+      // mode=nostarted2: turn2's turn/started never arrives, so its epoch is
+      // still UNBOUND when turn1's late failure lands (the re-bind hole)
+      if (mode !== "nostarted2") {
+        send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: message.params.threadId, turn: { id: "t2" } } });
+      }
+      // turn1's failure arrives LATE, while turn2 is in flight
+      setTimeout(() => {
+        send({ jsonrpc: "2.0", method: "turn/failed", params: { threadId: message.params.threadId, turn: { id: "t1", error: { message: "late boom" } } } });
+      }, 20);
+      setTimeout(() => {
+        send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: "t2" } } });
+      }, 60);
+    }
+  } else if (message.method === "process/kill") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  }
+});
+EOF
+  printf '%s\n' "$fake"
+}
+
+@test "codex-bridge: a late turn/failed never settles the next turn's snapshot (idle gap)" {
+  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
+  if [ "$status" -ne 0 ]; then
+    skip "node child_process.spawn is not available in this sandbox"
+  fi
+
+  bash "$SCRIPTS/join.sh" team carol codex "$PROJ" >/dev/null
+  bash "$SCRIPTS/send.sh" team bob alice "first wave" >/dev/null
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  local midA="${output%%$'\x1f'*}"
+  [ -n "$midA" ]
+
+  local fake
+  fake="$(write_late_failed_fake idle)"
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake $SCRIPTS idle" run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --max-wakes 2 --inline-inbox
+  [ "$status" -eq 0 ]
+  # turn1's snapshot was orphan-drained at turn2 start; the late t1 failure
+  # then found nothing to settle — and touched nothing else
+  [[ "$output" == *"orphaned snapshot"* ]]
+  [[ "$output" == *"no pending snapshot"* ]]
+  # bob (turn1's sender) got exactly the orphan notice for HIS ids — not the
+  # late failure's reason
+  run bash "$SCRIPTS/inbox.sh" team bob
+  [[ "$output" == *"outcome unknown (ids $midA)"* ]]
+  [[ "$output" != *"late boom"* ]]
+  # carol (turn2's sender) got no compensation notice — her snapshot was not
+  # mis-consumed by turn1's late failure
+  run bash "$SCRIPTS/inbox.sh" team carol
+  [[ "$output" != *"[bridge-error]"* ]]
+}
+
+@test "codex-bridge: a late turn/failed after a watchdog turn end does not cross turns" {
+  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
+  if [ "$status" -ne 0 ]; then
+    skip "node child_process.spawn is not available in this sandbox"
+  fi
+
+  bash "$SCRIPTS/join.sh" team carol codex "$PROJ" >/dev/null
+  bash "$SCRIPTS/send.sh" team bob alice "first wave" >/dev/null
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  local midA="${output%%$'\x1f'*}"
+  [ -n "$midA" ]
+
+  local fake
+  fake="$(write_late_failed_fake watchdog)"
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake $SCRIPTS watchdog" run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --turn-timeout 1 --max-wakes 2 --inline-inbox
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no turn completion within 1s"* ]]   # watchdog ended turn1
+  [[ "$output" == *"orphaned snapshot"* ]]
+  [[ "$output" == *"no pending snapshot"* ]]
+  run bash "$SCRIPTS/inbox.sh" team bob
+  [[ "$output" == *"outcome unknown (ids $midA)"* ]]
+  [[ "$output" != *"late boom"* ]]
+  run bash "$SCRIPTS/inbox.sh" team carol
+  [[ "$output" != *"[bridge-error]"* ]]
+}
+
+@test "codex-bridge: a late turn/failed never re-binds to a new turn with no turn/started yet" {
+  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
+  if [ "$status" -ne 0 ]; then
+    skip "node child_process.spawn is not available in this sandbox"
+  fi
+
+  bash "$SCRIPTS/join.sh" team carol codex "$PROJ" >/dev/null
+  bash "$SCRIPTS/send.sh" team bob alice "first wave" >/dev/null
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  local midA="${output%%$'\x1f'*}"
+  [ -n "$midA" ]
+
+  local fake
+  fake="$(write_late_failed_fake nostarted2)"
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake $SCRIPTS nostarted2" run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --max-wakes 2 --inline-inbox
+  [ "$status" -eq 0 ]
+  # t1's binding was removed by the orphan-drain; with turn2's epoch still
+  # unbound, the late t1 failure must resolve to "unknown turn" — never
+  # re-bind to turn2
+  [[ "$output" == *"orphaned snapshot"* ]]
+  [[ "$output" == *"turn t1 has no pending snapshot"* ]]
+  run bash "$SCRIPTS/inbox.sh" team bob
+  [[ "$output" == *"outcome unknown (ids $midA)"* ]]
+  [[ "$output" != *"late boom"* ]]
+  # carol (turn2's sender): no failed notice, her snapshot was not consumed —
+  # pre-fix, the terminal-event late-bind would have eaten it right here
+  run bash "$SCRIPTS/inbox.sh" team carol
+  [[ "$output" != *"[bridge-error]"* ]]
+}
+
+@test "codex-bridge: a corrupt outbound spool is quarantined, never silently overwritten" {
+  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
+  if [ "$status" -ne 0 ]; then
+    skip "node child_process.spawn is not available in this sandbox"
+  fi
+
+  bash "$SCRIPTS/send.sh" team bob alice "doomed" >/dev/null
+  local fake
+  fake="$(write_turn_failed_fake)"
+  local spool="$TEST_SKILL_DIR/run/codex-bridge.team.alice.outbound.json"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '{"to":"bob","body":' > "$spool"      # truncated JSON from a crashed writer
+
+  # send path down → the new failure notice must be queued, but the corrupt
+  # spool must be preserved (quarantined), not clobbered by queueOutbound.
+  cp "$SCRIPTS/send.sh" "$SCRIPTS/send.sh.orig"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$SCRIPTS/send.sh"
+  chmod +x "$SCRIPTS/send.sh"
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake" run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --max-wakes 1 --inline-inbox
+  mv "$SCRIPTS/send.sh.orig" "$SCRIPTS/send.sh"
+  chmod +x "$SCRIPTS/send.sh"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"quarantined"* ]]
+  # the corrupt payload survives for manual recovery
+  ls "$spool".corrupt-* >/dev/null
+  grep -q '"body":' "$spool".corrupt-*
+  # the fresh spool was rebuilt as valid JSON via the atomic tmp+rename path
+  grep -q "bridge-error" "$spool"
+  node -e 'const a = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); if (!Array.isArray(a)) process.exit(1);' "$spool"
+  # no tmp litter from the atomic write
+  ! ls "$spool".tmp-* 2>/dev/null
 }
 
 @test "codex-bridge: --role-file prepends the standing role to the turn input" {

@@ -662,9 +662,24 @@ class CodexBridge {
     this.watchFailureCount = 0;
     this.watchRearmTimer = null;
     this.inlineInboxText = "";
+    // inline-inbox consumption tracking. turn/start's RESPONSE carries no turn id
+    // in this protocol (result: {}), so each started turn gets a local, monotonic
+    // "epoch" and the server's turn id is bound to that epoch lazily — from
+    // turn/started, or from the first id-carrying terminal event that arrives
+    // while its turn is still the active one (see resolveTurnEpoch). A terminal
+    // event whose id maps to no epoch settles NOTHING (logged instead), so a
+    // late turn/failed can never consume a newer turn's snapshot.
+    this.turnEpoch = 0;             // last locally started turn
+    this.activeTurnEpoch = 0;       // epoch of the most recently started turn
+    this.turnSnapshots = new Map(); // epoch -> Map(sender -> [message ids]) consumed for that turn
+    this.turnIdToEpoch = new Map(); // server turn id -> epoch
+    this.pendingConsumption = null; // staged by readInboxForPrompt, claimed by tryStartTurn
     this.stopping = false;
     this.pidfile = path.join(RUN_DIR, `codex-bridge.${identity.team}.${identity.name}.pid`);
     this.metafile = path.join(RUN_DIR, `codex-bridge.${identity.team}.${identity.name}.meta`);
+    // Failure notices whose send failed, persisted so they survive a restart and
+    // are retried before each new turn (cursor-bridge's outbound-first rule).
+    this.outboundFile = path.join(RUN_DIR, `codex-bridge.${identity.team}.${identity.name}.outbound.json`);
   }
 
   async run() {
@@ -672,16 +687,20 @@ class CodexBridge {
     this.ensureSingleInstance();
     this.writeMeta();
     this.installSignals();
+    // Deliver failure notices a previous bridge run spooled (send.sh was failing
+    // when it stopped) before doing anything else.
+    this.flushOutbound();
     this.client.on("process/exited", this.clientHandler("process/exited", (params) => this.onProcessExited(params)));
     this.client.on("error", this.clientHandler("error", (params) => this.onServerError(params)));
     this.client.on("item/agentMessage/delta", this.clientHandler("item/agentMessage/delta", (params) => this.onAgentMessageDelta(params)));
     this.client.on("thread/status/changed", this.clientHandler("thread/status/changed", (params) => this.onThreadStatus(params)));
-    this.client.on("turn/started", this.clientHandler("turn/started", () => {
+    this.client.on("turn/started", this.clientHandler("turn/started", (params) => {
       this.turnActive = true;
       this.threadIdle = false;
+      this.bindTurnId(params && params.turn && params.turn.id);
     }));
     this.client.on("turn/completed", this.clientHandler("turn/completed", (params) => this.onTurnCompleted(params)));
-    this.client.on("turn/failed", this.clientHandler("turn/failed", () => this.onTurnCompleted()));
+    this.client.on("turn/failed", this.clientHandler("turn/failed", (params) => this.onTurnFailed(params)));
 
     this.client.start();
     await this.client.ready?.();
@@ -904,6 +923,50 @@ class CodexBridge {
     }
   }
 
+  // Bind a server turn id to the most recently started local epoch. First
+  // binding wins: an epoch gets at most one id, an id maps to one epoch.
+  bindTurnId(turnId) {
+    if (!turnId || this.turnIdToEpoch.has(turnId)) return;
+    if (this.activeTurnEpoch && !this.epochHasBoundId(this.activeTurnEpoch)) {
+      this.turnIdToEpoch.set(turnId, this.activeTurnEpoch);
+    }
+  }
+
+  epochHasBoundId(epoch) {
+    for (const bound of this.turnIdToEpoch.values()) {
+      if (bound === epoch) return true;
+    }
+    return false;
+  }
+
+  // Which local epoch does a terminal event refer to? An id is trusted ONLY if
+  // turn/started bound it (bindTurnId); an id-carrying event whose id is not
+  // bound resolves to 0 = unknown, and the CALLER MUST log and settle nothing.
+  // Deliberately NO late-binding off terminal events: an orphan-drain removes a
+  // turn's binding, so a late terminal event for that turn would otherwise
+  // re-bind its id to the CURRENT turn (whose own turn/started may not have
+  // arrived yet) and consume the wrong snapshot. The cost of this rule: a turn
+  // whose turn/started never arrives is never settled by its completion and
+  // falls to the orphan-drain (outcome-unknown notice) — safe-side by design.
+  // Events with no id at all attribute to the most recently started turn (the
+  // pre-id behavior; unavoidable ambiguity without ids).
+  resolveTurnEpoch(params) {
+    const turnId = (params && ((params.turn && params.turn.id) || params.turnId)) || "";
+    if (turnId) {
+      if (this.turnIdToEpoch.has(turnId)) return { epoch: this.turnIdToEpoch.get(turnId), turnId };
+      return { epoch: 0, turnId };
+    }
+    return { epoch: this.activeTurnEpoch, turnId: "" };
+  }
+
+  // Drop an epoch's snapshot and any id binding that points at it.
+  dropTurnEpoch(epoch) {
+    this.turnSnapshots.delete(epoch);
+    for (const [turnId, bound] of this.turnIdToEpoch) {
+      if (bound === epoch) this.turnIdToEpoch.delete(turnId);
+    }
+  }
+
   async onTurnCompleted(params = {}) {
     if (params.threadId && params.threadId !== this.threadId) return;
     if (params.turn && params.turn.error) {
@@ -911,7 +974,54 @@ class CodexBridge {
     } else {
       console.error(`codex-bridge: turn completed on thread ${this.threadId}`);
     }
+    const { epoch, turnId } = this.resolveTurnEpoch(params);
+    if (epoch) {
+      this.dropTurnEpoch(epoch);   // settled: the turn handled its consumed messages
+    } else if (turnId) {
+      console.error(`codex-bridge: turn/completed for unknown turn ${turnId}; no snapshot to settle`);
+    }
     await this.onTurnEnded();
+  }
+
+  // turn/failed: in inline-inbox mode the messages were already consumed (marked
+  // read at fetch, see readInboxForPrompt), so without compensation the failed
+  // turn loses them silently. Notify each sender via the normal send path instead
+  // of un-reading them — un-reading would re-run the failed turn on every wake,
+  // the runaway-retry pattern behind the cursor-bridge incident. Only THIS turn's
+  // snapshot (resolved via the event's turn id) is notified; a late failure whose
+  // snapshot is gone or whose id was never seen logs and settles nothing. KNOWN
+  // LIMIT: non-inline-inbox mode is not covered — codex itself runs inbox.sh
+  // (which marks read on fetch) and the bridge never learns the ids.
+  async onTurnFailed(params = {}) {
+    if (params.threadId && params.threadId !== this.threadId) return;
+    const reason = turnFailureReason(params);
+    const { epoch, turnId } = this.resolveTurnEpoch(params);
+    console.error(`codex-bridge: turn failed${turnId ? ` (turn ${turnId})` : ""}: ${reason}`);
+    if (epoch && this.turnSnapshots.has(epoch)) {
+      const bySender = this.turnSnapshots.get(epoch);
+      this.dropTurnEpoch(epoch);
+      this.notifyConsumed(bySender, (ids) =>
+        `[bridge-error] codex turn failed (ids ${ids}): ${reason}. Messages consumed; resend to retry.`);
+    } else if (epoch || turnId) {
+      console.error(
+        `codex-bridge: turn/failed for ${turnId ? `turn ${turnId}` : "the last turn"} has no pending snapshot (already settled or orphan-drained); nothing to notify`,
+      );
+    }
+    await this.onTurnEnded();
+  }
+
+  // Send a compensation notice to every sender in a consumption snapshot;
+  // buildNotice(idsCsv) composes the body. Send failures spool to outboundFile.
+  notifyConsumed(bySender, buildNotice) {
+    for (const [sender, ids] of bySender) {
+      const notice = buildNotice(ids.join(","));
+      if (this.sendAgmsg(sender, notice)) {
+        console.error(`codex-bridge: notified ${sender} (ids ${ids.join(",")})`);
+      } else {
+        this.queueOutbound(sender, notice);
+        console.error(`codex-bridge: could not notify ${sender}; notice spooled to ${this.outboundFile}`);
+      }
+    }
   }
 
   // Single exit point for "the turn is no longer running", reachable from
@@ -944,6 +1054,18 @@ class CodexBridge {
 
   async tryStartTurn() {
     if (!this.pendingWake || this.turnActive || !this.threadIdle) return;
+    // Retry spooled failure notices BEFORE burning a new turn (outbound-first).
+    this.flushOutbound();
+    // Orphaned snapshots: a previous turn ended via idle/watchdog and neither
+    // turn/completed nor turn/failed claimed its consumption snapshot before the
+    // NEXT turn starts. The fate of those consumed ids is unknown — tell the
+    // senders rather than stay silent, then drop the entry.
+    for (const [epoch, bySender] of Array.from(this.turnSnapshots)) {
+      console.error(`codex-bridge: orphaned snapshot for turn epoch ${epoch}; notifying its senders and dropping it`);
+      this.dropTurnEpoch(epoch);
+      this.notifyConsumed(bySender, (ids) =>
+        `[bridge-error] codex turn outcome unknown (ids ${ids}): the turn ended without a completion signal. Messages consumed; resend if you got no reply.`);
+    }
     if (this.opts.inlineInbox) {
       this.inlineInboxText = this.readInboxForPrompt();
       if (!this.inlineInboxText.trim()) {
@@ -956,6 +1078,15 @@ class CodexBridge {
     const prompt = this.buildPrompt();
     this.turnActive = true;
     this.threadIdle = false;
+    // Register this turn's consumption under a fresh local epoch BEFORE the
+    // request: turn/started (which binds the server's turn id to this epoch)
+    // can arrive while the request is still in flight.
+    this.turnEpoch += 1;
+    this.activeTurnEpoch = this.turnEpoch;
+    if (this.pendingConsumption && this.pendingConsumption.size) {
+      this.turnSnapshots.set(this.turnEpoch, this.pendingConsumption);
+    }
+    this.pendingConsumption = null;
     try {
       await this.client.request("turn/start", {
         threadId: this.threadId,
@@ -973,6 +1104,8 @@ class CodexBridge {
       this.turnActive = false;
       this.threadIdle = true;
       this.clearTurnWatchdog();
+      this.dropTurnEpoch(this.activeTurnEpoch);
+      this.activeTurnEpoch = 0;
       throw error;
     }
   }
@@ -1045,11 +1178,19 @@ class CodexBridge {
     ].join("\n");
   }
 
+  // Inline-inbox fetch. Reads the unread snapshot WITH ids (--format ids does not
+  // mark read), remembers {id, from} per message so a failed turn can notify the
+  // senders (onTurnFailed), renders the same human-style text the plain inbox.sh
+  // path produced, then marks EXACTLY those ids read. Net consume-at-fetch
+  // semantics are unchanged (and the mark is now scoped to the snapshot instead
+  // of blanket-marking everything unread); the bridge just knows the ids.
   readInboxForPrompt() {
-    const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, "inbox.sh"), this.identity.team, this.identity.name], {
-      cwd: this.opts.project,
-      encoding: "utf8",
-    });
+    this.pendingConsumption = null;
+    const result = spawnSync(
+      BASH_BIN,
+      [path.join(SCRIPTS_DIR, "inbox.sh"), this.identity.team, this.identity.name, "--format", "ids"],
+      { cwd: this.opts.project, encoding: "utf8" },
+    );
     if (result.error) {
       console.error(`codex-bridge: inbox.sh failed: ${result.error.message}`);
       return "";
@@ -1058,7 +1199,119 @@ class CodexBridge {
       console.error(`codex-bridge: inbox.sh exited ${result.status}: ${(result.stderr || "").trim()}`);
       return "";
     }
-    return result.stdout || "";
+    const rows = String(result.stdout || "")
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        const [id, from, body, ts] = line.split("\x1f");
+        return { id, from, body: body || "", ts: ts || "" };
+      })
+      .filter((row) => row.id && row.from);
+    if (!rows.length) return "";
+    const bySender = new Map();
+    for (const row of rows) {
+      if (!bySender.has(row.from)) bySender.set(row.from, []);
+      bySender.get(row.from).push(row.id);
+    }
+    this.pendingConsumption = bySender;
+    const ack = spawnSync(
+      BASH_BIN,
+      [path.join(SCRIPTS_DIR, "inbox.sh"), this.identity.team, this.identity.name, "--mark-read-ids", rows.map((row) => row.id).join(",")],
+      { cwd: this.opts.project, encoding: "utf8" },
+    );
+    if (ack.error || ack.status !== 0) {
+      console.error("codex-bridge: mark-read-ids failed; the same messages may be re-delivered next wake");
+    }
+    return [
+      `${rows.length} new message(s):`,
+      "",
+      ...rows.map((row) => `  [${row.ts}] ${row.from}: ${row.body}`),
+      "",
+    ].join("\n");
+  }
+
+  sendAgmsg(to, body) {
+    const result = spawnSync(
+      BASH_BIN,
+      [path.join(SCRIPTS_DIR, "send.sh"), this.identity.team, this.identity.name, to, "--stdin"],
+      { cwd: this.opts.project, encoding: "utf8", input: body },
+    );
+    return !result.error && result.status === 0;
+  }
+
+  // --- outbound spool: failure notices whose send failed ----------------------
+  // JSON array of {to, body} in outboundFile. Persisted so a broken send path is
+  // never silent: the notice is retried at startup and before every new turn,
+  // without ever re-running the failed turn itself.
+  readOutbound() {
+    let raw;
+    try {
+      raw = fs.readFileSync(this.outboundFile, "utf8");
+    } catch (_) {
+      return [];   // absent — nothing spooled
+    }
+    try {
+      const entries = JSON.parse(raw);
+      if (!Array.isArray(entries)) throw new Error("spool is not a JSON array");
+      return entries;
+    } catch (error) {
+      // Corrupt spool: never silently discard what it may still hold (a later
+      // queueOutbound would overwrite it). Quarantine for manual recovery and
+      // restart from an empty spool.
+      const quarantine = `${this.outboundFile}.corrupt-${Date.now()}`;
+      try {
+        fs.renameSync(this.outboundFile, quarantine);
+        console.error(`codex-bridge: outbound spool is corrupt (${error.message}); quarantined to ${quarantine}`);
+      } catch (renameError) {
+        console.error(`codex-bridge: outbound spool is corrupt and could not be quarantined: ${renameError.message}`);
+      }
+      return [];
+    }
+  }
+
+  writeOutbound(entries) {
+    try {
+      if (!entries.length) {
+        if (fs.existsSync(this.outboundFile)) fs.unlinkSync(this.outboundFile);
+        return;
+      }
+      // Atomic replace: write a same-directory tmp file, then rename over the
+      // spool, so a crash mid-write can never leave a truncated spool behind.
+      const tmp = `${this.outboundFile}.tmp-${process.pid}`;
+      try {
+        fs.writeFileSync(tmp, JSON.stringify(entries) + "\n");
+        fs.renameSync(tmp, this.outboundFile);
+      } catch (error) {
+        try { fs.unlinkSync(tmp); } catch (_) { /* best effort */ }
+        throw error;
+      }
+    } catch (error) {
+      console.error(`codex-bridge: cannot persist outbound spool: ${error.message}`);
+    }
+  }
+
+  queueOutbound(to, body) {
+    const entries = this.readOutbound();
+    entries.push({ to, body });
+    this.writeOutbound(entries);
+  }
+
+  flushOutbound() {
+    const entries = this.readOutbound();
+    if (!entries.length) return;
+    const remaining = [];
+    for (const entry of entries) {
+      if (!entry || !entry.to || !entry.body) continue;   // drop corrupt entries
+      if (this.sendAgmsg(entry.to, entry.body)) {
+        console.error(`codex-bridge: delivered spooled notice to ${entry.to}`);
+      } else {
+        remaining.push(entry);
+      }
+    }
+    this.writeOutbound(remaining);
+    if (remaining.length) {
+      console.error(`codex-bridge: ${remaining.length} spooled notice(s) still undeliverable; will retry before the next turn`);
+    }
   }
 
   async shutdown() {
@@ -1212,6 +1465,17 @@ function readPid(file) {
 function parseMaxId(stdout) {
   const match = String(stdout || "").match(/\bmax_id=([0-9]+)/);
   return match ? Number(match[1]) : 0;
+}
+
+// Best-effort human-readable reason from a turn/failed payload. The app-server
+// ships { turn: { error } } or { error }; fall back to "unknown reason" and
+// truncate so a huge payload cannot bloat the compensation notice.
+function turnFailureReason(params) {
+  const err = (params && ((params.turn && params.turn.error) || params.error)) || null;
+  let text = "";
+  if (err) text = typeof err === "string" ? err : err.message || JSON.stringify(err);
+  if (!text) text = "unknown reason";
+  return text.length > 500 ? `${text.slice(0, 500)}...` : text;
 }
 
 async function main() {
