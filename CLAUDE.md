@@ -33,20 +33,19 @@ agmsg has three orthogonal **axes**, each with exactly one active **driver** at 
 
 | Axis | What it abstracts | Bundled drivers |
 |---|---|---|
-| **storage** | Where messages and team state live | `sqlite` (default), `jsonl-duckdb` |
-| **agent** | Per-runtime hook formats and settings locations | `claude-code`, `codex`, `gemini`, `antigravity`, `copilot` |
+| **storage** | Where messages and team state live | `sqlite` (default; `jsonl-duckdb` is spec-only — see `docs/spec/`, no bundled implementation) |
+| **agent** | Per-runtime hook formats and settings locations | `scripts/drivers/types/` の10種: `claude-code`, `codex`, `cursor`, `gemini`, `antigravity`, `copilot`, `grok-build`, `hermes`, `opencode`, `agmsg-app` |
 | **delivery** | How a recipient is notified | `monitor`, `turn`, `both`, `off` |
 
 The three axes are fully orthogonal — any combination is valid.
 
 **Key directories:**
-- `scripts/` — directly-invokable user-facing commands (e.g. `send.sh`, `inbox.sh`, `dispatch.sh`)
+- `scripts/` — directly-invokable user-facing commands (e.g. `send.sh`, `inbox.sh`, `spawn.sh`)
 - `scripts/lib/` — shared helpers sourced by commands (`storage.sh`, `validate.sh`, etc.)
-- `scripts/drivers/<axis>/` — driver implementations (bundled; currently storage axis only)
+- `scripts/drivers/types/<name>/` — per-agent-type driver implementations (`type.conf`, `template.md` = the command template installed as each agent's skill, plus bridge/spawn scripts)
 - `tests/` — BATS test suite; `tests/test_helper.bash` is shared setup/teardown
 - `docs/spec/` — formal driver interface contracts (authoritative for what a driver must implement)
 - `docs/adr/` — Architecture Decision Records capturing *why* key decisions were made
-- `templates/` — per-agent command templates (what each agent's skill invokes)
 
 **Runtime install location:** `~/.agents/skills/agmsg/` — scripts read their own paths relative to `$0` or `BASH_SOURCE[0]`, not the repo.
 
