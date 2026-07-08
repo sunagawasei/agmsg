@@ -111,6 +111,123 @@ agmsg_reviewer_add_dir_roots() {
   printf '%s' "$out"
 }
 
+# Byte-level, locale-independent membership test for the shared safe-token
+# charset [A-Za-z0-9._-]: true (0) iff $1 is non-empty and every byte is in
+# that set. Used to gate BOTH the worker-name segment spliced into a
+# config.sh dotted key (spawn.codex_model.<name>) and the model/effort VALUES
+# spliced into appcmd. Implemented by deleting the allowed bytes and checking
+# the remainder is empty (`tr -d`, byte-wise) rather than a `case`/glob
+# pattern: a bracket-expression range like [A-Za-z0-9] is interpreted per the
+# shell's LC_COLLATE/LC_CTYPE and can silently accept/reject a different byte
+# set under a non-C locale. LC_ALL=C forces plain ASCII byte semantics
+# regardless of the caller's environment, and a `tr` byte-deletion cannot be
+# fooled by an embedded newline the way a glob anchor test might be.
+agmsg_codex_safe_token() {
+  local val="$1" rest
+  [ -n "$val" ] || return 1
+  # `$(...)` strips ALL trailing newlines from what it captures. If the ONLY
+  # disallowed byte(s) in $val were embedded newline(s) (e.g. every other
+  # character is a plain letter/digit), tr's entire remainder would be just
+  # "\n" — and capturing that via a bare `$(tr -d ...)` would silently strip
+  # it to an empty string, i.e. a false "safe" verdict for a value that
+  # smuggles a newline. Append a non-newline sentinel byte after tr in the
+  # SAME command substitution so the captured stream's true last byte is
+  # never a newline, and compare against the sentinel instead of testing for
+  # emptiness — this can no longer be fooled by trailing-newline stripping.
+  #
+  # The sentinel also carries tr's own exit status ($? right after a pipeline
+  # is that pipeline's LAST command's status, i.e. tr's, regardless of
+  # pipefail). Without this, a broken/missing `tr` would make the pipeline
+  # emit NOTHING — a bare `printf 'X'` afterwards would still unconditionally
+  # succeed, so ANY value (including a genuinely unsafe one) would compare
+  # equal to the sentinel and be misread as "nothing disallowed found", i.e.
+  # fail-OPEN. Comparing against "X0" instead makes a tr failure of any kind
+  # (missing binary, I/O error, killed by a signal, ...) read as unsafe.
+  # (Empirically confirmed under `set -euo pipefail`: a failing command inside
+  # a `var=$(...)` assignment does not itself abort the script, so this
+  # capture always completes and `rest` is always compared, never skipped.)
+  rest="$(printf '%s' "$val" | LC_ALL=C tr -d 'A-Za-z0-9._-'; printf 'X%s' "$?")"
+  [ "$rest" = "X0" ]
+}
+
+# Sanitize an untrusted value before it is echoed into a spawn warning: strip
+# control bytes (LF/CR forge a fake extra log line; ESC starts an ANSI escape
+# that can rewrite/hide terminal output — both are C0 control bytes, covered
+# by [:cntrl:] in the forced C locale, which also catches DEL/0x7f) and cap the
+# length so one oversized value can't flood stderr. The surrounding printable
+# text is otherwise left intact — this only removes the bytes that let a
+# value escape being "just the next word in this one warning line".
+agmsg_codex_sanitize_for_log() {
+  local val
+  val="$(printf '%s' "$1" | LC_ALL=C tr -d '[:cntrl:]')"
+  printf '%s' "${val:0:80}"
+}
+
+# Resolve an optional model / reasoning-effort override for a headless codex
+# worker, formatted as `-c model="<id>" -c model_reasoning_effort="<val>"`
+# ready to splice onto the end of appcmd (empty when neither applies — today's
+# behaviour, unset falls back to the worker's global ~/.codex/config.toml).
+#
+# Precedence:
+#   model:  spawn.sh's --model (parsed into $MODEL_ID by spawn.sh, but otherwise
+#           unconsumed on the headless path — the interactive/TUI path already
+#           wires it via the manifest's model_arg=-m) > config
+#           spawn.codex_model.<name> > unset.
+#   effort: config spawn.codex_effort.<name> only (headless-only knob, no CLI
+#           flag) > unset.
+#
+# The config lookups key on `$name` (the spawned actas name) as a literal
+# fragment of a config.sh dotted key (`spawn.codex_model.$name`). config.sh's
+# yaml_get/yaml_set interpolate that field UNESCAPED into an awk ERE — a name
+# containing an ERE metacharacter (legal per validate.sh's agmsg_validate_agent_name,
+# e.g. `+ * ? ( ) | ^ $` or a space) can silently misresolve to the wrong config
+# line instead of erroring. Gate BOTH per-name config lookups on
+# agmsg_codex_safe_token(name) so an unsafe name skips config entirely (warn,
+# don't guess) rather than risk a wrong-field match; --model (MODEL_ID) has no
+# such hazard (it never becomes part of a config key) and stays available for
+# every name.
+#
+# Fail-closed input validation: appcmd is a single string re-parsed by `sh -lc`
+# in codex-bridge.js (see AGMSG_CODEX_APP_SERVER_CMD), so an unvalidated value
+# could inject shell syntax. Any model/effort value that is not a
+# agmsg_codex_safe_token is DROPPED — warn to stderr (value sanitized via
+# agmsg_codex_sanitize_for_log first) and continue the spawn without that
+# override — rather than embedded verbatim. Applies to both the --model flag
+# and the config values alike; neither is trusted here. Each accepted value is
+# wrapped in a single-quoted `-c 'key="value"'` clause: the single quotes protect
+# the clause across the `sh -lc` re-parse, and the literal double quotes inside
+# make the spliced text a valid quoted TOML string for codex's -c KEY=VALUE.
+agmsg_codex_model_effort_args() {
+  local name="$1" model="" effort="" args="" name_safe=1
+  agmsg_codex_safe_token "$name" || name_safe=0
+
+  if [ "$name_safe" != 1 ]; then
+    echo "spawn: worker name '$(agmsg_codex_sanitize_for_log "$name")' is not a safe config-key segment (must match ^[A-Za-z0-9._-]+\$); skipping spawn.codex_model.<name>/spawn.codex_effort.<name> lookup (use --model for the model id; effort has no CLI override)" >&2
+  fi
+
+  if [ -n "${MODEL_ID:-}" ]; then
+    model="$MODEL_ID"
+  elif [ "$name_safe" = 1 ]; then
+    model="$("$SCRIPT_DIR/config.sh" get "spawn.codex_model.$name" "" 2>/dev/null || true)"
+  fi
+  if [ "$name_safe" = 1 ]; then
+    effort="$("$SCRIPT_DIR/config.sh" get "spawn.codex_effort.$name" "" 2>/dev/null || true)"
+  fi
+
+  if [ -n "$model" ] && ! agmsg_codex_safe_token "$model"; then
+    echo "spawn: ignoring unsafe codex model id '$(agmsg_codex_sanitize_for_log "$model")' (must match ^[A-Za-z0-9._-]+\$)" >&2
+    model=""
+  fi
+  if [ -n "$effort" ] && ! agmsg_codex_safe_token "$effort"; then
+    echo "spawn: ignoring unsafe codex reasoning-effort value '$(agmsg_codex_sanitize_for_log "$effort")' (must match ^[A-Za-z0-9._-]+\$)" >&2
+    effort=""
+  fi
+
+  [ -n "$model" ]  && args="$args -c 'model=\"$model\"'"
+  [ -n "$effort" ] && args="$args -c 'model_reasoning_effort=\"$effort\"'"
+  printf '%s' "$args"
+}
+
 # approval_policy=never in both because a headless worker cannot answer approvals.
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run"
@@ -121,6 +238,7 @@ agmsg_spawn_headless() {
   agmsg_validate_team_name "$TEAM" >/dev/null 2>&1 || die "spawn: team name '$TEAM' is not a path-safe segment"
   agmsg_validate_agent_name "$NAME" >/dev/null 2>&1 || die "spawn: agent name '$NAME' is not valid (same rule join.sh applies: no '.', '..', '/', '\\', '\"', '[', ']', leading '-', or control chars)"
   local bridge="${AGMSG_CODEX_BRIDGE_CMD:-$SCRIPT_DIR/drivers/types/codex/codex-bridge.js}"
+  local model_effort_args; model_effort_args="$(agmsg_codex_model_effort_args "$NAME")"
 
   # Resolve the working dir + app-server sandbox for the selected mode.
   local cwd appcmd
@@ -148,12 +266,12 @@ agmsg_spawn_headless() {
       add_dir_roots=""
     fi
     local fs="{ $fs_base$add_dir_roots }"
-    appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-reviewer -c 'permissions.agmsg-reviewer.filesystem=$fs' -c 'permissions.agmsg-reviewer.network={ enabled=false }' -c web_search=live -c approval_policy=never"
+    appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-reviewer -c 'permissions.agmsg-reviewer.filesystem=$fs' -c 'permissions.agmsg-reviewer.network={ enabled=false }' -c web_search=live -c approval_policy=never$model_effort_args"
   else
     cwd="$run_dir/codex-$TEAM-cwd"
     mkdir -p "$cwd"
     local wr="[\"$SKILL_DIR/db\",\"$SKILL_DIR/teams\",\"$run_dir\"]"
-    appcmd="codex app-server --listen stdio:// -c sandbox_mode=workspace-write -c sandbox_workspace_write.writable_roots='$wr' -c web_search=live -c approval_policy=never"
+    appcmd="codex app-server --listen stdio:// -c sandbox_mode=workspace-write -c sandbox_workspace_write.writable_roots='$wr' -c web_search=live -c approval_policy=never$model_effort_args"
   fi
 
   # Refuse before registering anything if we're nested inside an outer macOS

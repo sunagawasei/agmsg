@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `spawn.codex_model.<name>` / `spawn.codex_effort.<name>` config keys: per-worker
+  model and reasoning-effort overrides for headless codex workers, spliced into
+  the app-server command as `-c model="..."` / `-c model_reasoning_effort="..."`
+  with fail-closed charset validation. `--model` now reaches the headless codex
+  path too (previously silently ignored); precedence: `--model` >
+  `spawn.codex_model.<name>` > global codex config.
 - `delivery.default_mode` config: set a machine-wide default delivery mode the
   join flow auto-applies, skipping the per-project prompt. Resolved per-type via
   `delivery.sh default-mode <type>` (honored only where the type supports the

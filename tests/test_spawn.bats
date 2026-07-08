@@ -584,6 +584,13 @@ EOF
   [[ "$output" == *"approval_policy=never"* ]]
   [[ "$output" == *"web_search=live"* ]]
   [[ "$output" == *"writable_roots="* ]]
+  # No model/effort override was requested: appcmd must end EXACTLY at
+  # approval_policy=never (end-of-string anchor, not just a substring match) —
+  # a substring check alone would miss a regression that appends a stray/empty
+  # clause after it, and neither "model=" nor the effort key must appear at all.
+  [[ "$output" =~ approval_policy=never$ ]]
+  [[ "$output" != *"model="* ]]
+  [[ "$output" != *"model_reasoning_effort="* ]]
 
   # reviewer was registered to the scratch dir, not the real project.
   run cat "$TEST_SKILL_DIR/teams/myteam/config.json"
@@ -634,6 +641,12 @@ EOF
   [[ "$output" != *"sandbox_mode=workspace-write"* ]]     # profile supersedes sandbox_mode
   [[ "$output" == *"web_search=live"* ]]
   [[ "$output" == *"approval_policy=never"* ]]
+  # No model/effort override was requested: appcmd must end EXACTLY at
+  # approval_policy=never on the REVIEWER branch too (the other appcmd
+  # assignment — see the consultant-branch anchor above).
+  [[ "$output" =~ approval_policy=never$ ]]
+  [[ "$output" != *"model="* ]]
+  [[ "$output" != *"model_reasoning_effort="* ]]
 
   # registered to the real project, not a scratch dir.
   run cat "$TEST_SKILL_DIR/teams/myteam/config.json"
@@ -813,6 +826,282 @@ CODEX_STUB
   for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
   run cat "$CAPTURE"
   [[ "$output" != *"\"$PROJ\"=\"read\""* ]]   # already :workspace_roots — not re-granted
+}
+
+# --- per-worker model / reasoning-effort override for headless codex ---
+# (spawn.codex_model.<name> / spawn.codex_effort.<name>; see
+# codex/_spawn.sh's agmsg_codex_model_effort_args). --model (interactive-spawn
+# flag, reused here for the headless path) takes precedence over the config
+# key for the model id; effort has no CLI flag (headless-only, config only).
+
+@test "spawn --model: headless codex embeds -c model=\"...\" in the app-server command" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless --model gpt-5.6-sol
+  [ "$status" -eq 0 ]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *'model="gpt-5.6-sol"'* ]]
+}
+
+@test "spawn --model: headless REVIEWER codex also embeds -c model=\"...\" (both appcmd branches)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer --model gpt-5.6-sol
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless reviewer codex 'rv'"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"default_permissions=agmsg-reviewer"* ]]   # confirms the reviewer branch built appcmd
+  [[ "$output" == *'model="gpt-5.6-sol"'* ]]
+}
+
+@test "spawn: headless codex embeds -c model=\"...\" from config key spawn.codex_model.<name>" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_model.reviewer gpt-5.6-sol
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *'model="gpt-5.6-sol"'* ]]
+
+  # a DIFFERENT name's worker must not pick up reviewer's model.
+  rm -f "$CAPTURE"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex otherworker --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *"model="* ]]
+}
+
+@test "spawn: --model takes precedence over spawn.codex_model.<name> for headless codex" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_model.reviewer gpt-5-from-config
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless --model gpt-5-from-flag
+  [ "$status" -eq 0 ]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *'model="gpt-5-from-flag"'* ]]
+  [[ "$output" != *"gpt-5-from-config"* ]]
+}
+
+@test "spawn: headless codex embeds -c model_reasoning_effort=\"...\" from config key spawn.codex_effort.<name>" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_effort.reviewer high
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *'model_reasoning_effort="high"'* ]]
+}
+
+@test "spawn: an unsafe headless codex model value is ignored, not embedded (fail closed)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless --model 'foo;rm'
+  [ "$status" -eq 0 ]                          # the spawn still proceeds, just without the override
+  [[ "$output" == *"ignoring unsafe codex model id"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *"foo;rm"* ]]                # payload never reached appcmd
+  [[ "$output" != *" -c model="* ]]            # no override clause at all
+  [[ "$output" != *" -c 'model="* ]]           # the exact splice signature we emit is absent too
+}
+
+@test "spawn: a broken/failing 'tr' fails closed for agmsg_codex_model_effort_args (isolated)" {
+  # agmsg_codex_safe_token's validation runs entirely through `tr`. If tr is
+  # missing/broken, a naive "delete allowed chars, check remainder empty"
+  # implementation would see EMPTY output for ANY value (tr never ran, so it
+  # never emitted the disallowed bytes either) and misread that as "nothing
+  # disallowed" — fail-OPEN.
+  #
+  # `tr` is ALSO a load-bearing dependency of unrelated agmsg machinery
+  # (storage.sh's agmsg_sqlite_mem strips \r via tr for EVERY sqlite call,
+  # including join.sh's registration and spawn.sh's own team resolution) — a
+  # stub that breaks tr globally on PATH breaks a full `spawn.sh` run for
+  # reasons that have nothing to do with this check. Test the helper directly
+  # instead: source just the codex spawn plug in an isolated subshell with a
+  # broken tr ahead on PATH, and confirm a genuinely unsafe MODEL_ID is still
+  # rejected (no `-c 'model=...'` clause in the function's output) rather than
+  # silently accepted because tr never ran to report anything disallowed.
+  local stubdir="$TEST_SKILL_DIR/broken-tr-stub"
+  mkdir -p "$stubdir"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$stubdir/tr"
+  chmod +x "$stubdir/tr"
+
+  run env PATH="$stubdir:$PATH" SCRIPT_DIR="$SCRIPTS" MODEL_ID='foo;rm' bash -c '
+    set -euo pipefail
+    die() { echo "die: $*" >&2; exit 1; }
+    . "$SCRIPT_DIR/drivers/types/codex/_spawn.sh"
+    agmsg_codex_model_effort_args reviewer
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"foo;rm"* ]]
+  [[ "$output" != *" -c 'model="* ]]
+}
+
+@test "spawn: an unsafe headless codex effort config value is ignored, not embedded (fail closed)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_effort.reviewer 'high; touch pwned'
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *"pwned"* ]]
+  [[ "$output" != *"model_reasoning_effort="* ]]
+  [[ "$output" != *" -c 'model_reasoning_effort="* ]]   # the exact splice signature we emit is absent too
+}
+
+# --- unsafe worker NAME as a config-key segment (spawn.codex_model.<name> /
+# spawn.codex_effort.<name> are UNESCAPED awk-ERE field text in config.sh — a
+# name legal for actas/validate.sh but containing an ERE metacharacter or a
+# space could silently misresolve to the wrong config line) ---
+
+@test "spawn: an unsafe worker name skips the config-key lookup (warns, spawn still succeeds, --model unaffected)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  # Decoy: a DIFFERENT (safe) name's config key must never leak into this one.
+  bash "$SCRIPTS/config.sh" set spawn.codex_model.reviewer gpt-5.6-decoy
+  _make_fake_bridge
+
+  # No --model: the config lookup for this unsafe name must be skipped outright
+  # (not attempted, not merely validated-and-rejected) — no override at all.
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex 'worker+1' --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not a safe config-key segment"* ]]
+  [[ "$output" == *"spawn.codex_model.<name>/spawn.codex_effort.<name>"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *" -c model="* ]]
+  [[ "$output" != *"gpt-5.6-decoy"* ]]           # the decoy's value never leaked in
+  [[ "$output" != *"model_reasoning_effort="* ]]
+
+  # With --model given, the same unsafe name must still warn (config is still
+  # skipped) but --model itself is unaffected by the name's safety.
+  rm -f "$CAPTURE"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex 'worker+2' --project "$PROJ" --headless --model gpt-5.6-sol
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not a safe config-key segment"* ]]
+
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *'model="gpt-5.6-sol"'* ]]
+}
+
+@test "spawn: the model/effort -c clauses survive a real shell re-parse as single argv tokens" {
+  # codex-bridge.js hands the captured appcmd STRING to
+  # spawn("/bin/sh", ["-lc", appcmd]) — sh re-parses it as shell syntax. Go one
+  # level past asserting on the string: actually feed it through a shell against
+  # a stub "codex" that dumps its argv one-per-line, and assert each -c value
+  # arrives as ONE argv token shaped exactly `model="..."` /
+  # `model_reasoning_effort="..."` — proving the single-quote/double-quote
+  # splice (see agmsg_codex_model_effort_args) isn't split or mangled by the
+  # re-parse. Uses `sh -c` (no `-l`): a login shell sources profile scripts that
+  # can reorder PATH ahead of our stub dir (observed with Homebrew's
+  # path_helper) and pick up a REAL codex binary instead — an environment
+  # artifact unrelated to what this test checks (quoting survival), so avoiding
+  # `-l` keeps the test deterministic without weakening the thing under test.
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_effort.reviewer high
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless --model gpt-5.6-sol
+  [ "$status" -eq 0 ]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  local appcmd
+  appcmd="$(sed -n 's/^APPCMD: //p' "$CAPTURE")"
+  [ -n "$appcmd" ]
+
+  local argvdir="$TEST_SKILL_DIR/argv-stub"
+  mkdir -p "$argvdir"
+  # Absolute-path shebang (not `#!/usr/bin/env bash`): PATH below is
+  # deliberately restricted to ONLY this stub dir (env -i), and `env` would
+  # need PATH to find `bash` — an absolute shebang is resolved by the kernel
+  # directly, so it needs no PATH lookup at all.
+  cat > "$argvdir/codex" <<'STUB'
+#!/bin/bash
+for a in "$@"; do printf 'ARGV<%s>\n' "$a"; done
+STUB
+  chmod +x "$argvdir/codex"
+
+  run env -i PATH="$argvdir" /bin/sh -c "$appcmd"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'ARGV<model="gpt-5.6-sol">'* ]]
+  [[ "$output" == *'ARGV<model_reasoning_effort="high">'* ]]
+}
+
+# --- control-byte sanitization of REJECTED values in warnings (#codex-review:
+# an unsanitized reject value echoed to stderr could forge an extra log line
+# (embedded newline) or an ANSI escape sequence (ESC) — see
+# agmsg_codex_sanitize_for_log) ---
+
+@test "spawn: a reject warning strips an embedded newline (no forged extra log line)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+
+  local evil
+  evil="$(printf 'evilvalue\nPWNED_LINE')"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless --model "$evil"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ignoring unsafe codex model id"* ]]
+  # The embedded newline must be gone from the warning — it must never appear as
+  # its own line (a raw newline immediately followed by the payload's tail).
+  [[ "$output" != *$'\n'"PWNED_LINE"* ]]
+}
+
+@test "spawn: a reject warning strips embedded ANSI/control bytes (no raw escape reaches stderr)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+
+  local ansi_evil
+  ansi_evil="$(printf 'evilANSI\x1b[2K\x1b[1A')"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless --model "$ansi_evil"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ignoring unsafe codex model id"* ]]
+  # No raw ESC (0x1b) byte reaches the combined output — the CSI sequence's
+  # printable remainder ("[2K", "[1A") is harmless without its leading ESC.
+  [[ "$output" != *$'\x1b'* ]]
 }
 
 @test "spawn: grok-build skips the readiness wait even without --no-wait (monitor=no)" {
