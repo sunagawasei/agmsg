@@ -248,6 +248,30 @@ agmsg_codex_client_name() {
   printf '%s' "$client"
 }
 
+# Resolve an optional per-worker turn timeout (seconds) for a headless codex
+# worker, injected as AGMSG_CODEX_BRIDGE_TURN_TIMEOUT. Empty → the bridge's
+# built-in default (60s), which is too short for research / deep-review turns
+# that do web lookups or long reasoning (the bridge orphans the turn and the
+# reply is lost). Set spawn.codex_turn_timeout.<name>=<seconds> to extend it.
+# Validated as a positive integer with no leading zero and at most 6 digits, so
+# seconds*1000 stays within the bridge's 32-bit setTimeout ceiling (a larger
+# value would overflow to a near-immediate fire or Infinity and silently break
+# the timeout). Anything else is ignored with a warning.
+agmsg_codex_turn_timeout() {
+  local name="$1" timeout=""
+  if agmsg_codex_safe_token "$name"; then
+    timeout="$("$SCRIPT_DIR/config.sh" get "spawn.codex_turn_timeout.$name" "" 2>/dev/null || true)"
+  fi
+  if [ -n "$timeout" ]; then
+    case "$timeout" in
+      *[!0-9]*|0*|[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*)
+        echo "spawn: ignoring invalid codex turn timeout '$(agmsg_codex_sanitize_for_log "$timeout")' (must be a positive integer of at most 6 digits, in seconds)" >&2
+        timeout="" ;;
+    esac
+  fi
+  printf '%s' "$timeout"
+}
+
 # approval_policy=never in both because a headless worker cannot answer approvals.
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run"
@@ -260,6 +284,8 @@ agmsg_spawn_headless() {
   local bridge="${AGMSG_CODEX_BRIDGE_CMD:-$SCRIPT_DIR/drivers/types/codex/codex-bridge.js}"
   local model_effort_args; model_effort_args="$(agmsg_codex_model_effort_args "$NAME")"
   local codex_client_name; codex_client_name="$(agmsg_codex_client_name "$NAME")"
+  local codex_turn_timeout; codex_turn_timeout="$(agmsg_codex_turn_timeout "$NAME")"
+  [ -z "$codex_turn_timeout" ] && codex_turn_timeout="${AGMSG_CODEX_BRIDGE_TURN_TIMEOUT:-}"
 
   # Resolve the working dir + app-server sandbox for the selected mode.
   local cwd appcmd
@@ -428,7 +454,7 @@ agmsg_spawn_headless() {
   local -a role_args=()
   [ -n "$rolefile" ] && role_args+=(--role-file "$rolefile")
   local log="$run_dir/codex-bridge.$TEAM.$NAME.log"
-  AGMSG_CODEX_APP_SERVER_CMD="$appcmd" AGMSG_CODEX_CLIENT_NAME="$codex_client_name" nohup "$bridge" \
+  AGMSG_CODEX_APP_SERVER_CMD="$appcmd" AGMSG_CODEX_CLIENT_NAME="$codex_client_name" AGMSG_CODEX_BRIDGE_TURN_TIMEOUT="$codex_turn_timeout" nohup "$bridge" \
     --project "$cwd" --type codex --team "$TEAM" --name "$NAME" --inline-inbox \
     --identity-key "$_idkey" \
     ${role_args[@]+"${role_args[@]}"} \
