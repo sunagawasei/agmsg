@@ -753,7 +753,7 @@ class CodexBridge {
   async initialize() {
     await this.client.request("initialize", {
       clientInfo: {
-        name: "agmsg-codex-bridge",
+        name: process.env.AGMSG_CODEX_CLIENT_NAME || "agmsg-codex-bridge",
         title: "agmsg Codex bridge",
         version: readVersion(),
       },

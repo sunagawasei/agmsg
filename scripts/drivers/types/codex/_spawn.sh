@@ -228,6 +228,26 @@ agmsg_codex_model_effort_args() {
   printf '%s' "$args"
 }
 
+# Resolve an optional app-server clientInfo.name override for a headless codex
+# worker. Default (empty) → the bridge advertises "agmsg-codex-bridge". Some
+# limited-preview models (e.g. gpt-5.6-sol) are gated server-side to a
+# first-party client identity on the app-server/thread API and reject the
+# bridge's own name with a 400 "requires a newer version" — set
+# spawn.codex_client_name.<name>=codex_cli to opt that worker into presenting
+# the first-party name so the gate passes. Read by the bridge via
+# AGMSG_CODEX_CLIENT_NAME (empty → the bridge keeps its default name).
+agmsg_codex_client_name() {
+  local name="$1" client=""
+  if agmsg_codex_safe_token "$name"; then
+    client="$("$SCRIPT_DIR/config.sh" get "spawn.codex_client_name.$name" "" 2>/dev/null || true)"
+  fi
+  if [ -n "$client" ] && ! agmsg_codex_safe_token "$client"; then
+    echo "spawn: ignoring unsafe codex client name '$(agmsg_codex_sanitize_for_log "$client")' (must match ^[A-Za-z0-9._-]+\$)" >&2
+    client=""
+  fi
+  printf '%s' "$client"
+}
+
 # approval_policy=never in both because a headless worker cannot answer approvals.
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run"
@@ -239,6 +259,7 @@ agmsg_spawn_headless() {
   agmsg_validate_agent_name "$NAME" >/dev/null 2>&1 || die "spawn: agent name '$NAME' is not valid (same rule join.sh applies: no '.', '..', '/', '\\', '\"', '[', ']', leading '-', or control chars)"
   local bridge="${AGMSG_CODEX_BRIDGE_CMD:-$SCRIPT_DIR/drivers/types/codex/codex-bridge.js}"
   local model_effort_args; model_effort_args="$(agmsg_codex_model_effort_args "$NAME")"
+  local codex_client_name; codex_client_name="$(agmsg_codex_client_name "$NAME")"
 
   # Resolve the working dir + app-server sandbox for the selected mode.
   local cwd appcmd
@@ -407,7 +428,7 @@ agmsg_spawn_headless() {
   local -a role_args=()
   [ -n "$rolefile" ] && role_args+=(--role-file "$rolefile")
   local log="$run_dir/codex-bridge.$TEAM.$NAME.log"
-  AGMSG_CODEX_APP_SERVER_CMD="$appcmd" nohup "$bridge" \
+  AGMSG_CODEX_APP_SERVER_CMD="$appcmd" AGMSG_CODEX_CLIENT_NAME="$codex_client_name" nohup "$bridge" \
     --project "$cwd" --type codex --team "$TEAM" --name "$NAME" --inline-inbox \
     --identity-key "$_idkey" \
     ${role_args[@]+"${role_args[@]}"} \
