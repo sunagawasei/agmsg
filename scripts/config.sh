@@ -35,10 +35,23 @@ yaml_get() {
 
   local value=""
   if [ -n "$section" ]; then
-    # Find value under section
+    # Find value under section. Key matching is a literal string-PREFIX
+    # comparison (key_eq below), NOT an awk ERE built from $section/$field:
+    # a dotted field (e.g. a per-worker key like "codex_implementer.<name>")
+    # contains a literal "." that would silently become an ERE wildcard if
+    # spliced into a pattern, letting a lookup for "codex_implementer.foo.bar"
+    # match a stored key one character off, e.g. "codex_implementer.fooXbar"
+    # — a real privilege-escalation-shaped hazard for a per-worker layout
+    # flag (spawn.codex_implementer.<name>) keyed by an actas name that can
+    # legally contain regex metacharacters. substr()-equality can't be
+    # fooled this way: every byte of $section/$field is compared literally.
     value=$(awk -v section="$section" -v field="$field" '
-      /^[^ #]/ { in_section = ($0 ~ "^" section ":") }
-      in_section && $0 ~ "^  " field ":" {
+      function key_eq(line, prefix,    n) {
+        n = length(prefix)
+        return substr(line, 1, n) == prefix
+      }
+      /^[^ #]/ { in_section = key_eq($0, section ":") }
+      in_section && key_eq($0, "  " field ":") {
         sub(/^  [^ ]+:[ \t]*/, "")
         # Strip inline comments
         sub(/[ \t]+#.*$/, "")
@@ -47,9 +60,13 @@ yaml_get() {
       }
     ' "$CONFIG_FILE")
   else
-    # Top-level key
+    # Top-level key — same literal-prefix matching as above.
     value=$(awk -v field="$field" '
-      /^[^ #]/ && $0 ~ "^" field ":" {
+      function key_eq(line, prefix,    n) {
+        n = length(prefix)
+        return substr(line, 1, n) == prefix
+      }
+      /^[^ #]/ && key_eq($0, field ":") {
         sub(/^[^ ]+:[ \t]*/, "")
         sub(/[ \t]+#.*$/, "")
         print
@@ -83,19 +100,33 @@ yaml_set() {
     create_default_config
   fi
 
+  # Same literal string-PREFIX matching as yaml_get (key_eq), for the same
+  # reason: section/field come from a caller-supplied dotted key (e.g. a
+  # per-worker key like "spawn.codex_implementer.<name>") and can legally
+  # contain "." or other ERE metacharacters that must NOT be interpreted as
+  # regex syntax — an unescaped "." would let set() silently rewrite/append
+  # to the WRONG key one character off. grep's own "^pattern" is a BRE, so
+  # it has the same hazard for the section-existence probe below; replaced
+  # with the same awk key_eq() helper used everywhere else in this file.
   if [ -n "$section" ]; then
     # Check if section exists
-    if ! grep -q "^${section}:" "$CONFIG_FILE" 2>/dev/null; then
+    if ! awk -v section="$section" '
+      function key_eq(line, prefix,    n) { n = length(prefix); return substr(line, 1, n) == prefix }
+      /^[^ #]/ && key_eq($0, section ":") { found=1; exit }
+      END { exit !found }
+    ' "$CONFIG_FILE" 2>/dev/null; then
       printf '\n%s:\n  %s: %s\n' "$section" "$field" "$value" >> "$CONFIG_FILE"
     elif awk -v section="$section" -v field="$field" '
-      /^[^ #]/ { in_section = ($0 ~ "^" section ":") }
-      in_section && $0 ~ "^  " field ":" { found=1; exit }
+      function key_eq(line, prefix,    n) { n = length(prefix); return substr(line, 1, n) == prefix }
+      /^[^ #]/ { in_section = key_eq($0, section ":") }
+      in_section && key_eq($0, "  " field ":") { found=1; exit }
       END { exit !found }
     ' "$CONFIG_FILE" 2>/dev/null; then
       # Update existing field under section
       awk -v section="$section" -v field="$field" -v value="$value" '
-        /^[^ #]/ { in_section = ($0 ~ "^" section ":") }
-        in_section && $0 ~ "^  " field ":" {
+        function key_eq(line, prefix,    n) { n = length(prefix); return substr(line, 1, n) == prefix }
+        /^[^ #]/ { in_section = key_eq($0, section ":") }
+        in_section && key_eq($0, "  " field ":") {
           print "  " field ": " value
           next
         }
@@ -104,17 +135,23 @@ yaml_set() {
     else
       # Add field to existing section
       awk -v section="$section" -v field="$field" -v value="$value" '
+        function key_eq(line, prefix,    n) { n = length(prefix); return substr(line, 1, n) == prefix }
         { print }
-        /^[^ #]/ && $0 ~ "^" section ":" {
+        /^[^ #]/ && key_eq($0, section ":") {
           print "  " field ": " value
         }
       ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
     fi
   else
-    if grep -q "^${field}:" "$CONFIG_FILE" 2>/dev/null; then
+    if awk -v field="$field" '
+      function key_eq(line, prefix,    n) { n = length(prefix); return substr(line, 1, n) == prefix }
+      /^[^ #]/ && key_eq($0, field ":") { found=1; exit }
+      END { exit !found }
+    ' "$CONFIG_FILE" 2>/dev/null; then
       # Update existing top-level key
       awk -v field="$field" -v value="$value" '
-        $0 ~ "^" field ":" {
+        function key_eq(line, prefix,    n) { n = length(prefix); return substr(line, 1, n) == prefix }
+        key_eq($0, field ":") {
           print field ": " value
           next
         }

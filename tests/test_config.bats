@@ -57,3 +57,26 @@ teardown() {
   run bash "$SCRIPTS/config.sh" get display.format
   [ "$output" = "xyz" ]
 }
+
+# --- literal key matching (a "." in a dotted per-worker field, e.g. the
+# spawn.codex_implementer.<name> layout key, must NOT act as a regex wildcard) ---
+
+@test "config get: a literal '.' in a per-worker key does not wildcard-match a decoy key one character off (fail closed)" {
+  # Decoy stored FIRST: if the lookup below were still ERE-based, the
+  # unescaped "." in "foo.bar" would match ANY character, including the "X"
+  # in this decoy — silently returning true for a key that was never set.
+  bash "$SCRIPTS/config.sh" set spawn.codex_implementer.fooXbar true
+  run bash "$SCRIPTS/config.sh" get spawn.codex_implementer.foo.bar false
+  [ "$output" = "false" ]
+}
+
+@test "config get/set: a dotted per-worker key and its 1-char-off decoy coexist without cross-contamination" {
+  # Reverse order (dotted key set first) and opposite values, so a leak in
+  # either direction would flip the wrong assertion.
+  bash "$SCRIPTS/config.sh" set spawn.codex_implementer.foo.bar false
+  bash "$SCRIPTS/config.sh" set spawn.codex_implementer.fooXbar true
+  run bash "$SCRIPTS/config.sh" get spawn.codex_implementer.foo.bar default
+  [ "$output" = "false" ]
+  run bash "$SCRIPTS/config.sh" get spawn.codex_implementer.fooXbar default
+  [ "$output" = "true" ]
+}
