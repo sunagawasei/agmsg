@@ -346,6 +346,39 @@ _wait_pidfile() {
   return 1
 }
 
+@test "watch: stale composite adopts a live AGMSG_AGENT_PID before creating artifacts" {
+  skip_on_windows "watcher process mgmt under Git Bash (#182)"
+  local stale_pid=2147483647
+  local agent_pid watcher
+  sleep 60 & agent_pid=$!
+  local iid="stale-adopt.$agent_pid"
+  local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
+  local err="$TEST_SKILL_DIR/stale-adopt.err"
+
+  AGMSG_AGENT_PID="$agent_pid" AGMSG_WATCH_INTERVAL=5 \
+    bash "$SCRIPTS/watch.sh" "stale-adopt.$stale_pid" "$PROJ" claude-code \
+    >/dev/null 2>"$err" 3>&- &
+  watcher=$!
+
+  _wait_pidfile "$pf" "$watcher"
+  run kill -0 "$watcher"; [ "$status" -eq 0 ]
+  grep -q "agmsg watch: instance pid $stale_pid is gone; adopted live agent pid $agent_pid (stale directive, e.g. resumed session)" "$err"
+  [ ! -e "$TEST_SKILL_DIR/run/watch.stale-adopt.$stale_pid.pid" ]
+
+  kill "$watcher" "$agent_pid" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  wait "$agent_pid" 2>/dev/null || true
+}
+
+@test "watch: stale composite exits zero with a diagnostic when no agent can be resolved" {
+  skip_on_windows "watcher process mgmt under Git Bash (#182)"
+  local stale_pid=2147483647
+
+  run env AGMSG_AGENT_PID= bash "$SCRIPTS/watch.sh" "stale-exit.$stale_pid" "$PROJ" claude-code
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"agmsg watch: composite instance pid $stale_pid is dead and no live claude-code agent found in ancestry; exiting (stale directive?)"* ]]
+}
+
 @test "watch: two sessions sharing a session_id keep independent watchers (#93)" {
   skip_on_windows "watcher process mgmt under Git Bash (#182)"
   # Pre-composite instance ids (same sid prefix, different agent pid) — what

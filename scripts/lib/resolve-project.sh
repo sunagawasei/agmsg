@@ -89,12 +89,31 @@ agmsg_pid_is_agent() {
   return 1
 }
 
+# Match instance-id liveness semantics without sourcing instance-id.sh back
+# into this lower-level resolver. In particular, EPERM means alive: a sandbox
+# may deny signalling its live parent agent process.
+_agmsg_resolve_pid_alive() {
+  local pid="$1"
+  case "${MSYSTEM:-}" in
+    MINGW*|MSYS*|CLANGARM*)
+      MSYS_NO_PATHCONV=1 tasklist /FI "PID eq $pid" 2>/dev/null | grep -q "$pid"
+      return $?
+      ;;
+  esac
+  local err
+  err=$(LC_ALL=C kill -0 "$pid" 2>&1) && return 0
+  case "$err" in
+    *"No such process"*|*"no such process"*|*"NO SUCH PROCESS"*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # Walk the process tree from $$ upward, echoing the PID of the nearest ancestor
 # that looks like an agent process of <type>. Empty (return 1) when none is
 # found — e.g. a detached watcher or a plain human shell.
 #
-# Override hook: when AGMSG_AGENT_PID is set, it pins the resolved pid instead
-# of walking the tree — a non-empty value is echoed as-is, an empty value forces
+# Override hook: when AGMSG_AGENT_PID is set, it pins a live resolved pid instead
+# of walking the tree — an empty value forces
 # the "no agent ancestor" path (so instance-id derivation falls back to the bare
 # session_id). This makes instance-id keying (#93) deterministic for the test
 # suite regardless of the ambient process tree, and is a usable escape hatch
@@ -107,7 +126,13 @@ agmsg_agent_pid() {
       *[!0-9]*)              # non-numeric → ignore, warn, fall back to bare
         printf 'agmsg: ignoring non-numeric AGMSG_AGENT_PID=%s; using bare session_id\n' "$AGMSG_AGENT_PID" >&2
         return 1 ;;
-      *) printf '%s' "$AGMSG_AGENT_PID"; return 0 ;;
+      *)
+        if _agmsg_resolve_pid_alive "$AGMSG_AGENT_PID"; then
+          printf '%s' "$AGMSG_AGENT_PID"
+          return 0
+        fi
+        printf 'agmsg: ignoring dead AGMSG_AGENT_PID=%s; walking process ancestry\n' "$AGMSG_AGENT_PID" >&2
+        ;;
     esac
   fi
   local pid="$$" hops=0

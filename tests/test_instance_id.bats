@@ -131,10 +131,13 @@ teardown() { teardown_test_env; }
 # --- AGMSG_AGENT_PID override ---
 
 @test "override: a numeric AGMSG_AGENT_PID pins the resolved pid" {
-  AGMSG_AGENT_PID=4242 run agmsg_agent_pid claude-code
+  sleep 60 & local agent_pid=$!
+  AGMSG_AGENT_PID="$agent_pid" run agmsg_agent_pid claude-code
   [ "$status" -eq 0 ]
-  [ "$output" = "4242" ]
-  [ "$(AGMSG_AGENT_PID=4242 agmsg_instance_id sess claude-code)" = "sess.4242" ]
+  [ "$output" = "$agent_pid" ]
+  [ "$(AGMSG_AGENT_PID="$agent_pid" agmsg_instance_id sess claude-code)" = "sess.$agent_pid" ]
+  kill "$agent_pid" 2>/dev/null || true
+  wait "$agent_pid" 2>/dev/null || true
 }
 
 @test "override: an empty AGMSG_AGENT_PID forces the bare fallback" {
@@ -148,6 +151,17 @@ teardown() { teardown_test_env; }
   AGMSG_AGENT_PID="abc" run agmsg_agent_pid claude-code
   [ "$status" -ne 0 ]
   [[ "$output" == *"ignoring non-numeric AGMSG_AGENT_PID"* ]]
+}
+
+@test "override: a dead AGMSG_AGENT_PID warns and falls back to the ppid walk" {
+  local walk_pid="$$"
+  compat_get_ppid() { printf '%s\n' "$walk_pid"; }
+  agmsg_pid_is_agent() { [ "$1" = "$walk_pid" ]; }
+
+  AGMSG_AGENT_PID=2147483647 run agmsg_agent_pid claude-code
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ignoring dead AGMSG_AGENT_PID=2147483647"* ]]
+  [ "${lines[${#lines[@]} - 1]}" = "$walk_pid" ]
 }
 
 # --- actas distinctness: the #93 payoff ---
