@@ -2,11 +2,11 @@
 # cursor spawn plug — headless read-only-reviewer worker launch (Template Method).
 #
 # Sourced by spawn.sh in its global context (so it sees AGENT_TYPE, NAME, TEAM,
-# PROJECT, HEADLESS, HEADLESS_SET, REVIEWER, REVIEWER_SET, SCRIPT_DIR, SKILL_DIR
-# and the helpers agmsg_placement_lock_*, agmsg_spawn_path, agmsg_type_get and
-# die()). Defines agmsg_spawn_resolve_modes + agmsg_spawn_headless, overriding
-# spawn.sh's no-op / "unsupported" defaults — same Template Method convention as
-# codex/_spawn.sh.
+# PROJECT, HEADLESS, HEADLESS_SET, REVIEWER, REVIEWER_SET, IMPLEMENTER,
+# IMPLEMENTER_SET, SCRIPT_DIR, SKILL_DIR and the helpers agmsg_placement_lock_*,
+# agmsg_spawn_path, agmsg_type_get and die()). Defines agmsg_spawn_resolve_modes +
+# agmsg_spawn_headless, overriding spawn.sh's no-op / "unsupported" defaults —
+# same Template Method convention as codex/_spawn.sh.
 #
 # Why this is so much smaller than codex/_spawn.sh: cursor-agent's headless
 # interface is a ONE-SHOT CLI (`cursor-agent -p --output-format json --resume
@@ -62,6 +62,14 @@ agmsg_spawn_resolve_modes() {
     die "--reviewer is not supported for 'cursor' (a headless cursor is always a read-only reviewer in the project dir)"
   fi
   REVIEWER=0
+  # cursor has no implementer layout either — the bridge never writes/runs shell
+  # (approach b: read-only + reply via send.sh), so a repo-writable codex-style
+  # implementer is not something cursor can be. Reject an explicit flag; the
+  # codex config opt-in must never silently apply here.
+  if [ "$IMPLEMENTER_SET" = 1 ] && [ "$IMPLEMENTER" = 1 ]; then
+    die "--implementer is not supported for 'cursor' (a headless cursor is always a read-only reviewer in the project dir)"
+  fi
+  IMPLEMENTER=0
 }
 
 # Launch a no-terminal cursor bridge worker and return. Called by spawn.sh when

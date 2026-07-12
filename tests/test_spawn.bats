@@ -540,6 +540,31 @@ YAML
   [[ "$output" == *"skipping readiness wait"* ]]
 }
 
+# --- fail-closed: agmsg install path quote/backslash safety (codex review) ---
+
+@test "spawn: refuses a headless codex when the agmsg install path contains a quote (fail closed, all layouts)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+
+  # A symlink whose name contains a single quote, pointing at the real
+  # (quote-free) TEST_SKILL_DIR. `cd LINK && pwd` (what spawn.sh's
+  # SCRIPT_DIR/SKILL_DIR derivation does under the hood) keeps the LOGICAL
+  # path — the quote survives — reproducing an agmsg install path with a
+  # character that would otherwise break the single-quoted -c clauses / TOML
+  # strings SKILL_DIR/run_dir are hand-spliced into.
+  local link="${TEST_SKILL_DIR}-evil'quote"
+  ln -s "$TEST_SKILL_DIR" "$link"
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$link/scripts/spawn.sh" codex impl --project "$PROJ" --headless --implementer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"install path contains a quote/backslash"* ]]
+  # The bridge must NOT have been launched (no capture written).
+  [ ! -s "$CAPTURE" ]
+
+  rm -f "$link"
+}
+
 # --- headless codex (config-driven default) ---
 
 # A fake codex-bridge that records its args AND the injected app-server command,
@@ -692,6 +717,161 @@ EOF
   [[ "$output" == *"not enforced"* ]]
   # The bridge must NOT have been launched (no capture written).
   [ ! -s "$CAPTURE" ]
+}
+
+# --- headless codex implementer (cwd=repo + workspace-write) ---
+
+@test "spawn: codex --implementer launches in the repo with workspace-write" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex impl --project "$PROJ" --headless --implementer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless implementer codex 'impl'"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"--name impl"* ]]
+  [[ "$output" == *"--project $PROJ"* ]]                  # cwd = the real repo
+  [[ "$output" != *"codex-myteam-cwd"* ]]                 # NOT the scratch dir
+  [[ "$output" == *"sandbox_mode=workspace-write"* ]]     # workspace-write, not a permission profile
+  [[ "$output" == *"writable_roots="* ]]
+  [[ "$output" != *"default_permissions=agmsg-reviewer"* ]]
+  [[ "$output" == *"web_search=live"* ]]
+  [[ "$output" == *"approval_policy=never"* ]]
+
+  # registered to the real project, not a scratch dir.
+  run cat "$TEST_SKILL_DIR/teams/myteam/config.json"
+  [[ "$output" != *"codex-myteam-cwd"* ]]
+}
+
+@test "spawn: codex defaults to implementer when spawn.codex_implementer.<name>=true" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_implementer.impl2 true
+  # A conflicting GLOBAL reviewer default must not win over the per-worker
+  # implementer key.
+  bash "$SCRIPTS/config.sh" set spawn.codex_reviewer true
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex impl2 --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless implementer codex 'impl2'"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"sandbox_mode=workspace-write"* ]]
+  [[ "$output" != *"default_permissions=agmsg-reviewer"* ]]
+}
+
+@test "spawn: explicit --reviewer wins over spawn.codex_implementer.<name>=true (explicit beats config)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_implementer.rvw true
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rvw --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless reviewer codex 'rvw'"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"default_permissions=agmsg-reviewer"* ]]
+  [[ "$output" != *"sandbox_mode=workspace-write"* ]]
+}
+
+@test "spawn: explicit --no-implementer wins over spawn.codex_implementer.<name>=true (falls back to consultant)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_implementer.noimpl true
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex noimpl --project "$PROJ" --headless --no-implementer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless codex 'noimpl'"* ]]
+  [[ "$output" != *"implementer"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"codex-myteam-cwd"* ]]                # scratch cwd, not the repo
+  [[ "$output" == *"sandbox_mode=workspace-write"* ]]
+  [[ "$output" != *"default_permissions=agmsg-reviewer"* ]]
+}
+
+@test "spawn: --implementer and --reviewer are mutually exclusive" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" codex rv3 --project "$PROJ" --headless --implementer --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"mutually exclusive"* ]]
+
+  # nothing was registered for the contradictory identity.
+  run cat "$TEST_SKILL_DIR/teams/myteam/config.json"
+  [[ "$output" != *"rv3"* ]]
+}
+
+@test "spawn: --implementer requires headless" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" codex rv4 --project "$PROJ" --interactive --implementer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"requires --headless"* ]]
+}
+
+@test "spawn --model: headless IMPLEMENTER codex also embeds -c model=\"...\" (implementer appcmd branch)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex implm --project "$PROJ" --headless --implementer --model gpt-5.6-sol
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless implementer codex 'implm'"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"sandbox_mode=workspace-write"* ]]   # confirms the implementer branch built appcmd
+  [[ "$output" == *'model="gpt-5.6-sol"'* ]]
+}
+
+@test "spawn: an unsafe worker name skips the spawn.codex_implementer.<name> lookup (warns, --implementer flag still works)" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  # Decoy: a DIFFERENT (safe) name's config key must never leak into this one.
+  bash "$SCRIPTS/config.sh" set spawn.codex_implementer.reviewer true
+  _make_fake_bridge
+
+  # No --implementer: the config lookup for this unsafe name must be skipped
+  # outright (not attempted) — the spawn stays a plain consultant, not implementer.
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex 'worker+3' --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not a safe config-key segment"* ]]
+  [[ "$output" == *"spawn.codex_implementer.<name>"* ]]
+  [[ "$output" == *"spawned headless codex 'worker+3'"* ]]   # consultant, not implementer
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"codex-myteam-cwd"* ]]                 # scratch cwd, not the repo
+  [[ "$output" != *"default_permissions=agmsg-reviewer"* ]]
+
+  # An EXPLICIT --implementer bypasses the per-name config lookup entirely (no
+  # implementer-lookup warning needed — the flag itself decides, config is
+  # never consulted). The unsafe name still triggers the UNRELATED
+  # spawn.codex_model.<name>/spawn.codex_effort.<name> warning (that lookup
+  # always runs regardless of layout — see the "unsafe worker NAME as a
+  # config-key segment" tests below) — assert on the implementer-specific
+  # message, not the shared "not a safe config-key segment" substring, so
+  # this test isn't confused by that independent warning.
+  rm -f "$CAPTURE"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex 'worker+4' --project "$PROJ" --headless --implementer
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"skipping spawn.codex_implementer.<name> lookup"* ]]
+  [[ "$output" == *"spawned headless implementer codex 'worker+4'"* ]]
 }
 
 @test "spawn: refuses when nested inside an outer Seatbelt sandbox (sandbox_apply)" {

@@ -150,9 +150,11 @@ Do NOT manually edit config files. Always use join.sh.
 #                        idle session is never noticed).
 #   --headless           (codex/cursor; types with `headless=yes`) run a no-terminal
 #                        bridge worker instead of a TUI. codex: scratch cwd under
-#                        `run/`, optional `--reviewer` for repo read-only. cursor:
-#                        always a read-only reviewer in `--project`. Tear down with
-#                        `despawn --force` (neither has a Monitor watcher).
+#                        `run/`, optional `--reviewer` for repo read-only or
+#                        `--implementer` for repo WRITABLE (mutually exclusive).
+#                        cursor: always a read-only reviewer in `--project`.
+#                        Tear down with `despawn --force` (neither has a Monitor
+#                        watcher).
 #   --interactive        (codex/cursor; alias --no-headless) force the non-headless
 #                        path even when the type's headless default is on (config
 #                        spawn.codex_headless / spawn.cursor_headless).

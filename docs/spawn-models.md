@@ -59,8 +59,9 @@ which has no such restriction and works for any name.
 
 Both accepted values are spliced into the headless worker's app-server command
 (the same `-c key=value` overrides used for the sandbox/approval policy) as
-`-c model="<id>"` / `-c model_reasoning_effort="<val>"`, applied to both the
-consultant (scratch cwd) and reviewer (`--reviewer`) sandbox profiles alike.
+`-c model="<id>"` / `-c model_reasoning_effort="<val>"`, applied to all three of
+the consultant (scratch cwd), implementer (`--implementer`, repo writable), and
+reviewer (`--reviewer`, repo read-only) sandbox profiles alike.
 
 Fail-closed input validation: the app-server command is a single string
 re-parsed by `sh -lc` inside the bridge, so a value is only spliced in if it

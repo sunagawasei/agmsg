@@ -2,10 +2,11 @@
 # codex spawn plug — headless/reviewer worker launch (Template Method).
 #
 # Sourced by spawn.sh in its global context (so it sees AGENT_TYPE, NAME, TEAM,
-# PROJECT, HEADLESS, HEADLESS_SET, REVIEWER, REVIEWER_SET, SCRIPT_DIR, SKILL_DIR
-# and the helpers agmsg_placement_lock_*, agmsg_spawn_path, agmsg_type_get, the
-# die() function). Defines agmsg_spawn_resolve_modes (called right after arg-parse)
-# and agmsg_spawn_headless (called when HEADLESS=1), overriding the no-op / "not
+# PROJECT, HEADLESS, HEADLESS_SET, REVIEWER, REVIEWER_SET, IMPLEMENTER,
+# IMPLEMENTER_SET, SCRIPT_DIR, SKILL_DIR and the helpers agmsg_placement_lock_*,
+# agmsg_spawn_path, agmsg_type_get, the die() function). Defines
+# agmsg_spawn_resolve_modes (called right after arg-parse) and
+# agmsg_spawn_headless (called when HEADLESS=1), overriding the no-op / "not
 # supported" defaults spawn.sh installs before sourcing — same Template Method
 # convention as _session-start.sh.
 #
@@ -20,6 +21,18 @@
 # free of any "codex" literal.
 #   precedence: --headless / --interactive  >  config spawn.codex_headless  >  TUI
 #   precedence: --reviewer / --no-reviewer  >  config spawn.codex_reviewer  >  off
+#   precedence: --implementer / --no-implementer  >  config spawn.codex_implementer.<name>  >  off
+#
+# NAME is already resolved (spawn.sh assigns it from $2 near the top of the
+# script, well before this function is called) so the per-name
+# spawn.codex_implementer.$NAME lookup below can run here. Gated on
+# agmsg_codex_safe_token(NAME) first — same hazard and same fix as
+# agmsg_codex_model_effort_args's spawn.codex_model.<name>/spawn.codex_effort.<name>
+# lookups below: NAME becomes a literal, unescaped fragment of a config.sh
+# dotted key, and a name containing an ERE metacharacter could silently
+# misresolve to the wrong config line instead of erroring. An unsafe name
+# skips the lookup (warn, don't guess) rather than risk that; --implementer
+# has no such hazard and stays available for every name.
 agmsg_spawn_resolve_modes() {
   if [ "$HEADLESS_SET" = 0 ]; then
     case "$("$SCRIPT_DIR/config.sh" get spawn.codex_headless false 2>/dev/null || true)" in
@@ -30,6 +43,27 @@ agmsg_spawn_resolve_modes() {
     case "$("$SCRIPT_DIR/config.sh" get spawn.codex_reviewer false 2>/dev/null || true)" in
       true|1|yes|on) REVIEWER=1 ;;
     esac
+  fi
+  if [ "$IMPLEMENTER_SET" = 0 ]; then
+    if agmsg_codex_safe_token "$NAME"; then
+      case "$("$SCRIPT_DIR/config.sh" get "spawn.codex_implementer.$NAME" false 2>/dev/null || true)" in
+        true|1|yes|on) IMPLEMENTER=1 ;;
+      esac
+    else
+      echo "spawn: worker name '$(agmsg_codex_sanitize_for_log "$NAME")' is not a safe config-key segment (must match ^[A-Za-z0-9._-]+\$); skipping spawn.codex_implementer.<name> lookup (use --implementer)" >&2
+    fi
+  fi
+  # implementer/reviewer overlap normalization: explicit beats config; both
+  # explicit is a contradiction; both config-derived lets the per-worker
+  # implementer key beat the global reviewer default.
+  if [ "$IMPLEMENTER" = 1 ] && [ "$REVIEWER" = 1 ]; then
+    if [ "$IMPLEMENTER_SET" = 1 ] && [ "$REVIEWER_SET" = 1 ]; then
+      die "spawn: --implementer and --reviewer are mutually exclusive"
+    elif [ "$REVIEWER_SET" = 1 ]; then
+      IMPLEMENTER=0
+    else
+      REVIEWER=0
+    fi
   fi
 }
 
@@ -59,13 +93,20 @@ preflight_seatbelt_nesting() {
 
 # Launch a no-terminal codex bridge worker and return. Called by spawn.sh when
 # HEADLESS=1. The worker is a codex-bridge.js process driving its own stdio
-# app-server. Two sandbox layouts, selected by REVIEWER:
+# app-server. Three sandbox layouts, selected by IMPLEMENTER/REVIEWER:
 #
 #   default (consultant) — cwd is a neutral scratch dir under run/, NOT the repo.
 #     codex's workspace-write sandbox always permits writing the cwd and
 #     writable_roots is additive (it cannot revoke cwd write), so using the repo
 #     as cwd would let codex write the repo. scratch + writable_roots scoped to
 #     agmsg = codex can read anywhere but write only agmsg.
+#
+#   implementer — cwd IS the target repo, workspace-write. workspace-write always
+#     permits writing the cwd (see above), so this is exactly the consultant's
+#     appcmd with cwd=$PROJECT instead of scratch: the repo IS writable, for
+#     implementation work delegated to codex. writable_roots additionally grants
+#     agmsg's db/teams/run so replies via send.sh still work (same reasoning as
+#     the reviewer's write grants below).
 #
 #   reviewer — cwd IS the target repo so codex can autonomously explore it, under
 #     a permission profile (default_permissions) that grants the repo READ-only
@@ -276,6 +317,22 @@ agmsg_codex_turn_timeout() {
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run"
   mkdir -p "$run_dir"   # reviewer mode's cwd is the repo, so nothing else creates run/
+
+  # Fail closed BEFORE building any layout's appcmd/profile: SKILL_DIR and
+  # run_dir are hand-spliced into the app-server command (inside single-quoted
+  # -c clauses for consultant/implementer's writable_roots, and into the
+  # reviewer's filesystem-table profile body) without shell-quoting the value
+  # itself — a "'" breaks out of the single-quoted -c clause, a '"' breaks the
+  # TOML string, and a "\" is a TOML escape character. Any of the three could
+  # corrupt the spliced config or inject unintended -c/profile syntax. This is
+  # a property of the agmsg install path (an admin-controlled, effectively
+  # fixed value), not of any per-spawn input, so refusing here is a one-time
+  # environment check, not a per-worker cost.
+  case "$SKILL_DIR$run_dir" in
+    *\'*|*\"*|*\\*)
+      die "spawn: agmsg install path contains a quote/backslash and cannot be spliced into the codex sandbox config safely: $SKILL_DIR" ;;
+  esac
+
   # Fail closed on a path-unsafe team/name BEFORE any run/ artifact (role snapshot,
   # pidfile, log) or registration is composed from them — the same guard cursor
   # applies, and required now that role staging runs before join.sh validates.
@@ -289,7 +346,16 @@ agmsg_spawn_headless() {
 
   # Resolve the working dir + app-server sandbox for the selected mode.
   local cwd appcmd
-  if [ "$REVIEWER" = 1 ]; then
+  if [ "$IMPLEMENTER" = 1 ]; then
+    cwd="$PROJECT"
+    # Implementer: the repo IS writable — workspace-write with the repo as cwd
+    # (the exact layout the consultant comment above warns against; here it is
+    # the point). writable_roots additively grants agmsg so send.sh replies
+    # keep working. No permission profile, no probes: repo modification is
+    # intended. Network stays off (workspace-write default).
+    local wr="[\"$SKILL_DIR/db\",\"$SKILL_DIR/teams\",\"$run_dir\"]"
+    appcmd="codex app-server --listen stdio:// -c sandbox_mode=workspace-write -c sandbox_workspace_write.writable_roots='$wr' -c web_search=live -c approval_policy=never$model_effort_args"
+  elif [ "$REVIEWER" = 1 ]; then
     cwd="$PROJECT"
     # Read-only repo + tmp/toolchain reads + writes confined to agmsg. The toolchain
     # roots let codex run git/rg/etc. installed outside the repo; extend this list if
@@ -466,8 +532,10 @@ agmsg_spawn_headless() {
   printf '%s\t%s\t%s\n' "pid:$bpid" "$cwd" "codex" \
     > "$(agmsg_spawn_path "$TEAM" "$NAME")" 2>/dev/null || true
   local kind="headless codex"; [ "$REVIEWER" = 1 ] && kind="headless reviewer codex"
+  [ "$IMPLEMENTER" = 1 ] && kind="headless implementer codex"
   echo "spawned $kind '$NAME' in team '$TEAM' (pid $bpid)"
   [ "$REVIEWER" = 1 ] && echo "  cwd (repo, read-only): $cwd"
+  [ "$IMPLEMENTER" = 1 ] && echo "  workspace (WRITE): $cwd"
   [ "$REVIEWER" = 1 ] && [ -n "$add_dir_roots" ] && \
     echo "  add-dir reads (read-only):$(printf '%s' "$add_dir_roots" | sed 's/="read"//g; s/[",]/ /g')"
   [ -n "$rolefile" ] && echo "  role: $ROLE_FILE"

@@ -62,6 +62,11 @@ set -euo pipefail
 #                      modify the repo. --no-reviewer forces it off. Defaults from
 #                      config spawn.codex_reviewer. Without it, headless codex sits
 #                      in a neutral scratch cwd (read-anywhere, write only agmsg).
+#   --implementer      (headless codex only) cwd = the target repo, workspace-write
+#                      — the repo is WRITABLE, for implementation work delegated to
+#                      codex. --no-implementer forces it off. Mutually exclusive
+#                      with --reviewer. Defaults from config
+#                      spawn.codex_implementer.<name>.
 #   --model <id>       launch the agent on a specific model. The id is passed
 #                      through to the CLI unchecked (the CLI rejects unknown
 #                      ids); the flag spelling comes from the type's manifest
@@ -157,6 +162,8 @@ HEADLESS=0           # codex only: run a no-terminal bridge worker (resolved val
 HEADLESS_SET=0       # whether an explicit --headless/--interactive flag was given
 REVIEWER=0           # headless codex only: cwd=repo + read-only-repo profile (resolved)
 REVIEWER_SET=0       # whether an explicit --reviewer/--no-reviewer flag was given
+IMPLEMENTER=0        # headless codex only: cwd=repo + workspace-write (repo WRITABLE)
+IMPLEMENTER_SET=0    # whether an explicit --implementer/--no-implementer flag was given
 MODEL_ID=""          # --model: pass-through model id for the launched CLI
 ROLE_FILE=""          # resolved standing role-prompt file (empty = none); see lib/spawn-role.sh
 ROLE_FILE_EXPLICIT="" # --role-file override (highest precedence)
@@ -180,6 +187,8 @@ while [ $# -gt 0 ]; do
     --interactive|--no-headless) HEADLESS=0; HEADLESS_SET=1; shift ;;
     --reviewer)                  REVIEWER=1; REVIEWER_SET=1; shift ;;
     --no-reviewer)               REVIEWER=0; REVIEWER_SET=1; shift ;;
+    --implementer)                IMPLEMENTER=1; IMPLEMENTER_SET=1; shift ;;
+    --no-implementer)             IMPLEMENTER=0; IMPLEMENTER_SET=1; shift ;;
     --model) MODEL_ID="${2:?--model needs a model id}"; shift 2 ;;
     --role-file) ROLE_FILE_EXPLICIT="${2:?--role-file needs a path}"; shift 2 ;;
     --no-role)   ROLE_DISABLE=1; shift ;;
@@ -224,6 +233,16 @@ if [ "$REVIEWER" = 1 ] && [ "$HEADLESS" != 1 ]; then
     die "--reviewer requires --headless (an interactive spawn already runs in the project dir)"
   fi
   REVIEWER=0
+fi
+# Implementer only changes the headless worker's cwd/sandbox; it is meaningless
+# for a TUI spawn (which already launches in the project dir, writable). Error
+# only on an explicit flag; a config opt-in silently does not apply to
+# interactive spawns.
+if [ "$IMPLEMENTER" = 1 ] && [ "$HEADLESS" != 1 ]; then
+  if [ "$IMPLEMENTER_SET" = 1 ]; then
+    die "--implementer requires --headless (an interactive spawn already runs in the project dir)"
+  fi
+  IMPLEMENTER=0
 fi
 
 # Resolve the terminal override for the non-tmux path:
