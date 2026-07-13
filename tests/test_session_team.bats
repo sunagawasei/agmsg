@@ -219,6 +219,18 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   [ -z "$output" ]
 }
 
+@test "delivery monitor: joins and pins the current session team mid-session" {
+  enable_st
+
+  run env CLAUDE_CODE_SESSION_ID=sess-MID bash "$SCRIPTS/delivery.sh" set monitor claude-code "$PROJ"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"claude --team s-sess-MID"* ]]
+
+  run bash "$SCRIPTS/identities.sh" "$PROJ" claude-code
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"claude"* ]]
+}
+
 @test "session-end: keeps the codex worker if a parallel-resume sibling is alive" {
   enable_st
   sleep 300 & local fake=$!

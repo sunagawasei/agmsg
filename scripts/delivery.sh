@@ -44,6 +44,8 @@ RUN_DIR="$SKILL_DIR/run"
 . "$SCRIPT_DIR/lib/instance-id.sh"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/node.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/session-team.sh"
 # hash.sh provides agmsg_sha1 — stop_codex_bridge derives the per-project
 # app-server record paths (codex-app-server.<hash>.{pid,port,version}) from it.
 # shellcheck disable=SC1091
@@ -308,6 +310,19 @@ EOF
   # (#188).
   local watch_command
   watch_command="$(printf '%q %q %q %q' "$watch" "$session_id" "$project" "$type")"
+
+  # In session-team mode, mid-session mode changes that reach this function
+  # (/agmsg mode monitor|both, restart) need the same setup as session-start.sh:
+  # join this Claude to its session team and pin the watcher to that team.
+  # Without both, watch.sh has no subscription and exits immediately.
+  if [ "$type" = "claude-code" ]; then
+    local session_team
+    session_team="$(agmsg_session_team_name_from_id "${CLAUDE_CODE_SESSION_ID:-}")"
+    if [ -n "$session_team" ]; then
+      AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$session_team" claude "$type" "$project" >/dev/null 2>&1 || true
+      watch_command="$watch_command $(printf '%q %q %q' claude --team "$session_team")"
+    fi
+  fi
   cat <<EOF
 
 AGMSG-DIRECTIVE: For this running session, invoke the Monitor tool now with:
