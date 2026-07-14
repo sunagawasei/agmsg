@@ -95,18 +95,14 @@ preflight_seatbelt_nesting() {
 # HEADLESS=1. The worker is a codex-bridge.js process driving its own stdio
 # app-server. Three sandbox layouts, selected by IMPLEMENTER/REVIEWER:
 #
-#   default (consultant) — cwd is a neutral scratch dir under run/, NOT the repo.
-#     codex's workspace-write sandbox always permits writing the cwd and
-#     writable_roots is additive (it cannot revoke cwd write), so using the repo
-#     as cwd would let codex write the repo. scratch + writable_roots scoped to
-#     agmsg = codex can read anywhere but write only agmsg.
+#   default (consultant) — cwd is a neutral scratch dir under run/, NOT the repo,
+#     under a permission profile that grants WRITE to that scratch cwd and agmsg's
+#     db/teams/run state while explicitly disabling network access.
 #
-#   implementer — cwd IS the target repo, workspace-write. workspace-write always
-#     permits writing the cwd (see above), so this is exactly the consultant's
-#     appcmd with cwd=$PROJECT instead of scratch: the repo IS writable, for
-#     implementation work delegated to codex. writable_roots additionally grants
-#     agmsg's db/teams/run so replies via send.sh still work (same reasoning as
-#     the reviewer's write grants below).
+#   implementer — cwd IS the target repo, under a permission profile that grants
+#     the repo WRITE access for implementation work delegated to codex. The
+#     profile also grants agmsg's db/teams/run writes so replies via send.sh keep
+#     working, while network access is disabled.
 #
 #   reviewer — cwd IS the target repo so codex can autonomously explore it, under
 #     a permission profile (default_permissions) that grants the repo READ-only
@@ -313,15 +309,14 @@ agmsg_codex_turn_timeout() {
   printf '%s' "$timeout"
 }
 
-# approval_policy=never in both because a headless worker cannot answer approvals.
+# approval_policy=never in every mode because a headless worker cannot answer approvals.
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run"
   mkdir -p "$run_dir"   # reviewer mode's cwd is the repo, so nothing else creates run/
 
   # Fail closed BEFORE building any layout's appcmd/profile: SKILL_DIR and
-  # run_dir are hand-spliced into the app-server command (inside single-quoted
-  # -c clauses for consultant/implementer's writable_roots, and into the
-  # reviewer's filesystem-table profile body) without shell-quoting the value
+  # run_dir are hand-spliced into the consultant / implementer / reviewer
+  # filesystem-table profile bodies without shell-quoting the value
   # itself — a "'" breaks out of the single-quoted -c clause, a '"' breaks the
   # TOML string, and a "\" is a TOML escape character. Any of the three could
   # corrupt the spliced config or inject unintended -c/profile syntax. This is
@@ -348,13 +343,11 @@ agmsg_spawn_headless() {
   local cwd appcmd
   if [ "$IMPLEMENTER" = 1 ]; then
     cwd="$PROJECT"
-    # Implementer: the repo IS writable — workspace-write with the repo as cwd
-    # (the exact layout the consultant comment above warns against; here it is
-    # the point). writable_roots additively grants agmsg so send.sh replies
-    # keep working. No permission profile, no probes: repo modification is
-    # intended. Network stays off (workspace-write default).
-    local wr="[\"$SKILL_DIR/db\",\"$SKILL_DIR/teams\",\"$run_dir\"]"
-    appcmd="codex app-server --listen stdio:// -c sandbox_mode=workspace-write -c sandbox_workspace_write.writable_roots='$wr' -c web_search=live -c approval_policy=never$model_effort_args"
+    # Implementer: the repo IS writable, along with agmsg's state directories so
+    # send.sh replies keep working. Toolchain and agmsg scripts remain read-only,
+    # and the permission profile explicitly disables network access.
+    local fs="{ \":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"write\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\" }"
+    appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-implementer -c 'permissions.agmsg-implementer.filesystem=$fs' -c 'permissions.agmsg-implementer.network={ enabled=false }' -c web_search=live -c approval_policy=never$model_effort_args"
   elif [ "$REVIEWER" = 1 ]; then
     cwd="$PROJECT"
     # Read-only repo + tmp/toolchain reads + writes confined to agmsg. The toolchain
@@ -373,18 +366,18 @@ agmsg_spawn_headless() {
     local add_dir_roots; add_dir_roots="$(agmsg_reviewer_add_dir_roots "$cwd")"
     if [ -n "$add_dir_roots" ] && ! codex sandbox -P agmsg-reviewer -C "$cwd" \
          -c "permissions.agmsg-reviewer.filesystem={ $fs_base$add_dir_roots }" \
-         -c 'permissions.agmsg-reviewer.network={ enabled=false }' \
+         -c 'permissions.agmsg-reviewer.network={ enabled=true }' \
          -- /usr/bin/true >/dev/null 2>&1; then
       echo "spawn: reviewer add-dir inheritance disabled (augmented sandbox profile failed to apply); using base profile" >&2
       add_dir_roots=""
     fi
     local fs="{ $fs_base$add_dir_roots }"
-    appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-reviewer -c 'permissions.agmsg-reviewer.filesystem=$fs' -c 'permissions.agmsg-reviewer.network={ enabled=false }' -c web_search=live -c approval_policy=never$model_effort_args"
+    appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-reviewer -c 'permissions.agmsg-reviewer.filesystem=$fs' -c 'permissions.agmsg-reviewer.network={ enabled=true }' -c web_search=live -c approval_policy=never$model_effort_args"
   else
     cwd="$run_dir/codex-$TEAM-cwd"
     mkdir -p "$cwd"
-    local wr="[\"$SKILL_DIR/db\",\"$SKILL_DIR/teams\",\"$run_dir\"]"
-    appcmd="codex app-server --listen stdio:// -c sandbox_mode=workspace-write -c sandbox_workspace_write.writable_roots='$wr' -c web_search=live -c approval_policy=never$model_effort_args"
+    local fs="{ \":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"write\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\" }"
+    appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-consultant -c 'permissions.agmsg-consultant.filesystem=$fs' -c 'permissions.agmsg-consultant.network={ enabled=false }' -c web_search=live -c approval_policy=never$model_effort_args"
   fi
 
   # Refuse before registering anything if we're nested inside an outer macOS
@@ -413,7 +406,7 @@ agmsg_spawn_headless() {
     local probe="$cwd/.agmsg_reviewer_probe.$$" probe_out
     if probe_out="$(codex sandbox -P agmsg-reviewer -C "$cwd" \
          -c "permissions.agmsg-reviewer.filesystem=$fs" \
-         -c 'permissions.agmsg-reviewer.network={ enabled=false }' \
+         -c 'permissions.agmsg-reviewer.network={ enabled=true }' \
          -- /bin/sh -c "touch -- \"$probe\"" 2>&1)"; then
       rm -f "$probe" 2>/dev/null || true
       die "reviewer sandbox is not enforced by this codex build (the repo would be writable); refusing to launch. Upgrade codex, or spawn with --no-reviewer for the scratch consultant."
@@ -435,7 +428,7 @@ agmsg_spawn_headless() {
     local pos_probe="$run_dir/.agmsg_reviewer_probe.$$"
     if ! codex sandbox -P agmsg-reviewer -C "$cwd" \
          -c "permissions.agmsg-reviewer.filesystem=$fs" \
-         -c 'permissions.agmsg-reviewer.network={ enabled=false }' \
+         -c 'permissions.agmsg-reviewer.network={ enabled=true }' \
          -- /bin/sh -c "touch -- \"$pos_probe\" && rm -f -- \"$pos_probe\"" \
          >/dev/null 2>&1; then
       die "reviewer sandbox can't write to run_dir ($run_dir); the worker would be unable to reply via send.sh. Check the filesystem profile's write grants for \$SKILL_DIR/run."
