@@ -148,6 +148,48 @@ agmsg_reviewer_add_dir_roots() {
   printf '%s' "$out"
 }
 
+# Resolve additive filesystem roots shared by every headless codex layout.
+# The global spawn.codex_extra_fs_roots config value is a flat, comma-separated
+# scalar of PATH=PERM tokens (PERM is read or write). Echoes each accepted root
+# as `, "<path>"="<perm>"`, ready to append to a filesystem table. The worker
+# name argument is kept in the resolver signature for parity with the sibling
+# codex config resolvers; this key is intentionally global, not per-worker.
+#
+# Paths beginning with ~/ or the literal $HOME/ are expanded without eval.
+# Because the result is spliced through both a single-quoted -c clause and a
+# TOML string, any quote or backslash is fatal rather than emitted unsafely.
+agmsg_codex_extra_fs_roots() {
+  local _name="$1" value="" remaining="" token="" perm="" path_="" out=""
+  value="$("$SCRIPT_DIR/config.sh" get "spawn.codex_extra_fs_roots" "" 2>/dev/null || true)"
+  [ -n "$value" ] || return 0
+
+  # Appending one delimiter lets the same loop handle a single token and retain
+  # empty tokens at either edge; empty tokens are intentionally ignored.
+  remaining="$value,"
+  while [ -n "$remaining" ]; do
+    token="${remaining%%,*}"
+    remaining="${remaining#*,}"
+    [ -n "$token" ] || continue
+
+    perm="${token##*=}"
+    path_="${token%=*}"
+    case "$path_" in
+      \~/*) path_="$HOME/${path_#\~/}" ;;
+      \$HOME/*) path_="$HOME/${path_#\$HOME/}" ;;
+    esac
+    case "$path_" in
+      *\'*|*\"*|*\\*)
+        die "spawn: codex extra filesystem root contains a quote/backslash and cannot be spliced into the sandbox config safely" ;;
+    esac
+    case "$perm" in
+      read|write) ;;
+      *) die "spawn: invalid codex extra filesystem root permission (expected read or write)" ;;
+    esac
+    out="$out, \"$path_\"=\"$perm\""
+  done
+  printf '%s' "$out"
+}
+
 # Byte-level, locale-independent membership test for the shared safe-token
 # charset [A-Za-z0-9._-]: true (0) iff $1 is non-empty and every byte is in
 # that set. Used to gate BOTH the worker-name segment spliced into a
@@ -370,6 +412,7 @@ agmsg_spawn_headless() {
   local codex_client_name; codex_client_name="$(agmsg_codex_client_name "$NAME")"
   local codex_turn_timeout; codex_turn_timeout="$(agmsg_codex_turn_timeout "$NAME")"
   [ -z "$codex_turn_timeout" ] && codex_turn_timeout="${AGMSG_CODEX_BRIDGE_TURN_TIMEOUT:-}"
+  local extra_fs; extra_fs="$(agmsg_codex_extra_fs_roots "$NAME")"
 
   # Resolve the working dir + app-server sandbox for the selected mode.
   local cwd appcmd
@@ -378,7 +421,7 @@ agmsg_spawn_headless() {
     # Implementer: the repo IS writable, along with agmsg's state directories so
     # send.sh replies keep working. Toolchain and agmsg scripts remain read-only,
     # and the permission profile explicitly disables network access.
-    local fs="{ \":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"write\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\" }"
+    local fs="{ \":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"write\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\"$extra_fs }"
     appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-implementer -c 'permissions.agmsg-implementer.filesystem=$fs' -c 'permissions.agmsg-implementer.network={ enabled=false }' -c web_search=live -c approval_policy=never$model_effort_args"
   elif [ "$REVIEWER" = 1 ]; then
     cwd="$PROJECT"
@@ -388,6 +431,7 @@ agmsg_spawn_headless() {
     # -c values that contain spaces are single-quoted: the bridge runs the command
     # via `sh -lc`, which re-parses the string (see codex-bridge.js).
     local fs_base="\":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"read\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\""
+    fs_base="$fs_base$extra_fs"
     # Additively grant READ on the Claude session's /add-dir directories (gated;
     # see agmsg_reviewer_add_dir_roots). Purely additive and fail-open: pre-flight
     # the augmented profile with a trivial sandboxed command, and if it fails to
@@ -428,7 +472,7 @@ agmsg_spawn_headless() {
   else
     cwd="$run_dir/codex-$TEAM-cwd"
     mkdir -p "$cwd"
-    local fs="{ \":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"write\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\" }"
+    local fs="{ \":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"write\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\"$extra_fs }"
     appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-consultant -c 'permissions.agmsg-consultant.filesystem=$fs' -c 'permissions.agmsg-consultant.network={ enabled=false }' -c web_search=live -c approval_policy=never$model_effort_args"
   fi
 
