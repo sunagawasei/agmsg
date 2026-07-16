@@ -605,10 +605,11 @@ EOF
   [[ "$output" == *"--name reviewer"* ]]
   [[ "$output" == *"--inline-inbox"* ]]
   [[ "$output" == *"codex-myteam-cwd"* ]]                # --project = scratch cwd
-  [[ "$output" == *"sandbox_mode=workspace-write"* ]]    # app-server policy injected
+  [[ "$output" == *"default_permissions=agmsg-consultant"* ]]
+  [[ "$output" != *"sandbox_mode=workspace-write"* ]]
   [[ "$output" == *"approval_policy=never"* ]]
   [[ "$output" == *"web_search=live"* ]]
-  [[ "$output" == *"writable_roots="* ]]
+  [[ "$output" == *"permissions.agmsg-consultant.filesystem="* ]]
   # No model/effort override was requested: appcmd must end EXACTLY at
   # approval_policy=never (end-of-string anchor, not just a substring match) —
   # a substring check alone would miss a regression that appends a stray/empty
@@ -736,8 +737,9 @@ EOF
   [[ "$output" == *"--name impl"* ]]
   [[ "$output" == *"--project $PROJ"* ]]                  # cwd = the real repo
   [[ "$output" != *"codex-myteam-cwd"* ]]                 # NOT the scratch dir
-  [[ "$output" == *"sandbox_mode=workspace-write"* ]]     # workspace-write, not a permission profile
-  [[ "$output" == *"writable_roots="* ]]
+  [[ "$output" == *"default_permissions=agmsg-implementer"* ]]
+  [[ "$output" != *"sandbox_mode=workspace-write"* ]]
+  [[ "$output" == *"permissions.agmsg-implementer.filesystem="* ]]
   [[ "$output" != *"default_permissions=agmsg-reviewer"* ]]
   [[ "$output" == *"web_search=live"* ]]
   [[ "$output" == *"approval_policy=never"* ]]
@@ -763,7 +765,8 @@ EOF
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
   run cat "$CAPTURE"
-  [[ "$output" == *"sandbox_mode=workspace-write"* ]]
+  [[ "$output" == *"default_permissions=agmsg-implementer"* ]]
+  [[ "$output" != *"sandbox_mode=workspace-write"* ]]
   [[ "$output" != *"default_permissions=agmsg-reviewer"* ]]
 }
 
