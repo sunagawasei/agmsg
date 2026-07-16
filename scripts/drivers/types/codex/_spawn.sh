@@ -309,6 +309,38 @@ agmsg_codex_turn_timeout() {
   printf '%s' "$timeout"
 }
 
+# Resolve an optional per-worker gh CLI config directory for a reviewer worker.
+# Empty/unset means no gh-specific filesystem grant or environment injection.
+# This helper is called ONLY from the reviewer layout so consultant/implementer
+# workers ignore the key completely, including invalid-value warnings.
+#
+# The path is spliced into both a TOML filesystem table and appcmd (which the
+# bridge re-parses via `sh -lc`), so fail closed unless it is an existing
+# absolute directory with no whitespace, quote, backslash, or control byte.
+# The sentinel preserves trailing newlines in the comparison and carries tr's
+# status, preventing a broken tr from turning validation into fail-open.
+agmsg_codex_gh_config_dir() {
+  local name="$1" dir="" filtered="" valid=1
+  if agmsg_codex_safe_token "$name"; then
+    dir="$("$SCRIPT_DIR/config.sh" get "spawn.codex_gh_config_dir.$name" "" 2>/dev/null || true)"
+  fi
+  [ -n "$dir" ] || return 0
+
+  case "$dir" in
+    /*) ;;
+    *) valid=0 ;;
+  esac
+  if [ "$valid" = 1 ]; then
+    filtered="$(printf '%s' "$dir" | LC_ALL=C tr -d "[:cntrl:] '\"\\\\"; printf 'X%s' "$?")"
+    [ "$filtered" = "${dir}X0" ] || valid=0
+  fi
+  if [ "$valid" != 1 ] || [ ! -d "$dir" ]; then
+    echo "spawn: ignoring invalid codex GH config dir for '$name' (spawn.codex_gh_config_dir.<name> must be an existing absolute directory without whitespace, quotes, backslashes, or control characters)" >&2
+    dir=""
+  fi
+  printf '%s' "$dir"
+}
+
 # approval_policy=never in every mode because a headless worker cannot answer approvals.
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run"
@@ -371,8 +403,28 @@ agmsg_spawn_headless() {
       echo "spawn: reviewer add-dir inheritance disabled (augmented sandbox profile failed to apply); using base profile" >&2
       add_dir_roots=""
     fi
-    local fs="{ $fs_base$add_dir_roots }"
-    appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-reviewer -c 'permissions.agmsg-reviewer.filesystem=$fs' -c 'permissions.agmsg-reviewer.network={ enabled=true }' -c web_search=live -c approval_policy=never$model_effort_args"
+    # The optional gh config directory is reviewer-only. Probe it together with
+    # the already-vetted add-dir roots so the profile used by app-server is the
+    # exact augmented profile proved to apply. If this final augmentation fails,
+    # drop only the gh grant/environment injection and retain the existing
+    # reviewer/add-dir layout.
+    local gh_config_dir; gh_config_dir="$(agmsg_codex_gh_config_dir "$NAME")"
+    local gh_config_root="" gh_config_arg=""
+    if [ -n "$gh_config_dir" ]; then
+      gh_config_root=", \"$gh_config_dir\"=\"read\""
+      if ! codex sandbox -P agmsg-reviewer -C "$cwd" \
+           -c "permissions.agmsg-reviewer.filesystem={ $fs_base$add_dir_roots$gh_config_root }" \
+           -c 'permissions.agmsg-reviewer.network={ enabled=true }' \
+           -- /usr/bin/true >/dev/null 2>&1; then
+        echo "spawn: reviewer codex GH config injection disabled (augmented sandbox profile failed to apply); using the existing reviewer profile" >&2
+        gh_config_dir=""
+        gh_config_root=""
+      else
+        gh_config_arg=" -c 'shell_environment_policy.set.GH_CONFIG_DIR=\"$gh_config_dir\"'"
+      fi
+    fi
+    local fs="{ $fs_base$add_dir_roots$gh_config_root }"
+    appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-reviewer -c 'permissions.agmsg-reviewer.filesystem=$fs' -c 'permissions.agmsg-reviewer.network={ enabled=true }' -c web_search=live -c approval_policy=never$model_effort_args$gh_config_arg"
   else
     cwd="$run_dir/codex-$TEAM-cwd"
     mkdir -p "$cwd"

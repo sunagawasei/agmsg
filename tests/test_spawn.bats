@@ -1008,6 +1008,143 @@ CODEX_STUB
   [[ "$output" != *"\"$PROJ\"=\"read\""* ]]   # already :workspace_roots — not re-granted
 }
 
+# --- reviewer gh CLI config (spawn.codex_gh_config_dir.<name>) ---
+
+@test "spawn: codex reviewer does not inject GH_CONFIG_DIR when the per-worker key is unset" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *"GH_CONFIG_DIR"* ]]
+}
+
+@test "spawn: codex reviewer grants and injects a valid per-worker GH config directory" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  local ghdir="$TEST_SKILL_DIR/gh-config-rv"; mkdir -p "$ghdir"
+  bash "$SCRIPTS/config.sh" set spawn.codex_gh_config_dir.rv "$ghdir"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" == *"\"$ghdir\"=\"read\""* ]]
+  [[ "$output" == *"shell_environment_policy.set.GH_CONFIG_DIR=\"$ghdir\""* ]]
+}
+
+@test "spawn: codex reviewer ignores a relative per-worker GH config directory with a warning" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_gh_config_dir.rv relative/gh-config
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ignoring invalid codex GH config dir"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *"GH_CONFIG_DIR"* ]]
+  [[ "$output" != *"relative/gh-config"* ]]
+}
+
+@test "spawn: codex reviewer ignores a quoted per-worker GH config directory with a warning" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  local ghdir="$TEST_SKILL_DIR/gh'config"; mkdir -p "$ghdir"
+  bash "$SCRIPTS/config.sh" set spawn.codex_gh_config_dir.rv "$ghdir"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ignoring invalid codex GH config dir"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *"GH_CONFIG_DIR"* ]]
+  [[ "$output" != *"$ghdir"* ]]
+}
+
+@test "spawn: codex reviewer ignores a non-existent per-worker GH config directory with a warning" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  local ghdir="$TEST_SKILL_DIR/no-such-gh-config"
+  bash "$SCRIPTS/config.sh" set spawn.codex_gh_config_dir.rv "$ghdir"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ignoring invalid codex GH config dir"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *"GH_CONFIG_DIR"* ]]
+  [[ "$output" != *"$ghdir"* ]]
+}
+
+@test "spawn: codex implementer ignores a configured per-worker GH config directory" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  local ghdir="$TEST_SKILL_DIR/gh-config-impl"; mkdir -p "$ghdir"
+  bash "$SCRIPTS/config.sh" set spawn.codex_gh_config_dir.impl "$ghdir"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex impl --project "$PROJ" --headless --implementer
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"codex GH config dir"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *"GH_CONFIG_DIR"* ]]
+  [[ "$output" != *"$ghdir"* ]]
+}
+
+@test "spawn: codex reviewer drops only GH config injection when its augmented profile probe fails" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  export GH_TEST_REJECT_DIR="$TEST_SKILL_DIR/gh-config-rejected"
+  mkdir -p "$GH_TEST_REJECT_DIR"
+  bash "$SCRIPTS/config.sh" set spawn.codex_gh_config_dir.rv "$GH_TEST_REJECT_DIR"
+  _make_fake_bridge
+  cat > "$STUB_BIN/codex" <<'CODEX_STUB'
+#!/usr/bin/env bash
+if [ "$1" = sandbox ]; then
+  case "$*" in
+    *"$GH_TEST_REJECT_DIR"*) exit 1 ;;
+    *"rm -f"*) exit 0 ;;
+    *touch*) echo "touch: probe: Operation not permitted" >&2; exit 1 ;;
+    *) exit 0 ;;
+  esac
+fi
+exit 0
+CODEX_STUB
+  chmod +x "$STUB_BIN/codex"
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"reviewer codex GH config injection disabled"* ]]
+  [[ "$output" == *"spawned headless reviewer codex 'rv'"* ]]
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  run cat "$CAPTURE"
+  [[ "$output" != *"GH_CONFIG_DIR"* ]]
+  [[ "$output" != *"$GH_TEST_REJECT_DIR"* ]]
+}
+
 # --- per-worker model / reasoning-effort override for headless codex ---
 # (spawn.codex_model.<name> / spawn.codex_effort.<name>; see
 # codex/_spawn.sh's agmsg_codex_model_effort_args). --model (interactive-spawn
