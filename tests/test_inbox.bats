@@ -6,7 +6,6 @@ setup() {
   setup_test_env
   bash "$SCRIPTS/join.sh" testteam alice claude-code /tmp/project-a
   bash "$SCRIPTS/join.sh" testteam bob claude-code /tmp/project-a
-  DBPATH="$TEST_SKILL_DIR/db/messages.db"
   BARRIER="$TEST_SKILL_DIR/mark-barrier"
 }
 
@@ -14,8 +13,15 @@ teardown() {
   teardown_test_env
 }
 
+# Counts unread via the storage facade (send.sh now writes the event log, not
+# the legacy messages table's read_at column — a raw "read_at IS NULL" count
+# would silently always read 0 post-flip and never catch a real regression).
 unread_count() {
-  sqlite3 "$DBPATH" "SELECT COUNT(*) FROM messages WHERE team='testteam' AND to_agent='$1' AND read_at IS NULL;" | tr -d '\r'
+  bash -c '
+    source "'"$SCRIPTS"'/lib/storage.sh"
+    agmsg_storage_load
+    storage_list_unread testteam "$1"
+  ' _ "$1" | grep -c .
 }
 
 # Wait until the script under test has displayed and is paused before its

@@ -1193,8 +1193,8 @@ JSON
   # messages aren't replayed. Send NEW messages through the facade (storage_send
   # writes the event log the watcher now streams) and wait for several polls.
   sleep 1
-  bash "$SCRIPTS/send.sh" myteam system alice "new-for-alice" >/dev/null
-  bash "$SCRIPTS/send.sh" myteam system bob "new-for-bob" >/dev/null
+  bash "$SCRIPTS/send.sh" myteam system alice "new-for-alice" --force >/dev/null
+  bash "$SCRIPTS/send.sh" myteam system bob "new-for-bob" --force >/dev/null
   sleep 3
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
@@ -1296,8 +1296,8 @@ JSON
 
   # Send messages for both via the facade. alice should arrive (alice was in the
   # original subscription set); bob should NOT arrive (joined after launch).
-  bash "$SCRIPTS/send.sh" myteam sys alice "for-alice-static" >/dev/null
-  bash "$SCRIPTS/send.sh" myteam sys bob   "for-bob-static" >/dev/null
+  bash "$SCRIPTS/send.sh" myteam sys alice "for-alice-static" --force >/dev/null
+  bash "$SCRIPTS/send.sh" myteam sys bob   "for-bob-static" --force >/dev/null
 
   # A sentinel for alice inserted AFTER bob's row. Its arrival proves the
   # watcher has already scanned past for-bob-static, which is what makes "bob

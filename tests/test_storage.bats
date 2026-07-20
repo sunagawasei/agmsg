@@ -161,7 +161,7 @@ SH
 
   [ "$(agmsg_runtime_lock_acquire codex-dispatcher:test 111)" = 111 ]
   bash "$SCRIPTS/send.sh" team alice bob "after lock init" --force
-  [ "$(agmsg_sqlite "$(agmsg_db_path)" "SELECT COUNT(*) FROM messages WHERE body = 'after lock init';")" = 1 ]
+  [ "$(agmsg_sqlite "$(agmsg_db_path)" "SELECT COUNT(*) FROM events WHERE type='message_sent' AND body = 'after lock init';")" = 1 ]
 }
 
 @test "send: concurrent fan-out to N recipients all land (no SQLITE_BUSY)" {
