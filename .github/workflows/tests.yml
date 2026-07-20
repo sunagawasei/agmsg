@@ -116,27 +116,10 @@ jobs:
     # down instead of falling back to running everything.
     if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
-    # Bound a hung runner/test so a stall fails fast (and is re-runnable) instead
-    # of pinning this REQUIRED check for the GitHub default of 6h.
-    #
-    # Keep this comfortably above the real suite time, not just above it. The
-    # cap was 15 when the suite ran in ~5 min; the suite has since grown to 728
-    # tests and macOS measures 11m57s-14m10s, leaving 1-3 min of headroom. The
-    # result was that ~47% of macOS runs (9 of 19 sampled) were killed mid-suite
-    # at ~15m18s, at whatever test happened to be running — a REQUIRED check
-    # behaving like a coin flip on PRs that changed nothing relevant. 25 matches
-    # the app-test-windows job below.
-    #
-    # If a shard starts firing this cap, re-shard (raise SHARD_TOTAL) rather
-    # than re-running until it passes: a job that always dies at the same
-    # elapsed time is a timeout, not a flaky test.
-    # bats-windows sets its own timeout; this covers ubuntu/macos.
-    #
-    # Left at the pre-sharding value on purpose. A shard is a quarter of the
-    # suite, so this is now generous headroom rather than a tight bound — and
-    # a cap that only ever fires on a genuine hang is the one that carries no
-    # false positives. (It was 15 against a 12-14 min macOS suite, and killed
-    # ~47% of macOS runs mid-suite at whatever test was running.)
+    # Bound a hung runner/test without cutting off the slower macOS suite. The
+    # full suite now exceeds 15 min on macOS as coverage has grown; 25 min still
+    # fails fast compared with GitHub's 6h default. bats-windows has its own
+    # timeout; this covers ubuntu/macos.
     timeout-minutes: 25
     strategy:
       # Cover both GNU (Linux) and BSD (macOS) userlands — the scripts shell out
