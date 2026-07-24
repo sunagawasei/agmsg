@@ -256,12 +256,17 @@ case "$COMMAND" in
     ;;
 
   team)
-    team_arg="${1:-${TEAM:-}}"
-    if [ -z "$team_arg" ]; then
-      resolve_identity 1 0
-      team_arg="$RESOLVED_TEAM"
+    if [ "${1:-}" = "list" ]; then
+      shift
+      run_script team-list.sh "$@"
+    else
+      team_arg="${1:-${TEAM:-}}"
+      if [ -z "$team_arg" ]; then
+        resolve_identity 1 0
+        team_arg="$RESOLVED_TEAM"
+      fi
+      run_script team.sh "$(first_team "$team_arg")"
     fi
-    run_script team.sh "$(first_team "$team_arg")"
     ;;
 
   config)

@@ -130,3 +130,22 @@ reply_after_request() {
   [ "$status" -eq 0 ]
   [[ "$output" =~ "Delivery mode set to 'turn'" ]]
 }
+
+@test "dispatch: 'team list' reaches team-list.sh, not team.sh (co1 P1 — 'list' must never be treated as a team name)" {
+  run bash "$SCRIPTS/windows/dispatch.sh" --type codex --project "$PROJECT_ALICE" -- team list --json
+  [ "$status" -eq 0 ]
+  # team.sh's "Team not found: list" / "Team: list" output would appear if
+  # this had been misrouted to team.sh with "list" as the team name.
+  [[ "$output" != *"Team not found: list"* ]]
+  [[ "$output" != *"Team: list"* ]]
+  [ "$(echo "$output" | python3 -c "import json,sys; print(json.load(sys.stdin)['schema_version'])")" = "1" ]
+  local names
+  names="$(echo "$output" | python3 -c "import json,sys; print(','.join(t['name'] for t in json.load(sys.stdin)['teams']))")"
+  [[ ",$names," == *",demo,"* ]]
+}
+
+@test "dispatch: bare 'team demo' still reaches team.sh (no regression from the 'team list' routing fix)" {
+  run bash "$SCRIPTS/windows/dispatch.sh" --type codex --project "$PROJECT_ALICE" -- team demo
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Team: demo"* ]]
+}

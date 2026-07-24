@@ -107,6 +107,10 @@ Each output line is one message: `<ts> | <team> | <from> -> <to> | <body>`. Reac
 If argument is "history":
 1. Run: `~/.agents/skills/__SKILL_NAME__/scripts/history.sh $TEAM $AGENT`
 
+If argument starts with "team list" (e.g. "team list", "team list --json", "team list --scope project"):
+1. Run: `~/.agents/skills/__SKILL_NAME__/scripts/team-list.sh <the rest of the args after "team list", unchanged>`
+2. This is a distinct command from bare "team" below — check for "team list" FIRST so "list" is never mistaken for a team name.
+
 If argument is "team":
 1. For each TEAM, run: `~/.agents/skills/__SKILL_NAME__/scripts/team.sh $TEAM`
 
