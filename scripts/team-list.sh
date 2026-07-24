@@ -108,6 +108,28 @@ TEAMS_DIR="$SKILL_DIR/teams"
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 
 MAX_TEAMS="${AGMSG_TEAM_LIST_MAX_TEAMS:-10000}"
+# Validated immediately (co1 delta review): `[ "$count" -gt "$MAX_TEAMS" ]`
+# below is a bash `test` integer comparison inside an `if` condition, which
+# `set -e` does NOT abort on — so an invalid override (non-numeric, or the
+# empty string) would make `test` print "integer expression expected" to
+# stderr and just never take the truncation branch, silently enumerating
+# every team with no bound at all. That would break the bounded-
+# enumeration guarantee this whole script (and --json's fail-closed
+# authority contract) depends on, so a bad override must fail loudly here
+# rather than be allowed to silently disable the bound. Zero/negative are
+# rejected too — a bound of "0 or fewer" is not a meaningful team-count
+# limit and would only make the truncation logic's intent ambiguous.
+case "$MAX_TEAMS" in
+  ''|*[!0-9]*)
+    echo "agmsg: AGMSG_TEAM_LIST_MAX_TEAMS must be a positive integer, got '$MAX_TEAMS'" >&2
+    exit 1
+    ;;
+esac
+if [ "$MAX_TEAMS" -le 0 ]; then
+  echo "agmsg: AGMSG_TEAM_LIST_MAX_TEAMS must be a positive integer, got '$MAX_TEAMS'" >&2
+  exit 1
+fi
+
 MAX_CONFIG_BYTES=$((10 * 1024 * 1024))
 
 json=0

@@ -179,6 +179,29 @@ json_field() {
   [[ "$output" == *"refusing to print a partial list"* ]]
 }
 
+@test "team list: rejects a non-numeric AGMSG_TEAM_LIST_MAX_TEAMS override (co1 delta review) — never silently unbounded" {
+  bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
+  run bash -c "AGMSG_TEAM_LIST_MAX_TEAMS=not-a-number bash '$SCRIPTS/team-list.sh' --json"
+  [ "$status" -ne 0 ]
+  [ "$status" -ne 2 ]
+  [[ "$output" == *"must be a positive integer"* ]]
+  [[ "$output" != *"schema_version"* ]]
+}
+
+@test "team list: rejects AGMSG_TEAM_LIST_MAX_TEAMS=0" {
+  run bash -c "AGMSG_TEAM_LIST_MAX_TEAMS=0 bash '$SCRIPTS/team-list.sh' --json"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"must be a positive integer"* ]]
+  [[ "$output" != *"schema_version"* ]]
+}
+
+@test "team list: rejects a negative AGMSG_TEAM_LIST_MAX_TEAMS override" {
+  run bash -c "AGMSG_TEAM_LIST_MAX_TEAMS=-5 bash '$SCRIPTS/team-list.sh' --json"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"must be a positive integer"* ]]
+  [[ "$output" != *"schema_version"* ]]
+}
+
 @test "team list (human, no --json): a bad config or a truncated bound still prints what it found, with a warning, exit 0" {
   mkdir -p "$SCRIPTS/../teams/badteam"
   printf 'not even json' > "$SCRIPTS/../teams/badteam/config.json"
