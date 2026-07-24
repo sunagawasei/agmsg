@@ -107,26 +107,37 @@ TEAMS_DIR="$SKILL_DIR/teams"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 
+# An explicitly empty override (AGMSG_TEAM_LIST_MAX_TEAMS=) falls back to
+# the 10000 default via bash's `:-`, same as leaving it unset — this is
+# the intended behavior, not something rejected below.
 MAX_TEAMS="${AGMSG_TEAM_LIST_MAX_TEAMS:-10000}"
-# Validated immediately (co1 delta review): `[ "$count" -gt "$MAX_TEAMS" ]`
-# below is a bash `test` integer comparison inside an `if` condition, which
-# `set -e` does NOT abort on — so an invalid override (non-numeric, or the
-# empty string) would make `test` print "integer expression expected" to
-# stderr and just never take the truncation branch, silently enumerating
-# every team with no bound at all. That would break the bounded-
-# enumeration guarantee this whole script (and --json's fail-closed
-# authority contract) depends on, so a bad override must fail loudly here
-# rather than be allowed to silently disable the bound. Zero/negative are
-# rejected too — a bound of "0 or fewer" is not a meaningful team-count
-# limit and would only make the truncation logic's intent ambiguous.
+readonly _MAX_TEAMS_UPPER_BOUND=10000
+# Validated immediately (co1 delta review, two rounds): `[ "$count" -gt
+# "$MAX_TEAMS" ]` below is a bash `test` integer comparison inside an `if`
+# condition, which `set -e` does NOT abort on — so ANY input `test` can't
+# evaluate as an in-range integer (non-numeric, zero, negative, OR an
+# all-digit string too large for bash's native fixed-width arithmetic to
+# represent, e.g. 30 nines) makes `test` print "integer expression
+# expected" to stderr and just never take the truncation branch, silently
+# enumerating every team with no bound at all — breaking the bounded-
+# enumeration guarantee this script (and --json's fail-closed authority
+# contract) depends on. The digit-count check below rejects an oversized
+# numeral BEFORE it ever reaches `-lt`/`-gt` arithmetic, rather than
+# trying to detect overflow after the fact (bash gives no reliable signal
+# to detect it with other than the same silent-if-condition-false
+# behavior this is closing).
 case "$MAX_TEAMS" in
   ''|*[!0-9]*)
     echo "agmsg: AGMSG_TEAM_LIST_MAX_TEAMS must be a positive integer, got '$MAX_TEAMS'" >&2
     exit 1
     ;;
 esac
-if [ "$MAX_TEAMS" -le 0 ]; then
-  echo "agmsg: AGMSG_TEAM_LIST_MAX_TEAMS must be a positive integer, got '$MAX_TEAMS'" >&2
+if [ "${#MAX_TEAMS}" -gt ${#_MAX_TEAMS_UPPER_BOUND} ]; then
+  echo "agmsg: AGMSG_TEAM_LIST_MAX_TEAMS must be between 1 and $_MAX_TEAMS_UPPER_BOUND, got '$MAX_TEAMS'" >&2
+  exit 1
+fi
+if [ "$MAX_TEAMS" -lt 1 ] || [ "$MAX_TEAMS" -gt "$_MAX_TEAMS_UPPER_BOUND" ]; then
+  echo "agmsg: AGMSG_TEAM_LIST_MAX_TEAMS must be between 1 and $_MAX_TEAMS_UPPER_BOUND, got '$MAX_TEAMS'" >&2
   exit 1
 fi
 

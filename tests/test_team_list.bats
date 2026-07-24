@@ -191,7 +191,7 @@ json_field() {
 @test "team list: rejects AGMSG_TEAM_LIST_MAX_TEAMS=0" {
   run bash -c "AGMSG_TEAM_LIST_MAX_TEAMS=0 bash '$SCRIPTS/team-list.sh' --json"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"must be a positive integer"* ]]
+  [[ "$output" == *"must be between 1 and 10000"* ]]
   [[ "$output" != *"schema_version"* ]]
 }
 
@@ -200,6 +200,30 @@ json_field() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"must be a positive integer"* ]]
   [[ "$output" != *"schema_version"* ]]
+}
+
+@test "team list: rejects an all-digit AGMSG_TEAM_LIST_MAX_TEAMS override too large for bash's native integer arithmetic (co1 delta review round 2)" {
+  # An all-digit string this long overflows bash's fixed-width `test`
+  # arithmetic the SAME way a non-numeric value does (silent "integer
+  # expression expected", never true, never truncates) — this is the
+  # digit-count guard closing that exact bypass, not just the earlier
+  # non-numeric/negative checks.
+  run bash -c "AGMSG_TEAM_LIST_MAX_TEAMS=999999999999999999999999999999 bash '$SCRIPTS/team-list.sh' --json"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"must be between 1 and 10000"* ]]
+  [[ "$output" != *"schema_version"* ]]
+}
+
+@test "team list: rejects an in-range-looking but out-of-bound AGMSG_TEAM_LIST_MAX_TEAMS override (e.g. 99999)" {
+  run bash -c "AGMSG_TEAM_LIST_MAX_TEAMS=99999 bash '$SCRIPTS/team-list.sh' --json"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"must be between 1 and 10000"* ]]
+  [[ "$output" != *"schema_version"* ]]
+}
+
+@test "team list: accepts AGMSG_TEAM_LIST_MAX_TEAMS at the exact upper bound (10000)" {
+  run bash -c "AGMSG_TEAM_LIST_MAX_TEAMS=10000 bash '$SCRIPTS/team-list.sh' --json"
+  [ "$status" -eq 0 ]
 }
 
 @test "team list (human, no --json): a bad config or a truncated bound still prints what it found, with a warning, exit 0" {
