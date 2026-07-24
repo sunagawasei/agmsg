@@ -21,13 +21,33 @@ discipline this ADR family already applies to server-supplied JSON —
 config.json is locally written by our own scripts, but this is a
 read-only listing command with no reason to guess at a malformed file's
 meaning rather than skip it outright).
+
+Fail-closed in --format json specifically (co1 delta review): --scope all
+is the authority a no-arg cloud connect flow uses to decide whether its
+choice is ambiguous (one team vs several). Silently returning a partial
+list as if it were the complete one — because one team's config failed
+to parse, or the caller's own MAX_TEAMS bound was hit — could make a
+driver see "1 team" or "0 teams" and auto-select/report ambiguity
+wrongly, when the true count differs. So in JSON mode, if ANY team was
+skipped or the entries list was truncated upstream (--truncated), this
+prints NO JSON payload at all and exits 2, rather than a "successful"
+partial object a consumer could mistake for authoritative. Human mode
+(--format human) keeps printing whatever was found plus the warnings and
+exits 0 — a person reading it isn't fooled by partial output the way an
+automated ambiguity check would be, and seeing what's readable is more
+useful to them than a bare error.
 """
 import argparse
 import json
 import sys
 
 
+_SKIPPED = 0
+
+
 def _warn_skip(name, reason):
+    global _SKIPPED
+    _SKIPPED += 1
     print(f"agmsg: team list: skipping '{name}': {reason}", file=sys.stderr)
 
 
@@ -69,9 +89,16 @@ def _team_row(name, cfg, variants):
     else:
         binding_state = "active"
 
-    team_id = binding.get("remote_team_id") if binding_state != "none" else None
-    if not isinstance(team_id, str) or not team_id:
-        team_id = None
+    # Named remote_team_id, not team_id (mentor-cc ruling): this is the
+    # server-assigned id of the remote BINDING, not a stable local identity
+    # anchor for the team itself — those are two different things, and a
+    # team with no remote binding correctly has none of this at all. ADR
+    # 0010 may define a local, always-present team identity later; that
+    # would be a genuinely new field (e.g. local_team_id), not a
+    # reinterpretation of this one.
+    remote_team_id = binding.get("remote_team_id") if binding_state != "none" else None
+    if not isinstance(remote_team_id, str) or not remote_team_id:
+        remote_team_id = None
 
     scope = "other"
     agents = cfg.get("agents")
@@ -86,22 +113,22 @@ def _team_row(name, cfg, variants):
             if scope == "project":
                 break
 
-    # PLACEHOLDERS pending ADR 0010 (local-first onboarding / roster
-    # convergence) — see team-list.sh's header comment for why these three
-    # are deliberately coarse/fail-closed rather than a preview of that
-    # design's real state machine.
-    onboarding_state = "connected" if binding_state in ("active", "disconnected") else "not_connected"
-    promote_eligible = False
-    blocked_reason = "adr_0010_not_implemented"
+    # onboarding_state/promote_eligible/blocked_reason are deliberately NOT
+    # included in v1 (mentor-cc ruling): their real meaning depends on ADR
+    # 0010 (local-first onboarding / roster convergence), which hasn't
+    # landed, so today they could only be a fixed/mechanically-derived
+    # placeholder value — zero information a consumer couldn't already get
+    # from binding_state, but a shipped field a consumer might still start
+    # depending on. A shipped field whose MEANING later changes is a
+    # breaking change; a field added later that didn't exist before is not.
+    # So: add these additively, with real semantics, once ADR 0010 fixes
+    # what they mean — never ship them as placeholders now.
 
     return {
         "name": name,
-        "team_id": team_id,
+        "remote_team_id": remote_team_id,
         "scope": scope,
         "binding_state": binding_state,
-        "onboarding_state": onboarding_state,
-        "promote_eligible": promote_eligible,
-        "blocked_reason": blocked_reason,
     }
 
 
@@ -112,6 +139,9 @@ def main():
     parser.add_argument("--scope", required=True, choices=("all", "project"))
     parser.add_argument("--max-config-bytes", required=True, type=int)
     parser.add_argument("--format", required=True, choices=("human", "json"))
+    parser.add_argument("--truncated", action="store_true",
+                         help="the caller's own team-count bound was hit; "
+                              "the entries file is itself incomplete")
     args = parser.parse_args()
 
     with open(args.variants, encoding="utf-8") as f:
@@ -148,18 +178,39 @@ def main():
     if args.scope == "project":
         rows = [r for r in rows if r["scope"] == "project"]
 
-    # Canonical sort (name, then team_id — team_id is null-safe via "").
-    rows.sort(key=lambda r: (r["name"], r["team_id"] or ""))
+    # Canonical sort (name, then remote_team_id — null-safe via "").
+    rows.sort(key=lambda r: (r["name"], r["remote_team_id"] or ""))
+
+    incomplete = _SKIPPED > 0 or args.truncated
 
     if args.format == "json":
+        if incomplete:
+            reasons = []
+            if args.truncated:
+                reasons.append("the team count was truncated at the caller's bound")
+            if _SKIPPED:
+                reasons.append(f"{_SKIPPED} team config(s) were skipped as unreadable/invalid")
+            print(
+                "agmsg: team list --json: refusing to print a partial list as if it were "
+                "complete (" + "; ".join(reasons) + "). Not safe to use as the --scope all "
+                "ambiguity authority. See stderr above for which team(s) were skipped.",
+                file=sys.stderr,
+            )
+            return 2
         sys.stdout.write(json.dumps({"schema_version": 1, "teams": rows}, sort_keys=True) + "\n")
     else:
         if not rows:
             print("No teams found.")
         else:
             for r in rows:
-                team_id_disp = r["team_id"] or "-"
-                print(f"{r['name']}\t{team_id_disp}\t{r['scope']}\t{r['binding_state']}")
+                remote_team_id_disp = r["remote_team_id"] or "-"
+                print(f"{r['name']}\t{remote_team_id_disp}\t{r['scope']}\t{r['binding_state']}")
+        if incomplete:
+            print(
+                "agmsg: warning: this list is incomplete (some teams were skipped or "
+                "truncated — see warnings above).",
+                file=sys.stderr,
+            )
 
     return 0
 

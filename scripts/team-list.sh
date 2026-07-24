@@ -10,8 +10,63 @@ set -euo pipefail
 # device knows about, across every registered project.
 #
 # --json: strict, versioned machine ABI:
-#   { schema_version, teams: [{ name, team_id, scope, binding_state,
-#     onboarding_state, promote_eligible, blocked_reason }] }
+#   { schema_version, teams: [{ name, remote_team_id, scope, binding_state }] }
+# Every team entry always includes all four fields — none is ever omitted,
+# so a consumer never needs to guess whether a missing key means "absent"
+# vs "not yet populated" (a required-but-nullable field is null; it is
+# never simply left out).
+#
+#   name             string. The local team name (also its directory name
+#                    under teams/).
+#   remote_team_id   string | null. Server-assigned id of this team's
+#                    CURRENT remote binding (ADR 0007's
+#                    remote_binding.remote_team_id) — null when the team
+#                    has never connected. Deliberately named
+#                    remote_team_id, not team_id: this is a property of the
+#                    binding, not a stable local identity anchor for the
+#                    team itself (no such anchor exists in the current
+#                    schema — every local team's stable identity today
+#                    IS its name; there is no separate immutable local
+#                    UUID). A future portable/local team id (ADR 0010)
+#                    would be a genuinely NEW field (e.g. local_team_id),
+#                    never a reinterpretation of this one.
+#   scope            exactly "project" | "other". "project": this team has
+#                    at least one agent registration for the project this
+#                    command was run against. "other": it does not. Always
+#                    present regardless of which --scope filter was
+#                    requested (see --scope below).
+#   binding_state    exactly "active" | "disconnected" | "none".
+#                    "none": never connected. "active": connected, not
+#                    since disconnected. "disconnected": was connected, has
+#                    since been disconnected (remote_team_id is retained
+#                    from that binding, as history, not a live claim).
+#
+# A row whose computed scope/binding_state would fall outside these exact
+# enums (should never happen — both are derived from a closed set of
+# branches, never read verbatim off disk as a free-form string) is treated
+# as invalid and dropped from the list like any other unreadable config —
+# fail-closed per-entry, never widening the enum silently to fit.
+#
+# schema_version increment convention (mentor-cc ruling, pin this before
+# ever bumping it): adding a NEW field is additive and does NOT bump
+# schema_version — a consumer MUST ignore fields it doesn't recognize.
+# Only changing or removing an EXISTING field's meaning bumps it. This is
+# why the fields above are limited to ones whose meaning is fully settled
+# today, rather than shipping a placeholder now and changing what it means
+# later (that would be the field-count staying the same while the
+# contract silently broke — worse than just not having shipped it yet).
+#
+# onboarding_state/promote_eligible/blocked_reason are deliberately NOT in
+# v1 (mentor-cc ruling): their real meaning depends on ADR 0010
+# (local-first onboarding / roster convergence), which hasn't landed, so
+# right now they could only be a fixed/mechanically-derived value with
+# zero information a consumer couldn't already get from binding_state —
+# exactly the "field exists, meaning undetermined" shape that becomes a
+# breaking change the moment ADR 0010 gives them real semantics. Add them
+# additively (a new field, not a changed one) once ADR 0010 fixes what
+# they mean — do not resurrect a placeholder version of them before then.
+# Same reasoning applies to any future local/portable team identity field.
+#
 # With no --json, prints the equivalent as human-readable text.
 #
 # --scope (default: all) — all: every locally known team (this is the
@@ -26,37 +81,21 @@ set -euo pipefail
 #   requested, so a consumer can always tell which is which even under
 #   `all`.
 #
-# team_id/onboarding_state/promote_eligible/blocked_reason are placeholders
-# ahead of ADR 0010 (local-first onboarding / roster convergence), which is
-# still in design review as of this writing:
-#   - team_id: the team's remote_team_id if it has ever connected
-#     (ADR 0007's remote_binding — the only server-issued team identifier
-#     that exists in the CURRENT schema), else null. ADR 0010 may
-#     introduce a portable team_id independent of any remote connection;
-#     this field will pick that up once it exists.
-#   - onboarding_state: "connected" | "not_connected" — derived only from
-#     whether a remote binding exists today. ADR 0010's actual onboarding
-#     state machine (promote/join/pending-acceptance/etc.) is not
-#     implemented yet; this is intentionally a coarse stand-in, not a
-#     preview of that enum.
-#   - promote_eligible: always false. The real gate is ADR 0010's reserve
-#     CAS, which does not exist yet — false is the fail-closed placeholder
-#     until that authority exists; this field must never claim a team is
-#     promotable before the mechanism that would make it safe is built.
-#   - blocked_reason: "adr_0010_not_implemented" whenever promote_eligible
-#     is false for that reason (currently: always), else null.
-# None of these four are load-bearing for anything today; they exist so
-# consumers can start writing against the final field set now. Revisit
-# all four once ADR 0010's local config v2 lands.
-#
 # Bounded (never unbounded local enumeration/output): at most
-# MAX_TEAMS team dirs are considered (excess are skipped with a stderr
-# warning — never silently truncated without saying so), and each config.json
-# read is capped at MAX_CONFIG_BYTES. A team whose config fails strict
-# parsing (invalid JSON, or a duplicate key at any depth — the same #87/D4
-# class of hygiene this ADR family already applies to server-supplied
-# JSON, held to config.json too) is skipped with a stderr warning rather
-# than guessed at.
+# MAX_TEAMS team dirs are considered, and each config.json read is capped
+# at MAX_CONFIG_BYTES. A team whose config fails strict parsing (invalid
+# JSON, or a duplicate key at any depth — the same #87/D4 class of hygiene
+# this ADR family already applies to server-supplied JSON, held to
+# config.json too) is skipped with a stderr warning.
+#
+# --json fails closed on incompleteness (co1 delta review): if the
+# MAX_TEAMS bound was hit, or any team's config was skipped, --format json
+# prints NO JSON payload at all and exits 2 — a partial list must never be
+# handed to a consumer as if it were the complete, authoritative one (the
+# whole point of --scope all is deciding "one team vs several" correctly).
+# --format human (no --json) still prints whatever it found plus the
+# warnings and exits 0, since a person reading it isn't fooled the way an
+# automated ambiguity check would be.
 #
 # Never mutates local state, and never prints a secret or an absolute
 # filesystem path (the "scope" field is a classification, "project" or
@@ -68,7 +107,7 @@ TEAMS_DIR="$SKILL_DIR/teams"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 
-MAX_TEAMS=10000
+MAX_TEAMS="${AGMSG_TEAM_LIST_MAX_TEAMS:-10000}"
 MAX_CONFIG_BYTES=$((10 * 1024 * 1024))
 
 json=0
@@ -92,6 +131,7 @@ work_file="$(mktemp "${TMPDIR:-/tmp}/agmsg-team-list-work.XXXXXX")"
 chmod 600 "$work_file"
 trap 'rm -f "$work_file"' EXIT INT TERM
 
+truncated=0
 if [ -d "$TEAMS_DIR" ]; then
   count=0
   for d in "$TEAMS_DIR"/*/; do
@@ -101,6 +141,7 @@ if [ -d "$TEAMS_DIR" ]; then
     count=$((count + 1))
     if [ "$count" -gt "$MAX_TEAMS" ]; then
       echo "agmsg: team list bounded at $MAX_TEAMS teams — some local teams were not enumerated" >&2
+      truncated=1
       break
     fi
     name="$(basename "$d")"
@@ -116,6 +157,10 @@ agmsg_project_path_variants "$project_path" > "$variants_file"
 format="human"
 [ "$json" -eq 1 ] && format="json"
 
+truncated_flag=()
+[ "$truncated" -eq 1 ] && truncated_flag=(--truncated)
+
 python3 "$SCRIPT_DIR/internal/team-list.py" \
   --entries "$work_file" --variants "$variants_file" \
-  --scope "$scope" --max-config-bytes "$MAX_CONFIG_BYTES" --format "$format"
+  --scope "$scope" --max-config-bytes "$MAX_CONFIG_BYTES" --format "$format" \
+  "${truncated_flag[@]}"

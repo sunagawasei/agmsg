@@ -79,6 +79,18 @@ Do NOT manually edit config files. Always use join.sh. If the name was recently 
 # List team members
 ~/.agents/skills/agmsg/scripts/team.sh <team>
 
+# List every locally known team (read-only, secret-free — "agmsg team list").
+# Distinct from `team.sh <team>` above: check for "team list" FIRST so
+# "list" is never mistaken for a team name. --json emits a strict,
+# versioned object ({schema_version, teams: [{name, remote_team_id, scope,
+# binding_state}]}) and exits non-zero with NO payload if any team was
+# unreadable or the count was truncated — never a partial list dressed up
+# as complete. See scripts/team-list.sh's own header comment for the exact
+# enums and why onboarding_state/promote_eligible/blocked_reason are
+# deliberately NOT in this schema yet (their meaning depends on ADR 0010,
+# which hasn't landed).
+~/.agents/skills/agmsg/scripts/team-list.sh [--json] [--scope all|project] [<project_path>]
+
 # Leave a team
 ~/.agents/skills/agmsg/scripts/leave.sh <team> <agent_id>
 
@@ -269,21 +281,6 @@ config.json rollback, and doesn't use the age-v1 profile's pinned
 canonical epoch-snapshot shape), so it's held back rather than shipping a
 protection that isn't actually there. Do not suggest it as a working
 command.
-
-```bash
-# Read-only, secret-free enumeration of every locally known team (ADR 0007
-# family addition), across every registered project — unlike `team.sh
-# <team>` above, which shows one team's members. --json emits a strict,
-# versioned object ({schema_version, teams: [{name, team_id, scope,
-# binding_state, onboarding_state, promote_eligible, blocked_reason}]});
-# team_id/onboarding_state/promote_eligible/blocked_reason are placeholders
-# ahead of ADR 0010 (local-first onboarding) — see team-list.sh's own
-# header comment before relying on their exact values. --scope all (the
-# default) is the only correct basis for an automated "is this ambiguous"
-# decision; --scope project is a human-facing convenience filter, never a
-# substitute for `all` in that decision.
-~/.agents/skills/agmsg/scripts/team-list.sh [--json] [--scope all|project] [<project_path>]
-```
 
 Slash-command surface (SKILL.md / per-type templates), same mapping
 pattern as every command above:

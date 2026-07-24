@@ -35,20 +35,17 @@ json_field() {
   [ "$(sqlite_mem "SELECT json_extract('$(printf %s "$teams" | sed "s/'/''/g")', '\$[1].name');")" = "zteam" ]
 }
 
-@test "team list --json: an unconnected team has binding_state=none, team_id=null" {
+@test "team list --json: an unconnected team has binding_state=none, remote_team_id=null" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
   run bash "$SCRIPTS/team-list.sh" --json
   [ "$status" -eq 0 ]
   local team; team="$(sqlite_mem "SELECT json_extract('$(printf %s "$(json_field "$output" teams)" | sed "s/'/''/g")', '\$[0]');")"
   local escaped; escaped="$(printf %s "$team" | sed "s/'/''/g")"
   [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.binding_state');")" = "none" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.team_id');")" = "" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.onboarding_state');")" = "not_connected" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.promote_eligible');")" = "0" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.blocked_reason');")" = "adr_0010_not_implemented" ]
+  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.remote_team_id');")" = "" ]
 }
 
-@test "team list --json: an actively connected team has binding_state=active and a real team_id" {
+@test "team list --json: an actively connected team has binding_state=active and a real remote_team_id" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
 
   MOCK_REVOKE_FAIL="${MOCK_REVOKE_FAIL:-}" python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
@@ -61,22 +58,21 @@ json_field() {
   local mock_port; mock_port="$(cat "$TEST_SKILL_DIR/server.port")"
   local endpoint="http://127.0.0.1:$mock_port"
   bash "$SCRIPTS/remote.sh" connect --endpoint "$endpoint" good-token myteam
-  local committed_team_id
-  committed_team_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['remote_team_id'])")
+  local committed_remote_team_id
+  committed_remote_team_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['remote_team_id'])")
 
   run bash "$SCRIPTS/team-list.sh" --json
   kill "$mock_pid" 2>/dev/null || true
   [ "$status" -eq 0 ]
   local escaped; escaped="$(printf %s "$(sqlite_mem "SELECT json_extract('$(printf %s "$(json_field "$output" teams)" | sed "s/'/''/g")', '\$[0]');")" | sed "s/'/''/g")"
   [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.binding_state');")" = "active" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.team_id');")" = "$committed_team_id" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.onboarding_state');")" = "connected" ]
+  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.remote_team_id');")" = "$committed_remote_team_id" ]
   # No secret and no absolute filesystem path anywhere in the output.
   [[ "$output" != *"session-credential"* ]]
   [[ "$output" != *"/tmp/project-a"* ]]
 }
 
-@test "team list --json: a disconnected team has binding_state=disconnected, team_id retained" {
+@test "team list --json: a disconnected team has binding_state=disconnected, remote_team_id retained" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
   python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
     > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
@@ -95,7 +91,7 @@ json_field() {
   [ "$status" -eq 0 ]
   local escaped; escaped="$(printf %s "$(sqlite_mem "SELECT json_extract('$(printf %s "$(json_field "$output" teams)" | sed "s/'/''/g")', '\$[0]');")" | sed "s/'/''/g")"
   [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.binding_state');")" = "disconnected" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.team_id');")" != "" ]
+  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.remote_team_id');")" != "" ]
 }
 
 @test "team list --scope project: only includes teams registered for the given project" {
@@ -141,34 +137,58 @@ json_field() {
   [ "$(sqlite_mem "SELECT json_extract('$(printf %s "$teams" | sed "s/'/''/g")', '\$[0].name');")" = "$team" ]
 }
 
-@test "team list: skips a team whose config.json contains a duplicate JSON key, with a stderr warning" {
+@test "team list --json: fails closed (no payload, exit 2) when a team's config has a duplicate JSON key (co1 P2 — never authoritative on a partial list)" {
   mkdir -p "$SCRIPTS/../teams/badteam"
   printf '{"name":"badteam","agents":{},"agents":{}}' > "$SCRIPTS/../teams/badteam/config.json"
   bash "$SCRIPTS/join.sh" goodteam alice claude-code /tmp/project-a
 
-  # bats' `run` merges stdout+stderr into $output, which would corrupt JSON
-  # parsing here (the script emits the warning on stderr, the payload on
-  # stdout) — check each stream in its own `run`, not the combined one.
+  # bats' `run` merges stdout+stderr into $output — check each stream in
+  # its own `run` so a stray warning line can never be mistaken for (or
+  # corrupt parsing of) the JSON payload.
   run bash -c "bash '$SCRIPTS/team-list.sh' --json 2>/dev/null"
-  [ "$status" -eq 0 ]
-  local teams; teams="$(json_field "$output" teams)"
-  [ "$(sqlite_mem "SELECT json_array_length('$(printf %s "$teams" | sed "s/'/''/g")');")" -eq 1 ]
-  [ "$(sqlite_mem "SELECT json_extract('$(printf %s "$teams" | sed "s/'/''/g")', '\$[0].name');")" = "goodteam" ]
+  [ "$status" -eq 2 ]
+  [ -z "$output" ]
+
+  run bash -c "bash '$SCRIPTS/team-list.sh' --json 2>&1 >/dev/null"
+  [[ "$output" == *"skipping 'badteam'"* ]]
+  [[ "$output" == *"refusing to print a partial list"* ]]
+}
+
+@test "team list --json: fails closed (no payload, exit 2) when a team's config is not valid JSON" {
+  mkdir -p "$SCRIPTS/../teams/badteam"
+  printf 'not even json' > "$SCRIPTS/../teams/badteam/config.json"
+
+  run bash -c "bash '$SCRIPTS/team-list.sh' --json 2>/dev/null"
+  [ "$status" -eq 2 ]
+  [ -z "$output" ]
 
   run bash -c "bash '$SCRIPTS/team-list.sh' --json 2>&1 >/dev/null"
   [[ "$output" == *"skipping 'badteam'"* ]]
 }
 
-@test "team list: skips a team whose config.json is not valid JSON, with a stderr warning" {
+@test "team list --json: fails closed (no payload, exit 2) when the team count is truncated at the bound" {
+  bash "$SCRIPTS/join.sh" teama alice claude-code /tmp/project-a
+  bash "$SCRIPTS/join.sh" teamb bob claude-code /tmp/project-b
+
+  run bash -c "AGMSG_TEAM_LIST_MAX_TEAMS=1 bash '$SCRIPTS/team-list.sh' --json 2>/dev/null"
+  [ "$status" -eq 2 ]
+  [ -z "$output" ]
+
+  run bash -c "AGMSG_TEAM_LIST_MAX_TEAMS=1 bash '$SCRIPTS/team-list.sh' --json 2>&1 >/dev/null"
+  [[ "$output" == *"bounded at 1 teams"* ]]
+  [[ "$output" == *"refusing to print a partial list"* ]]
+}
+
+@test "team list (human, no --json): a bad config or a truncated bound still prints what it found, with a warning, exit 0" {
   mkdir -p "$SCRIPTS/../teams/badteam"
   printf 'not even json' > "$SCRIPTS/../teams/badteam/config.json"
+  bash "$SCRIPTS/join.sh" goodteam alice claude-code /tmp/project-a
 
-  run bash -c "bash '$SCRIPTS/team-list.sh' --json 2>/dev/null"
+  run bash "$SCRIPTS/team-list.sh"
   [ "$status" -eq 0 ]
-  [ "$(json_field "$output" teams)" = "[]" ]
-
-  run bash -c "bash '$SCRIPTS/team-list.sh' --json 2>&1 >/dev/null"
+  [[ "$output" == *"goodteam"* ]]
   [[ "$output" == *"skipping 'badteam'"* ]]
+  [[ "$output" == *"this list is incomplete"* ]]
 }
 
 @test "team list: human-readable output includes name and binding state" {
