@@ -502,9 +502,12 @@ EOF
   [ "$status" -eq 0 ]
   [[ ! "$output" =~ "syntax error" ]]
   [[ ! "$output" =~ ".parameter" ]]
-  run bash "$SCRIPTS/team.sh" myteam
-  [[ "$output" =~ "$new" ]]
-  [[ ! "$output" =~ "$old" ]]
+  run node -e '
+    const config = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+    process.exit(Number(!Object.hasOwn(config.agents, process.argv[2]) ||
+      Object.hasOwn(config.agents, process.argv[3])));
+  ' "$TEST_SKILL_DIR/teams/myteam/config.json" "$new" "$old"
+  [ "$status" -eq 0 ]
 }
 
 @test "rename: rejects an old/new agent name containing path-hazard characters" {
