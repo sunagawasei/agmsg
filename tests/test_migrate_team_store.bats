@@ -133,7 +133,9 @@ shared_rows() {
   # the comment there that points at this script is the documentation, so the
   # check skips comment lines rather than matching the name anywhere.
   local called
+  # grep -n on ONE file prints "NNN:text" with no leading filename, so the
+  # comment filter anchors at the start rather than after a colon.
   called="$(grep -n 'migrate-team-store' "$BATS_TEST_DIRNAME/../install.sh" \
-    | grep -v ':[0-9]*: *#' || true)"
+    | grep -v '^[0-9]*: *#' || true)"
   [ -z "$called" ] || { echo "$called"; false; }
 }

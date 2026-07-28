@@ -416,6 +416,12 @@ if [ ! -f "$SKILL_DIR/db/messages.db" ]; then
   bash "$SKILL_DIR/scripts/internal/init-db.sh"
 fi
 
+# Nothing moves stores here. Installing must not change where a team's messages
+# live: programs outside agmsg read the shared store directly, and an install
+# that relocated their data would break them without anything saying so. A team
+# moves to its own store only when connecting requires it, and only that team —
+# see scripts/drivers/layout/ and internal/migrate-team-store.sh.
+
 # Initialize config
 if [ ! -f "$SKILL_DIR/db/config.yaml" ]; then
   bash "$SKILL_DIR/scripts/config.sh" show >/dev/null
