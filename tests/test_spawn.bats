@@ -1235,7 +1235,8 @@ STUB
   for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
   run cat "$CAPTURE"
   [[ "$output" == *"codex-myteam-cwd"* ]]                # scratch cwd, not the repo
-  [[ "$output" == *"sandbox_mode=workspace-write"* ]]
+  [[ "$output" == *"default_permissions=agmsg-consultant"* ]]
+  [[ "$output" != *"default_permissions=agmsg-implementer"* ]]
   [[ "$output" != *"default_permissions=agmsg-reviewer"* ]]
 }
 
@@ -1269,7 +1270,7 @@ STUB
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
   run cat "$CAPTURE"
-  [[ "$output" == *"sandbox_mode=workspace-write"* ]]   # confirms the implementer branch built appcmd
+  [[ "$output" == *"default_permissions=agmsg-implementer"* ]]   # confirms the implementer branch built appcmd
   [[ "$output" == *'model="gpt-5.6-sol"'* ]]
 }
 
