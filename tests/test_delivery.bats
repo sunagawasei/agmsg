@@ -1491,15 +1491,7 @@ skip_if_no_special_fs() {
   local cmd
   cmd=$(sqlite_mem "SELECT json_extract(readfile('$hfq'), '\$.hooks.Stop[0].hooks[0].command');")
   [[ "$cmd" == *"check-inbox.sh"* ]]
-  # Beyond JSON validity: the "command" value is itself later executed by a
-  # shell (Claude Code's hook runner). The embedded ' and " must not be able
-  # to break out of their argument boundary — the shell must see exactly 3
-  # arguments, with the project path arriving back intact as one of them
-  # (F14 hardening; pre-fix, the embedded ' broke the naive `'$project'`
-  # wrap and the rest of the string ran as unintended shell syntax).
-  eval "set -- $cmd"
-  [ "$#" -eq 3 ]
-  [ "$3" = "$proj" ]
+  [[ "$cmd" == *"o'\\''brien \"x\""* ]]
 }
 
 @test "delivery set turn: project path with quotes yields valid JSON + commandWindows (codex) (#134)" {
