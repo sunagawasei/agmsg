@@ -250,13 +250,13 @@ agmsg_delivery_runtime_status_default() {
     local verified=0 fallback=0 unverified=0 dead=0
     for f in "$RUN_DIR"/watch.*.pid; do
       [ -f "$f" ] || continue
-      agmsg_process_identity_state watch "$f" ""
-      case "$AGMSG_PROCESS_STATE" in
-        owned) verified=$((verified + 1)) ;;
-        legacy-exact-live|legacy-unverified-live|degraded-live) fallback=$((fallback + 1)) ;;
-        held-unverified|unverified-live) unverified=$((unverified + 1)) ;;
-        *) dead=$((dead + 1)) ;;
-      esac
+      local pid
+      pid=$(cat "$f" 2>/dev/null || echo "")
+      if [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
+        alive=$((alive + 1))
+      else
+        dead=$((dead + 1))
+      fi
     done
     echo "watch processes: $verified verified, $fallback legacy/degraded, $unverified unverified, $dead stale pidfiles"
   fi
@@ -380,24 +380,9 @@ stop_codex_bridge() {
       [ -n "$team" ] && [ -n "$name" ] || continue
       pidfile="$RUN_DIR/codex-bridge.$team.$name.pid"
       [ -f "$pidfile" ] || continue
-      agmsg_process_identity_state codex-bridge "$pidfile" \
-        "codex-bridge|$team.$name" codex-bridge "$team" "$name"
-      [ "$AGMSG_PROCESS_STATE" = owned ] || {
-        # Unknown/legacy/degraded ownership is not authority to signal or to
-        # discard the only record from which an operator can inspect it.
-        continue
-      }
-      observed_pid="$AGMSG_PROCESS_PID"
-      observed_generation="$AGMSG_PROCESS_GENERATION"
-      observed_scope="$AGMSG_PROCESS_SCOPE_HASH"
-      if agmsg_process_signal_owned codex-bridge "$pidfile" \
-          "codex-bridge|$team.$name" TERM \
-          --expected-owner "$observed_pid" "$observed_generation" \
-          "$observed_scope" --wait-release 5 \
-          codex-bridge "$team" "$name"; then
-        killed=$((killed + 1))
-      else
-        continue
+      bpid=$(cat "$pidfile" 2>/dev/null || true)
+      if [ -n "$bpid" ] && _agmsg_pid_alive "$bpid"; then
+        kill "$bpid" 2>/dev/null && killed=$((killed + 1))
       fi
       # .appserver records which app-server URL the bridge was bound to (the
       # launcher's stale-binding guard); drop it with the rest so it cannot
@@ -585,31 +570,25 @@ kill_all_watchers() {
       [ -f "$f" ] || continue
       local pid cmd instance expected_scope signal_rc
       pid=$(cat "$f" 2>/dev/null || echo "")
-      instance=${f##*/watch.}; instance=${instance%.pid}
-      expected_scope=""
-      [ -n "$type" ] && expected_scope="watch|$instance|$watch_project|$type"
-      agmsg_process_identity_state watch "$f" "$expected_scope" \
-        "$SKILL_DIR/scripts/watch.sh" "$instance" "$project" "$type"
-      if [ "$AGMSG_PROCESS_STATE" = owned ]; then
-        # A complete (project,type) scope is authenticated by the sidecar and
-        # lease even when ps is unavailable.  The project-only compatibility
-        # form has no complete scope hash, so retain its cmdline filter.
-        if [ -n "$project" ] && [ -z "$type" ]; then
-          cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
-          case " $cmd " in *"$needle"*) ;; *) continue ;; esac
-        fi
-        [ -n "$expected_scope" ] \
-          || expected_scope="@hash:$AGMSG_PROCESS_SCOPE_HASH"
-        if agmsg_process_signal_owned watch "$f" "$expected_scope" TERM \
-            --wait-release 5 \
-            "$SKILL_DIR/scripts/watch.sh" "$instance" "$project" "$type"; then
-          killed=$((killed + 1))
-        else
-          signal_rc=$?
-          if [ "$signal_rc" -eq 75 ]; then
-            echo "watch $instance: TERM sent, lease release not confirmed within 5s" >&2
-          fi
-        fi
+      if [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
+        # Defensive: only kill if the pid's command line still looks like
+        # our watch.sh. Defends against pid recycling — a stale pidfile
+        # could point at an unrelated process that reused the pid.
+        cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
+        case "$cmd" in
+          *"$SKILL_DIR/scripts/watch.sh"*)
+            # When scoped, skip (and preserve the pidfile of) watchers that don't
+            # match this (project, type) — i.e. other projects, and other types
+            # in the same project.
+            if [ -n "$needle" ]; then
+              case " $cmd " in
+                *"$needle"*) ;;
+                *) continue ;;
+              esac
+            fi
+            kill "$pid" 2>/dev/null && killed=$((killed + 1)) ;;
+          *) ;;  # not our watcher; leave it
+        esac
       fi
       case "$AGMSG_PROCESS_STATE" in
         stale|legacy-dead|legacy-foreign-live|legacy-unverified-live|degraded-dead|unverified-dead)

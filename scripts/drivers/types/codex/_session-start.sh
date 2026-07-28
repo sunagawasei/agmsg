@@ -164,11 +164,11 @@ EOF
     bridge_pairs+=(--pair "$candidate_team"$'\t'"$candidate_name")
   done <<< "$PAIRS"
   pidfile="$RUN_DIR/codex-bridge.$bridge_key.pid"
-  bridge_scope="codex-bridge|$bridge_key"
-  if [ -f "$pidfile" ] \
-      && agmsg_process_dedup_should_suppress codex-bridge "$pidfile" "$bridge_scope" \
-        codex-bridge "$bridge_key"; then
-    exit 0
+  if [ -f "$pidfile" ]; then
+    bridge_pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [ -n "$bridge_pid" ] && _agmsg_pid_alive "$bridge_pid"; then
+      exit 0
+    fi
   fi
 
   log="$RUN_DIR/codex-bridge.$bridge_key.log"
