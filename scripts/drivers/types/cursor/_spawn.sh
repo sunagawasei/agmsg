@@ -46,6 +46,8 @@ CURSOR_BIN="${AGMSG_CURSOR_AGENT_CMD:-cursor-agent}"
 # scratch CFGDIR is rm -rf'd, so a path-unsafe name must never reach it).
 # shellcheck source=../../lib/validate.sh
 . "$SCRIPT_DIR/lib/validate.sh"
+# shellcheck source=../../lib/identity-key.sh
+. "$SCRIPT_DIR/lib/identity-key.sh"
 
 # Resolve the headless default from config when no explicit flag was given.
 #   precedence: --headless / --interactive  >  config spawn.cursor_headless  >  TUI
@@ -121,9 +123,11 @@ agmsg_spawn_headless() {
   # Opaque per-identity marker handed to the bridge below; the dup-check fallback
   # matches on THIS, so team/name content (spaces, regex metachars, flag-like
   # substrings) can never create argv-boundary or regex ambiguity in the scan.
-  # base64url(team\tname) — no spaces, no metachars, no '/'.
+  # The shared generator appends a non-base64url terminator, so a shorter
+  # encoded identity cannot match a longer identity's prefix even when this is
+  # the final argv pair (cursor intentionally keeps optional args after it).
   local _idkey
-  _idkey="$(printf '%s\t%s' "$TEAM" "$NAME" | base64 | tr -d '\n' | tr '+/' '-_')"
+  _idkey="$(agmsg_identity_key "$TEAM" "$NAME")"
 
   # Refuse a second bridge for the same (team,name) BEFORE registering or staging
   # anything — two bridges on one identity produce duplicate replies, and an early

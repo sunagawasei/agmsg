@@ -18,6 +18,150 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `delivery.sh default-mode <type>` (honored only where the type supports the
   mode; unset/invalid/unsupported falls back to asking).
 
+## [1.1.11] - 2026-07-27
+
+### Added
+- Offer monitor as the default delivery mode, drop the beta framing (#497)
+- Support spawning into herdr panes (#495)
+- Drag files onto a pane to insert their path (#481)
+- Render terminals via WebGL, attached only to the active pane (#446)
+
+### Fixed
+- Stop the bridge launcher duplicating children and burning a core (#496)
+- Make the turn watchdog an idle timeout, not a fixed ceiling (#443)
+- Mark read_at on live delivery so a later inbox.sh does not replay it (#439)
+- Memoize the sqlite3 -escape probe instead of re-running it (#494)
+- Treat kill -0 EPERM as alive under the command sandbox (#447)
+- Fail loudly on shifted args instead of running with zero subscriptions (#477)
+- Add -g to macOS Terminal/iTerm launch so it doesn't steal focus (#470)
+- Make record-session project arg optional, reject poison records (#473)
+- Avoid two-line grep -c count breaking record-session integer test (#484)
+- Bound the self-clean race in the watcher re-invocation test (#440)
+- Shell-quote delivery hook command paths (F14) (#487)
+- Close #87-class SQLi/path-hazard gaps in rename/leave/reset/rename-team/team/api (#482)
+
+### Documentation
+- State how to pronounce agmsg (#498)
+
+## [1.1.10] - 2026-07-19
+
+### Fixed
+- Allow launcher-reserved bridge PID (#444)
+
+## [1.1.9] - 2026-07-19
+
+### Added
+- Isolate Codex monitor bridges by role (#425)
+- Free shell tab, unattached to any agent (#431)
+- Add session-only dismiss to outdated-CLI banner (#430)
+- Extend join/actas prompts with roster-aware name suggestions (#421)
+- Remember the last active tab per team (#417)
+
+### Fixed
+- Tombstone renamed-away names so join/actas can't silently revive them (#427)
+- Don't let co-located app-v* tags pollute the recorded core VERSION (#432)
+- Resolve shim through symlinks, warn when monitor mode isn't actually reached (#429)
+- Skip Monitor directive for .claude/worktrees sub-sessions (#428)
+- Grace fallback for thread/resume failure on Codex 0.142+ (rebase of #276) (#426)
+- Stop Claude Code 2.1.x daemon from hijacking pid resolution (#424)
+- Mark only the displayed messages as read (#361)
+- Replace flaky ls -t rollout lookup with find + portable mtime sort (#423)
+- Bound the stdin read so a never-closed pipe cannot freeze the agent pane (#422)
+- Convert team config paths for readfile() via agmsg_sql_readfile_path (#396)
+- Fix Codex monitor multi-identity delivery (#419)
+- Auto-decline approval requests, arm the turn watchdog on externally-active turns (#420)
+- Add Shell requirement to all type templates (#345)
+- Validate team name before resolving roster config path (#418)
+- Give team-status-rail its own gray for zero-pane teams (#413)
+
+### Documentation
+- Clarify sandbox and storage guidance (#362)
+- Fix leftover OpenCode references in cursor template (#398)
+
+## [1.1.8] - 2026-07-15
+
+### Added
+- Sidebar per-section + buttons, replacing the New dropdown (#407)
+- Green status-unknown default, roomier team-status-rail rows (#406)
+- Phase-lock agent-status and monitor pulse dots to wall clock (#403)
+- Detect grok/grok-build agent status (#395)
+- Persist UI settings across restarts (#391)
+- Snap pane dividers to terminal cell units, herdr-style gaps (#390)
+- Show agent and team status (#385)
+
+### Fixed
+- Filter non-numeric characters out of the font-size draft (#405)
+- Reject unregistered from/to agents (#409)
+- Resolve Codex leftovers and delivery_modes mismatch (#408)
+- Forward args on a flags-only monitored launch (#404)
+- Clean up the Settings font-size input (#401)
+- Display chat timestamps in local time, not raw UTC (#394)
+- Normalise Windows backslash paths before handing to bash/curl (#392)
+
+### Performance
+- Batch pty-output writes to one term.write() per animation frame (#402)
+
+## [app-v0.1.5] - 2026-07-13
+
+### Added
+- 0.1.5 UI polish — sidebar collapse, chat pane min/max, Team Room toggle, About version, lucide icons (#377)
+
+### Fixed
+- Authenticode-sign Windows binaries during tauri build (#354)
+
+## [1.1.7] - 2026-07-13
+
+### Added
+- Role-to-session affinity: named sessions, resume-by-role boot, tmux-resurrect (#339) (#344)
+
+### Fixed
+- Wrap boot script with bash -l for psmux on Windows (#335) (#363)
+- Guard '/'-prefixed boot prompt against MSYS path conversion on Git Bash (#358)
+- Stop ancestor project resolution from over-reaching to $HOME / other teams (#357) (#359)
+- Bind the bridge to the role's recorded thread, not "loaded" (#350) (#353)
+- Detect the real GEMINI_CLI env var, not GOOGLE_GEMINI_CLI (#351)
+
+## [1.1.6] - 2026-07-05
+
+### Added
+- Aligned-grid seam-segment dragging + lazy transpose (issue #317, part 3) (#327)
+- Wire pane split tree into rendering + drag-drop (issue #317, part 2) (#324)
+- Pane split tree — pure data model + tests (issue #317, part 1) (#321)
+- Expose pane layout in the View menu (#316)
+
+### Fixed
+- Correct boot script for Windows-tmux launch and per-type prefix (#282, #283) (#329)
+- Strip inherited same-type session-identity env vars (#294) (#326)
+- Match project registrations across Windows path forms (#268) (#328)
+- Launch agents via cmd.exe on Windows so PATHEXT/aliases resolve (#314, #313) (#325)
+- Resolve MSYS project paths to native on Windows spawn (#315) (#319)
+- Normalize Windows drive-letter project path to POSIX before identity resolution (#275)
+
+## [app-v0.1.3] - 2026-07-04
+
+### Fixed
+- Explicit PATH propagation to spawned processes, dscl shell fallback, diagnostic log (#312)
+- V0.1.3 — import login shell PATH so agent spawn works from Finder (#311)
+
+## [app-v0.1.2] - 2026-07-04
+
+### Fixed
+- Suppress bash's console window and profile-loading delay (#310)
+- Fall back to USERPROFILE when HOME is unset (#309)
+- Resolve Git Bash explicitly + bump version to 0.1.2 (#308)
+- V0.1.2 — Windows bash path bug, banner overlap, update feedback (#306)
+
+## [app-v0.1.1] - 2026-07-04
+
+### Added
+- Add update-cask.sh — automate the Homebrew tap bump (#304)
+
+### Fixed
+- V0.1.1 — agmsg-app pin fix, updater artifacts, outdated-CLI warning (#303)
+
+### Documentation
+- Add brew trust step to macOS install instructions (#301)
+
 ## [app-v0.1.0] - 2026-07-03
 
 ### Added
@@ -206,6 +350,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Handle empty TaskList explicitly to stop fresh-session loop (#71)
 - Storage driver pluginization design (epic #51) (#52)
 
+[1.1.11]: https://github.com/fujibee/agmsg/compare/v1.1.10...v1.1.11
+[1.1.10]: https://github.com/fujibee/agmsg/compare/app-v0.3.0...v1.1.10
+[1.1.9]: https://github.com/fujibee/agmsg/compare/app-v0.2.0...v1.1.9
+[1.1.8]: https://github.com/fujibee/agmsg/compare/app-v0.1.5...v1.1.8
+[app-v0.1.5]: https://github.com/fujibee/agmsg/compare/v1.1.7...app-v0.1.5
+[1.1.7]: https://github.com/fujibee/agmsg/compare/app-v0.1.4...v1.1.7
+[1.1.6]: https://github.com/fujibee/agmsg/compare/app-v0.1.3...v1.1.6
+[app-v0.1.3]: https://github.com/fujibee/agmsg/compare/app-v0.1.2...app-v0.1.3
+[app-v0.1.2]: https://github.com/fujibee/agmsg/compare/app-v0.1.1...app-v0.1.2
+[app-v0.1.1]: https://github.com/fujibee/agmsg/compare/v1.1.5...app-v0.1.1
 [app-v0.1.0]: https://github.com/fujibee/agmsg/compare/v1.1.4...app-v0.1.0
 [1.1.4]: https://github.com/fujibee/agmsg/compare/v1.1.3...v1.1.4
 [1.1.3]: https://github.com/fujibee/agmsg/compare/v1.1.2...v1.1.3
@@ -217,4 +371,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.0.4]: https://github.com/fujibee/agmsg/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/fujibee/agmsg/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/fujibee/agmsg/releases/tag/v1.0.2
-

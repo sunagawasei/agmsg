@@ -65,6 +65,16 @@ RUN_DIR="$SKILL_DIR/run"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/delivery-rulefile.sh"
 
+# Single-quote-escape $1 for splicing into a hook command string as its own
+# shell argument: replace each embedded ' with '\'' (close the quote, emit an
+# escaped literal quote, reopen the quote), matching the standard POSIX
+# technique. Unlike `'$var'`, this round-trips correctly through the shell
+# that later executes the resulting "command" value even when $var itself
+# contains a single quote.
+_agmsg_shq() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # The per-project delivery hooks file is the type's manifest `hooks_file=`
 # (project-relative), not a hardcoded per-type case. The hook FORMAT written into
 # it is still type-specific (apply_settings_* below).
@@ -120,21 +130,30 @@ agmsg_delivery_apply_default() {
   strip_agmsg_event_file "$tmp_state" "Stop"
 
   # 2) Re-add what this mode wants.
+  #
+  # Each hook argument is wrapped with _agmsg_shq rather than a plain '...'
+  # literal: $project (and, in principle, $type) is attacker-influenceable —
+  # e.g. an extracted archive's directory name — and a bare `'$project'`
+  # breaks out of its argument boundary as soon as the value itself contains
+  # a single quote, letting the rest of the string run as shell syntax on the
+  # next SessionStart/SessionEnd/Stop event. The JSON-string escaping
+  # add_event_entry_file applies below only keeps the *JSON* well-formed; it
+  # says nothing about the shell that later executes the "command" value.
   case "$mode" in
     monitor)
-      local ss="'$SKILL_DIR/scripts/session-start.sh' '$type' '$project'"
-      local se="'$SKILL_DIR/scripts/session-end.sh'   '$type' '$project'"
+      local ss="$(_agmsg_shq "$SKILL_DIR/scripts/session-start.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
+      local se="$(_agmsg_shq "$SKILL_DIR/scripts/session-end.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       add_event_entry_file "$tmp_state" "SessionStart" "$ss" "$ww"
       add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$ww"
       ;;
     turn)
-      local cmd="'$SKILL_DIR/scripts/check-inbox.sh' '$type' '$project'"
+      local cmd="$(_agmsg_shq "$SKILL_DIR/scripts/check-inbox.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       add_event_entry_file "$tmp_state" "Stop" "$cmd" "$ww"
       ;;
     both)
-      local ss="'$SKILL_DIR/scripts/session-start.sh' '$type' '$project'"
-      local se="'$SKILL_DIR/scripts/session-end.sh'   '$type' '$project'"
-      local st="'$SKILL_DIR/scripts/check-inbox.sh'   '$type' '$project'"
+      local ss="$(_agmsg_shq "$SKILL_DIR/scripts/session-start.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
+      local se="$(_agmsg_shq "$SKILL_DIR/scripts/session-end.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
+      local st="$(_agmsg_shq "$SKILL_DIR/scripts/check-inbox.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       add_event_entry_file "$tmp_state" "SessionStart" "$ss" "$ww"
       add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$ww"
       add_event_entry_file "$tmp_state" "Stop"         "$st" "$ww"
@@ -234,9 +253,9 @@ agmsg_delivery_runtime_status_default() {
       # _agmsg_pid_alive, not bare kill -0: a watcher from another session runs
       # under a different sandbox, where kill -0 returns EPERM and would be
       # miscounted as a stale pidfile. Treat EPERM as alive (see instance-id.sh).
-      # Status only reads liveness (no kill), so fail-open is safe here; the
-      # kill-bearing teardown paths keep bare kill -0 because a cross-sandbox
-      # kill cannot signal the target anyway.
+      # Status only reads liveness (no kill), so fail-open is safe here. The
+      # teardown paths below use the same helper before attempting a signal;
+      # EPERM must not be mistaken for a stale/recycled pid.
       if [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
         alive=$((alive + 1))
       else
@@ -295,7 +314,9 @@ emit_monitor_directive() {
   if [ -f "$pidfile" ]; then
     local existing
     existing=$(cat "$pidfile" 2>/dev/null || true)
-    if [ -n "$existing" ] && kill -0 "$existing" 2>/dev/null; then
+    # EPERM-aware liveness (_agmsg_pid_alive): a sandbox-unsignalable watcher is
+    # still alive, so we must not re-emit and spawn a duplicate.
+    if [ -n "$existing" ] && _agmsg_pid_alive "$existing"; then
       cat <<EOF
 
 A watch.sh is already streaming into this session (pid $existing). No
@@ -359,7 +380,7 @@ stop_codex_bridge() {
       pidfile="$RUN_DIR/codex-bridge.$team.$name.pid"
       [ -f "$pidfile" ] || continue
       bpid=$(cat "$pidfile" 2>/dev/null || true)
-      if [ -n "$bpid" ] && kill -0 "$bpid" 2>/dev/null; then
+      if [ -n "$bpid" ] && _agmsg_pid_alive "$bpid"; then
         kill "$bpid" 2>/dev/null && killed=$((killed + 1))
       fi
       # .appserver records which app-server URL the bridge was bound to (the
@@ -383,7 +404,7 @@ EOF
     server_pidfile="$RUN_DIR/codex-app-server.$project_hash.pid"
     if [ -f "$server_pidfile" ]; then
       server_pid="$(cat "$server_pidfile" 2>/dev/null || true)"
-      if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
+      if [ -n "$server_pid" ] && _agmsg_pid_alive "$server_pid"; then
         server_cmd="$(compat_get_cmdline "$server_pid" 2>/dev/null || true)"
         case "$server_cmd" in
           *codex*app-server*) kill "$server_pid" 2>/dev/null || true ;;
@@ -412,7 +433,7 @@ do_set() {
   esac
   # Second: does THIS type accept the mode? A type declares the modes its CLI
   # accepts via the delivery_modes= manifest key (e.g. codex omits 'both' — the
-  # bridge beta has no both-mode; rule-file types like opencode omit
+  # the bridge has no both-mode; rule-file types like opencode omit
   # 'monitor'/'both'). Reject anything not listed, before any file is touched.
   # Types without the key fall back to the full set so an unconfigured manifest
   # still works.
@@ -540,7 +561,7 @@ kill_all_watchers() {
       [ -f "$f" ] || continue
       local pid cmd
       pid=$(cat "$f" 2>/dev/null || echo "")
-      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      if [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
         # Defensive: only kill if the pid's command line still looks like
         # our watch.sh. Defends against pid recycling — a stale pidfile
         # could point at an unrelated process that reused the pid.

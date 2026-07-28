@@ -24,6 +24,10 @@ setup() {
 
   # shellcheck disable=SC1090
   source "$SKILL_DIR/scripts/lib/resolve-project.sh"
+  # Real gc_stale callers load _agmsg_pid_alive via actas-lock.sh; mirror that so
+  # the GC exercises the real liveness path, not its missing-helper guard.
+  # shellcheck disable=SC1090
+  source "$SKILL_DIR/scripts/lib/instance-id.sh"
 }
 
 teardown() {
@@ -69,6 +73,102 @@ reg() {
   [ "$result" = "$ROOT/sub" ]   # no codex registration → unchanged
 }
 
+# --- #357: over-reach of the ancestor walk (poison registrations) ---
+
+# Inject a registration directly into a team's config, bypassing join.sh's guard
+# -- this simulates a poison registration left by an older version (join now
+# refuses $HOME / root, but old data persists).
+poison_reg() {  # <team> <agent> <project> [type]
+  local team="$1" agent="$2" proj="$3" type="${4:-claude-code}"
+  mkdir -p "$SKILL_DIR/teams/$team"
+  cat > "$SKILL_DIR/teams/$team/config.json" <<JSON
+{"name":"$team","agents":{"$agent":{"registrations":[{"type":"$type","project":"$proj"}]}}}
+JSON
+}
+
+@test "resolve: a \$HOME registration never captures resolution (#357 shallow-exclusion)" {
+  local home_norm; home_norm="$(agmsg_normalize_project_path "$HOME")"
+  mkdir -p "$HOME/agmsg-agents/aglive"
+  poison_reg test cc "$home_norm" claude-code       # poison: $HOME registered
+
+  # Sanity: the poison IS in the (all-teams) registry, so this really exercises
+  # the exclusion rather than a missing registration.
+  agmsg_registered_projects claude-code | grep -Fxq -- "$home_norm"
+
+  # A session deep under $HOME must NOT resolve up to $HOME.
+  result="$(agmsg_resolve_project "$HOME/agmsg-agents/aglive" claude-code)"
+  [ "$result" = "$(agmsg_normalize_project_path "$HOME/agmsg-agents/aglive")" ]
+}
+
+@test "resolve: a / registration never captures resolution (#357)" {
+  poison_reg test cc "/" claude-code
+  other="$(mktemp -d)"
+  result="$(agmsg_resolve_project "$other/x" claude-code)"
+  [ "$result" = "$other/x" ]            # falls back to pwd, not "/"
+  rm -rf "$other"
+}
+
+@test "resolve: a \$HOME/ (trailing slash) registration is still excluded (#357 normalized compare)" {
+  local home_norm; home_norm="$(agmsg_normalize_project_path "$HOME")"
+  mkdir -p "$HOME/agmsg-agents/aglive"
+  poison_reg test cc "$home_norm/" claude-code       # stored WITH a trailing slash
+
+  # The walk generates a trailing-slash candidate too, so this really matches the
+  # poison -- the exclusion must still fire because it compares normalized paths.
+  result="$(agmsg_resolve_project "$HOME/agmsg-agents/aglive" claude-code)"
+  [ "$result" = "$(agmsg_normalize_project_path "$HOME/agmsg-agents/aglive")" ]
+}
+
+@test "resolve: a // (doubled-slash root) registration is still excluded (#357)" {
+  poison_reg test cc "//" claude-code
+  other="$(mktemp -d)"
+  result="$(agmsg_resolve_project "$other/x" claude-code)"
+  [ "$result" = "$other/x" ]            # // normalizes to / -> excluded
+  rm -rf "$other"
+}
+
+
+@test "resolve: team scoping ignores another team's registration (#357)" {
+  local home_norm; home_norm="$(agmsg_normalize_project_path "$HOME")"
+  mkdir -p "$HOME/agmsg-agents/aglive"
+  poison_reg test cc "$home_norm" claude-code       # poison lives in team 'test'
+
+  # Scoped to 'aglive' (no registration there) → the 'test' poison is invisible.
+  result="$(agmsg_resolve_project "$HOME/agmsg-agents/aglive" claude-code aglive)"
+  [ "$result" = "$(agmsg_normalize_project_path "$HOME/agmsg-agents/aglive")" ]
+}
+
+@test "registered_projects: a team scope returns only that team's projects (#357)" {
+  reg aglive lead "$ROOT" claude-code
+  poison_reg other cc "/some/other/proj" claude-code
+
+  run agmsg_registered_projects claude-code aglive
+  [[ "$output" == *"$ROOT"* ]]
+  [[ "$output" != *"/some/other/proj"* ]]
+
+  # No team → legacy all-teams scan still sees both (back-compat).
+  run agmsg_registered_projects claude-code
+  [[ "$output" == *"$ROOT"* ]]
+  [[ "$output" == *"/some/other/proj"* ]]
+}
+
+@test "join: ALLOWS registering a project at \$HOME (deliberate use case) (#357)" {
+  # Starting a project at $HOME is legitimate (both claude and codex run there);
+  # #357 protects on the resolution side, not by refusing the registration.
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SKILL_DIR/scripts/join.sh" T alice claude-code "$HOME"
+  [ "$status" -eq 0 ]
+}
+
+@test "resolve: an exact \$HOME registration still resolves \$HOME for a session AT \$HOME (#357)" {
+  # The exclusion stops the ancestor walk from LANDING on $HOME for sessions
+  # beneath it, but a session whose pwd IS $HOME still resolves to $HOME -- via
+  # the pwd fallback, so "someone who started there works".
+  local home_norm; home_norm="$(agmsg_normalize_project_path "$HOME")"
+  poison_reg test cc "$home_norm" claude-code
+  result="$(agmsg_resolve_project "$HOME" claude-code)"
+  [ "$result" = "$home_norm" ]
+}
+
 # --- opt-out ---
 
 @test "resolve: AGMSG_RESOLVE_PROJECT=0 forces the raw pwd" {
@@ -106,11 +206,101 @@ reg() {
   [ -f "$(agmsg_project_marker_path "$$")" ]
 }
 
+# EPERM-aware GC: under the sandbox `kill -0` on a live pid returns EPERM. Reading
+# that as dead would delete a live session's marker; only ESRCH drops it. `kill`
+# is stubbed to script each errno string (real EPERM is hard to force).
+
+@test "marker-gc: keeps a marker whose pid is EPERM-live (sandbox)" {
+  skip_on_windows "POSIX kill path; Windows uses tasklist (#134)"
+  agmsg_write_project_marker 4242 "$ROOT"
+  kill() { echo "bash: kill: (4242) - Operation not permitted" >&2; return 1; }
+  agmsg_marker_gc_stale
+  [ -f "$(agmsg_project_marker_path 4242)" ]
+}
+
+@test "marker-gc: drops a marker whose pid is ESRCH-dead" {
+  skip_on_windows "POSIX kill path; Windows uses tasklist (#134)"
+  agmsg_write_project_marker 4242 "$ROOT"
+  kill() { echo "bash: kill: (4242) - No such process" >&2; return 1; }
+  agmsg_marker_gc_stale
+  [ ! -f "$(agmsg_project_marker_path 4242)" ]
+}
+
+@test "marker-gc: skips (keeps marker) when _agmsg_pid_alive is unavailable" {
+  # Guard: without the helper, GC must skip rather than `|| rm -f` a live marker.
+  # Isolated shell sources ONLY resolve-project.sh, so the helper is truly absent.
+  agmsg_write_project_marker 4242 "$ROOT"
+  run bash -c '
+    export SKILL_DIR="'"$SKILL_DIR"'"
+    source "$SKILL_DIR/scripts/lib/resolve-project.sh"
+    declare -F _agmsg_pid_alive >/dev/null && { echo "helper unexpectedly present"; exit 2; }
+    agmsg_marker_gc_stale
+  '
+  [ "$status" -eq 0 ]
+  [ -f "$(agmsg_project_marker_path 4242)" ]
+}
+
 # --- pid-recycling guard ---
 
 @test "pid-is-agent: a live non-agent process is not trusted" {
   # $$ is bats/bash, not claude/codex — must not be accepted as an agent.
   run agmsg_pid_is_agent "$$" claude-code
+  [ "$status" -ne 0 ]
+}
+
+# --- Claude Code 2.1.x daemon architecture (#349) ---
+
+@test "pid-is-agent: excludes a 'claude daemon run' process even though argv0 matches" {
+  skip_on_windows "process argv faking via exec -a (#349)"
+  bash -c 'exec -a "claude daemon run --json-path /tmp/agmsg-test-daemon.json" sleep 5' 3>&- &
+  local p=$!
+  sleep 0.3
+  run agmsg_pid_is_agent "$p" claude-code
+  kill "$p" 2>/dev/null || true
+  [ "$status" -ne 0 ]
+}
+
+@test "pid-is-agent: accepts the real session shape (version-named binary + --bg-spare)" {
+  skip_on_windows "process argv faking via exec -a (#349)"
+  # --bg-spare appears on the REAL per-session binary too (per #349's report),
+  # so it must NOT be an exclusion signal on its own — only "daemon run"
+  # identifies the daemon. This is the actual reported shape:
+  # ".../claude/versions/2.1.199 --bg-spare ...".
+  bash -c 'exec -a "2.1.199 --bg-spare" sleep 5' 3>&- &
+  local p=$!
+  sleep 0.3
+  run agmsg_pid_is_agent "$p" claude-code
+  kill "$p" 2>/dev/null || true
+  [ "$status" -eq 0 ]
+}
+
+@test "pid-is-agent: accepts a version-named claude-code session binary" {
+  skip_on_windows "process argv faking via exec -a (#349)"
+  bash -c 'exec -a "2.1.199" sleep 5' 3>&- &
+  local p=$!
+  sleep 0.3
+  run agmsg_pid_is_agent "$p" claude-code
+  kill "$p" 2>/dev/null || true
+  [ "$status" -eq 0 ]
+}
+
+@test "pid-is-agent: accepts a version-named session binary under a full versions/ path" {
+  skip_on_windows "process argv faking via exec -a (#349)"
+  bash -c 'exec -a "/home/x/.local/share/claude/versions/2.1.199" sleep 5' 3>&- &
+  local p=$!
+  sleep 0.3
+  run agmsg_pid_is_agent "$p" claude-code
+  kill "$p" 2>/dev/null || true
+  [ "$status" -eq 0 ]
+}
+
+@test "pid-is-agent: a version-named binary is NOT accepted for a non-claude-code type" {
+  skip_on_windows "process argv faking via exec -a (#349)"
+  bash -c 'exec -a "2.1.199" sleep 5' 3>&- &
+  local p=$!
+  sleep 0.3
+  run agmsg_pid_is_agent "$p" codex
+  kill "$p" 2>/dev/null || true
   [ "$status" -ne 0 ]
 }
 
@@ -166,7 +356,7 @@ reg() {
   # Launch the actas watcher (ACTIVE_NAME=alice) from a subdir; without
   # resolution it would see no registration and exit immediately.
   bash "$SKILL_DIR/scripts/watch.sh" sid-w "$ROOT/sub/deep" claude-code alice \
-    >"$BATS_TEST_TMPDIR/w.out" 2>&1 &
+    >"$BATS_TEST_TMPDIR/w.out" 2>&1 3>&- &
   local wpid=$!
   sleep 1
   # A resolving watcher is still alive in its poll loop; an unresolved one has

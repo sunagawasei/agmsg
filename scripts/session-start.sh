@@ -46,6 +46,8 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/type-registry.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/session-team.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/role-session.sh"  # role->session reverse lookup (#339)
 
 # Read the hook input JSON (stdin) up-front. The hook's session_id is the
 # authoritative source for the session team, and stdin can be read only once —
@@ -104,6 +106,34 @@ fi
 
 # (INPUT / SESSION_ID were parsed at the top — stdin is read only once.)
 
+# --- Skip spawned worktree sub-sessions (.claude/worktrees checkouts). ---
+# Claude Code's background-task feature runs a short-lived sub-session in an
+# isolated worktree under .claude/worktrees/<name>. SessionStart still fires
+# there (#92's resolve-project normalizes its cwd back to the registered
+# project, so identities resolve fine), so a persistent inbox watcher was
+# getting launched for it too — but that watcher keeps the sub-session's
+# Monitor alive past the point its task finishes, so the parent session never
+# receives the sub-session's completion notification (#367). The sub-session
+# is also not normally an agmsg team member in its own right, so a watcher
+# has little value there anyway. cwd may arrive as forward slashes or
+# JSON-escaped backslashes depending on platform (a single escaped backslash
+# decodes to two raw '\' bytes in the captured substring), so normalize both
+# to '/' and squeeze doubled separators before matching. Match the exact
+# ".claude/worktrees" PATH SEGMENT sequence, not a loose substring — a naive
+# `*.claude*worktrees*` glob would also skip an unrelated project merely
+# named e.g. ".claude-tools/my-worktrees-app".
+HOOK_CWD=""
+if [ -n "$INPUT" ]; then
+  HOOK_CWD=$(printf '%s' "$INPUT" \
+    | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -1)
+fi
+[ -z "$HOOK_CWD" ] && HOOK_CWD="${PWD:-}"
+HOOK_CWD_NORM=$(printf '%s' "$HOOK_CWD" | tr '\\' '/' | sed 's#//*#/#g')
+case "$HOOK_CWD_NORM" in
+  */.claude/worktrees|*/.claude/worktrees/*|.claude/worktrees|.claude/worktrees/*) exit 0 ;;
+esac
+
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 
 # --- Identify the enclosing Claude Code process. ---
@@ -135,7 +165,7 @@ for f in "$RUN_DIR"/cc-instance.*; do
   [ -f "$f" ] || continue
   pid=${f##*.}
   case "$pid" in ''|*[!0-9]*) continue ;; esac
-  if kill -0 "$pid" 2>/dev/null; then
+  if _agmsg_pid_alive "$pid"; then
     s=$(cat "$f" 2>/dev/null || true)
     [ -n "$s" ] && live_sids="$live_sids|$s"
   fi
@@ -147,14 +177,14 @@ for f in "$RUN_DIR"/cc-instance.*; do
   [ -f "$f" ] || continue
   pid=${f##*.}
   case "$pid" in ''|*[!0-9]*) continue ;; esac
-  kill -0 "$pid" 2>/dev/null && continue
+  _agmsg_pid_alive "$pid" && continue
   dead_sid=$(cat "$f" 2>/dev/null || true)
   if [ -n "$dead_sid" ] \
       && ! printf '%s\n' "$live_sids" | tr '|' '\n' | grep -Fxq "$dead_sid"; then
     orphan_pidfile="$RUN_DIR/watch.$dead_sid.pid"
     if [ -f "$orphan_pidfile" ]; then
       orphan_pid=$(cat "$orphan_pidfile" 2>/dev/null || true)
-      if [ -n "$orphan_pid" ] && kill -0 "$orphan_pid" 2>/dev/null; then
+      if [ -n "$orphan_pid" ] && _agmsg_pid_alive "$orphan_pid"; then
         # Defensive: only kill if the pid's command line actually matches
         # our watch.sh. Defends against pid recycling — a stale pidfile
         # could point at an unrelated process that took the same pid.
@@ -181,7 +211,7 @@ for f in "$RUN_DIR"/watch.*.pid; do
     rm -f "$f"
     continue
   fi
-  kill -0 "$pid" 2>/dev/null || rm -f "$f"
+  _agmsg_pid_alive "$pid" || rm -f "$f"
 done
 
 # Garbage-collect actas exclusivity locks whose owner session_id no longer
@@ -230,7 +260,7 @@ if [ -n "$CC_PID" ]; then
       prev_pidfile="$RUN_DIR/watch.$prev.pid"
       if [ -f "$prev_pidfile" ]; then
         prev_pid=$(cat "$prev_pidfile" 2>/dev/null || true)
-        if [ -n "$prev_pid" ] && kill -0 "$prev_pid" 2>/dev/null; then
+        if [ -n "$prev_pid" ] && _agmsg_pid_alive "$prev_pid"; then
           kill "$prev_pid" 2>/dev/null || true
         fi
       fi
@@ -247,20 +277,20 @@ fi
 # session's own codex (same uuid → seen alive via upgrade-compat) is never
 # reaped. Best-effort; never blocks the directive below.
 if agmsg_session_team_enabled; then
-  # pgrep -f prints PIDs (portable: BSD/macOS + GNU). The command line is then
-  # read per-pid via `ps -o args=`. The earlier `pgrep -af` relied on a GNU-only
-  # flag (-a, "list full command line"); on macOS BSD pgrep that flag is rejected,
-  # the whole pipeline failed under `|| true`, and this GC silently did nothing —
-  # so crash/SIGKILL orphans accumulated. See the macOS BSD pgrep note.
-  while IFS= read -r _pid; do
-    [ -n "$_pid" ] || continue
-    _args="$(ps -o args= -p "$_pid" 2>/dev/null || true)"
-    _gteam=$(printf '%s' "$_args" | sed -n 's/.*--team \(s-[^ ]*\).*/\1/p')
-    [ -n "$_gteam" ] || continue
+  # Headless spawn records are already keyed by the exact session team and
+  # identity. Scan those records rather than parsing the retired bridge
+  # --team/--name argv contract (the role-scoped bridge now uses --pair).
+  # Session-team lazy spawn uses the fixed member name "codex", matching the
+  # previous GC scope.
+  for _spawn_rec in "$RUN_DIR"/spawn.s-*__codex; do
+    [ -f "$_spawn_rec" ] || continue
+    _gteam="${_spawn_rec##*/spawn.}"
+    _gteam="${_gteam%__codex}"
+    case "$_gteam" in s-*) ;; *) continue ;; esac
     if ! agmsg_instance_alive "${_gteam#s-}" 2>/dev/null; then
       "$SCRIPT_DIR/despawn.sh" "$_gteam" claude codex --force >/dev/null 2>&1 || true
     fi
-  done < <(pgrep -f "codex-bridge\.js .*--team s-.* --name codex" 2>/dev/null || true)
+  done
 fi
 
 # --- Stale session-team GC (session-team mode). ---
@@ -298,7 +328,7 @@ fi
 WATCHER_PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
 if [ -f "$WATCHER_PIDFILE" ]; then
   existing=$(cat "$WATCHER_PIDFILE" 2>/dev/null || true)
-  if [ -n "$existing" ] && kill -0 "$existing" 2>/dev/null; then
+  if [ -n "$existing" ] && _agmsg_pid_alive "$existing"; then
     cat <<EOF
 AGMSG monitor mode: a watch.sh is already streaming for this session (pid $existing).
 No action needed — the existing watcher is the active one.
@@ -307,11 +337,58 @@ EOF
   fi
 fi
 
+# --- Role-aware resume (#339). ---
+# If this session's bare sid was recorded as a role's seat (by actas-claim, or
+# codex actas), and that (team, agent) is registered for THIS project, emit the
+# ROLE-FILTERED directive instead of the generic unfiltered one: watch.sh with a
+# 4th <agent> arg restricts receive to that role AND re-claims its exclusivity
+# lock. This covers a manual `claude --resume <uuid>` that bypasses spawn's actas
+# boot prompt -- the resumed session re-arms as its role automatically. Fail-open:
+# no record, no project match, or an unreadable record => generic directive.
+ROLE_NAME=""; ROLE_TEAM=""
+_bare_sid="$(agmsg_instance_bare_sid "$SESSION_ID" 2>/dev/null || printf '%s' "$SESSION_ID")"
+_rec="$(agmsg_role_session_lookup_by_sid "$_bare_sid" 2>/dev/null || true)"
+if [ -n "$_rec" ]; then
+  _r_agent="$(printf '%s\n' "$_rec" | sed -n 's/^agent=//p' | head -1)"
+  _r_team="$(printf '%s\n' "$_rec" | sed -n 's/^team=//p' | head -1)"
+  # Guard against a cross-project sid collision: only honor the record when its
+  # (team, agent) is actually one of this project's registered pairs.
+  if [ -n "$_r_agent" ] && [ -n "$_r_team" ] \
+     && printf '%s\n' "$PAIRS" | grep -Fxq "$(printf '%s\t%s' "$_r_team" "$_r_agent")"; then
+    ROLE_NAME="$_r_agent"; ROLE_TEAM="$_r_team"
+  fi
+fi
+
 WATCH="$SKILL_DIR/scripts/watch.sh"
 # Shell-quote each argv so the host can paste the command into Monitor and run
 # it verbatim. A plain '...' wrap breaks on paths with an apostrophe
 # (/Users/o'brien/...); printf %q escapes spaces, quotes and other metacharacters
-# safely for shell re-execution (#188).
+# safely for shell re-execution (#188). A resumed role adds the 4th <agent> arg.
+if [ -n "$ROLE_NAME" ]; then
+  WATCH_COMMAND="$(printf '%q %q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE" "$ROLE_NAME")"
+  cat <<EOF
+AGMSG monitor mode (resumed role \`$ROLE_NAME\` in team \`$ROLE_TEAM\`): this
+session was recorded as that role's seat, so invoke the Monitor tool now with the
+following parameters, before any other action in this session.
+
+  command: $WATCH_COMMAND
+  description: agmsg inbox stream (acting as $ROLE_NAME)
+  persistent: true
+
+The 4th argument restricts receive to \`$ROLE_NAME\` only and re-claims its actas
+exclusivity lock — a resume restores context but not runtime state, so this
+re-establishes the role. Send with \`send.sh ... $ROLE_NAME ...\` (this session's
+active FROM is \`$ROLE_NAME\`). Each output line is one message:
+\`<ts> | <team> | <from> → <to> | <body>\`. React as they arrive.
+
+Note: On a /clear or --continue/--resume re-fire, you may shortly see a
+"Monitor … stopped" notification for an earlier 'agmsg inbox stream'
+task. That is the previous watcher being cleaned up — expected. Do NOT
+relaunch it; the Monitor you invoke from this directive replaces it.
+EOF
+  exit 0
+fi
+
 WATCH_COMMAND="$(printf '%q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE")"
 if [ -n "$SESSION_TEAM" ]; then
   # session-team mode: register this Claude as `claude` in its own per-session

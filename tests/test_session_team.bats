@@ -11,6 +11,8 @@ load test_helper
 setup() {
   setup_test_env
   PROJ="/tmp/agmsg-st-proj"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/identity-key.sh"
 }
 
 teardown() {
@@ -60,7 +62,9 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   enable_st
   # Same project dir registered into TWO session teams (the accumulation case).
   bash "$SCRIPTS/join.sh" s-AAA claude claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" s-AAA peer codex "$PROJ" >/dev/null
   bash "$SCRIPTS/join.sh" s-BBB claude claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" s-BBB peer codex "$PROJ" >/dev/null
 
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" sess-w "$PROJ" claude-code claude --team s-AAA \
     >"$TEST_SKILL_DIR/w.log" 2>/dev/null &
@@ -86,6 +90,10 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 
 @test "ask/--wait only matches a reply in the same team" {
   enable_st
+  bash "$SCRIPTS/join.sh" s-AAA claude claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" s-AAA codex codex "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" s-BBB claude claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" s-BBB codex codex "$PROJ" >/dev/null
   AGMSG_SEND_WAIT_INTERVAL=1 bash "$SCRIPTS/send.sh" s-AAA claude codex "Q" --wait --timeout 12 \
     >"$TEST_SKILL_DIR/ask.log" 2>/dev/null &
   local pid=$!
@@ -117,12 +125,16 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 
 @test "send: allows a send to the session's OWN team in session-team mode" {
   enable_st
+  bash "$SCRIPTS/join.sh" s-sess-MINE claude claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" s-sess-MINE codex codex "$PROJ" >/dev/null
   run env CLAUDE_CODE_SESSION_ID=sess-MINE bash "$SCRIPTS/send.sh" s-sess-MINE claude codex "ok"
   [ "$status" -eq 0 ]
 }
 
 @test "send: AGMSG_ALLOW_CROSS_TEAM escape hatch permits a cross-team send" {
   enable_st
+  bash "$SCRIPTS/join.sh" s-sess-OTHER claude claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" s-sess-OTHER codex codex "$PROJ" >/dev/null
   run env CLAUDE_CODE_SESSION_ID=sess-MINE AGMSG_ALLOW_CROSS_TEAM=1 \
     bash "$SCRIPTS/send.sh" s-sess-OTHER claude codex "deliberate"
   [ "$status" -eq 0 ]
@@ -130,6 +142,8 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 
 @test "send: no cross-session guard when session-team mode is off" {
   # Mode off → no expected team → any team is allowed (legacy project-team flows).
+  bash "$SCRIPTS/join.sh" s-sess-OTHER claude claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" s-sess-OTHER codex codex "$PROJ" >/dev/null
   run env CLAUDE_CODE_SESSION_ID=sess-MINE bash "$SCRIPTS/send.sh" s-sess-OTHER claude codex "ok"
   [ "$status" -eq 0 ]
 }
@@ -138,6 +152,8 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   # A bridge reply runs send.sh with the env var scrubbed by codex's sandbox, so
   # there is no expected team and the reply to any team passes.
   enable_st
+  bash "$SCRIPTS/join.sh" s-sess-OTHER claude claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" s-sess-OTHER codex codex "$PROJ" >/dev/null
   run env -u CLAUDE_CODE_SESSION_ID bash "$SCRIPTS/send.sh" s-sess-OTHER codex claude "reply"
   [ "$status" -eq 0 ]
 }
@@ -148,6 +164,8 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   # resolution is claude-code-only). Its project-team send must NOT be refused —
   # the guard only protects session teams (s-*), not project teams.
   enable_st
+  bash "$SCRIPTS/join.sh" myproject gemini gemini "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" myproject claude claude-code "$PROJ" >/dev/null
   run env CLAUDE_CODE_SESSION_ID=sess-MINE bash "$SCRIPTS/send.sh" myproject gemini claude "ok"
   [ "$status" -eq 0 ]
 }
@@ -165,6 +183,61 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   run env -u CLAUDE_CODE_SESSION_ID bash "$SCRIPTS/ensure-codex.sh" "$PROJ"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
+}
+
+@test "ensure-codex: recognizes an existing role-scoped bridge by identity key" {
+  enable_st
+  local key
+  key="$(agmsg_identity_key s-sess-LIVE codex)"
+  local stub_bin="$TEST_SKILL_DIR/ensure-stub"
+  mkdir -p "$stub_bin"
+  cat > "$stub_bin/pgrep" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"codex-bridge\\.js"*"--identity-key $EXPECTED_IDENTITY_KEY"*) exit 0 ;;
+  *) exit 1 ;;
+esac
+STUB
+  chmod +x "$stub_bin/pgrep"
+
+  run env PATH="$stub_bin:$PATH" EXPECTED_IDENTITY_KEY="$key" \
+    CLAUDE_CODE_SESSION_ID=sess-LIVE bash "$SCRIPTS/ensure-codex.sh" "$PROJ"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already running"* ]]
+}
+
+@test "ensure-codex: a longer identity-key prefix is not mistaken for this worker" {
+  enable_st
+  # s-X<TAB>aa is 6 bytes, so its unpadded base64 is a prefix of the encoding
+  # for s-X<TAB>aabbb (9 bytes). This exercises the exact collision shape.
+  local legacy_short legacy_long long_key
+  legacy_short="$(printf '%s\t%s' s-X aa | base64 | tr -d '\r\n' | tr '+/' '-_')"
+  legacy_long="$(printf '%s\t%s' s-X aabbb | base64 | tr -d '\r\n' | tr '+/' '-_')"
+  [[ "$legacy_short" != *"="* ]]
+  [[ "$legacy_long" == "$legacy_short"* ]]
+  long_key="$(agmsg_identity_key s-X aabbb)"
+
+  local stub_bin="$TEST_SKILL_DIR/ensure-prefix-stub"
+  mkdir -p "$stub_bin"
+  cat > "$stub_bin/pgrep" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-}" = "-f" ] || exit 1
+printf 'node /x/codex-bridge.js --identity-key %s --pair s-X\\taabbb\n' \
+  "$LONG_IDENTITY_KEY" | grep -Eq -- "${2:-}"
+STUB
+  chmod +x "$stub_bin/pgrep"
+
+  # Make the expected post-scan spawn attempt deterministic: the assertion is
+  # that ensure-codex reaches it instead of returning "already running".
+  mv "$SCRIPTS/spawn.sh" "$SCRIPTS/spawn.sh.real"
+  printf '#!/usr/bin/env bash\nexit 37\n' > "$SCRIPTS/spawn.sh"
+  chmod +x "$SCRIPTS/spawn.sh"
+
+  run env PATH="$stub_bin:$PATH" LONG_IDENTITY_KEY="$long_key" \
+    CLAUDE_CODE_SESSION_ID=X bash "$SCRIPTS/ensure-codex.sh" "$PROJ" aa
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"failed to spawn"* ]]
+  [[ "$output" != *"already running"* ]]
 }
 
 # --- PR2: SessionEnd teardown + orphan GC ------------------------------------
@@ -191,12 +264,27 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 @test "session-end: tears down a codex worker via ps-args when no meta exists" {
   enable_st
   # No meta file: despawn's guard must confirm the recorded pid IS our bridge by
-  # its command line before killing (PID-reuse safety). Disguise the fake's argv
-  # as the real bridge so the ps-args branch matches.
-  ( exec -a "node /x/codex-bridge.js --team s-sessAPS --name codex --inline-inbox" sleep 300 ) & local fake=$!
+  # its command line before killing (PID-reuse safety). Stub ps for this pid so
+  # the check is deterministic even in a sandbox that denies process listings.
+  local key
+  key="$(agmsg_identity_key s-sessAPS codex)"
+  sleep 300 & local fake=$!
+  local stub_bin="$TEST_SKILL_DIR/ps-stub"
+  mkdir -p "$stub_bin"
+  cat > "$stub_bin/ps" <<'STUB'
+#!/usr/bin/env bash
+if [ "$*" = "-o args= -p $FAKE_BRIDGE_PID" ]; then
+  printf 'node /x/codex-bridge.js --identity-key %s --pair s-sessAPS\tcodex --inline-inbox\n' "$FAKE_IDENTITY_KEY"
+  exit 0
+fi
+exit 1
+STUB
+  chmod +x "$stub_bin/ps"
   mkdir -p "$TEST_SKILL_DIR/run"
   printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-aps" > "$TEST_SKILL_DIR/run/spawn.s-sessAPS__codex"
-  printf '{"session_id":"sessAPS"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
+  printf '{"session_id":"sessAPS"}' | env PATH="$stub_bin:$PATH" \
+    FAKE_BRIDGE_PID="$fake" FAKE_IDENTITY_KEY="$key" \
+    bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
   wait_until 8 bash -c "[ ! -f '$TEST_SKILL_DIR/run/spawn.s-sessAPS__codex' ]"
   [ ! -f "$TEST_SKILL_DIR/run/spawn.s-sessAPS__codex" ]
   run kill -0 "$fake"; [ "$status" -ne 0 ]
@@ -257,10 +345,13 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 @test "session-start: orphan-codex GC reaps a bridge whose owner session is dead" {
   enable_st
   # Fake a headless codex bridge for a DEAD session (no live cc-instance for it).
-  ( exec -a "node /x/codex-bridge.js --team s-DEADGC --name codex --inline-inbox" sleep 300 ) &
+  local key
+  key="$(agmsg_identity_key s-DEADGC codex)"
+  ( exec -a "node /x/codex-bridge.js --identity-key $key --pair s-DEADGC	codex --inline-inbox" sleep 300 ) &
   local fake=$!
   mkdir -p "$TEST_SKILL_DIR/run"
   printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-gc" > "$TEST_SKILL_DIR/run/spawn.s-DEADGC__codex"
+  printf 'pid=%s\nidentities=s-DEADGC/codex\ntype=codex\n' "$fake" > "$TEST_SKILL_DIR/run/codex-bridge.s-DEADGC.codex.meta"
   # A live (different) session start runs the GC pass.
   printf '{"session_id":"sess-gc-self"}' | bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
   sleep 1

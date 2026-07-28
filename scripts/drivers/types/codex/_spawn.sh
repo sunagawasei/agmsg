@@ -136,6 +136,8 @@ preflight_seatbelt_nesting() {
 # use; applied below before any run/ artifact is composed from TEAM/NAME.
 # shellcheck source=../../lib/validate.sh
 . "$SCRIPT_DIR/lib/validate.sh"
+# shellcheck source=../../lib/identity-key.sh
+. "$SCRIPT_DIR/lib/identity-key.sh"
 agmsg_reviewer_add_dir_roots() {
   # Wrap the shared harvest: format each collected dir as a codex filesystem-table
   # read entry (`, "<dir>"="read"`) to splice into the reviewer profile body. The
@@ -150,16 +152,24 @@ agmsg_reviewer_add_dir_roots() {
 
 # Resolve additive filesystem roots shared by every headless codex layout.
 # The global spawn.codex_extra_fs_roots config value is a flat, comma-separated
-# scalar of PATH=PERM tokens (PERM is read or write). Echoes each accepted root
-# as `, "<path>"="<perm>"`, ready to append to a filesystem table. The worker
-# name argument is kept in the resolver signature for parity with the sibling
-# codex config resolvers; this key is intentionally global, not per-worker.
+# scalar of PATH=PERM tokens (PERM is read or write). In the default "profile"
+# mode, echoes each accepted root as `, "<path>"="<perm>"`, ready to append to
+# a filesystem table. In "runtime-write-roots" mode, echoes only PATHs whose
+# permission is write, one per line, for bridge --workspace-root arguments.
+# Read-only profile roots must never be promoted into writable runtime roots.
+# The worker name argument is kept in the resolver signature for parity with
+# the sibling codex config resolvers; this key is intentionally global, not
+# per-worker.
 #
 # Paths beginning with ~/ or the literal $HOME/ are expanded without eval.
 # Because the result is spliced through both a single-quoted -c clause and a
 # TOML string, any quote or backslash is fatal rather than emitted unsafely.
 agmsg_codex_extra_fs_roots() {
-  local _name="$1" value="" remaining="" token="" perm="" path_="" out=""
+  local _name="$1" mode="${2:-profile}" value="" remaining="" token="" perm="" path_="" out=""
+  case "$mode" in
+    profile|runtime-write-roots) ;;
+    *) die "spawn: internal error: unknown codex extra filesystem root output mode '$mode'" ;;
+  esac
   value="$("$SCRIPT_DIR/config.sh" get "spawn.codex_extra_fs_roots" "" 2>/dev/null || true)"
   [ -n "$value" ] || return 0
 
@@ -185,9 +195,16 @@ agmsg_codex_extra_fs_roots() {
       read|write) ;;
       *) die "spawn: invalid codex extra filesystem root permission (expected read or write)" ;;
     esac
-    out="$out, \"$path_\"=\"$perm\""
+    if [ "$mode" = "runtime-write-roots" ]; then
+      [ "$perm" = "write" ] && printf '%s\n' "$path_"
+    else
+      out="$out, \"$path_\"=\"$perm\""
+    fi
   done
-  printf '%s' "$out"
+  if [ "$mode" = "profile" ]; then
+    printf '%s' "$out"
+  fi
+  return 0
 }
 
 # Byte-level, locale-independent membership test for the shared safe-token
@@ -329,9 +346,10 @@ agmsg_codex_client_name() {
 
 # Resolve an optional per-worker turn timeout (seconds) for a headless codex
 # worker, injected as AGMSG_CODEX_BRIDGE_TURN_TIMEOUT. Empty → the bridge's
-# built-in default (60s), which is too short for research / deep-review turns
-# that do web lookups or long reasoning (the bridge orphans the turn and the
-# reply is lost). Set spawn.codex_turn_timeout.<name>=<seconds> to extend it.
+# built-in default (60s). The bridge treats this as an idle timeout and re-arms
+# it on turn activity, so the value is the tolerated interval of true silence,
+# not a fixed ceiling on research / deep-review turn duration. Set
+# spawn.codex_turn_timeout.<name>=<seconds> to adjust that silence allowance.
 # Validated as a positive integer with no leading zero and at most 6 digits, so
 # seconds*1000 stays within the bridge's 32-bit setTimeout ceiling (a larger
 # value would overflow to a near-immediate fire or Infinity and silently break
@@ -386,6 +404,7 @@ agmsg_codex_gh_config_dir() {
 # approval_policy=never in every mode because a headless worker cannot answer approvals.
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run"
+  local storage_dir; storage_dir="$(agmsg_storage_dir)"
   mkdir -p "$run_dir"   # reviewer mode's cwd is the repo, so nothing else creates run/
 
   # Fail closed BEFORE building any layout's appcmd/profile: SKILL_DIR and
@@ -397,7 +416,7 @@ agmsg_spawn_headless() {
   # a property of the agmsg install path (an admin-controlled, effectively
   # fixed value), not of any per-spawn input, so refusing here is a one-time
   # environment check, not a per-worker cost.
-  case "$SKILL_DIR$run_dir" in
+  case "$SKILL_DIR$run_dir$storage_dir" in
     *\'*|*\"*|*\\*)
       die "spawn: agmsg install path contains a quote/backslash and cannot be spliced into the codex sandbox config safely: $SKILL_DIR" ;;
   esac
@@ -413,6 +432,17 @@ agmsg_spawn_headless() {
   local codex_turn_timeout; codex_turn_timeout="$(agmsg_codex_turn_timeout "$NAME")"
   [ -z "$codex_turn_timeout" ] && codex_turn_timeout="${AGMSG_CODEX_BRIDGE_TURN_TIMEOUT:-}"
   local extra_fs; extra_fs="$(agmsg_codex_extra_fs_roots "$NAME")"
+  local -a runtime_root_args=(
+    --workspace-root "$storage_dir"
+    --workspace-root "$SKILL_DIR/teams"
+    --workspace-root "$run_dir"
+  )
+  local extra_write_roots extra_write_root
+  extra_write_roots="$(agmsg_codex_extra_fs_roots "$NAME" runtime-write-roots)"
+  while IFS= read -r extra_write_root; do
+    [ -n "$extra_write_root" ] || continue
+    runtime_root_args+=(--workspace-root "$extra_write_root")
+  done <<< "$extra_write_roots"
 
   # Resolve the working dir + app-server sandbox for the selected mode.
   local cwd appcmd
@@ -421,7 +451,7 @@ agmsg_spawn_headless() {
     # Implementer: the repo IS writable, along with agmsg's state directories so
     # send.sh replies keep working. Toolchain and agmsg scripts remain read-only,
     # and the permission profile explicitly disables network access.
-    local fs="{ \":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"write\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\"$extra_fs }"
+    local fs="{ \":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"write\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$storage_dir\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\"$extra_fs }"
     appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-implementer -c 'permissions.agmsg-implementer.filesystem=$fs' -c 'permissions.agmsg-implementer.network={ enabled=false }' -c web_search=live -c approval_policy=never$model_effort_args"
   elif [ "$REVIEWER" = 1 ]; then
     cwd="$PROJECT"
@@ -430,7 +460,7 @@ agmsg_spawn_headless() {
     # a review needs another global read root (e.g. a language's module cache). The
     # -c values that contain spaces are single-quoted: the bridge runs the command
     # via `sh -lc`, which re-parses the string (see codex-bridge.js).
-    local fs_base="\":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"read\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\""
+    local fs_base="\":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"read\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$storage_dir\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\""
     fs_base="$fs_base$extra_fs"
     # Additively grant READ on the Claude session's /add-dir directories (gated;
     # see agmsg_reviewer_add_dir_roots). Purely additive and fail-open: pre-flight
@@ -472,7 +502,7 @@ agmsg_spawn_headless() {
   else
     cwd="$run_dir/codex-$TEAM-cwd"
     mkdir -p "$cwd"
-    local fs="{ \":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"write\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$SKILL_DIR/db\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\"$extra_fs }"
+    local fs="{ \":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"write\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$storage_dir\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\"$extra_fs }"
     appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-consultant -c 'permissions.agmsg-consultant.filesystem=$fs' -c 'permissions.agmsg-consultant.network={ enabled=false }' -c web_search=live -c approval_policy=never$model_effort_args"
   fi
 
@@ -558,14 +588,17 @@ agmsg_spawn_headless() {
   # codex-bridge.js bound to this team+name.
   # Opaque per-identity marker handed to the bridge below; the dup-check fallback
   # matches on THIS, so team/name content (spaces, regex metachars, flag-like
-  # substrings) can never create argv-boundary or regex ambiguity. base64url(team\tname).
+  # substrings) can never create argv-boundary or regex ambiguity. The shared
+  # generator appends a non-base64url terminator so prefix-related identities
+  # remain distinct even when --identity-key is the final argv pair.
   local _idkey
-  _idkey="$(printf '%s\t%s' "$TEAM" "$NAME" | base64 | tr -d '\n' | tr '+/' '-_')"
+  _idkey="$(agmsg_identity_key "$TEAM" "$NAME")"
 
   local pidfile="$run_dir/codex-bridge.$TEAM.$NAME.pid"
-  local running=""
-  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
-    running="$(cat "$pidfile" 2>/dev/null)"
+  local running="" recorded_pid=""
+  [ -f "$pidfile" ] && recorded_pid="$(cat "$pidfile" 2>/dev/null || true)"
+  if [ -n "$recorded_pid" ] && _agmsg_pid_alive "$recorded_pid"; then
+    running="$recorded_pid"
   else
     # Fallback: list codex-bridge candidates, then confirm identity by the opaque
     # --identity-key via grep -F (-- guards the leading dashes). ps -ww avoids argv
@@ -610,8 +643,10 @@ agmsg_spawn_headless() {
   [ -n "$rolefile" ] && role_args+=(--role-file "$rolefile")
   local log="$run_dir/codex-bridge.$TEAM.$NAME.log"
   AGMSG_CODEX_APP_SERVER_CMD="$appcmd" AGMSG_CODEX_CLIENT_NAME="$codex_client_name" AGMSG_CODEX_BRIDGE_TURN_TIMEOUT="$codex_turn_timeout" nohup "$bridge" \
-    --project "$cwd" --type codex --team "$TEAM" --name "$NAME" --inline-inbox \
+    --project "$cwd" --type codex --inline-inbox \
     --identity-key "$_idkey" \
+    --pair "$TEAM"$'\t'"$NAME" \
+    "${runtime_root_args[@]}" \
     ${role_args[@]+"${role_args[@]}"} \
     >> "$log" 2>&1 &
   local bpid=$!

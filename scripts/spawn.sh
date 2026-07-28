@@ -71,6 +71,11 @@ set -euo pipefail
 #                      through to the CLI unchecked (the CLI rejects unknown
 #                      ids); the flag spelling comes from the type's manifest
 #                      `model_arg=`. Refused for a type with no model_arg.
+#   --fresh            force a brand-new session even when the role has a
+#                      resumable prior session. Without it, a type that supports
+#                      resume (manifest `resume_arg=`) is brought back into its
+#                      last session's context when that transcript still exists
+#                      (#339); with it, spawn always boots fresh.
 #
 # Spawn options: extra CLI args to always pass a given type's launched
 # binary (e.g. a default permission mode or sandbox policy), configured
@@ -106,6 +111,12 @@ source "$SCRIPT_DIR/lib/session-team.sh"
 source "$SCRIPT_DIR/lib/spawn-role.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/spawn-options.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/resolve-project.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/role-session.sh"  # role->session record lookup (#339)
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/boot-command.sh"  # shared boot-command construction (#339)
 
 die() { echo "spawn: $*" >&2; exit 1; }
 
@@ -168,6 +179,7 @@ MODEL_ID=""          # --model: pass-through model id for the launched CLI
 ROLE_FILE=""          # resolved standing role-prompt file (empty = none); see lib/spawn-role.sh
 ROLE_FILE_EXPLICIT="" # --role-file override (highest precedence)
 ROLE_DISABLE=0        # --no-role: force no role injection even if a role file exists
+FRESH=0              # --fresh: force a fresh session even if the role is resumable
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -192,6 +204,7 @@ while [ $# -gt 0 ]; do
     --model) MODEL_ID="${2:?--model needs a model id}"; shift 2 ;;
     --role-file) ROLE_FILE_EXPLICIT="${2:?--role-file needs a path}"; shift 2 ;;
     --no-role)   ROLE_DISABLE=1; shift ;;
+    --fresh) FRESH=1; shift ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -266,6 +279,7 @@ if [ ! -d "$PROJECT" ]; then
   die "project path does not exist: $PROJECT"
 fi
 PROJECT="$(cd "$PROJECT" && pwd)"
+PROJECT="$(agmsg_normalize_project_path "$PROJECT")"
 
 # --- Resolve the launch method from the manifest ---
 # A non-empty `spawn=` launcher means this type runs via a Node launcher (e.g. an
@@ -301,13 +315,42 @@ if [ -n "$MODEL_ID" ] && [ -z "$MODEL_ARG" ]; then
   die "agent type '$AGENT_TYPE' does not support --model (no model_arg in its manifest)"
 fi
 
-# Some CLIs don't accept the actas prompt as a bare positional argument — they
-# require it as the value of a named flag instead (e.g. antigravity's
-# `--prompt-interactive <text>`, copilot's `-i/--interactive <text>`; their
-# `-p/--prompt` equivalents are a DIFFERENT one-shot, non-interactive mode and
-# would not work here). `prompt_arg=` in the manifest names that flag; unset
-# (the default) keeps today's bare-positional behavior.
-PROMPT_ARG="$(agmsg_type_get "$AGENT_TYPE" prompt_arg)"
+# Note: prompt_arg= (some CLIs require the actas prompt as a named flag's value
+# rather than a bare positional, e.g. antigravity's --prompt-interactive) is
+# resolved inside agmsg_role_cli_args (lib/boot-command.sh) now, so it stays in
+# sync with the name/resume flags across spawn and resurrect-panes.sh.
+
+# Session display name (#339). A type whose manifest declares `name_arg=` (e.g.
+# claude-code's -n) is launched with `<name_arg> <team>-<agent>`, so the spawned
+# session is born named after its role: meaningful in the prompt box / resume
+# picker, and -- key for the tmux-resurrect hook -- recorded verbatim in the
+# argv resurrect saves. Types without the key skip naming (unchanged). The name
+# joins team and agent with a '-'; either half may itself contain '-', so the
+# role-session record stores the whole `name=` for reverse lookup rather than
+# splitting it apart.
+# SESSION_NAME (<team>-<agent>) and the resume-or-fresh decision (#339) are both
+# computed AFTER team resolution below (a project-resolved --team is only known
+# then). The role-identity CLI args (name_arg/resume_arg/prompt) are emitted by
+# agmsg_role_cli_args (lib/boot-command.sh), so the launch flag order stays in
+# sync with resurrect-panes.sh.
+
+# Session-identity env vars to strip from a spawned same-type child (issue #294).
+# A terminal launcher (tmux new-window/split-window, a new OS terminal) copies
+# the parent shell's exported environment verbatim. When the spawner is itself a
+# session of the SAME CLI type (e.g. a claude-code session running
+# `agmsg spawn claude-code <name>`), the child inherits the parent's
+# session-identity vars (claude-code's CLAUDE_CODE_SESSION_ID) and mistakes the
+# parent's session for its own — every turn then fails with an Authentication
+# error despite valid credentials. Unset them in the generated boot script so the
+# child starts with a clean identity.
+#
+# This reads a dedicated `spawn_unset_env=` manifest key, NOT `detect=`. `detect=`
+# names the vars whoami uses to recognize a live session of a type, but those are
+# not always session-identity vars: gemini's `detect=GEMINI_API_KEY ...` is a
+# CREDENTIAL, and unsetting it would break the spawned child's auth — the opposite
+# of the fix. `spawn_unset_env=` lists only vars that are safe (and necessary) to
+# drop on spawn; unset (the default) strips nothing.
+SPAWN_UNSET_VARS="$(agmsg_type_get "$AGENT_TYPE" spawn_unset_env)"
 
 # Extra CLI args for this type from the spawn options file (opt-in, see
 # scripts/lib/spawn-options.sh). Read line-by-line — never word-split — so a
@@ -333,16 +376,17 @@ fi
 # registered for this project (any type). Zero or many → require --team.
 resolve_team() {
   [ -d "$TEAMS_DIR" ] || return 0
-  local config_file team_name cfg_sql proj_sql count_for_project
+  local config_file team_name cfg_sql project_sql_in count_for_project
   local found=""
   # Read each config via readfile() and compare with SQL string literals rather
   # than `.param set` bindings: the sqlite3 shell's dot-command tokenizer does
   # NOT honour SQL '' escaping, so a value containing a single quote (a project
   # path like /tmp/pro'j) breaks `.param set`. SQL string literals do honour ''.
-  proj_sql=$(printf '%s' "$PROJECT" | sed "s/'/''/g")
+  project_sql_in=$(agmsg_project_sql_in_list "$PROJECT")
   for config_file in "$TEAMS_DIR"/*/config.json; do
     [ -f "$config_file" ] || continue
-    cfg_sql=$(printf '%s' "$config_file" | sed "s/'/''/g")
+    # readfile() needs a native-Windows path — agmsg_sql_readfile_path converts and SQL-escapes it.
+    cfg_sql=$(agmsg_sql_readfile_path "$config_file")
     team_name=$(agmsg_sqlite_mem \
       "SELECT json_extract(CAST(readfile('$cfg_sql') AS TEXT), '\$.name');")
     # Does any agent in this team have a registration for PROJECT (any type)?
@@ -358,7 +402,7 @@ resolve_team() {
       )
       SELECT COUNT(*)
       FROM agents, json_each(agents.registrations) AS r
-      WHERE json_extract(r.value, '\$.project') = '$proj_sql';
+      WHERE json_extract(r.value, '\$.project') IN ($project_sql_in);
     ")
     if [ "${count_for_project:-0}" -gt 0 ]; then
       found="${found:+$found
@@ -388,6 +432,16 @@ if [ -z "$TEAM" ]; then
     die "project belongs to multiple teams ($(printf '%s' "$CANDIDATES" | paste -sd, -)); pass --team <team>"
   fi
 fi
+
+# Role's session display name (#339): now that TEAM is final, join it to the
+# agent name. Emitted into the boot script when the type declares name_arg.
+SESSION_NAME="${TEAM}-${NAME}"
+
+# Resume-or-fresh decision (#339): resumable session id, or empty for a fresh
+# boot. All fail-open gates (force --fresh, no resume_arg, no record, stale/
+# missing transcript) live in agmsg_role_resume_uuid (lib/boot-command.sh), so
+# spawn and resurrect-panes.sh decide identically.
+RESUME_UUID="$(agmsg_role_resume_uuid "$AGENT_TYPE" "$TEAM" "$NAME" "$PROJECT" "$FRESH")"
 
 # --- Pre-flight: refuse if <name> is currently held by another live session ---
 # The child's actas flow would refuse anyway; failing here avoids launching a
@@ -455,30 +509,70 @@ AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$TEAM" "$NAME" "$AGENT_TYPE" "$PR
 # its identity AND acts on the task in the same first turn. This is the only way
 # to hand a one-shot goal to a codex peer, which has no Monitor and so never
 # notices a message sent after it goes idle (see docs/codex-monitor-beta.md).
-CMD_NAME="$(basename "$SKILL_DIR")"
-ACTAS_PROMPT="/${CMD_NAME} actas ${NAME}"
+# Base actas prompt: `<cmd_prefix><cmd_name> actas <name>` (the cmd_prefix "/"
+# vs "$" per-CLI subtlety and the custom-install command name live in
+# agmsg_actas_prompt, lib/boot-command.sh, shared with resurrect-panes.sh). When
+# --boot-prompt gives a task, append it newline-separated so the agent claims its
+# identity AND acts on the task in the same first turn -- the only way to hand a
+# one-shot goal to a codex peer, which has no Monitor.
+ACTAS_PROMPT="$(agmsg_actas_prompt "$AGENT_TYPE" "$NAME")"
 if [ -n "$PROMPT" ]; then
   ACTAS_PROMPT="${ACTAS_PROMPT}
 ${PROMPT}"
+fi
+
+# Git Bash / MSYS path conversion rewrites exec args that look like absolute
+# POSIX paths when invoking a native Windows binary: a '/<cmd> actas <name>'
+# initial prompt reaches the CLI as 'C:/Program Files/Git/<cmd> actas <name>'
+# and the agent never sees a valid skill invocation. Exclude args starting
+# with the slash command from conversion. The exclusion is prefix-scoped on
+# purpose — MSYS_NO_PATHCONV=1 would also stop converting genuine POSIX-path
+# args (e.g. a node launcher's --project /e/...) that native CLIs rely on.
+# Only the '/' prefix is path-shaped; '$'-prefixed prompts (#283) are never
+# converted, and the variable is inert outside MSYS environments.
+# cmd_prefix/cmd_name are resolved exactly as agmsg_actas_prompt does
+# (lib/boot-command.sh) -- #344 moved that resolution into the helper, so the two
+# inputs the guard needs are recomputed here rather than read from now-absent vars.
+_msys_cmd_name="$(basename "$SKILL_DIR")"
+_msys_cmd_prefix="$(agmsg_type_get "$AGENT_TYPE" cmd_prefix)"
+[ -n "$_msys_cmd_prefix" ] || _msys_cmd_prefix="/"
+MSYS_GUARD=""
+if [ "$_msys_cmd_prefix" = "/" ]; then
+  MSYS_GUARD="MSYS2_ARG_CONV_EXCL=/${_msys_cmd_name} "
 fi
 
 BOOT_DIR="${TMPDIR:-/tmp}/agmsg-spawn"
 mkdir -p "$BOOT_DIR" 2>/dev/null || true
 # Best-effort GC of boot scripts left behind by spawns whose window was closed
 # before the script could remove itself (see the trailing rm below).
-find "$BOOT_DIR" -name 'boot-*.command' -type f -mtime +1 -delete 2>/dev/null || true
+# GC matches both the bare and the .command-suffixed form (see the rename below).
+find "$BOOT_DIR" -name 'boot-*' -type f -mtime +1 -delete 2>/dev/null || true
 BOOT="$(mktemp "$BOOT_DIR/boot-XXXXXX")"
-mv "$BOOT" "$BOOT.command"   # .command so macOS `open` runs it in Terminal
-BOOT="$BOOT.command"
+# macOS `open -a Terminal` (launch_macos_terminal) only runs a file as a shell
+# script if it ends in .command, so rename there. Every other launcher invokes
+# the script through bash (Linux/Windows Terminal) or runs it via its shebang
+# (tmux) — and on Windows the .command extension makes Explorer/psmux open it in
+# Notepad instead of executing it (#282), so keep the bare executable path.
+case "$(uname -s)" in
+  Darwin) mv "$BOOT" "$BOOT.command"; BOOT="$BOOT.command" ;;
+esac
 {
   echo '#!/usr/bin/env bash'
   printf 'cd %q || exit 1\n' "$PROJECT"
+  # Mark the launched session as spawn-born (#339): the CLI inherits this, so the
+  # actas flow knows the session is already named <team>-<agent> (name_arg) and
+  # suppresses the "rename this session" tip meant for hand-started sessions.
+  echo 'export AGMSG_SPAWNED=1'
+  # Drop inherited same-type session-identity vars before exec'ing the CLI (#294).
+  if [ -n "$SPAWN_UNSET_VARS" ]; then
+    printf 'unset %s\n' "$SPAWN_UNSET_VARS"
+  fi
   if [ -n "$SPAWN_AGENT" ]; then
     # Node-launcher path: pass the universal agmsg context + the actas prompt.
     # Type-specific config is the launcher's own default/env, so core stays
     # generic and names no add-on. Spawn-options tokens (if any) land before
     # --initial-input, same relative position as the direct-CLI path below.
-    printf '%q %q \\\n' "$NODE_BIN" "$SPAWN_AGENT"
+    printf '%s%q %q \\\n' "$MSYS_GUARD" "$NODE_BIN" "$SPAWN_AGENT"
     printf '  --name %q \\\n' "$NAME"
     printf '  --team %q \\\n' "$TEAM"
     printf '  --project %q \\\n' "$PROJECT"
@@ -488,20 +582,30 @@ BOOT="$BOOT.command"
     printf '  --initial-input %q\n' "$ACTAS_PROMPT"
   else
     # Direct-CLI launch:
-    # `<cli> [<model_arg> <model_id>] [spawn-options...] [<prompt_arg>] "/<cmd> actas <name>"`.
+    # `<cli> [<resume_arg> <uuid>] [<model_arg> <model_id>] [spawn-options...] [<name_arg> <name>] [<prompt_arg>] "/<cmd> actas <name>"`.
     # cli is emitted unquoted — it is trusted fixed-prefix manifest data (see
     # above) that may itself be several tokens (e.g. `opencode run --interactive`).
-    # model_arg/prompt_arg are the manifest flag spellings (not %q-quoted — bare
-    # flags like --model or -i); the model id, every spawn-options token, and the
-    # actas prompt are quoted. prompt_arg (when set) lands immediately before the
-    # prompt so there is no ambiguity about which token is its value.
-    printf '%s' "$CLI_BIN"
+    # The resume head (#339) is emitted RIGHT AFTER the cli, before all other
+    # args: mandatory for a subcommand-shaped resume (codex `resume <id>`),
+    # harmless for a flag-shaped one (claude `--resume <id>`) -- see
+    # agmsg_role_resume_head. model_arg is the manifest flag spelling (bare, not
+    # %q-quoted); the model id and every spawn-options token are quoted. The
+    # role-identity tail (name/prompt_arg + the actas prompt) is emitted by
+    # agmsg_role_cli_args so its flag order matches resurrect-panes.sh.
+    # MSYS_GUARD (#336) prefixes the CLI line as a command-local env assignment;
+    # emitted with %s (not %q) so it stays an assignment, not a single token.
+    printf '%s%s' "$MSYS_GUARD" "$CLI_BIN"
+    agmsg_role_resume_head "$AGENT_TYPE" "$RESUME_UUID"
     [ -n "$MODEL_ID" ] && printf ' %s %q' "$MODEL_ARG" "$MODEL_ID"
     for _tok in ${SPAWN_OPT_TOKENS[@]+"${SPAWN_OPT_TOKENS[@]}"}; do
       printf ' %q' "$_tok"
     done
-    [ -n "$PROMPT_ARG" ] && printf ' %s' "$PROMPT_ARG"
-    printf ' %q\n' "$ACTAS_PROMPT"
+    # Role-identity tail: name the session and pass the actas prompt. The actas
+    # prompt runs in BOTH fresh and resume cases -- resume restores context only,
+    # so the actas re-run re-establishes the watcher, the lock, and the active
+    # FROM (claim is idempotent per sid).
+    agmsg_role_cli_args "$AGENT_TYPE" "$SESSION_NAME" "$ACTAS_PROMPT"
+    printf '\n'
   fi
   echo 'rm -f "$0" 2>/dev/null'   # self-clean once the agent exits
   echo 'exec "${SHELL:-/bin/bash}" -i'
@@ -523,17 +627,25 @@ launch_in_tmux() {
   command -v tmux >/dev/null 2>&1 \
     || die "\$TMUX is set but the tmux binary is not on PATH; add it to PATH, or run outside tmux to use the OS-terminal path"
 
+  # On Windows (psmux), tmux launches processes via Windows APIs that do not
+  # process shebang lines; an extensionless boot script is accepted but never
+  # executed (#335). Wrap with `bash -l` — same pattern as launch_windows_terminal.
+  local -a tmux_boot=("$BOOT")
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) tmux_boot=(bash -l "$BOOT") ;;
+  esac
+
   # Name the window/pane after the agent rather than letting tmux fall back to
   # the boot script's filename (boot-XXXXXX). `automatic-rename off` keeps the
   # name from being clobbered once the boot script runs the CLI / drops to a
   # shell.
   local target_id
   if [ "$TMUX_TARGET" = "window" ]; then
-    target_id="$(tmux new-window -P -F '#{window_id}' -n "$NAME" -c "$PROJECT" "$BOOT")"
+    target_id="$(tmux new-window -P -F '#{window_id}' -n "$NAME" -c "$PROJECT" "${tmux_boot[@]}")"
     tmux set-window-option -t "$target_id" automatic-rename off 2>/dev/null || true
   else
     local dir="-h"; [ "$SPLIT" = "v" ] && dir="-v"
-    target_id="$(tmux split-window "$dir" -P -F '#{pane_id}' -c "$PROJECT" "$BOOT")"
+    target_id="$(tmux split-window "$dir" -P -F '#{pane_id}' -c "$PROJECT" "${tmux_boot[@]}")"
     tmux select-pane -t "$target_id" -T "$NAME" 2>/dev/null || true
   fi
   # Record placement so `despawn --force` can tear this member down even if its
@@ -546,10 +658,15 @@ launch_in_tmux() {
 launch_macos_terminal() {
   # `open -a` is a launch, not an AppleEvent, so it does not trip the
   # Automation (TCC) consent prompts that `osascript ... do script` does.
+  # `-g`/`--background` keeps the newly opened terminal from stealing focus.
+  # This path is taken whenever $TMUX is unset -- notably when the spawning
+  # process itself has no tmux context (e.g. a GUI app, or any non-terminal
+  # caller), where a foreground terminal popup interrupts whatever the user
+  # is currently doing in the foreground app.
   local app="${1:-Terminal}"
   case "$app" in
-    iterm|iterm2|iTerm|iTerm2) open -a iTerm "$BOOT" ;;
-    *)                         open -a Terminal "$BOOT" ;;
+    iterm|iterm2|iTerm|iTerm2) open -g -a iTerm "$BOOT" ;;
+    *)                         open -g -a Terminal "$BOOT" ;;
   esac
 }
 
@@ -593,14 +710,86 @@ launch_with_template() {
   bash -c "$cmd"
 }
 
+is_herdr_env() {
+  [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] \
+    && command -v herdr >/dev/null 2>&1
+}
+
+# Extract one string field from a herdr JSON response by explicit path.
+#
+# herdr returns structured JSON, so the pane id must be addressed by path, not
+# by text matching. A greedy regex over the whole response picks the LAST
+# "pane_id" in it, which succeeds against a response carrying more than one
+# pane object and hands back somebody else's pane — the caller would then
+# rename it, run the boot script in it, and persist that id as the placement
+# record. Key order is not a contract either: a reordered or nested field
+# breaks a `[^}]*`-delimited match. sqlite3's JSON1 is already a core
+# dependency (whoami.sh, api.sh), so address the value directly.
+#
+# Fail closed: invalid JSON, a missing path, a non-string value, or an empty
+# string all yield empty output, and every caller treats empty as fatal.
+herdr_json_str() {
+  local resp="$1" path="$2" esc
+  esc="$(printf '%s' "$resp" | sed "s/'/''/g")"
+  agmsg_sqlite_mem "
+    WITH raw(json) AS (SELECT '$esc'),
+    doc(json) AS (SELECT CASE WHEN json_valid(json) THEN json END FROM raw)
+    SELECT CASE
+             WHEN json_type(json, '$path') = 'text'
+             THEN json_extract(json, '$path')
+           END
+    FROM doc;
+  " 2>/dev/null
+}
+
+launch_in_herdr() {
+  local new_id resp
+  if [ "$TMUX_TARGET" = "window" ]; then
+    local ws="${HERDR_WORKSPACE_ID:-}"
+    if [ -z "$ws" ]; then
+      echo "spawn: --window requested but \$HERDR_WORKSPACE_ID is not set; falling back to split" >&2
+      TMUX_TARGET="pane"
+      launch_in_herdr
+      return $?
+    fi
+    resp="$(herdr tab create --workspace "$ws" --label "$NAME" --cwd "$PROJECT" 2>&1)" \
+      || die "herdr tab create failed: $resp"
+    new_id="$(herdr_json_str "$resp" '$.result.root_pane.pane_id')"
+    [ -n "$new_id" ] || die "herdr tab create: could not read result.root_pane.pane_id from response: $resp"
+  else
+    local dir="right"; [ "$SPLIT" = "v" ] && dir="down"
+    resp="$(herdr pane split "$HERDR_PANE_ID" --direction "$dir" --no-focus --cwd "$PROJECT" 2>&1)" \
+      || die "herdr pane split failed: $resp"
+    new_id="$(herdr_json_str "$resp" '$.result.pane.pane_id')"
+    [ -n "$new_id" ] || die "herdr pane split: could not read result.pane.pane_id from response: $resp"
+  fi
+  herdr pane rename "$new_id" "$NAME" >/dev/null 2>&1 || true
+  herdr pane run "$new_id" "$BOOT" 2>/dev/null \
+    || die "herdr pane run failed for pane $new_id"
+  # Record placement with herdr: scheme tag. The herdr pane_id contains ":"
+  # (e.g. wC:pN), so despawn strips the prefix with ${id#herdr:}.
+  local _spawn_rec
+  _spawn_rec="$(agmsg_spawn_path "$TEAM" "$NAME")"
+  mkdir -p "$(dirname "$_spawn_rec")"
+  printf 'herdr:%s\t%s\t%s\n' "$new_id" "$PROJECT" "$AGENT_TYPE" \
+    > "$_spawn_rec" 2>/dev/null || true
+}
+
 place_and_launch() {
+  # Priority: $TMUX (tmux-inside-herdr backward compat) → herdr → OS terminal.
   if [ -n "${TMUX:-}" ]; then
     launch_in_tmux
     echo "spawned ${AGENT_TYPE} '${NAME}' in tmux (${TMUX_TARGET})"
     return 0
   fi
 
-  # Non-tmux: open an OS terminal. A {cmd} template wins outright on any OS.
+  if is_herdr_env; then
+    launch_in_herdr
+    echo "spawned ${AGENT_TYPE} '${NAME}' in herdr (${TMUX_TARGET})"
+    return 0
+  fi
+
+  # Non-tmux/herdr: open an OS terminal. A {cmd} template wins outright on any OS.
   if [ -n "$TERMINAL_TMPL" ] && is_terminal_template "$TERMINAL_TMPL"; then
     launch_with_template
     echo "spawned ${AGENT_TYPE} '${NAME}' via custom terminal template"

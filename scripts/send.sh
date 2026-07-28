@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: send.sh <team> <from> <to> <message|--stdin> [--wait] [--timeout <sec>] [--interval <sec>]
+# Usage: send.sh <team> <from> <to> <message|--stdin> [--force] [--wait]
+#                [--timeout <sec>] [--interval <sec>]
 #
 # Message body: pass it as the 4th positional argument (legacy), or pass --stdin
 # to read the entire body from standard input. --stdin keeps a large body (e.g. a
@@ -32,8 +33,7 @@ set -euo pipefail
 # (e.g. 540) and loop send --wait calls within a single turn for longer
 # exchanges. A monitor watcher will also surface the same reply as a duplicate
 # event afterward — treat the --wait result as authoritative and ignore it.
-
-TEAM="${1:?Usage: send.sh <team> <from> <to> <message|--stdin> [--wait] [--timeout <sec>] [--interval <sec>]}"
+TEAM="${1:?Usage: send.sh <team> <from> <to> <message|--stdin> [--force] [--wait] [--timeout <sec>] [--interval <sec>]}"
 FROM="${2:?Missing from agent}"
 TO="${3:?Missing to agent}"
 shift 3
@@ -50,17 +50,19 @@ else
 fi
 
 WAIT=0
+FORCE=0
 TIMEOUT="${AGMSG_SEND_WAIT_TIMEOUT:-300}"
 INTERVAL="${AGMSG_SEND_WAIT_INTERVAL:-2}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --stdin) shift ;;   # already consumed by the pre-scan above
+    --force) FORCE=1; shift ;;
     --wait) WAIT=1; shift ;;
     --timeout) TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
     --interval) INTERVAL="${2:?--interval needs seconds}"; shift 2 ;;
     -h|--help)
-      echo "Usage: send.sh <team> <from> <to> <message|--stdin> [--wait] [--timeout <sec>] [--interval <sec>]"
+      echo "Usage: send.sh <team> <from> <to> <message|--stdin> [--force] [--wait] [--timeout <sec>] [--interval <sec>]"
       exit 0 ;;
     *) echo "send: unknown option: $1" >&2; exit 1 ;;
   esac
@@ -72,6 +74,15 @@ case "$INTERVAL" in ''|*[!0-9]*) echo "send: --interval must be a whole number o
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/validate.sh"
+
+# #414: TEAM becomes a path segment (teams/$TEAM/config.json) below whether or
+# not --force is given, so validate it unconditionally, before any config-path
+# resolution or DB init. --force bypasses roster *membership* only — it must
+# never bypass team-name path safety.
+agmsg_validate_team_name "$TEAM" || exit 1
+
 DB="$(agmsg_db_path)"
 
 # Cross-session isolation guard. A session team (s-<session-id>) is PRIVATE to one
@@ -111,11 +122,56 @@ fi
 
 [ -f "$DB" ] || bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
 
-sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
-T_ESC="$(sql_escape "$TEAM")"
-F_ESC="$(sql_escape "$FROM")"
-O_ESC="$(sql_escape "$TO")"
-B_ESC="$(sql_escape "$BODY")"
+# #355: reject a from/to that isn't registered in <team> — an unnoticed typo
+# (e.g. a stray send to "dummy") used to insert successfully with exit 0,
+# landing an undeliverable message and polluting history. Validation lives
+# here (the front door), not in storage.sh, so other entry points (api.sh)
+# can keep their own policy. --force bypasses this for intentional
+# pre-registration sends (e.g. notifying a role before its own join.sh runs).
+if [ "$FORCE" -ne 1 ]; then
+  TEAM_CONFIG="$SCRIPT_DIR/../teams/$TEAM/config.json"
+
+  _agmsg_roster_check() {
+    local role="$1" name="$2"
+    if [ ! -f "$TEAM_CONFIG" ]; then
+      echo "Error: team '$TEAM' has no registered agents — cannot send as $role '$name' (use --force to bypass)." >&2
+      return 1
+    fi
+    local cfg_sql name_sql found roster
+    cfg_sql=$(agmsg_sql_readfile_path "$TEAM_CONFIG")
+    name_sql=$(printf '%s' "$name" | sed "s/'/''/g")
+    found=$(agmsg_sqlite_mem "
+      WITH raw(json) AS (SELECT CAST(readfile('$cfg_sql') AS TEXT)),
+      cfg(json) AS (SELECT CASE WHEN json_valid(json) THEN json END FROM raw)
+      SELECT value
+      FROM cfg, json_each(json_extract(cfg.json, '\$.agents'))
+      WHERE key = '$name_sql';
+    ")
+    if [ -z "$found" ]; then
+      roster=$(agmsg_sqlite_mem "
+        WITH raw(json) AS (SELECT CAST(readfile('$cfg_sql') AS TEXT)),
+        cfg(json) AS (SELECT CASE WHEN json_valid(json) THEN json END FROM raw)
+        SELECT group_concat(key, ', ')
+        FROM cfg, json_each(json_extract(cfg.json, '\$.agents'));
+      ")
+      echo "Error: $role agent '$name' is not registered in team '$TEAM' (registered: ${roster:-none}). Use --force to bypass." >&2
+      return 1
+    fi
+    return 0
+  }
+
+  _agmsg_roster_check "from" "$FROM" || exit 1
+  _agmsg_roster_check "to" "$TO" || exit 1
+fi
+
+# Escape EVERY interpolated value as a SQL string literal, not just body: a
+# team/agent name containing a single quote would otherwise break the INSERT
+# (correctness) or change its meaning (injection surface).
+_agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
+T_ESC="$(_agmsg_sqlesc "$TEAM")"
+F_ESC="$(_agmsg_sqlesc "$FROM")"
+O_ESC="$(_agmsg_sqlesc "$TO")"
+B_ESC="$(_agmsg_sqlesc "$BODY")"
 
 # Insert and capture the new row id in one connection so --wait can scope the
 # reply strictly to messages that arrive AFTER this send. id is INTEGER PRIMARY

@@ -23,6 +23,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/session-team.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/identity-key.sh"
 
 TEAM="$(agmsg_session_team_name)"
 [ -n "$TEAM" ] || exit 0   # not in session-team mode (or no session id) → nothing to do
@@ -30,9 +32,14 @@ TEAM="$(agmsg_session_team_name)"
 RUN_DIR="$SKILL_DIR/run"
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 
-# A live codex-bridge.js bound to THIS exact team+name means we are done. Match
-# the full flag signature so a bridge for another team never counts as ours.
-BRIDGE_SIG="codex-bridge\.js .*--team $TEAM --name $NAME --inline-inbox"
+# A live codex-bridge.js bound to THIS exact team+name means we are done. The
+# role-scoped bridge CLI carries identities via --pair, and the headless spawn
+# also supplies a terminated base64url identity marker. Match that opaque marker
+# rather than the retired --team/--name signature: team/name may contain regex or
+# whitespace characters, while the marker is an unambiguous safe token whose
+# terminator prevents one worker's encoded key matching a longer key's prefix.
+IDENTITY_KEY="$(agmsg_identity_key "$TEAM" "$NAME")"
+BRIDGE_SIG="codex-bridge\\.js .*--identity-key $IDENTITY_KEY"
 if pgrep -f "$BRIDGE_SIG" >/dev/null 2>&1; then
   echo "ensure-codex: codex '$NAME' already running in team '$TEAM'"
   exit 0

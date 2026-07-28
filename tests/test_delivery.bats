@@ -240,6 +240,60 @@ settings_file() {
   [ "$3" = "$sp" ]
 }
 
+# --- session-start.sh role-aware resume directive (#339) ---
+
+# Write a role-session record into the isolated skill dir's run/.
+_seed_role_record() {
+  local team="$1" agent="$2" sid="$3" proj="$4" type="${5:-claude-code}"
+  SKILL_DIR="$TEST_SKILL_DIR" bash -c '
+    source "$1/lib/role-session.sh"
+    agmsg_role_session_record "$2" "$3" "$4" "$5" "$6"
+  ' _ "$SCRIPTS" "$team" "$agent" "$sid" "$proj" "$type"
+}
+
+@test "session-start: a resumed role's sid emits the role-filtered directive (#339)" {
+  local sp="$TEST_PROJECT"
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$sp" >/dev/null
+  _seed_role_record team alice "sid-resumed" "$sp" claude-code
+
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< '{"session_id":"sid-resumed"}'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"resumed role"* ]]
+  [[ "$output" == *"acting as alice"* ]]
+  # The 4th watch.sh arg restricts receive to the role.
+  local cmdline; cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
+  eval "set -- $cmdline"
+  [ "$5" = "alice" ]
+}
+
+@test "session-start: an unrecorded sid emits the generic directive (#339)" {
+  local sp="$TEST_PROJECT"
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$sp" >/dev/null
+  # no record for this sid
+
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< '{"session_id":"sid-unknown"}'
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"resumed role"* ]]
+  [[ "$output" == *"invoke the Monitor tool"* ]]
+  # Generic directive: watch.sh has no 4th (role) arg.
+  local cmdline; cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
+  eval "set -- $cmdline"
+  [ "$#" -eq 4 ]
+}
+
+@test "session-start: a record for a role not registered here is ignored (#339)" {
+  local sp="$TEST_PROJECT"
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$sp" >/dev/null
+  # Same sid, but recorded for a (team, agent) that is NOT registered in this
+  # project -- a cross-project sid collision must not mis-seat this session.
+  _seed_role_record team ghost "sid-resumed" "/some/other/proj" claude-code
+
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< '{"session_id":"sid-resumed"}'
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"resumed role"* ]]
+  [[ "$output" == *"invoke the Monitor tool"* ]]
+}
+
 @test "delivery set turn: emits AGMSG-DIRECTIVE to stop any running watcher" {
   run bash "$SCRIPTS/delivery.sh" set turn claude-code "$TEST_PROJECT"
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
@@ -262,21 +316,21 @@ settings_file() {
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-test "$TEST_PROJECT" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-test "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.stop-test.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.stop-test.pid" ]
   run bash "$SCRIPTS/delivery.sh" stop
   [[ "$output" =~ "Killed 1 watch" ]]
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
   [ ! -f "$TEST_SKILL_DIR/run/watch.stop-test.pid" ]
-  sleep 1
+  wait_for_pid_exit "$watch_pid"
   ! kill -0 "$watch_pid" 2>/dev/null
 }
 
 @test "delivery stop: skips pid whose command line is not watch.sh (pid recycling safety)" {
   mkdir -p "$TEST_SKILL_DIR/run"
-  sleep 30 &
+  sleep 30 3>&- &
   local unrelated_pid=$!
   echo "$unrelated_pid" > "$TEST_SKILL_DIR/run/watch.stale-sess.pid"
   run bash "$SCRIPTS/delivery.sh" stop
@@ -315,9 +369,9 @@ JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
   # A live claude-code watcher for this project.
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess "$TEST_PROJECT" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.cc-sess.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.cc-sess.pid" ]
   # Switching a DIFFERENT type's delivery in the SAME project must not touch it.
   run bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT"
@@ -333,14 +387,14 @@ JSON
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess2 "$TEST_PROJECT" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess2 "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.cc-sess2.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.cc-sess2.pid" ]
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [ ! -f "$TEST_SKILL_DIR/run/watch.cc-sess2.pid" ]
-  sleep 1
+  wait_for_pid_exit "$watch_pid"
   ! kill -0 "$watch_pid" 2>/dev/null
 }
 
@@ -355,9 +409,9 @@ JSON
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$sp"}]}}}
 JSON
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sp-sess "$sp" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sp-sess "$sp" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sp-sess.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
   # Another type's set turn in the SAME space-containing project: must NOT kill it.
   run bash "$SCRIPTS/delivery.sh" set turn copilot "$sp"
@@ -368,7 +422,7 @@ JSON
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$sp"
   [ "$status" -eq 0 ]
   [ ! -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
-  sleep 1
+  wait_for_pid_exit "$watch_pid"
   ! kill -0 "$watch_pid" 2>/dev/null
 }
 
@@ -381,14 +435,59 @@ JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
 
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sigterm-test "$TEST_PROJECT" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sigterm-test "$TEST_PROJECT" claude-code 3>&- &
   local pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sigterm-test.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
   kill -TERM "$pid"
-  sleep 1
+  wait_for_pid_exit "$pid"
   ! kill -0 "$pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
+}
+
+# --- session-start.sh: skip worktree sub-sessions (#367) ---
+
+@test "session-start: skips the Monitor directive when hook cwd is under .claude/worktrees/" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+  local sub_cwd="$TEST_PROJECT/.claude/worktrees/bg-task-1"
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<< "{\"session_id\":\"sid-sub\",\"cwd\":\"$sub_cwd\"}"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [[ ! "$output" =~ "invoke the Monitor tool" ]]
+}
+
+@test "session-start: skips when hook cwd uses escaped-backslash (Windows JSON) separators" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<< '{"session_id":"sid-sub-win","cwd":"C:\\proj\\.claude\\worktrees\\bg-1"}'
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "session-start: falls back to \$PWD for the worktree check when the hook input has no cwd" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+  local sub_cwd="$TEST_PROJECT/.claude/worktrees/bg-task-2"
+  mkdir -p "$sub_cwd"
+  run env AGMSG_RESOLVE_PROJECT=0 bash -c "cd '$sub_cwd' && bash '$SCRIPTS/session-start.sh' claude-code '$TEST_PROJECT' <<< '{\"session_id\":\"sid-sub-nocwd\"}'"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "session-start: still emits the Monitor directive for a normal (non-worktree) cwd" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<< "{\"session_id\":\"sid-normal\",\"cwd\":\"$TEST_PROJECT\"}"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "invoke the Monitor tool" ]]
+}
+
+@test "session-start: does NOT skip a project whose path merely contains 'claude' and 'worktrees' loosely" {
+  # Regression guard: a naive *.claude*worktrees* glob would also match
+  # unrelated project names like .claude-tools/my-worktrees-app, which don't
+  # form the actual .claude/worktrees path segment sequence.
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+  local decoy_cwd="$TEST_PROJECT/.claude-tools/my-worktrees-app"
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<< "{\"session_id\":\"sid-decoy\",\"cwd\":\"$decoy_cwd\"}"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "invoke the Monitor tool" ]]
 }
 
 # --- session-start.sh dedup across /clear ---
@@ -402,7 +501,7 @@ JSON
   mkdir -p "$TEST_SKILL_DIR/run"
 
   # Stand in for the previous watcher: a sleep that updates its own pidfile.
-  sleep 30 &
+  sleep 30 3>&- &
   local prev_pid=$!
   echo "$prev_pid" > "$TEST_SKILL_DIR/run/watch.session-A.pid"
   # Pin the cc-instance state to "session-A" for a fake CC pid we control.
@@ -421,7 +520,7 @@ JSON
   [ -f "$pidfile" ]
   prev_p=$(cat "$pidfile")
   kill "$prev_p"
-  sleep 1
+  wait_for_pid_exit "$prev_p"
   ! kill -0 "$prev_p" 2>/dev/null
 }
 
@@ -522,16 +621,25 @@ has_session_end() {
 # --- session-end.sh behavior ---
 
 @test "session-end.sh kills the watcher matching session_id and removes pidfile" {
-  mkdir -p "$TEST_SKILL_DIR/run"
-  # Disguise the fake watcher's argv as watch.sh so the pid-reuse guard (which
-  # only kills a pid whose command line is our watch.sh) actually fires — a bare
-  # `sleep` would be (correctly) skipped, leaving the kill unverified.
-  ( exec -a "bash $SCRIPTS/watch.sh sess-A $TEST_PROJECT claude-code" sleep 30 ) &
+  # The fixture must be a REAL watcher. session-end.sh only kills a pid whose
+  # command line still looks like watch.sh (pid-recycling safety, see its
+  # comment), so the `sleep 30` stand-in this used to launch could never be
+  # killed — and the assertion passed anyway, so the test never checked what its
+  # name claims. Converting the wait to a poll is what surfaced it: polling
+  # reports the process is still there, where the single post-sleep check did
+  # not.
+  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
+  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
+{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
+JSON
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sess-A "$TEST_PROJECT" claude-code 3>&- &
   local target_pid=$!
-  echo "$target_pid" > "$TEST_SKILL_DIR/run/watch.sess-A.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sess-A.pid"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
   # Teardown is detached; poll for the pidfile removal (its last watcher step).
   wait_until 8 bash -c "[ ! -f '$TEST_SKILL_DIR/run/watch.sess-A.pid' ]"
+  wait_for_pid_exit "$target_pid"
+  ! kill -0 "$target_pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sess-A.pid" ]
   run kill -0 "$target_pid"; [ "$status" -ne 0 ]   # watcher killed (enforced; bare ! is set-e exempt)
   kill "$target_pid" 2>/dev/null || true
@@ -539,7 +647,7 @@ has_session_end() {
 
 @test "session-end.sh leaves other sessions' watchers alone" {
   mkdir -p "$TEST_SKILL_DIR/run"
-  sleep 30 &
+  sleep 30 3>&- &
   local other_pid=$!
   echo "$other_pid" > "$TEST_SKILL_DIR/run/watch.sess-B.pid"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
@@ -604,7 +712,7 @@ JSON
 JSON
   bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
-  sleep 30 &
+  sleep 30 3>&- &
   local alive_pid=$!
   echo "$alive_pid" > "$TEST_SKILL_DIR/run/watch.live-session.pid"
   # Bind this watcher to a live CC instance (use $$ as a stand-in).
@@ -619,7 +727,7 @@ JSON
 @test "emit monitor directive: skips when a live watcher already exists for this session" {
   mkdir -p "$TEST_SKILL_DIR/run"
   # Spawn a live process and pretend it's our watcher for this session_id.
-  sleep 30 &
+  sleep 30 3>&- &
   local live_pid=$!
   CLAUDE_CODE_SESSION_ID="live-test-sid"
   export CLAUDE_CODE_SESSION_ID
@@ -660,6 +768,7 @@ JSON
   phys=$(cd "$realproj" && pwd -P)
 
   bash "$SCRIPTS/join.sh" team alice codex "$linkproj" >/dev/null
+  _seed_role_record team alice thread-sym "$linkproj" codex
 
   # Stage a Codex rollout whose session_meta records the PHYSICAL cwd.
   local sdir="$HOME/.codex/sessions/2026/06/19"
@@ -822,6 +931,50 @@ EOF
   [[ "$output" =~ "ping copilot" ]]
 }
 
+@test "check-inbox: does not hang when stdin is a non-TTY pipe that never reaches EOF (#381)" {
+  # A minimal `timeout` shim so this test exercises check-inbox.sh's own
+  # `command -v timeout` code path deterministically, regardless of whether
+  # the host actually ships GNU timeout (stock macOS does not) -- what's
+  # under test is check-inbox.sh's wiring to `timeout`, not the host
+  # environment. Prepended first on PATH so it wins even where a real one
+  # also exists.
+  local bindir="$TEST_SKILL_DIR/shimbin"
+  mkdir -p "$bindir"
+  cat > "$bindir/timeout" <<'EOF'
+#!/usr/bin/env bash
+secs="$1"; shift
+("$@") 3>&- & cmd_pid=$!
+( sleep "$secs"; kill "$cmd_pid" 2>/dev/null ) 3>&- & watchdog_pid=$!
+if wait "$cmd_pid" 2>/dev/null; then
+  kill "$watchdog_pid" 2>/dev/null
+  exit 0
+else
+  exit 124
+fi
+EOF
+  chmod +x "$bindir/timeout"
+
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT"
+
+  local fifo="$TEST_PROJECT/repro.fifo"
+  mkfifo "$fifo"
+  # Write the payload, then hold the write end open without closing it --
+  # exactly the "hook runtime forgets to close the pipe" shape from the
+  # issue's own FIFO repro. A plain `sleep N | check-inbox.sh` does NOT
+  # reproduce this: bash waits for every pipeline member, so it looks like a
+  # hang even when the hook itself exits immediately.
+  { printf '%s' '{"stop_hook_active":false,"session_id":"repro-381"}'; sleep 300; } \
+    3>&- 4>&- > "$fifo" &
+  local writer_pid="$!"
+
+  local newpath="$bindir:$PATH"
+  run bash -c "PATH='$newpath' AGMSG_HOOK_STDIN_TIMEOUT=1 bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT' < '$fifo'"
+
+  kill "$writer_pid" 2>/dev/null || true
+  rm -f "$fifo"
+
+  [ "$status" -eq 0 ]
+}
 
 
 
@@ -845,14 +998,20 @@ JSON
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'alice', 'for-alice');"
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'bob', 'for-bob');"
 
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-sid "$TEST_PROJECT" claude-code bob > /tmp/agmsg-as-bob 2>&1 &
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-sid "$TEST_PROJECT" claude-code bob > /tmp/agmsg-as-bob 2>&1 3>&- &
   local pid=$!
   # High-water-mark = MAX(id) at startup, so prior messages aren't replayed.
-  # Insert NEW messages and wait for several poll iterations.
-  sleep 1
+  # The watermark file is written the moment that mark is taken, so waiting for
+  # it — rather than a fixed second — is what actually makes the inserts below
+  # land after the mark.
+  wait_for_file "$TEST_SKILL_DIR/run/watch.t-sid.watermark"
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'alice', 'new-for-alice');"
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'bob', 'new-for-bob');"
-  sleep 3
+  # new-for-bob is the LAST row inserted, so by the time it has been delivered
+  # the watcher has necessarily scanned past new-for-alice. That is what makes
+  # the "alice never arrived" assertion below a real check; the fixed `sleep 3`
+  # it replaces only assumed enough poll iterations had gone by.
+  wait_for_file_contains /tmp/agmsg-as-bob "new-for-bob"
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
 
@@ -881,7 +1040,7 @@ JSON
   mkdir -p "$TEST_SKILL_DIR/run"
 
   # Orphan: watcher referenced by a cc-instance.<dead-pid> file.
-  sleep 30 &
+  sleep 30 3>&- &
   local orphan_pid=$!
   echo "$orphan_pid" > "$TEST_SKILL_DIR/run/watch.orphan-sid.pid"
   # Use a PID that's almost certainly not in use as the dead CC ancestor.
@@ -890,7 +1049,7 @@ JSON
 
   # Untracked watcher: no cc-instance points to it. Conservative semantics
   # leave it alone (we have no evidence the CC is dead).
-  sleep 30 &
+  sleep 30 3>&- &
   local untracked_pid=$!
   echo "$untracked_pid" > "$TEST_SKILL_DIR/run/watch.untracked-sid.pid"
 
@@ -917,7 +1076,7 @@ JSON
   # The session moved from one CC pid to another (claude --continue / resume).
   # cc-instance.<dead> still references the same session_id as
   # cc-instance.<live>. The watcher must NOT be killed.
-  sleep 30 &
+  sleep 30 3>&- &
   local watcher_pid=$!
   echo "$watcher_pid" > "$TEST_SKILL_DIR/run/watch.shared-sid.pid"
   local dead_cc=999999
@@ -942,9 +1101,9 @@ JSON
 
   # Watcher starts with only `alice` registered. Default subscription set
   # is resolved at launch and not re-evaluated each poll.
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-static "$TEST_PROJECT" claude-code > /tmp/agmsg-static 2>&1 &
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-static "$TEST_PROJECT" claude-code > /tmp/agmsg-static 2>&1 3>&- &
   local pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.t-static.watermark"
 
   # Join `bob` to the same (project, type) after the watcher is running.
   bash "$SCRIPTS/join.sh" myteam bob claude-code "$TEST_PROJECT"
@@ -954,7 +1113,13 @@ JSON
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'sys', 'alice', 'for-alice-static');"
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'sys', 'bob',   'for-bob-static');"
 
-  sleep 3
+  # A sentinel for alice inserted AFTER bob's row. Its arrival proves the
+  # watcher has already scanned past for-bob-static, which is what makes "bob
+  # never arrived" an assertion rather than a guess. Waiting on
+  # for-alice-static instead would not: it precedes bob's row, so seeing it
+  # says nothing about whether bob's had been reached yet.
+  sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'sys', 'alice', 'static-sentinel');"
+  wait_for_file_contains /tmp/agmsg-static "static-sentinel"
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
 
@@ -979,17 +1144,18 @@ JSON
 {"name":"team-b","agents":{"bob":{"registrations":[{"type":"claude-code","project":"$proj_b"}]}}}
 JSON
 
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sid-a "$proj_a" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sid-a "$proj_a" claude-code 3>&- &
   local pid_a=$!
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sid-b "$proj_b" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sid-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sid-a.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sid-b.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.sid-a.pid" ]
   [ -f "$TEST_SKILL_DIR/run/watch.sid-b.pid" ]
 
   run bash "$SCRIPTS/delivery.sh" set turn claude-code "$proj_a"
   [ "$status" -eq 0 ]
-  sleep 1
+  wait_for_pid_exit "$pid_a"
 
   # Target project A: watcher killed, pidfile removed.
   ! kill -0 "$pid_a" 2>/dev/null
@@ -1017,15 +1183,16 @@ JSON
 {"name":"team-b","agents":{"bob":{"registrations":[{"type":"claude-code","project":"$proj_b"}]}}}
 JSON
 
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" off-a "$proj_a" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" off-a "$proj_a" claude-code 3>&- &
   local pid_a=$!
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" off-b "$proj_b" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" off-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.off-a.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.off-b.pid"
 
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$proj_a"
   [ "$status" -eq 0 ]
-  sleep 1
+  wait_for_pid_exit "$pid_a"
 
   ! kill -0 "$pid_a" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.off-a.pid" ]
@@ -1049,15 +1216,23 @@ JSON
 {"name":"team-b","agents":{"bob":{"registrations":[{"type":"claude-code","project":"$proj_b"}]}}}
 JSON
 
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-a "$proj_a" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-a "$proj_a" claude-code 3>&- &
   local pid_a=$!
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-b "$proj_b" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.stop-a.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.stop-b.pid"
 
   run bash "$SCRIPTS/delivery.sh" stop
   [[ "$output" =~ "Killed 2 watch" ]]
-  sleep 1
+  # BOTH watchers must be waited for. `stop` sends TERM to each and returns;
+  # the order they actually die in is not guaranteed, so waiting only on A and
+  # asserting B in the same breath races B's exit trap. The `sleep 1` this
+  # replaced happened to cover both — the two other project-scoped tests above
+  # wait on one pid only because their second watcher is asserted to still be
+  # ALIVE, which needs no grace period.
+  wait_for_pid_exit "$pid_a"
+  wait_for_pid_exit "$pid_b"
   ! kill -0 "$pid_a" 2>/dev/null
   ! kill -0 "$pid_b" 2>/dev/null
 
@@ -1130,7 +1305,15 @@ skip_if_no_special_fs() {
   local cmd
   cmd=$(sqlite_mem "SELECT json_extract(readfile('$hfq'), '\$.hooks.Stop[0].hooks[0].command');")
   [[ "$cmd" == *"check-inbox.sh"* ]]
-  [[ "$cmd" == *"o'brien \"x\""* ]]
+  # Beyond JSON validity: the "command" value is itself later executed by a
+  # shell (Claude Code's hook runner). The embedded ' and " must not be able
+  # to break out of their argument boundary — the shell must see exactly 3
+  # arguments, with the project path arriving back intact as one of them
+  # (F14 hardening; pre-fix, the embedded ' broke the naive `'$project'`
+  # wrap and the rest of the string ran as unintended shell syntax).
+  eval "set -- $cmd"
+  [ "$#" -eq 3 ]
+  [ "$3" = "$proj" ]
 }
 
 @test "delivery set turn: project path with quotes yields valid JSON + commandWindows (codex) (#134)" {
@@ -1165,6 +1348,22 @@ skip_if_no_special_fs() {
   local cmd
   cmd=$(sqlite_mem "SELECT json_extract(readfile('$hfq'), '\$.hooks.Stop[0].hooks[0].command');")
   [[ "$cmd" == *'a\b'* ]]
+}
+
+@test "delivery set monitor: project path with a single quote can't break SessionStart/SessionEnd argument boundaries (F14 hardening)" {
+  skip_if_no_special_fs
+  local proj="$TEST_PROJECT/al'ice"
+  mkdir -p "$proj"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$proj"
+  [ "$status" -eq 0 ]
+  local hf="$proj/.claude/settings.local.json"
+  local hfq; hfq=$(sql_lit "$hf")
+  [ "$(sqlite_mem "SELECT json_valid(readfile('$hfq'));")" = "1" ]
+  local ss se
+  ss=$(sqlite_mem "SELECT json_extract(readfile('$hfq'), '\$.hooks.SessionStart[0].hooks[0].command');")
+  se=$(sqlite_mem "SELECT json_extract(readfile('$hfq'), '\$.hooks.SessionEnd[0].hooks[0].command');")
+  eval "set -- $ss"; [ "$#" -eq 3 ]; [ "$3" = "$proj" ]
+  eval "set -- $se"; [ "$#" -eq 3 ]; [ "$3" = "$proj" ]
 }
 
 @test "delivery set monitor: existing settings with single-quoted hook commands stays valid JSON (#134)" {
@@ -1399,9 +1598,35 @@ JSON
   [ "$count" -eq 1 ]
 }
 
+@test "antigravity supports off mode: removes rule file" {
+  bash "$SCRIPTS/delivery.sh" set turn antigravity "$TEST_PROJECT"
+  [ -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
+  run bash "$SCRIPTS/delivery.sh" set off antigravity "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [ ! -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
+}
+
+# #399: type.conf previously advertised delivery_modes=monitor turn both off,
+# but antigravity has no Monitor tool or bridge equivalent — the manifest must
+# match what the template actually offers (turn/off only, like cursor/gemini).
+@test "antigravity rejects monitor mode" {
+  run bash "$SCRIPTS/delivery.sh" set monitor antigravity "$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "not supported" ]]
+  [ ! -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
+}
+
+@test "antigravity rejects both mode" {
+  run bash "$SCRIPTS/delivery.sh" set both antigravity "$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "not supported" ]]
+  [ ! -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
+}
+
 # --- Codex monitor bridge (#41) ---
 @test "session-start.sh for codex starts bridge when monitor launcher env is present" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  _seed_role_record team alice thread-123 "$TEST_PROJECT" codex
   local fake="$TEST_SKILL_DIR/fake-codex-bridge"
   local log="$TEST_SKILL_DIR/fake-codex-bridge.log"
   cat >"$fake" <<'EOF'
@@ -1411,6 +1636,7 @@ EOF
   chmod +x "$fake"
 
   AGMSG_CODEX_BRIDGE=1 \
+  AGMSG_STORAGE_PATH="$TEST_SKILL_DIR/custom-store" \
   AGMSG_CODEX_BRIDGE_APP_SERVER="unix://$TEST_SKILL_DIR/run/codex-app-server.test.sock" \
   AGMSG_CODEX_BRIDGE_CMD="$fake" \
   AGMSG_TEST_LOG="$log" \
@@ -1424,6 +1650,7 @@ EOF
 
   [ -f "$log" ]
   grep -q -- "--project $TEST_PROJECT" "$log"
+  grep -q -- "--workspace-root $TEST_SKILL_DIR/custom-store" "$log"
   grep -q -- "--thread thread-123" "$log"
   grep -q -- "--app-server unix://$TEST_SKILL_DIR/run/codex-app-server.test.sock" "$log"
   grep -q -- "--inline-inbox" "$log"
@@ -1448,7 +1675,7 @@ EOF
 @test "delivery set monitor (codex): installs SessionStart and prints Codex shell function" {
   run bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Codex monitor beta is enabled"* ]]
+  [[ "$output" == *"Codex monitor is enabled"* ]]
   [[ "$output" == *"codex() {"* ]]
   [[ "$output" == *"codex-shim.sh"* ]]
   [[ "$output" == *"launch with codex"* ]]
@@ -1475,7 +1702,7 @@ EOF
   bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
 
-  sleep 60 &
+  sleep 60 3>&- &
   local bpid=$!
   # shellcheck disable=SC2064  # capture the current child pid for EXIT cleanup
   trap "kill $bpid 2>/dev/null || true" EXIT
@@ -1571,6 +1798,96 @@ EOF
   [[ "$output" != *"watch processes:"* ]]
 }
 
+@test "delivery status (codex): notes when the installed shim loses to a different codex on PATH and no bridge has ever been alive (#387)" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+
+  mkdir -p "$HOME/.agents/bin"
+  cp "$TYPES/codex/codex-shim.sh" "$HOME/.agents/bin/codex"
+  chmod +x "$HOME/.agents/bin/codex"
+
+  # A different, non-agmsg codex earlier on PATH -- exactly the "PATH order
+  # loses" shape from #387/#397: mode stays "monitor" but launches never
+  # actually reach the shim. No bridge has ever come alive here either, so
+  # this is the one case with enough corroboration to say something.
+  local other_bin="$TEST_SKILL_DIR/other-bin"
+  mkdir -p "$other_bin"
+  printf '#!/usr/bin/env bash\necho real\n' > "$other_bin/codex"
+  chmod +x "$other_bin/codex"
+
+  PATH="$other_bin:$HOME/.agents/bin:$PATH" run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Note: an agmsg codex shim is installed"* ]]
+  [[ "$output" == *"$other_bin/codex"* ]]
+}
+
+@test "delivery status (codex): no PATH-mismatch note when the shim correctly wins PATH order (#387)" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+
+  mkdir -p "$HOME/.agents/bin"
+  cp "$TYPES/codex/codex-shim.sh" "$HOME/.agents/bin/codex"
+  chmod +x "$HOME/.agents/bin/codex"
+
+  PATH="$HOME/.agents/bin:$PATH" run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Note: an agmsg codex shim"* ]]
+}
+
+@test "delivery status (codex): no PATH-mismatch note when no PATH-based shim is installed (#387)" {
+  # The shell-function-only install method is invisible to this script (a
+  # function from an interactive profile isn't inherited by a fresh
+  # `bash delivery.sh status` invocation) -- must not false-alarm here.
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Note: an agmsg codex shim"* ]]
+}
+
+@test "delivery status (codex): no PATH-mismatch note when a bridge is alive even if the shim file loses on PATH (#387 regression)" {
+  # Real-machine regression: the shim FILE existing at ~/.agents/bin/codex
+  # does not mean this install relies on PATH resolution for it -- the
+  # shell-function method (recommended first, in on_enable) is common, and
+  # having the PATH shim file ALSO present is a normal side effect of
+  # following the setup instructions, not evidence of a broken PATH-based
+  # setup. A live bridge is corroborating evidence that delivery is
+  # actually working (by whichever method), so the note must remain silent.
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+
+  mkdir -p "$HOME/.agents/bin" "$TEST_SKILL_DIR/run"
+  cp "$TYPES/codex/codex-shim.sh" "$HOME/.agents/bin/codex"
+  chmod +x "$HOME/.agents/bin/codex"
+
+  local other_bin="$TEST_SKILL_DIR/other-bin"
+  mkdir -p "$other_bin"
+  printf '#!/usr/bin/env bash\necho real\n' > "$other_bin/codex"
+  chmod +x "$other_bin/codex"
+
+  sleep 60 3>&- &
+  local bpid=$!
+  # shellcheck disable=SC2064  # capture the current child pid for EXIT cleanup
+  trap "kill $bpid 2>/dev/null || true" EXIT
+  printf '%s\n' "$bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+  cat > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta" <<EOF
+pid=$bpid
+project=$TEST_PROJECT
+team=team
+name=alice
+type=codex
+EOF
+
+  PATH="$other_bin:$HOME/.agents/bin:$PATH" run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Codex bridge: team/alice alive"* ]]
+  [[ "$output" != *"Note: an agmsg codex shim"* ]]
+
+  kill "$bpid" 2>/dev/null || true
+  trap - EXIT
+}
+
 @test "delivery status (codex): multiple identities are enumerated independently" {
   skip_on_windows "codex bridge status liveness under Git Bash (#182)"
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
@@ -1578,7 +1895,7 @@ EOF
   bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
 
-  sleep 60 &
+  sleep 60 3>&- &
   local bpid=$!
   # shellcheck disable=SC2064  # capture the current child pid for EXIT cleanup
   trap "kill $bpid 2>/dev/null || true" EXIT
@@ -1613,6 +1930,7 @@ EOF
 
 @test "session-start.sh for codex resolves thread id from rollout when CODEX_THREAD_ID is unset" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  _seed_role_record team alice rollout-thread-999 "$TEST_PROJECT" codex
   local fake="$TEST_SKILL_DIR/fake-codex-bridge"
   local log="$TEST_SKILL_DIR/fake-codex-bridge.log"
   cat >"$fake" <<'EOF'
@@ -1640,6 +1958,52 @@ EOF
   grep -q -- "--thread rollout-thread-999" "$log"
 }
 
+@test "session-start.sh for codex resolves the rollout by real mtime, not filename order (#416)" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  _seed_role_record team alice stale-by-name-uuid "$TEST_PROJECT" codex
+  local fake="$TEST_SKILL_DIR/fake-codex-bridge"
+  local log="$TEST_SKILL_DIR/fake-codex-bridge.log"
+  cat >"$fake" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$AGMSG_TEST_LOG"
+EOF
+  chmod +x "$fake"
+
+  # `ls -t "$dir"/*/*/*/rollout-*.jsonl` was flaky on Windows/Git Bash --
+  # intermittently returned an empty/truncated list with no filesystem
+  # changes in between, so agmsg_resolve_codex_thread got starved of any
+  # candidate and the SessionStart hook silently no-opped (#416). The fix
+  # replaced it with find + a portable per-file mtime sort. Prove it is a
+  # real mtime sort and not an accidental filename-lexical sort: one rollout
+  # has an OLDER-looking filename timestamp but its actual mtime is touched
+  # to be the newest of the two, matching this project's cwd. A find+sort-
+  # by-name "fix" would pick the wrong (stale) rollout here.
+  local rollout_dir="$TEST_SKILL_DIR/home/.codex/sessions/2026/06/17"
+  mkdir -p "$rollout_dir"
+  printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"id\":\"stale-by-name-uuid\",\"cwd\":\"$TEST_PROJECT\"}}" \
+    > "$rollout_dir/rollout-2020-01-01T00-00-00-stale-by-name-uuid.jsonl"
+  printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"id\":\"newer-by-name-uuid\",\"cwd\":\"$TEST_PROJECT\"}}" \
+    > "$rollout_dir/rollout-2026-06-17T00-00-00-newer-by-name-uuid.jsonl"
+  # Stays a real sleep. This is not waiting for a process to settle — it is
+  # separating two mtimes far enough apart that the code under test can order
+  # them, and filesystem timestamp granularity is a whole second on some of the
+  # filesystems CI runs on. There is no condition to poll for: the thing being
+  # waited on is the clock itself.
+  sleep 1
+  touch "$rollout_dir/rollout-2020-01-01T00-00-00-stale-by-name-uuid.jsonl"
+
+  HOME="$TEST_SKILL_DIR/home" \
+  AGMSG_CODEX_BRIDGE=1 \
+  AGMSG_CODEX_BRIDGE_APP_SERVER="unix://$TEST_SKILL_DIR/run/codex-app-server.test.sock" \
+  AGMSG_CODEX_BRIDGE_CMD="$fake" \
+  AGMSG_TEST_LOG="$log" \
+    env -u CODEX_THREAD_ID bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null
+
+  for _ in {1..20}; do [ -f "$log" ] && break; sleep 0.1; done
+  [ -f "$log" ]
+  grep -q -- "--thread stale-by-name-uuid" "$log"
+}
+
 @test "delivery set monitor (codex): warns loudly when Node is missing" {
   # Node preflight: the bridge is a Node program; enabling monitor without Node
   # must flag it rather than silently never starting. AGMSG_CODEX_NODE points the
@@ -1654,7 +2018,7 @@ EOF
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
   # Stand in for a live bridge with a real process we can check kill -0 against.
-  sleep 60 &
+  sleep 60 3>&- &
   local bpid=$!
   echo "$bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
   echo "pid=$bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta"
@@ -1722,9 +2086,9 @@ EOF
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" hermes-preserve-test "$TEST_PROJECT" claude-code &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" hermes-preserve-test "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
+  wait_for_file "$TEST_SKILL_DIR/run/watch.hermes-preserve-test.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.hermes-preserve-test.pid" ]
 
   run bash "$SCRIPTS/delivery.sh" set off hermes "$TEST_PROJECT"
@@ -1852,6 +2216,10 @@ JSON
   [[ "$output" == *"agmsg-delivery-mode: monitor"* ]]
   [[ "$output" == *"monitor"* ]]
   [[ "$output" == *"watch.sh"* ]]
+  # The rule bakes the sentinel form, not a droppable empty expansion: grok's
+  # monitor tool re-evaluates the command line and deletes a quoted-but-empty
+  # "$GROK_SESSION_ID" argument, shifting every later argument one slot left.
+  [[ "$output" == *'watch.sh "${GROK_SESSION_ID:--}"'* ]]
 }
 
 @test "delivery status (grok-build): reports monitor when the monitor rule is present" {

@@ -60,7 +60,7 @@ npx agmsg
 #    OpenCode:     $agmsg
 ```
 
-これだけだ。スラッシュコマンドは初回使用時にチーム名とエージェント名を尋ね、続けて[配信モード](#配信モード)を選ばせる（Claude Codeのデフォルトは `monitor` — リアルタイムプッシュ。Codexはベータの `monitor` ブリッジまたは `turn` を提供）。その後は自然な言葉でエージェントに話しかければよい — 詳しくは下記の[初回実行](#初回実行)を参照。
+これだけだ。スラッシュコマンドは初回使用時にチーム名とエージェント名を尋ね、続けて[配信モード](#配信モード)を選ばせる（Claude CodeとCodexのデフォルトは `monitor` — リアルタイムプッシュ。Codexはブリッジ経由で実現する）。その後は自然な言葉でエージェントに話しかければよい — 詳しくは下記の[初回実行](#初回実行)を参照。
 
 先にコードを確認したい、最新の `main` を追いたい、あるいはカスタムのコマンド名にしたい場合は、下記の[インストール](#インストール)にある `setup.sh` ワンライナー、`git clone`、Claude Codeプラグインマーケットプレイスの各手順を参照。
 
@@ -286,9 +286,9 @@ despawnは指定されたメンバーにのみ作用する — `despawn` を実�
 $agmsg                          — または /skills → agmsg
 ```
 
-Codexは `mode monitor` を**ベータ**のapp-serverブリッジとしてサポートし、加えて `mode turn` と `mode off` にも対応している。
+Codexは `mode monitor` をapp-serverブリッジ経由でサポートし、加えて `mode turn` と `mode off` にも対応している。
 
-> ⚠️ **monitorベータはCodexの起動方法を変える — 理解した上でのみオプトインすること。** CodexにはMonitorツールがないため、`mode monitor` はインタラクティブシェル内で `codex` をagmsgのmonitorシム経由にルーティングするシェル関数を表示する。monitorモードのプロジェクトでは、このシムがインタラクティブな起動を、受信したagmsgメッセージを現在のCodexスレッドのターンに変換するブリッジ経由にルーティングする。`codex exec` とmonitor対象外のプロジェクトは実物のCodexにそのまま通る。これは実験的なCodex app-serverの挙動に依存しており、既知の粗さがある（TUIを閉じるとオーファンが残る — #149、プロジェクトごとに1アイデンティティのみ — #150）。
+> ⚠️ **monitorモードはCodexの起動方法を変える — それを承知した上で有効化すること。** CodexにはMonitorツールがないため、`mode monitor` はインタラクティブシェル内で `codex` をagmsgのmonitorシム経由にルーティングするシェル関数を表示する。monitorモードのプロジェクトでは、このシムがインタラクティブな起動を、受信したagmsgメッセージを現在のCodexスレッドのターンに変換するブリッジ経由にルーティングする。`codex exec` とmonitor対象外のプロジェクトは実物のCodexにそのまま通る。これはCodex app-serverの挙動に依存しており、既知の制限がある（TUIを閉じるとオーファンが残る — #149）。
 
 グローバルなPATHシムを好むなら、`~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-shim-install.sh install` を実行し、`~/.agents/bin` を実物のCodexバイナリより前にPATHに置く。`~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-monitor.sh` で直接起動することもできる。Codexのサンドボックスはスキルの `db/`、`teams/`、`run/` ディレクトリへの書き込みを許可する必要がある — `~/.codex/config.toml` が存在する場合、`install.sh` がその `writable_roots` を設定する。セットアップの詳細と内部動作: [docs/codex-monitor-beta.md](docs/codex-monitor-beta.md)。
 
@@ -315,7 +315,7 @@ $agmsg
 ### シェル（任意のエージェント）
 
 ```bash
-~/.agents/skills/<cmd>/scripts/send.sh <team> <from> <to> "<message>"
+~/.agents/skills/<cmd>/scripts/send.sh <team> <from> <to> "<message>" [--force]
 ~/.agents/skills/<cmd>/scripts/inbox.sh <team> <agent_id>
 ~/.agents/skills/<cmd>/scripts/history.sh <team> [agent_id] [limit]
 ~/.agents/skills/<cmd>/scripts/team.sh <team>
@@ -325,7 +325,7 @@ $agmsg
 ~/.agents/skills/<cmd>/scripts/reset.sh <project_path> <type> [agent_id]
 ```
 
-`send.sh` はちょうど4つの位置引数を取る: `<team> <from> <to> "<message>"`。シェルが1つの引数として認識するようメッセージはクォートすること — クォートされていないスペース入りメッセージは誤って分割される。
+`send.sh` は4つの位置引数 `<team> <from> <to> "<message>"` に加えて、末尾に任意で `--force` を取る。シェルが1つの引数として認識するようメッセージはクォートすること — クォートされていないスペース入りメッセージは誤って分割される。`from`・`to` はどちらも `<team>` に事前登録済みである必要があり、未登録の名前は(登録済み一覧を添えて)エラーになる — 意図的な事前登録前送信をしたい場合のみ `--force` でこのチェックを迂回できる。
 
 ## FAQ / 設計メモ
 
@@ -368,6 +368,10 @@ v1にはない。2つのエージェントが同じ名前を購読していれ�
 **古いルームから新しいエージェントを再シードできるか?**
 
 メッセージストアは実質的にリプレイログだ。「ルームXから復元」というワンショットのコマンドはまだないが、`history.sh` で文字起こしを取得し、それを新しいエージェントにプロンプトとして渡すことはできる。それを可能にする鍵が永続化だと考えてほしい。
+
+**読み方は?**
+
+「えーじーめっせーじ」または「えーじーえむえすじー」。どちらでも大丈夫です。
 
 ## アップデート
 
@@ -422,6 +426,8 @@ Claude Codeのサンドボックスはファイルシステムへの書き込み
   }
 }
 ```
+
+allowlistを追加しただけではサンドボックスは有効にならない。Claude Codeで `/sandbox` を使ってサンドボックスモードを選ぶか、設定で有効にする場合は、同じ `"sandbox"` オブジェクトの `"filesystem"` と並べて `"enabled": true` を追加する。サンドボックスが有効になるまで、このallowlistは効果を持たない。
 
 プロジェクトごとのスコープにしたい場合は、プロジェクトレベルの `.claude/settings.local.json` にも同様に書ける。allowlistはすべての設定スコープにまたがってマージされ、再起動なしで即座に反映される。
 

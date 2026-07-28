@@ -11,11 +11,12 @@ teardown() {
 }
 
 resolve_extra_fs_roots() {
-  env SCRIPT_DIR="$SCRIPTS" bash -c '
+  local mode="${1:-profile}"
+  env SCRIPT_DIR="$SCRIPTS" EXTRA_FS_MODE="$mode" bash -c '
     set -euo pipefail
     die() { echo "die: $*" >&2; exit 1; }
     . "$SCRIPT_DIR/drivers/types/codex/_spawn.sh"
-    agmsg_codex_extra_fs_roots worker
+    agmsg_codex_extra_fs_roots worker "$EXTRA_FS_MODE"
   '
 }
 
@@ -31,6 +32,15 @@ resolve_extra_fs_roots() {
   run resolve_extra_fs_roots
   [ "$status" -eq 0 ]
   [ "$output" = ", \"$HOME/x\"=\"read\"" ]
+}
+
+@test "codex extra fs roots: runtime roots include write entries but never promote read entries" {
+  bash "$SCRIPTS/config.sh" set spawn.codex_extra_fs_roots '~/read-only=read,~/writable=write'
+
+  run resolve_extra_fs_roots runtime-write-roots
+  [ "$status" -eq 0 ]
+  [ "$output" = "$HOME/writable" ]
+  [[ "$output" != *"$HOME/read-only"* ]]
 }
 
 @test "codex extra fs roots: rejects an invalid permission" {

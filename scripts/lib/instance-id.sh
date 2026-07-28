@@ -45,22 +45,13 @@ _agmsg_pid_alive() {
       return $?
       ;;
   esac
-  # kill -0 exits 0 when the process exists and is signalable. A non-zero exit
-  # is ambiguous: ESRCH ("No such process") means the process is gone, but EPERM
-  # ("Operation not permitted") means the process exists yet we may not signal
-  # it — exactly what a sandbox (e.g. Claude Code) does to the parent agent
-  # process. Judging on exit code alone treated EPERM as dead, so the watcher's
-  # liveness guard self-exited immediately under the sandbox and real-time
-  # delivery silently never started. Treat only the unambiguous ESRCH case as
-  # dead so a sandboxed-but-alive session keeps its watcher running.
-  # Pin LC_ALL=C so the ESRCH wording is the C-locale "No such process"
-  # regardless of the caller's locale; otherwise a translated message would slip
-  # past the match and a truly-dead pid would read as alive (fail-open: only a
-  # GC delay, never a self-exit, but still worth keeping deterministic).
-  local _err
-  _err=$(LC_ALL=C kill -0 "$pid" 2>&1) && return 0
-  case "$_err" in
-    *"No such process"*|*"no such process"*|*"NO SUCH PROCESS"*) return 1 ;;
+  # A non-zero `kill -0` is ESRCH (dead) or EPERM (alive but unsignalable under
+  # the sandbox). Only ESRCH is dead. `export LC_ALL=C` (not a bare prefix, which
+  # misses the builtin on bash 3.2) forces English error text for the match.
+  local err
+  err="$(export LC_ALL=C; kill -0 "$pid" 2>&1)" && return 0
+  case "$err" in
+    *[Nn]'o such process'*) return 1 ;;
     *) return 0 ;;
   esac
 }
@@ -88,6 +79,21 @@ agmsg_instance_is_composite() {
     ''|*[!0-9]*) return 1 ;;
     *) return 0 ;;
   esac
+}
+
+# Extract the bare session_id from an instance id <token>: strips the trailing
+# ".<pid>" of a composite "<sid>.<pid>"; a bare "<sid>" is returned unchanged.
+# The bare sid is the identity that is STABLE across resume generations (the
+# enclosing pid changes on each resume, the session_id does not), so role→
+# session records key on it rather than on the composite instance id — see
+# role-session.sh.
+agmsg_instance_bare_sid() {
+  local token="$1"
+  if agmsg_instance_is_composite "$token"; then
+    printf '%s' "${token%.*}"
+  else
+    printf '%s' "$token"
+  fi
 }
 
 # Derive an instance id for <session_id> from the enclosing agent <type>.
@@ -282,7 +288,18 @@ EOF
 }
 
 # True iff <token> identifies a still-live instance.
-#   composite "<sid>.<pid>" → the embedded pid is alive (kill -0).
+#   composite "<sid>.<pid>" → the embedded pid is alive (kill -0), AND, when a
+#                            cc-instance.<pid> record exists for that pid, its
+#                            content still names this exact token. A shared pid
+#                            (the Claude Code 2.1.x daemon, #349) can outlive
+#                            the specific session that derived this token —
+#                            session-start.sh's dedup overwrites cc-instance.
+#                            <pid> with the newest attaching token, so a stale
+#                            token's kill-0-only check would otherwise report
+#                            "alive" forever via the shared pid. No record at
+#                            all (codex: its SessionStart plug exits before
+#                            ever reaching that write) falls back to the plain
+#                            pid check, unchanged from before.
 #   bare "<sid>"            → some live cc-instance.<p> file references it. For
 #                            upgrade compatibility a cc-instance whose content
 #                            is either exactly "<sid>" or the composite
@@ -294,7 +311,12 @@ agmsg_instance_alive() {
   [ -n "$token" ] || return 1
   if agmsg_instance_is_composite "$token"; then
     local pid="${token##*.}"
-    _agmsg_pid_alive "$pid" && return 0
+    _agmsg_pid_alive "$pid" || return 1
+    local f s
+    f="$SKILL_DIR/run/cc-instance.$pid"
+    [ -f "$f" ] || return 0
+    s="$(cat "$f" 2>/dev/null || true)"
+    [ "$s" = "$token" ] && return 0
     return 1
   fi
   local run f p s

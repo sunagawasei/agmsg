@@ -7,11 +7,19 @@
     "projectDirLabel": "Project dir"
   },
   "settings": {
-    "title": "Settings"
+    "title": "Settings",
+    "terminalFontSize": {
+      "label": "Terminal font size"
+    },
+    "timezone": {
+      "label": "Timezone",
+      "auto": "Auto ({{zone}})"
+    }
   },
   "startupError": {
     "installing": "Installing agmsg…",
     "installFailed": "Couldn't install agmsg: {{error}}",
+    "loginShellFailed": "Couldn't determine your login shell: {{error}}",
     "loadTeamsFailed": "Couldn't load agmsg teams: {{error}}. Is agmsg installed at ~/.agents/skills/agmsg?",
     "coreOutdated": "Your agmsg CLI is out of date ({{installed}} < {{pinned}}) and may not work correctly with this app.",
     "versionUnknown": "unknown",
@@ -23,12 +31,19 @@
   },
   "sidebar": {
     "logoAlt": "agmsg",
+    "collapse": "Collapse sidebar",
+    "expand": "Expand sidebar",
     "newMenu": {
       "trigger": "＋ New ▾",
       "team": "Team…",
       "agent": "Agent…"
     },
+    "team": {
+      "title": "Team",
+      "new": "New team"
+    },
     "title": "Agents",
+    "newAgent": "New agent",
     "filter": {
       "all": "all",
       "none": "none"
@@ -38,7 +53,7 @@
       "titleRunning": "already running — click to focus",
       "titleSpawn": "spawn in a PTY pane",
       "noTypes": "—",
-      "emptyState": "No agents yet. Use ＋ New → Agent."
+      "emptyState": "No agents yet. Use the + button above to add one."
     },
     "user": {
       "title": "app-user in {{team}}"
@@ -46,7 +61,9 @@
   },
   "tabs": {
     "roomLabel": "# team room",
-    "close": "×"
+    "close": "×",
+    "newShell": "New shell tab",
+    "shellLabel": "Shell"
   },
   "room": {
     "loadingMore": "Loading more…",
@@ -63,6 +80,10 @@
     "swapTitle": "Click, then click another pane in this tab to swap positions"
   },
   "chat": {
+    "title": "Chat",
+    "minimize": "Minimize",
+    "maximize": "Maximize",
+    "restore": "Restore",
     "peer": {
       "to": "→ {{to}}",
       "from": "{{from}} →"
@@ -74,7 +95,7 @@
     }
   },
   "composer": {
-    "asPrefix": "as",
+    "asLabel": "as {{appUser}}",
     "targetPlaceholder": "to…",
     "messagePlaceholder": "message",
     "sendButton": "send",
@@ -147,10 +168,17 @@
     },
     "window": {
       "rename": "Rename…",
+      "openShell": "Open shell",
       "layout": "Layout ▸",
       "layoutVertical": "Vertical",
       "layoutHorizontal": "Horizontal",
       "layoutTile": "Tile"
+    },
+    "room": {
+      "hide": "Hide Team Room"
+    },
+    "chat": {
+      "hide": "Hide User Chat"
     }
   },
   "terminal": {
@@ -175,7 +203,12 @@
     "paste": "Paste",
     "selectAll": "Select All",
     "viewMenu": "View",
+    "showTeamRoom": "Show Team Room",
     "showUserChat": "Show User Chat",
+    "paneLayout": "Pane Layout",
+    "paneLayoutVertical": "Vertical",
+    "paneLayoutHorizontal": "Horizontal",
+    "paneLayoutTile": "Tile",
     "zoomIn": "Zoom In",
     "zoomOut": "Zoom Out",
     "actualSize": "Actual Size",
@@ -192,5 +225,8 @@
     "updateFailed": "Update failed: {{error}}",
     "upToDate": "You're on the latest version.",
     "noUpdatesTitle": "No Updates"
+  },
+  "stage": {
+    "emptyHint": "Click a member on the left to start an agent."
   }
 }

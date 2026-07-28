@@ -38,6 +38,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"  # actas-lock.sh requires SKILL_DIR
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/actas-lock.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/identity-key.sh"
 
 die() { echo "despawn: $*" >&2; exit 1; }
 
@@ -78,14 +80,15 @@ fi
 #   - meta present: the bridge's meta pid must equal the recorded pid, else the
 #     record is stale (a re-spawn updated meta but not the placement) — skip.
 #   - meta absent/empty: confirm the live pid's command line IS our bridge for
-#     this team+name via `ps -o args=`. A recycled pid (now an unrelated process)
-#     fails the match and is left alone. The old code skipped the guard entirely
-#     when meta was missing and killed the pid blindly — a PID-reuse footgun.
+#     this team+name via the opaque --identity-key emitted by both headless
+#     spawners. A recycled pid (now an unrelated process) fails the match and is
+#     left alone. The old code skipped the guard entirely when meta was missing
+#     and killed the pid blindly — a PID-reuse footgun.
 # Neither verifiable (pid already gone) → nothing to do. SIGTERM first (the bridge
 # stops its work loop and any child it owns, e.g. codex's stdio app-server),
 # SIGKILL fallback.
 kill_headless_pid() {
-  local pid="$1" team="$2" name="$3" type="${4:-codex}" meta meta_pid n=0 args
+  local pid="$1" team="$2" name="$3" type="${4:-codex}" meta meta_pid n=0 args identity_key
   meta="$SKILL_DIR/run/$type-bridge.$team.$name.meta"
   [ -f "$meta" ] && meta_pid="$(sed -n 's/^pid=//p' "$meta" 2>/dev/null)"
   kill -0 "$pid" 2>/dev/null || return 0
@@ -95,9 +98,10 @@ kill_headless_pid() {
       return 0
     fi
   else
+    identity_key="$(agmsg_identity_key "$team" "$name")"
     args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
     case "$args" in
-      *"$type-bridge"*"--team $team"*"--name $name"*) ;;   # ours → proceed
+      *"$type-bridge"*"--identity-key $identity_key"*) ;;   # ours → proceed
       *)
         echo "despawn: pid $pid is not a $type-bridge for $team/$name and no meta confirms it — skipping kill (pid reuse?)" >&2
         return 0 ;;
@@ -133,6 +137,9 @@ kill_recorded_placement() {
   [ -n "$id" ] || return 1
   case "$id" in
     pid:*) kill_headless_pid "${id#pid:}" "$TEAM" "$NAME" "${_type:-codex}" ;;
+    herdr:*)
+      command -v herdr >/dev/null 2>&1 && herdr pane close "${id#herdr:}" 2>/dev/null || true
+      ;;
     %*|@*)
       if command -v tmux >/dev/null 2>&1; then
         case "$id" in
@@ -141,6 +148,7 @@ kill_recorded_placement() {
         esac
       fi ;;
   esac
+  printf '%s\t%s\t%s' "$id" "$_proj" "$_type"   # echo back for the caller
 }
 
 if [ "$FORCE" = "1" ]; then

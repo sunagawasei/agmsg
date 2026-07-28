@@ -63,6 +63,25 @@ teardown() { teardown_test_env; }
   ! agmsg_instance_is_composite "sess.12a"
 }
 
+# --- agmsg_instance_bare_sid ---
+
+@test "bare_sid: strips the pid from a composite token" {
+  [ "$(agmsg_instance_bare_sid "sess.1234")" = "sess" ]
+}
+
+@test "bare_sid: UUID-shaped composite yields the bare UUID" {
+  [ "$(agmsg_instance_bare_sid "11111111-2222-3333-4444-555555555555.987")" = "11111111-2222-3333-4444-555555555555" ]
+}
+
+@test "bare_sid: a bare sid passes through unchanged" {
+  [ "$(agmsg_instance_bare_sid "sess")" = "sess" ]
+}
+
+@test "bare_sid: a non-composite token with a dot but non-numeric suffix is unchanged" {
+  # "sess.12a" is NOT composite (suffix not all-digits), so it is a bare sid.
+  [ "$(agmsg_instance_bare_sid "sess.12a")" = "sess.12a" ]
+}
+
 # --- agmsg_instance_alive ---
 
 @test "instance_alive: composite with a live pid is alive" {
@@ -72,6 +91,21 @@ teardown() { teardown_test_env; }
 
 @test "instance_alive: composite with a dead pid is not alive" {
   ! agmsg_instance_alive "sess.2147483647"
+}
+
+@test "instance_alive: composite is not alive when cc-instance.<pid> now names a different token (#349)" {
+  skip_on_windows "instance-id live PID liveness under Git Bash (#182)"
+  # Simulates a shared pid (Claude Code 2.1.x daemon) whose cc-instance record
+  # was overwritten by a newer session attaching to the same pid — the pid is
+  # still alive, but this token is no longer the one it currently names.
+  echo "newsess.$$" > "$RUN_DIR/cc-instance.$$"
+  ! agmsg_instance_alive "oldsess.$$"
+}
+
+@test "instance_alive: composite is alive when cc-instance.<pid> still names this exact token (#349)" {
+  skip_on_windows "instance-id live PID liveness under Git Bash (#182)"
+  echo "sess.$$" > "$RUN_DIR/cc-instance.$$"
+  agmsg_instance_alive "sess.$$"
 }
 
 @test "instance_alive: bare sid with a live cc-instance is alive" {
@@ -94,6 +128,52 @@ teardown() { teardown_test_env; }
 
 @test "instance_alive: empty token is not alive" {
   ! agmsg_instance_alive ""
+}
+
+# --- _agmsg_pid_alive: EPERM vs ESRCH (Claude Code sandbox) ---
+#
+# Under the sandbox `kill -0` on a live pid returns EPERM, not ESRCH. Only ESRCH
+# is dead; EPERM must read as alive or the watcher self-exits. `kill` is stubbed
+# to script each errno string (real EPERM is hard to force).
+
+@test "pid_alive: a real live pid (self) is alive" {
+  skip_on_windows "POSIX kill path; Windows uses tasklist (#134)"
+  _agmsg_pid_alive $$
+}
+
+@test "pid_alive: a real dead pid is not alive (ESRCH end-to-end)" {
+  skip_on_windows "POSIX kill path; Windows uses tasklist (#134)"
+  ! _agmsg_pid_alive 2147483647
+}
+
+@test "pid_alive: a signalable pid (kill -0 exit 0) is alive" {
+  skip_on_windows "POSIX kill path; Windows uses tasklist (#134)"
+  kill() { return 0; }
+  _agmsg_pid_alive 12345
+}
+
+@test "pid_alive: ESRCH 'No such process' reads as dead" {
+  skip_on_windows "POSIX kill path; Windows uses tasklist (#134)"
+  kill() { echo "bash: kill: (999) - No such process" >&2; return 1; }
+  ! _agmsg_pid_alive 999
+}
+
+@test "pid_alive: lowercase 'no such process' (zsh wording) also reads as dead" {
+  skip_on_windows "POSIX kill path; Windows uses tasklist (#134)"
+  kill() { echo "kill: (999) - no such process" >&2; return 1; }
+  ! _agmsg_pid_alive 999
+}
+
+@test "pid_alive: EPERM 'Operation not permitted' reads as alive (sandbox)" {
+  skip_on_windows "POSIX kill path; Windows uses tasklist (#134)"
+  kill() { echo "bash: kill: (1) - Operation not permitted" >&2; return 1; }
+  _agmsg_pid_alive 1
+}
+
+@test "pid_alive: an unrecognized kill failure defaults to alive (fail-safe)" {
+  skip_on_windows "POSIX kill path; Windows uses tasklist (#134)"
+  kill() { echo "kill: some novel platform error" >&2; return 1; }
+  _agmsg_pid_alive 42
 }
 
 # --- agmsg_normalize_instance_id ---
@@ -170,8 +250,8 @@ teardown() { teardown_test_env; }
 # treated as distinct owners — the collision that broke the actas lock is gone.
 @test "actas: same session_id, different pid -> distinct live owners (#93)" {
   skip_on_windows "instance-id live PID liveness under Git Bash (#182)"
-  sleep 60 & local pa=$!
-  sleep 60 & local pb=$!
+  sleep 60 3>&- & local pa=$!
+  sleep 60 3>&- & local pb=$!
   local ta="sess.$pa" tb="sess.$pb"
 
   # pa claims; pb is refused because pa is a live, distinct owner.

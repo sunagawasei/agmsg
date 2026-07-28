@@ -40,9 +40,17 @@ agmsg_source_version() {
   # git repo would otherwise record that PARENT repo's describe instead of
   # agmsg's canonical VERSION. Requiring the toplevel to equal SCRIPT_DIR also
   # works for agmsg's own worktrees (install.sh sits at the worktree root).
+  #
+  # --match "v[0-9]*" restricts `describe` to core release tags (v1.1.8, ...);
+  # unrestricted --tags also matches the co-located app-v* tag lineage
+  # (app-v0.2.0, ...), and whichever lineage is closer in history wins. When
+  # an app-v* tag was the most recent, installs recorded provenance like
+  # "app-v0.2.0-26-g95d01ca" instead of "v1.1.8-27-g95d01ca" -- a string the
+  # app's own version comparison (agmsg_core_version_status in agmsg.rs)
+  # can't parse as semver, which it then treats as "outdated" unconditionally.
   top="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -n "$top" ] && [ "$top" = "$SCRIPT_DIR" ] \
-      && v="$(git -C "$SCRIPT_DIR" describe --tags --always --dirty --abbrev=7 2>/dev/null)" \
+      && v="$(git -C "$SCRIPT_DIR" describe --tags --always --dirty --abbrev=7 --match 'v[0-9]*' 2>/dev/null)" \
       && [ -n "$v" ]; then
     printf '%s' "$v"
   elif [ -f "$SCRIPT_DIR/VERSION" ]; then
@@ -60,7 +68,7 @@ AGENT_TYPE=""  # claude-code, codex, gemini, antigravity — passed via --agent-
 
 configure_codex_sandbox() {
   # --- Configure Codex sandbox (if Codex is installed) ---
-  # The Codex bridge (beta) writes pidfiles/sockets/request files under the
+  # The Codex bridge writes pidfiles/sockets/request files under the
   # skill's db/, teams/, run/ dirs; Codex's sandbox blocks those writes unless
   # they are listed as writable_roots. See docs/codex-monitor-beta.md.
   local code_config="$HOME/.codex/config.toml"
@@ -69,6 +77,16 @@ configure_codex_sandbox() {
   fi
 
   local writable_paths=("$SKILL_DIR/db" "$SKILL_DIR/teams" "$SKILL_DIR/run")
+  # On Windows (MSYS2/Git Bash), $SKILL_DIR is in MSYS form (/c/Users/...).
+  # Codex is a native Windows binary whose Rust path resolution cannot parse
+  # MSYS paths — /c/Users/... is resolved to C:\c\Users\... (a phantom path).
+  # Convert to the mixed C:/Users/... form that both the shell and Codex accept.
+  if command -v cygpath >/dev/null 2>&1; then
+    local i
+    for i in "${!writable_paths[@]}"; do
+      writable_paths[$i]="$(cygpath -m "${writable_paths[$i]}" 2>/dev/null || printf '%s' "${writable_paths[$i]}")"
+    done
+  fi
   local missing=()
   local p
   for p in "${writable_paths[@]}"; do
