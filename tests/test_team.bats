@@ -423,6 +423,51 @@ EOF
   [[ "$output" =~ "hello" ]]
 }
 
+@test "rename-team: atomically migrates cursor and sync sidecars" {
+  bash "$SCRIPTS/join.sh" oldteam alice claude-code /tmp/proj-a
+  export SKILL_DIR="$TEST_SKILL_DIR" AGMSG_STORAGE_DRIVER=sqlite
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  storage_init oldteam >/dev/null
+  storage_read_cursor_consume oldteam alice 0 >/dev/null
+  _sqlite_sync_schema oldteam
+  local generation db renamed_db store_dir
+  generation=$(_sqlite_sync_generation oldteam)
+  # This team is on the default shared layout, so both names resolve to the same
+  # file and the rename rewrites columns rather than moving anything. A team that
+  # owns its store is covered separately, in the layout tests.
+  db=$(agmsg_db_path oldteam)
+  renamed_db="$db"
+  store_dir=$(agmsg_storage_dir)
+  agmsg_sqlite "$db" "INSERT INTO sync_bindings
+    (local_team,server_instance_id,remote_team_id,protocol_version,driver_generation)
+    VALUES('oldteam','018f3f7e-0000-7000-8000-000000000000',
+      '018f3f7e-0000-7000-8000-000000000001',1,'$generation');"
+  mkdir -p "$store_dir/remote-sync"
+  printf '{"local_team":"oldteam","binding":"fixture"}\n' \
+    > "$store_dir/remote-sync/oldteam.json"
+  chmod 600 "$store_dir/remote-sync/oldteam.json"
+  bash "$SCRIPTS/rename-team.sh" oldteam newteam
+  [ "$(agmsg_sqlite "$renamed_db" "SELECT team FROM read_cursors;" | tr -d '\r')" = newteam ]
+  [ "$(agmsg_sqlite "$renamed_db" "SELECT local_team FROM sync_bindings;" | tr -d '\r')" = newteam ]
+  [ ! -e "$store_dir/remote-sync/oldteam.json" ]
+  [ "$(jq -r '.local_team' "$store_dir/remote-sync/newteam.json")" = newteam ]
+}
+
+@test "rename-team: JSONL keeps the cursor with the renamed event stream" {
+  export SKILL_DIR="$TEST_SKILL_DIR" AGMSG_STORAGE_DRIVER=jsonl
+  bash "$SCRIPTS/join.sh" oldteam alice claude-code /tmp/proj-a
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  local id tip
+  id=$(storage_send oldteam bob alice hello)
+  tip=$(storage_watch_tip oldteam:alice)
+  storage_read_cursor_consume oldteam alice "$tip" "$id" >/dev/null
+  bash "$SCRIPTS/rename-team.sh" oldteam newteam
+  [ "$(storage_read_cursor_get newteam alice)" = "$tip" ]
+  [ "$(storage_history newteam | jq -r '.team')" = newteam ]
+}
+
 @test "rename-team: fails when old team is missing" {
   run bash "$SCRIPTS/rename-team.sh" nope newname
   [ "$status" -ne 0 ]
