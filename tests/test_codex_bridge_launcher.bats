@@ -372,7 +372,11 @@ child_count_is() {
   [ "$(wait_for_child_count 1)" -eq 1 ]
 
   # Deregistering the role retires its child through the existing re-exec path.
-  bash "$SCRIPTS/leave.sh" team alice >/dev/null 2>&1 || true
+  # Put the cache markers in the future so config mtimes alone cannot reveal
+  # the write. The roster generation must still invalidate both launchers.
+  touch -t 203001010000 "$RUN_DIR"/.identity-cache.*
+  run bash "$SCRIPTS/leave.sh" team alice
+  [ "$status" -eq 0 ]
   [ "$(wait_for_child_count 0)" -eq 0 ]
 
   # The dispatcher must have forgotten the pair. Otherwise known_pairs still
