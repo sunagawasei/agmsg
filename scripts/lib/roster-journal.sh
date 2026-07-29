@@ -285,5 +285,4 @@ agmsg_roster_project_config() {
       FROM agents,retired;" 2>/dev/null | tr -d '\r')" || return 1
   [ -n "$updated" ] || return 1
   agmsg_write_atomic "$config" "$updated"
-  agmsg_registry_notify_identity_change "${team_dir%/*}"
 }

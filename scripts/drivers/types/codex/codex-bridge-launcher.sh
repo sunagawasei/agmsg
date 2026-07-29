@@ -139,9 +139,7 @@ resolve_identity() {  # prints "team<TAB>name" lines for the project's codex rol
 # eight-team install, and a poll loop was paying that several times a second.
 # The registrations it reads change only when join / leave / actas rewrite a
 # config, so the answer is cached and re-derived only when one of those files
-# has actually moved. Journal-backed roster projections also publish a content
-# generation. That signal covers filesystems where an atomic replacement can
-# retain a timestamp older than this process's marker.
+# has actually moved.
 #
 # Freshness is decided with builtins alone -- glob expansion and `[ -nt ]` -- so
 # a hit costs no processes at all. The marker is touched BEFORE the resolve, and
@@ -158,17 +156,11 @@ TEAMS_DIR="$SKILL_DIR/teams"
 IDENTITY_CACHE=""
 IDENTITY_CACHE_COUNT=-1
 IDENTITY_CACHE_MARKER="$RUN_DIR/.identity-cache.$$"
-IDENTITY_GENERATION_FILE="$TEAMS_DIR/.identity-generation"
-IDENTITY_CACHE_GENERATION=""
 IDENTITY_CACHE_FRESH=0   # 1 when the last refresh served the cache unchanged
 
 identity_cache_is_fresh() {
-  local f count=0 generation=""
+  local f count=0
   [ -f "$IDENTITY_CACHE_MARKER" ] || return 1
-  if [ -f "$IDENTITY_GENERATION_FILE" ]; then
-    IFS= read -r generation < "$IDENTITY_GENERATION_FILE" 2>/dev/null || true
-  fi
-  [ "$generation" = "$IDENTITY_CACHE_GENERATION" ] || return 1
   for f in "$TEAMS_DIR"/*/config.json; do
     [ -f "$f" ] || continue
     count=$((count + 1))
@@ -185,10 +177,6 @@ refresh_identity_cache() {
   fi
   IDENTITY_CACHE_FRESH=0
   : > "$IDENTITY_CACHE_MARKER" 2>/dev/null || true
-  IDENTITY_CACHE_GENERATION=""
-  if [ -f "$IDENTITY_GENERATION_FILE" ]; then
-    IFS= read -r IDENTITY_CACHE_GENERATION < "$IDENTITY_GENERATION_FILE" 2>/dev/null || true
-  fi
   local f count=0
   for f in "$TEAMS_DIR"/*/config.json; do
     [ -f "$f" ] || continue

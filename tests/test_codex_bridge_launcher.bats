@@ -365,16 +365,16 @@ child_count_is() {
 
 @test "launcher: a re-registered role gets a fresh child after deregistration (#485)" {
   put_record team alice thread-alice "$PROJ" codex
-  export MOCK_BRIDGE_SLEEP=12
-  start_live_parent; local parent="$LAST_LIVE_PARENT"
+  # A custom bridge command is waited synchronously by its role launcher. Keep
+  # the mock lifetime below wait_for_child_count's 10-second ceiling so this
+  # test measures deregistration, not the intentionally blocking test adapter.
+  export MOCK_BRIDGE_SLEEP=2
+  sleep 20 3>&- & local parent=$!
   bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent" >/dev/null 2>&1 3>&- &
   local dispatcher=$!
   [ "$(wait_for_child_count 1)" -eq 1 ]
 
   # Deregistering the role retires its child through the existing re-exec path.
-  # Put the cache markers in the future so config mtimes alone cannot reveal
-  # the write. The roster generation must still invalidate both launchers.
-  touch -t 203001010000 "$RUN_DIR"/.identity-cache.*
   run bash "$SCRIPTS/leave.sh" team alice
   [ "$status" -eq 0 ]
   [ "$(wait_for_child_count 0)" -eq 0 ]

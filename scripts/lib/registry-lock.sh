@@ -82,16 +82,3 @@ agmsg_write_atomic() {
   printf '%s\n' "$content" > "$tmp"
   mv "$tmp" "$dest"
 }
-
-# agmsg_registry_notify_identity_change <teams-dir>
-# Publish a content generation after a roster projection changes config.json.
-# Consumers compare the token rather than relying only on mtimes: atomic
-# replacements can retain an older timestamp on restored or coarse-clock
-# filesystems, which would otherwise leave a long-lived identity cache stale.
-agmsg_registry_notify_identity_change() {
-  local teams_dir="$1" dest tmp
-  dest="$teams_dir/.identity-generation"
-  tmp="$dest.tmp.$$"
-  printf '%s.%s.%s\n' "$$" "$RANDOM" "$RANDOM" > "$tmp"
-  mv "$tmp" "$dest"
-}
