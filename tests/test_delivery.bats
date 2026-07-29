@@ -295,6 +295,167 @@ eperm_pid() {
   [[ "$output" =~ "Unknown mode" ]]
 }
 
+# --- project_path validation (#493) ---
+# `set` used to build a hooks/rule-file path directly from an unvalidated
+# project_path and `mkdir -p` it, so a malformed argument -- e.g. a literal
+# trailing newline byte, the kind an LLM-agent-composed command can produce,
+# as opposed to a `$(pwd)`-style substitution which already strips one --
+# silently created a bogus sibling directory (the exact "myproject\n" repro
+# in #493) and installed hooks into it. agmsg_validate_project_path now
+# rejects a malformed value before any file or directory is touched, rather
+# than silently correcting it -- a caller that built a bad command should see
+# a loud error naming the exact value it passed, not a value that happens to
+# work this one time and hides the bug in whatever generated it.
+
+@test "delivery set: rejects a project_path with a trailing newline and creates no directory (#493 exact repro)" {
+  # Adjacent-quote concatenation appends a literal newline byte to the
+  # argument -- this is the exact #493 repro shape, not a $(cmd) substitution
+  # (which would already have stripped it). $TEST_PROJECT itself exists, so
+  # this also proves the fix does not silently fall back to the trimmed,
+  # pre-existing directory -- it refuses the malformed value outright.
+  local bogus="$TEST_PROJECT"$'\n'
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$bogus"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "carriage return or newline" ]]
+  # No sibling "<real project>\n" directory (or anything else) was created.
+  [ ! -e "$bogus" ]
+  ! has_session_start "$(settings_file)"
+}
+
+@test "delivery set: rejects a nonexistent project_path and creates no directory" {
+  local bogus="$TEST_PROJECT/does-not-exist"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$bogus"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "project path does not exist" ]]
+  [ ! -e "$bogus" ]
+}
+
+@test "delivery set: rejects an empty project_path" {
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code ""
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "Missing project_path" ]]
+}
+
+@test "delivery set: rejects a project_path that exists but cannot be entered" {
+  # -d passes for a directory with no execute bit, but every apply
+  # implementation then writes inside it. Prove we fail here with a clear
+  # message instead of later with a confusing mkdir error.
+  if [ "$(id -u)" -eq 0 ]; then
+    skip "running as root: permission bits do not restrict traversal"
+  fi
+  local locked="$TEST_PROJECT/locked"
+  mkdir -p "$locked"
+  chmod 000 "$locked"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$locked"
+  chmod 755 "$locked"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "cannot be entered" ]]
+}
+
+@test "delivery set: rejects a project_path that is only whitespace" {
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "   "
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "empty or only whitespace" ]]
+}
+
+@test "delivery set: accepts a project_path with leading/trailing spaces, using it literally (#493 scope follow-up)" {
+  # A plain leading/trailing space is a valid POSIX path byte -- #493 is
+  # about CR/LF, not about whitespace in general -- so a directory legitimately
+  # named with padding must be accepted and used as-is, not rejected.
+  local padded="$TEST_PROJECT/  padded name  "
+  mkdir -p -- "$padded"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$padded"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Delivery mode set to 'monitor'" ]]
+  [ -f "$padded/.claude/settings.local.json" ]
+  has_session_start "$padded/.claude/settings.local.json"
+}
+
+@test "delivery set: accepts a project_path with leading/trailing tabs, using it literally (#493 scope follow-up)" {
+  local padded="$TEST_PROJECT/"$'\t'"tabbed name"$'\t'
+  mkdir -p -- "$padded"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$padded"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Delivery mode set to 'monitor'" ]]
+  [ -f "$padded/.claude/settings.local.json" ]
+  has_session_start "$padded/.claude/settings.local.json"
+}
+
+@test "delivery set: a space-padded spelling of an EXISTING dir is used literally, never trimmed into the real one" {
+  # "  $TEST_PROJECT  " is a RELATIVE pathname whose first byte is a space --
+  # NOT the real (absolute) project path. Accepting spaces as literal path
+  # bytes must not come with a silent fallback that trims the padding and
+  # resolves to the directory the caller probably meant: the value is used
+  # as-is, found not to exist, and rejected -- with the real project left
+  # untouched. (This pins the "accept literally" half of the #493 follow-up
+  # from the other side: the old trim-then-compare rejection also prevented
+  # this fallback, so its removal must not quietly introduce one.)
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "  $TEST_PROJECT  "
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "does not exist" ]]
+  ! has_session_start "$(settings_file)"
+}
+
+@test "delivery set: rejects a project_path with an embedded newline" {
+  local bogus="$TEST_PROJECT"$'\n'"extra"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$bogus"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "carriage return or newline" ]]
+  [ ! -e "$bogus" ]
+}
+
+@test "delivery set: rejects a project_path with a trailing carriage return (CRLF line endings)" {
+  # The CR half of the CR/LF rule: a command composed on (or pasted from) a
+  # CRLF-line-ending environment leaves a bare \r on the value once the shell
+  # strips the \n. Same class of defect as the #493 repro, same rejection.
+  local bogus="$TEST_PROJECT"$'\r'
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$bogus"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "carriage return or newline" ]]
+  [ ! -e "$bogus" ]
+}
+
+@test "delivery set: rejects a project_path with a leading newline or an embedded carriage return" {
+  # The remaining corners of the "CR or LF anywhere" rule: leading (not just
+  # trailing) LF, and CR hiding mid-value rather than at an end.
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code $'\n'"$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "carriage return or newline" ]]
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"$'\r'"extra"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "carriage return or newline" ]]
+}
+
+@test "delivery set: an un-enterable relative path cannot validate via a same-named CDPATH match" {
+  # With CDPATH set, a bare `cd proj` can land in <cdpath-entry>/proj instead
+  # of ./proj -- so the traversability probe would test a DIFFERENT directory
+  # than the one `-d` just checked. The validator clears CDPATH for the probe;
+  # this pins that an un-enterable ./proj is still rejected even when an
+  # enterable directory of the same name sits on CDPATH.
+  if [ "$(id -u)" -eq 0 ]; then
+    skip "running as root: permission bits do not restrict traversal"
+  fi
+  local decoy_root="$TEST_PROJECT/cdpath-decoy"
+  mkdir -p "$decoy_root/proj"            # enterable decoy on CDPATH
+  mkdir -p "$TEST_PROJECT/here/proj"     # the real target, made un-enterable
+  chmod 000 "$TEST_PROJECT/here/proj"
+  cd "$TEST_PROJECT/here"
+  CDPATH="$decoy_root" run bash "$SCRIPTS/delivery.sh" set monitor claude-code "proj"
+  chmod 755 "$TEST_PROJECT/here/proj"
+  cd "$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "cannot be entered" ]]
+  # Nothing was written into the enterable decoy.
+  [ ! -e "$decoy_root/proj/.claude" ]
+}
+
+@test "delivery set: a normal valid project_path (the documented \$(pwd) shape) still works end to end" {
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Delivery mode set to 'monitor'" ]]
+  has_session_start "$(settings_file)"
+}
+
 # --- in-session directives ---
 
 @test "delivery set monitor: emits AGMSG-DIRECTIVE for Monitor invocation" {
