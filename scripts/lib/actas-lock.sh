@@ -119,11 +119,15 @@ _agmsg_placement_lock_path() {
 # seconds). Callers fail-open on acquire timeout — despawn's --expect-record
 # compare is the backstop that still refuses to act on a changed record.
 agmsg_placement_lock_acquire() {
-  local team="$1" agent="$2" timeout="${3:-10}" lock waited=0
+  local team="$1" agent="$2" timeout="${3:-10}" lock waited=0 stale_match=""
   lock="$(_agmsg_placement_lock_path "$team" "$agent")"
   mkdir -p "$(_actas_lock_dir)" 2>/dev/null || true
   while :; do
-    if [ -d "$lock" ] && find "$lock" -maxdepth 0 -mmin +2 >/dev/null 2>&1; then
+    stale_match=""
+    if [ -d "$lock" ]; then
+      stale_match="$(find "$lock" -maxdepth 0 -mmin +2 -print -quit 2>/dev/null || true)"
+    fi
+    if [ -n "$stale_match" ]; then
       rmdir "$lock" 2>/dev/null || true
     fi
     mkdir "$lock" 2>/dev/null && return 0

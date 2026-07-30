@@ -1,76 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ensure-codex.sh — lazily spawn the current session's codex worker.
-#
-# In session-team mode the per-session codex (team s-<uuid>) is started on first
-# use, not at SessionStart. The claude-code ask/send flow calls this right
-# before it messages codex. It is a NO-OP when session-team mode is off or there
-# is no CLAUDE_CODE_SESSION_ID, so it is safe to call unconditionally from that
-# flow. It is deliberately NOT wired into send.sh itself: one-way / ctrl:* sends
-# (e.g. despawn) must not resurrect a torn-down worker.
+# ensure-codex.sh — compatibility wrapper for the generic headless guard.
 #
 # Usage: ensure-codex.sh <project> [name]
-#
-# Concurrency: a mkdir lock serializes the check-then-spawn so two near-
-# simultaneous ask/send calls cannot double-spawn. If the lock is held another
-# spawn is already in flight, so we return 0 and let it come up.
 
 PROJECT="${1:?Usage: ensure-codex.sh <project> [name]}"
-NAME="${2:-codex}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/session-team.sh"
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/identity-key.sh"
-
-TEAM="$(agmsg_session_team_name)"
-[ -n "$TEAM" ] || exit 0   # not in session-team mode (or no session id) → nothing to do
-
-RUN_DIR="$SKILL_DIR/run"
-mkdir -p "$RUN_DIR" 2>/dev/null || true
-
-# A live codex-bridge.js bound to THIS exact team+name means we are done. The
-# role-scoped bridge CLI carries identities via --pair, and the headless spawn
-# also supplies a terminated base64url identity marker. Match that opaque marker
-# rather than the retired --team/--name signature: team/name may contain regex or
-# whitespace characters, while the marker is an unambiguous safe token whose
-# terminator prevents one worker's encoded key matching a longer key's prefix.
-IDENTITY_KEY="$(agmsg_identity_key "$TEAM" "$NAME")"
-BRIDGE_SIG="codex-bridge\\.js .*--identity-key $IDENTITY_KEY"
-if pgrep -f "$BRIDGE_SIG" >/dev/null 2>&1; then
-  echo "ensure-codex: codex '$NAME' already running in team '$TEAM'"
-  exit 0
-fi
-
-# Serialize the spawn. mkdir is atomic on POSIX. Filesystem-safe lock key.
-key="$(printf '%s__%s' "$TEAM" "$NAME" | tr -c 'A-Za-z0-9._-' '_')"
-LOCK="$RUN_DIR/ensure-codex.$key.lock"
-
-# Reclaim a stale lock left by an owner that crashed before spawning. A normal
-# spawn is sub-second; 2 minutes is a safe floor.
-if [ -d "$LOCK" ] && find "$LOCK" -maxdepth 0 -mmin +2 >/dev/null 2>&1; then
-  rmdir "$LOCK" 2>/dev/null || true
-fi
-
-if ! mkdir "$LOCK" 2>/dev/null; then
-  # Another ensure-codex holds the lock and is bringing the worker up.
-  echo "ensure-codex: spawn already in flight for '$NAME' in team '$TEAM'"
-  exit 0
-fi
-trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
-
-# Re-check under the lock: a peer may have spawned between our pgrep and here.
-if pgrep -f "$BRIDGE_SIG" >/dev/null 2>&1; then
-  echo "ensure-codex: codex '$NAME' already running in team '$TEAM'"
-  exit 0
-fi
-
-if "$SCRIPT_DIR/spawn.sh" codex "$NAME" --team "$TEAM" --project "$PROJECT" --headless >/dev/null 2>&1; then
-  echo "ensure-codex: spawned headless codex '$NAME' in team '$TEAM'"
-else
-  echo "ensure-codex: failed to spawn codex '$NAME' in team '$TEAM' — run spawn.sh directly to see why" >&2
-  exit 1
-fi
+exec "$SCRIPT_DIR/ensure-headless.sh" codex "$@"

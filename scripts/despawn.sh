@@ -89,6 +89,8 @@ fi
 # SIGKILL fallback.
 kill_headless_pid() {
   local pid="$1" team="$2" name="$3" type="${4:-codex}" meta meta_pid n=0 args identity_key
+  local -a argv=() arg
+  local bridge_token=0 identity_token=0 expect_identity=0
   meta="$SKILL_DIR/run/$type-bridge.$team.$name.meta"
   [ -f "$meta" ] && meta_pid="$(sed -n 's/^pid=//p' "$meta" 2>/dev/null)"
   kill -0 "$pid" 2>/dev/null || return 0
@@ -100,12 +102,26 @@ kill_headless_pid() {
   else
     identity_key="$(agmsg_identity_key "$team" "$name")"
     args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
-    case "$args" in
-      *"$type-bridge"*"--identity-key $identity_key"*) ;;   # ours → proceed
-      *)
-        echo "despawn: pid $pid is not a $type-bridge for $team/$name and no meta confirms it — skipping kill (pid reuse?)" >&2
-        return 0 ;;
-    esac
+    # ps returns a command-line rendering, so split it into argv-like tokens and
+    # require both markers as complete tokens. Bridge launchers use one of the
+    # known script extensions; a prefix/suffix near-match is not our bridge.
+    read -r -a argv <<<"$args" || true
+    for arg in "${argv[@]}"; do
+      if [ "$expect_identity" = 1 ]; then
+        [ "$arg" = "$identity_key" ] && identity_token=1
+        expect_identity=0
+        continue
+      fi
+      [ "$arg" = "--identity-key" ] && expect_identity=1
+      case "$arg" in
+        "$type-bridge"|*/"$type-bridge"|"$type-bridge".js|*/"$type-bridge".js|"$type-bridge".sh|*/"$type-bridge".sh)
+          bridge_token=1 ;;
+      esac
+    done
+    if [ "$bridge_token" != 1 ] || [ "$identity_token" != 1 ]; then
+      echo "despawn: pid $pid is not a $type-bridge for $team/$name and no meta confirms it — skipping kill (pid reuse?)" >&2
+      return 0
+    fi
   fi
   kill "$pid" 2>/dev/null || true
   while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 5 ]; do sleep 1; n=$((n + 1)); done

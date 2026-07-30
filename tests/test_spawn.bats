@@ -890,9 +890,9 @@ EOF
   chmod +x "$STUB_BIN/fake-bridge.sh"
 }
 
-@test "spawn: --headless is rejected for claude-code" {
-  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
-  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --headless
+@test "spawn: --headless is rejected for gemini" {
+  bash "$SCRIPTS/join.sh" myteam existing gemini "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" gemini alice --project "$PROJ" --headless
   [ "$status" -ne 0 ]
   [[ "$output" == *"--headless is not supported"* ]]
 }

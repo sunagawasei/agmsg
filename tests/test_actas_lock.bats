@@ -68,6 +68,30 @@ live_pid() { echo "$$"; }
   [ "$decoded" = "$original" ]
 }
 
+# --- placement lock ---
+
+@test "placement lock: fresh contention is not stale-reaped" {
+  local lock
+  lock="$(_agmsg_placement_lock_path T alice)"
+  mkdir "$lock"
+
+  run agmsg_placement_lock_acquire T alice 0
+  [ "$status" -eq 1 ]
+  [ -d "$lock" ]
+}
+
+@test "placement lock: an actual older-than-two-minutes match is reaped" {
+  local lock
+  lock="$(_agmsg_placement_lock_path T alice)"
+  mkdir "$lock"
+  touch -t 202001010000 "$lock"
+
+  run agmsg_placement_lock_acquire T alice 0
+  [ "$status" -eq 0 ]
+  [ -d "$lock" ]
+  agmsg_placement_lock_release T alice
+}
+
 # --- claim / state ---
 
 @test "claim: succeeds when lock file absent" {

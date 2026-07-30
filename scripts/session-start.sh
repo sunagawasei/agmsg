@@ -340,6 +340,8 @@ if agmsg_session_team_enabled; then
     rm -rf "$_d" 2>/dev/null || true
     rm -rf "$SKILL_DIR/run/codex-$_tn-cwd" 2>/dev/null || true
     rm -f "$SKILL_DIR/run/codex-bridge.$_tn".* 2>/dev/null || true
+    rm -rf "$SKILL_DIR/run/claude-code-$_tn-"*-cwd 2>/dev/null || true
+    rm -f "$SKILL_DIR/run/claude-code-bridge.$_tn".* 2>/dev/null || true
     rm -f "$SKILL_DIR/run/spawn.$_tn"__* 2>/dev/null || true
     rm -rf "$SKILL_DIR/run/placement.$_tn"__*.lock 2>/dev/null || true
   done

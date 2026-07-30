@@ -41,6 +41,43 @@ fake_session() {
   printf '%s' "$sid"
 }
 
+# --- placement lock concurrency ---
+
+@test "placement lock: true concurrent contenders yield exactly one acquisition" {
+  local go="$BATS_TEST_TMPDIR/placement.go"
+  local result_a="$BATS_TEST_TMPDIR/placement.a"
+  local result_b="$BATS_TEST_TMPDIR/placement.b"
+  local ready_a="$BATS_TEST_TMPDIR/placement.ready.a"
+  local ready_b="$BATS_TEST_TMPDIR/placement.ready.b"
+
+  placement_contender() {
+    local result="$1" ready="$2"
+    : > "$ready"
+    while [ ! -e "$go" ]; do sleep 0.01; done
+    if agmsg_placement_lock_acquire T alice 0; then
+      printf 'acquired\n' > "$result"
+      sleep 1
+      agmsg_placement_lock_release T alice
+    else
+      printf 'blocked\n' > "$result"
+    fi
+  }
+
+  placement_contender "$result_a" "$ready_a" &
+  local pid_a=$!
+  placement_contender "$result_b" "$ready_b" &
+  local pid_b=$!
+  wait_for_file "$ready_a"
+  wait_for_file "$ready_b"
+  : > "$go"
+  wait "$pid_a"
+  wait "$pid_b"
+
+  [ "$(grep -hxc acquired "$result_a" "$result_b" | awk '{ sum += $1 } END { print sum }')" -eq 1 ]
+  [ "$(grep -hxc blocked "$result_a" "$result_b" | awk '{ sum += $1 } END { print sum }')" -eq 1 ]
+  [ ! -d "$(_agmsg_placement_lock_path T alice)" ]
+}
+
 # --- actas-claim.sh ---
 
 @test "actas-claim: status=ok and claim recorded when role is free" {
