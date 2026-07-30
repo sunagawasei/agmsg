@@ -187,7 +187,9 @@ jobs:
       # hard lifetime so it cannot outlive the job it is watching.
       - name: Start hang sampler
         if: needs.changes.outputs.docs_only != 'true'
+        continue-on-error: true
         run: |
+          set +e
           cat > "$RUNNER_TEMP/sampler.sh" <<'SAMPLER'
           #!/usr/bin/env bash
           out="$RUNNER_TEMP/hang-samples.txt"
@@ -223,23 +225,43 @@ jobs:
 
       # always() so this also runs when the job is cancelled at its cap, which
       # is the only case that matters here.
+      # continue-on-error and a best-effort body: this step exists to describe a
+      # failure, and a probe that returns non-zero -- lsof on a pid that has just
+      # exited, a grep that matches nothing -- must never be what turns a green
+      # shard red. The runner's default shell is `bash -e`, so -e is dropped
+      # explicitly and every probe is allowed to fail. `head` is avoided in
+      # pipelines for the same reason: it closes the pipe early and SIGPIPEs
+      # whatever was writing.
       - name: Hang forensics
         if: always() && needs.changes.outputs.docs_only != 'true'
+        continue-on-error: true
         run: |
-          echo "##### live snapshot at $(date -u +%H:%M:%S)"
-          ps -ef 2>/dev/null | tail -n +2 | head -60
-          echo "##### anything still holding a pipe:"
-          for pid in $(ps -eo pid=,comm= 2>/dev/null | awk '$2 ~ /node|python|bats|bash|sleep/ {print $1}'); do
-            held="$(lsof -p "$pid" 2>/dev/null | awk '$5 == "PIPE" || $5 == "FIFO" {print}' | head -4)"
-            [ -n "$held" ] && { echo "--- pid $pid $(ps -o command= -p "$pid" 2>/dev/null | cut -c1-120)"; echo "$held"; }
+          set +e
+          set +o pipefail 2>/dev/null || true
+          echo "##### live snapshot at $(date -u +%H:%M:%S 2>/dev/null)"
+          ps -ef 2>/dev/null | awk 'NR > 1 && NR <= 61'
+          echo "##### anything still holding a pipe or fifo:"
+          pids="$(ps -eo pid=,comm= 2>/dev/null | awk '$2 ~ /node|python|bats|bash|sleep/ {print $1}')"
+          for pid in $pids; do
+            held="$(lsof -p "$pid" 2>/dev/null | awk '$5 == "PIPE" || $5 == "FIFO"' | awk 'NR <= 4')"
+            if [ -n "$held" ]; then
+              echo "--- pid $pid $(ps -o command= -p "$pid" 2>/dev/null | cut -c1-120)"
+              echo "$held"
+            fi
           done
           echo "##### bats temp remnants:"
-          ls -la "${TMPDIR:-/tmp}" 2>/dev/null | grep -i bats | head -20
+          ls -la "${TMPDIR:-/tmp}" 2>/dev/null | awk '/bats/ && NR <= 400' | awk 'NR <= 20'
           echo "##### sampler timeline:"
-          cat "$RUNNER_TEMP/hang-samples.txt" 2>/dev/null || echo "(no samples)"
+          if [ -s "$RUNNER_TEMP/hang-samples.txt" ]; then
+            cat "$RUNNER_TEMP/hang-samples.txt" 2>/dev/null
+          else
+            echo "(no samples)"
+          fi
+          exit 0
 
       - name: Upload hang samples
         if: always() && needs.changes.outputs.docs_only != 'true'
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: hang-samples-${{ matrix.os }}-${{ matrix.shard }}
