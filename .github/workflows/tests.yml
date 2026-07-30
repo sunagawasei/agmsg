@@ -202,10 +202,12 @@ jobs:
               echo "----- surviving node/python and what they hold:"
               for pid in $(ps -eo pid=,comm= 2>/dev/null | awk '$2 ~ /node|python/ {print $1}'); do
                 echo "--- pid $pid: $(ps -o command= -p "$pid" 2>/dev/null | cut -c1-160)"
-                lsof -p "$pid" 2>/dev/null | awk 'NR==1 || $4 ~ /^[0-9]+[rwu]?$/' | head -14
+                lsof -p "$pid" 2>/dev/null \
+                  | awk 'NR == 1 || $4 ~ /^[0-9]+[rwu]?$/ { n++; if (n <= 14) print }'
               done
               echo "----- bats temp dirs left behind:"
-              ls -la "${TMPDIR:-/tmp}" 2>/dev/null | grep -i bats | head -20
+              ls -la "${TMPDIR:-/tmp}" 2>/dev/null \
+                | awk 'tolower($0) ~ /bats/ { n++; if (n <= 20) print }'
             } >> "$out" 2>&1
             sleep 30
           done
@@ -250,7 +252,8 @@ jobs:
             fi
           done
           echo "##### bats temp remnants:"
-          ls -la "${TMPDIR:-/tmp}" 2>/dev/null | awk '/bats/ && NR <= 400' | awk 'NR <= 20'
+          ls -la "${TMPDIR:-/tmp}" 2>/dev/null \
+            | awk 'tolower($0) ~ /bats/ { n++; if (n <= 20) print }'
           echo "##### sampler timeline:"
           if [ -s "$RUNNER_TEMP/hang-samples.txt" ]; then
             cat "$RUNNER_TEMP/hang-samples.txt" 2>/dev/null
