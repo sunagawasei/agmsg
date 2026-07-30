@@ -199,107 +199,26 @@ Do NOT manually edit config files. Always use join.sh. If the name was recently 
 ~/.agents/skills/agmsg/scripts/despawn.sh <team> <from> <name> [--force] [--timeout N]
 ```
 
-### Remote sync & end-to-end encryption (ADR 0007)
+## Permission prompts (Claude Code)
 
-Connects a local team to a cloud/self-hosted sync endpoint and manages the
-team's `age-v1` encryption key. Additive to everything above — a team works
-purely locally without ever touching this. Login/token acquisition is out
-of this script's scope (some provider tooling, or a self-hosted server's
-own admin command, obtains the token); `connect` only ever receives one.
+Every agmsg step above runs through the host's Bash tool, so on Claude Code each call is gated by the permission system until you allowlist the script directory. Add these to `~/.claude/settings.json` (or project-level `.claude/settings.local.json`):
 
-**Always use the `--*-stdin` forms below from an agent context.** The bare
-positional forms (`<token>`, `<identity>`) exist only as a warned legacy
-path for a human typing directly into their own terminal — from an agent,
-they leak the secret into this session's own transcript/tool-result
-history, which is exactly the kind of exposure `--token-stdin`/
-`--identity-stdin` exist to avoid. Pipe the secret in; never pass it as
-a literal argument in a command you construct.
-
-```bash
-# Connect a team to a sync endpoint. <token> is a short-lived, single-use
-# exchange code (never the long-lived credential itself).
-#   --force    rebind an already-connected team to a new token (requires
-#              an explicit <team> — it cannot be inferred for this check)
-printf '%s' "$TOKEN" | ~/.agents/skills/agmsg/scripts/remote.sh connect --endpoint <url> --token-stdin [<team>] [--force]
-
-# If the team's capability response requires encryption and no local key
-# exists yet, connect pauses to generate or import one before finishing —
-# see the `key` commands below.
-
-# Show connection state. With no <team>, lists every locally-known
-# connected team (and whether each still needs a local encryption key).
-# --json emits a strict, secret-free machine-readable object instead of
-# the human text above (ADR 0007 addendum) — for a driver correlating its
-# own operation-status record against the local binding, not for a human
-# to read; prefer the plain form above in normal use.
-~/.agents/skills/agmsg/scripts/remote.sh status [<team>] [--json]
-
-# Disconnect a team: revokes the credential server-side (best-effort —
-# local state is always cleared even if the server is unreachable), then
-# clears the local sync driver override. Sends/reads keep working locally
-# afterward; this does not touch the team's encryption key.
-~/.agents/skills/agmsg/scripts/remote.sh disconnect <team>
-
-# Read-only preflight check (currently: is `age` installed?). No token, no
-# state change — safe to run any time, and the thing to point a user at
-# when troubleshooting a missing dependency.
-~/.agents/skills/agmsg/scripts/remote.sh doctor [<team>]
-
-# List (and, if orphaned, clean up) a `connect` exchange that succeeded
-# server-side but never finished committing locally — e.g. the process died
-# between the exchange call and writing local state (ADR 0007 addendum).
-# pending_id is an opaque, content-derived key; abort always works on it
-# alone, even for a record whose content doesn't fully validate (a
-# separately quarantined record — see remote.sh's own comments — is not
-# enumerated or abortable here; that's a human/admin recovery path). Not a
-# normal-use command — this exists for a driver doing its own crash
-# recovery, not for a human to run routinely.
-~/.agents/skills/agmsg/scripts/remote.sh pending list [--json]
-~/.agents/skills/agmsg/scripts/remote.sh pending abort <pending_id>
-
-# Generate the first age-v1 key for a team (single-writer onboarding only —
-# NOT the multi-writer cutover protocol, and NOT key rotation — see below).
-# Prints a mandatory backup notice: there is no server-side recovery, and
-# losing the device loses the key.
-~/.agents/skills/agmsg/scripts/key.sh generate [<team>]
-
-# Show the team's public recipient + fingerprint. --reveal-secret prints
-# the private identity instead, after an interactive typed confirmation —
-# refused outright when there's no TTY (i.e. never usable from agent mode).
-~/.agents/skills/agmsg/scripts/key.sh show [<team>] [--reveal-secret]
-
-# Install a private age identity obtained out-of-band (e.g. via
-# `key.sh show <team> --reveal-secret` on another device that already has
-# it). Rejected if it doesn't match the team's already-authorized key.
-printf '%s' "$IDENTITY" | ~/.agents/skills/agmsg/scripts/key.sh import <team> --identity-stdin
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(~/.agents/skills/agmsg/scripts/*)",
+      "Bash(/Users/<you>/.agents/skills/agmsg/scripts/*)",
+      "Bash(bash ~/.agents/skills/agmsg/scripts/*)",
+      "Bash(bash /Users/<you>/.agents/skills/agmsg/scripts/*)"
+    ]
+  }
+}
 ```
 
-**`key rotate` is NOT available in this release.** It refuses
-unconditionally and changes no state — a design review found its
-anti-rollback metadata insufficient (it can't detect a wholesale
-config.json rollback, and doesn't use the age-v1 profile's pinned
-canonical epoch-snapshot shape), so it's held back rather than shipping a
-protection that isn't actually there. Do not suggest it as a working
-command.
+Four entries rather than one because a rule matches the command string as written: the scripts are invoked both as `~/...` and as an absolute path, and with or without an explicit `bash` prefix. Replace `/Users/<you>` with your home directory, and the `agmsg` path segment with your command name if you installed under a different one.
 
-Slash-command surface (SKILL.md / per-type templates), same mapping
-pattern as every command above:
-
-```
-/agmsg remote connect --endpoint <url>   (paste the token when prompted)
-/agmsg remote status
-/agmsg remote disconnect <team>
-/agmsg remote doctor
-/agmsg key generate [<team>]
-/agmsg key show [<team>] [--reveal-secret]
-/agmsg key import <team>   (paste the identity when prompted)
-```
-
-Additional dependencies beyond bash/sqlite3 (only needed if these commands
-are used): `curl` (the exchange/revoke calls), `python3` (parsing the
-exchange response), and `age`/`age-keygen` (E2EE — `remote.sh doctor`
-checks for these and `key.sh`'s own commands refuse to run without them).
-`team-list.sh` needs only `python3`.
+**Every subcommand needs its own match.** [Claude Code's permission docs](https://code.claude.com/docs/en/permissions) state that a rule must match each subcommand independently, and that the recognized separators are `&&`, `||`, `;`, `|`, `|&`, `&`, and newlines. Chaining two agmsg scripts is fine — both match the entries above. What reintroduces the prompt is mixing in a command those entries do not cover: `delivery.sh status … ; printenv AGMSG_SPAWNED` prompts because of the `printenv`, not because of the `;`. Splitting it into its own call does not remove that prompt — it only keeps it from gating the agmsg call. Allowlist the command as well if it needs to be prompt-free.
 
 ## Sandbox compatibility (Claude Code)
 
