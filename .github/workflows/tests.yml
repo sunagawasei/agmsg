@@ -179,13 +179,73 @@ jobs:
           sqlite3 --version
           bats --version
 
+      # Diagnostics for the shards that report every test ok and then sit
+      # silent until the job's cap. The sampler writes to a file and never to
+      # this step's stdout: a process holding that pipe is one of the things
+      # under suspicion, so the instrument must not be able to cause what it is
+      # measuring. It closes fds 3 and 4 for the same reason, and gives itself a
+      # hard lifetime so it cannot outlive the job it is watching.
+      - name: Start hang sampler
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          cat > "$RUNNER_TEMP/sampler.sh" <<'SAMPLER'
+          #!/usr/bin/env bash
+          out="$RUNNER_TEMP/hang-samples.txt"
+          : > "$out"
+          for i in $(seq 1 46); do
+            [ -f "$RUNNER_TEMP/bats-done" ] && { echo "== bats finished, sampler stopping at sample $i" >> "$out"; break; }
+            {
+              echo "===== sample $i  $(date -u +%H:%M:%S)"
+              ps -ef 2>/dev/null | grep -vE '\[' | tail -n +2
+              echo "----- surviving node/python and what they hold:"
+              for pid in $(ps -eo pid=,comm= 2>/dev/null | awk '$2 ~ /node|python/ {print $1}'); do
+                echo "--- pid $pid: $(ps -o command= -p "$pid" 2>/dev/null | cut -c1-160)"
+                lsof -p "$pid" 2>/dev/null | awk 'NR==1 || $4 ~ /^[0-9]+[rwu]?$/' | head -14
+              done
+              echo "----- bats temp dirs left behind:"
+              ls -la "${TMPDIR:-/tmp}" 2>/dev/null | grep -i bats | head -20
+            } >> "$out" 2>&1
+            sleep 30
+          done
+          SAMPLER
+          chmod +x "$RUNNER_TEMP/sampler.sh"
+          nohup "$RUNNER_TEMP/sampler.sh" >/dev/null 2>&1 3>&- 4>&- &
+          echo "sampler pid $!"
+
       - name: Run bats suite (this shard)
         if: needs.changes.outputs.docs_only != 'true'
         run: |
-          set -euo pipefail
-          # Paths come from shard-tests.sh over tests/*.bats and contain no
-          # spaces; xargs keeps them as separate arguments to one bats run.
+          set +e
           xargs bats --print-output-on-failure < shard-files.txt
+          status=$?
+          : > "$RUNNER_TEMP/bats-done"
+          exit $status
+
+      # always() so this also runs when the job is cancelled at its cap, which
+      # is the only case that matters here.
+      - name: Hang forensics
+        if: always() && needs.changes.outputs.docs_only != 'true'
+        run: |
+          echo "##### live snapshot at $(date -u +%H:%M:%S)"
+          ps -ef 2>/dev/null | tail -n +2 | head -60
+          echo "##### anything still holding a pipe:"
+          for pid in $(ps -eo pid=,comm= 2>/dev/null | awk '$2 ~ /node|python|bats|bash|sleep/ {print $1}'); do
+            held="$(lsof -p "$pid" 2>/dev/null | awk '$5 == "PIPE" || $5 == "FIFO" {print}' | head -4)"
+            [ -n "$held" ] && { echo "--- pid $pid $(ps -o command= -p "$pid" 2>/dev/null | cut -c1-120)"; echo "$held"; }
+          done
+          echo "##### bats temp remnants:"
+          ls -la "${TMPDIR:-/tmp}" 2>/dev/null | grep -i bats | head -20
+          echo "##### sampler timeline:"
+          cat "$RUNNER_TEMP/hang-samples.txt" 2>/dev/null || echo "(no samples)"
+
+      - name: Upload hang samples
+        if: always() && needs.changes.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hang-samples-${{ matrix.os }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/hang-samples.txt
+          if-no-files-found: ignore
+          retention-days: 3
 
       # What the summary job checks the partition against. Uploaded only when
       # the suite actually ran, so a docs-only PR produces none — and the
