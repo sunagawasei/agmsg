@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 
@@ -25,15 +25,16 @@ source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 #      pid, so it would fall back to the bare session_id and miss every artifact
 #      keyed under the composite "<sid>.<pid>" (watch pidfile/watermark,
 #      cc-instance, actas locks). The worker is handed the resolved id.
-#   3. Snapshot the session-team codex spawn record so the worker can pass it to
-#      despawn --expect-record and refuse to tear down a worker a fast lazy-
-#      respawn replaced after we fired.
+#   3. Snapshot every spawn record for the session team into one temp file so
+#      the worker can pass each hook-time record to despawn --expect-record and
+#      refuse to tear down a worker a fast lazy-respawn replaced after we fired.
 #
 # Cleanup is best-effort and the script always exits 0 — SessionEnd cannot block
 # termination, and a non-zero exit would only add log noise.
 
-TYPE="${1:?Usage: session-end.sh <type> <project_path>}"
-PROJECT="${2:?Missing project_path}"
+TYPE="${1:-}"
+PROJECT="${2:-}"
+[ -n "$TYPE" ] && [ -n "$PROJECT" ] || exit 0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -57,24 +58,37 @@ source "$SCRIPT_DIR/lib/actas-lock.sh"
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 INSTANCE_ID="$(agmsg_instance_id "$SESSION_ID" "$TYPE")"
 
-# Snapshot the session-team codex spawn record (team s-<uuid>, agent codex — both
-# already filesystem-safe, so agmsg_spawn_path's encoding is the identity here).
-# Empty if there is none.
+# Snapshot every session-team spawn record. Use the exact encoded-team prefix
+# that agmsg_spawn_path writes, strip only that known prefix, then decode the
+# remaining worker name. One temp file keeps the detached argv small even when
+# several headless workers belong to the session.
 STEAM="s-${SESSION_ID%%.*}"
-SNAPSHOT="$(cat "$RUN_DIR/spawn.${STEAM}__codex" 2>/dev/null || true)"
+mkdir -p "$RUN_DIR" 2>/dev/null || true
+SNAPSHOT_PATH="$(mktemp "$RUN_DIR/.session-end-snapshot.XXXXXX" 2>/dev/null || true)"
+if [ -n "$SNAPSHOT_PATH" ]; then
+  ENCODED_STEAM="$(_actas_lock_encode "$STEAM")"
+  SPAWN_PREFIX="$RUN_DIR/spawn.${ENCODED_STEAM}__"
+  for SPAWN_FILE in "${SPAWN_PREFIX}"*; do
+    [ -f "$SPAWN_FILE" ] || continue
+    ENCODED_NAME="${SPAWN_FILE#"$SPAWN_PREFIX"}"
+    [ "$ENCODED_NAME" != "$SPAWN_FILE" ] || continue
+    NAME="$(_actas_lock_decode "$ENCODED_NAME")"
+    RECORD="$(cat "$SPAWN_FILE" 2>/dev/null || true)"
+    printf '%s\t%s\n' "$NAME" "$RECORD" >>"$SNAPSHOT_PATH" 2>/dev/null || true
+  done
+fi
 
 # Detach the cleanup so it survives this hook returning AND CC exiting. Prefer
 # setsid (a clean new session) where present; macOS has no setsid binary, so fall
 # back to nohup + & — the same pattern spawn.sh uses to launch the codex bridge,
 # which already outlives its launching session in this environment. stdio is fully
 # redirected so the child is never tied to the hook's pipes.
-mkdir -p "$RUN_DIR" 2>/dev/null || true
 LOG="$RUN_DIR/session-end.log"
 WORKER="$SCRIPT_DIR/session-end-worker.sh"
 if command -v setsid >/dev/null 2>&1; then
-  setsid "$WORKER" "$TYPE" "$PROJECT" "$SESSION_ID" "$INSTANCE_ID" "$SNAPSHOT" </dev/null >>"$LOG" 2>&1 &
+  setsid "$WORKER" "$TYPE" "$PROJECT" "$SESSION_ID" "$INSTANCE_ID" "$SNAPSHOT_PATH" </dev/null >>"$LOG" 2>&1 &
 else
-  nohup "$WORKER" "$TYPE" "$PROJECT" "$SESSION_ID" "$INSTANCE_ID" "$SNAPSHOT" </dev/null >>"$LOG" 2>&1 &
+  nohup "$WORKER" "$TYPE" "$PROJECT" "$SESSION_ID" "$INSTANCE_ID" "$SNAPSHOT_PATH" </dev/null >>"$LOG" 2>&1 &
 fi
 
 exit 0

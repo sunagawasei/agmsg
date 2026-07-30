@@ -53,6 +53,25 @@ _actas_lock_encode() {
   '
 }
 
+# Decode a value produced by _actas_lock_encode. Percent-encoded bytes are
+# restored under the C locale so UTF-8 worker names remain byte-for-byte
+# reversible before the caller's locale interprets them.
+_actas_lock_decode() {
+  printf '%s' "$1" | LC_ALL=C awk '
+    BEGIN { for (n = 0; n < 256; n++) byte[sprintf("%02X", n)] = sprintf("%c", n) }
+    {
+      for (i = 1; i <= length($0); i++) {
+        c = substr($0, i, 1)
+        if (c == "%") {
+          hex = substr($0, i + 1, 2)
+          printf "%s", byte[hex]
+          i += 2
+        } else printf "%s", c
+      }
+    }
+  '
+}
+
 # Compute the lock file path for (team, agent).
 actas_lock_path() {
   local team="$1" agent="$2"

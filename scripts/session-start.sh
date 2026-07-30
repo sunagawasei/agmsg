@@ -269,27 +269,53 @@ if [ -n "$CC_PID" ]; then
   printf '%s\n' "$INSTANCE_ID" > "$STATE"
 fi
 
-# --- Orphan-codex GC (session-team mode). ---
-# A per-session codex whose owning Claude session is gone (SessionEnd did not
-# fire — e.g. the terminal was force-closed) would otherwise linger. Tear down
-# headless codex bridges for s-<uuid> teams whose owner session is no longer
-# alive. Runs AFTER this session's cc-instance is recorded above, so a resuming
-# session's own codex (same uuid → seen alive via upgrade-compat) is never
-# reaped. Best-effort; never blocks the directive below.
+# --- Orphan headless GC (session-team mode). ---
+# A per-session headless worker whose owning Claude session is gone (SessionEnd
+# did not fire — e.g. the terminal was force-closed) would otherwise linger.
+# Tear down every headless placement for s-<uuid> teams whose owner session is
+# no longer alive. Runs AFTER this session's cc-instance is recorded above, so
+# a resuming session's own workers (same uuid → seen alive via upgrade-compat)
+# are never reaped. Best-effort; never blocks the directive below.
 if agmsg_session_team_enabled; then
-  # Headless spawn records are already keyed by the exact session team and
-  # identity. Scan those records rather than parsing the retired bridge
-  # --team/--name argv contract (the role-scoped bridge now uses --pair).
-  # Session-team lazy spawn uses the fixed member name "codex", matching the
-  # previous GC scope.
-  for _spawn_rec in "$RUN_DIR"/spawn.s-*__codex; do
+  # Spawn records use the same reversible encoding as actas locks:
+  #   spawn.<encoded-team>__<encoded-agent>
+  # Session-team names use the UUID-safe `s-<hex-and-dash>` contract, so the
+  # first `__` is the unambiguous team/worker delimiter. Worker names may still
+  # contain `__` and are decoded after stripping the team segment.
+  _orphan_gc_record() {
+    local _gc_rec="$1" _gc_key _gc_enc_team _gc_enc_name
+    local _gc_team _gc_sid _gc_name _gc_snapshot _gc_id _gc_project _gc_type
+    _gc_key="${_gc_rec##*/spawn.}"
+    _gc_enc_team="${_gc_key%%__*}"
+    _gc_enc_name="${_gc_key#*__}"
+    case "$_gc_enc_team" in s-*) ;; *) return 0 ;; esac
+    _gc_sid="${_gc_enc_team#s-}"
+    case "$_gc_sid" in ''|*[!0-9A-Fa-f-]*) return 0 ;; esac
+    _gc_team="$(_actas_lock_decode "$_gc_enc_team" 2>/dev/null || true)"
+    [ -n "$_gc_enc_name" ] || return 0
+    _gc_name="$(_actas_lock_decode "$_gc_enc_name" 2>/dev/null || true)"
+    [ -n "$_gc_name" ] || return 0
+    [ "$(_actas_lock_encode "$_gc_name" 2>/dev/null || true)" = "$_gc_enc_name" ] || return 0
+    agmsg_instance_alive "$_gc_sid" 2>/dev/null && return 0
+
+    # Read once. The same immutable snapshot drives eligibility and the
+    # compare-and-act guard, so a headless→interactive replacement cannot
+    # cause despawn to act on the new interactive placement.
+    _gc_snapshot="$(cat "$_gc_rec" 2>/dev/null || true)"
+    [ -n "$_gc_snapshot" ] || return 0
+    IFS=$'\t' read -r _gc_id _gc_project _gc_type <<<"$_gc_snapshot" || return 0
+    case "${_gc_id:-}" in
+      pid:*)
+        "$SCRIPT_DIR/despawn.sh" "$_gc_team" claude "$_gc_name" --force \
+          --expect-record "$_gc_snapshot" >/dev/null 2>&1 || true
+        ;;
+      *) ;; # interactive placements (%*, @*, herdr:*) are preserved
+    esac
+  }
+
+  for _spawn_rec in "$RUN_DIR"/spawn.s-*__*; do
     [ -f "$_spawn_rec" ] || continue
-    _gteam="${_spawn_rec##*/spawn.}"
-    _gteam="${_gteam%__codex}"
-    case "$_gteam" in s-*) ;; *) continue ;; esac
-    if ! agmsg_instance_alive "${_gteam#s-}" 2>/dev/null; then
-      "$SCRIPT_DIR/despawn.sh" "$_gteam" claude codex --force >/dev/null 2>&1 || true
-    fi
+    _orphan_gc_record "$_spawn_rec"
   done
 fi
 

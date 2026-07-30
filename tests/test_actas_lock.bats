@@ -54,6 +54,20 @@ live_pid() { echo "$$"; }
   [[ "$p" == *"%E3%83%81%E3%83%BC%E3%83%A0"* ]]
 }
 
+@test "actas_lock_decode: reverses worker names with __, spaces, and Japanese" {
+  local original='worker__二 号' encoded decoded
+  encoded="$(_actas_lock_encode "$original")"
+  decoded="$(_actas_lock_decode "$encoded")"
+  [ "$decoded" = "$original" ]
+}
+
+@test "actas_lock_decode: reverses every encoded byte emitted for special characters" {
+  local original='team/worker%name? 日本語' encoded decoded
+  encoded="$(_actas_lock_encode "$original")"
+  decoded="$(_actas_lock_decode "$encoded")"
+  [ "$decoded" = "$original" ]
+}
+
 # --- claim / state ---
 
 @test "claim: succeeds when lock file absent" {

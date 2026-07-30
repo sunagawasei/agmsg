@@ -346,12 +346,12 @@ STUB
   enable_st
   # Fake a headless codex bridge for a DEAD session (no live cc-instance for it).
   local key
-  key="$(agmsg_identity_key s-DEADGC codex)"
-  ( exec -a "node /x/codex-bridge.js --identity-key $key --pair s-DEADGC	codex --inline-inbox" sleep 300 ) &
+  key="$(agmsg_identity_key s-DEADCA codex)"
+  ( exec -a "node /x/codex-bridge.js --identity-key $key --pair s-DEADCA	codex --inline-inbox" sleep 300 ) &
   local fake=$!
   mkdir -p "$TEST_SKILL_DIR/run"
-  printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-gc" > "$TEST_SKILL_DIR/run/spawn.s-DEADGC__codex"
-  printf 'pid=%s\nidentities=s-DEADGC/codex\ntype=codex\n' "$fake" > "$TEST_SKILL_DIR/run/codex-bridge.s-DEADGC.codex.meta"
+  printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-gc" > "$TEST_SKILL_DIR/run/spawn.s-DEADCA__codex"
+  printf 'pid=%s\nidentities=s-DEADCA/codex\ntype=codex\n' "$fake" > "$TEST_SKILL_DIR/run/codex-bridge.s-DEADCA.codex.meta"
   # A live (different) session start runs the GC pass.
   printf '{"session_id":"sess-gc-self"}' | bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
   sleep 1
