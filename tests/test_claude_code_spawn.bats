@@ -285,8 +285,15 @@ for args_file in "$FAKE_CAPTURE"/bridge.args.*; do
   pidfile="$FAKE_RUN/claude-code-bridge.team.$name.pid"
   [ "$(cat "$pidfile" 2>/dev/null || true)" = "$requested" ] || continue
   key="$(awk '$0=="ARG=--identity-key" { getline; sub(/^ARG=/,""); print; exit }' "$args_file")"
+  model="$(awk '$0=="ARG=--model" { getline; sub(/^ARG=/,""); print; exit }' "$args_file")"
   [ -n "$key" ] || continue
-  printf '%s --identity-key %s\n' "$FAKE_BRIDGE" "$key"
+  if [ -n "$model" ]; then
+    printf 'returned=%s --model %s --identity-key %s\n' \
+      "$FAKE_BRIDGE" "$model" "$key" >> "$PS_STUB_LOG"
+    printf '%s --model %s --identity-key %s\n' "$FAKE_BRIDGE" "$model" "$key"
+  else
+    printf '%s --identity-key %s\n' "$FAKE_BRIDGE" "$key"
+  fi
   exit 0
 done
 printf 'unrelated process\n'
@@ -695,6 +702,21 @@ policy_shape() {
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$PROJ"
 }
 
+@test "bracketed Claude model alias reaches probe and bridge argv unchanged" {
+  bash "$SCRIPTS/config.sh" set spawn.claude_model.alias 'opus[1m]'
+
+  run spawn_claude alias
+  [ "$status" -eq 0 ]
+  wait_bridge_capture alias
+
+  [ "$(awk '$0=="ARG=--model" { getline; print; exit }' "$CAPTURE/probe.args.1")" = \
+    'ARG=opus[1m]' ]
+  [ "$(awk '$0=="ARG=--model" { getline; print; exit }' "$CAPTURE/bridge.args.alias")" = \
+    'ARG=opus[1m]' ]
+  [ "$(grep -Fxc 'ARG=--model' "$CAPTURE/probe.args.1")" -eq 1 ]
+  [ "$(grep -Fxc 'ARG=--model' "$CAPTURE/bridge.args.alias")" -eq 1 ]
+}
+
 @test "reviewer runtime is strictly probe policy plus disallowedTools and settings enforce deeper denies" {
   bash "$SCRIPTS/config.sh" set spawn.claude_reviewer true
   bash "$SCRIPTS/config.sh" set spawn.claude_model.review opus
@@ -869,6 +891,31 @@ policy_shape() {
   [[ "$output" == *"ignoring unsafe Claude model"* ]]
   wait_bridge_capture unsafe-cli
   ! grep -Fq 'x;touch' "$CAPTURE/bridge.args.unsafe-cli"
+}
+
+@test "malformed bracketed Claude model aliases are rejected" {
+  local -a malformed=(
+    'opus[[1m]]'
+    'opus[1m'
+    'opus1m]'
+    'opus[1m][x]'
+    '[1m]opus'
+    'opus[]'
+    'opus[1/m]'
+    $'opus[1m]\n'
+  )
+  local model name probe_number=0
+
+  for model in "${malformed[@]}"; do
+    probe_number=$((probe_number + 1))
+    name="bad-model-$probe_number"
+    run spawn_claude "$name" --model "$model"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ignoring unsafe Claude model"* ]]
+    wait_bridge_capture "$name"
+    ! grep -Fxq 'ARG=--model' "$CAPTURE/probe.args.$probe_number"
+    ! grep -Fxq 'ARG=--model' "$CAPTURE/bridge.args.$name"
+  done
 }
 
 @test "minimum version is numeric and malformed or wrong suffix fails before artifacts" {
@@ -1385,6 +1432,25 @@ SYMLINKS
   run spawn_claude wrong
   [ "$status" -eq 0 ]
   wait_bridge_capture wrong
+}
+
+@test "duplicate guard treats a bracketed model as argv data and keeps pgrep pattern constant" {
+  run spawn_claude model-pattern --model 'opus[1m]'
+  [ "$status" -eq 0 ]
+  wait_bridge_capture model-pattern
+
+  local first_pid launches
+  first_pid="$(cat "$TEST_SKILL_DIR/run/claude-code-bridge.team.model-pattern.pid")"
+  launches="$(wc -l < "$CAPTURE/bridge-launches" | tr -d ' ')"
+
+  run spawn_claude model-pattern --model 'opus[1m]'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already running"* ]]
+  [ "$(cat "$TEST_SKILL_DIR/run/claude-code-bridge.team.model-pattern.pid")" = "$first_pid" ]
+  [ "$(wc -l < "$CAPTURE/bridge-launches" | tr -d ' ')" = "$launches" ]
+  grep -Fq "returned=$FAKE_BRIDGE --model opus[1m] --identity-key " "$PS_STUB_LOG"
+  grep -Fxq 'argv=-f claude-code-bridge' "$PGREP_STUB_LOG"
+  ! grep -Fq 'opus[1m]' "$PGREP_STUB_LOG"
 }
 
 @test "bridge launch failure unwinds only owned artifacts and preserves recovery blobs" {

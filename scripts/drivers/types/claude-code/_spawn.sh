@@ -29,6 +29,21 @@ agmsg_claude_safe_token() {
   [ "$rest" = "X0" ]
 }
 
+agmsg_claude_safe_model_id() {
+  local val="$1" rest
+  [ -n "$val" ] || return 1
+  rest="$(printf '%s' "$val" | LC_ALL=C tr -d 'A-Za-z0-9._-'; printf 'X%s' "$?")"
+  case "$rest" in
+    X0) return 0 ;;
+    '[]X0')
+      case "$val" in
+        ?*'['?*']') return 0 ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
 agmsg_claude_sanitize_for_log() {
   local val
   val="$(printf '%s' "$1" | LC_ALL=C tr -d '[:cntrl:]')"
@@ -116,8 +131,8 @@ agmsg_claude_resolve_turn_options() {
     timeout="$("$SCRIPT_DIR/config.sh" get "spawn.claude_turn_timeout.$name" "" 2>/dev/null || true)"
   fi
 
-  if [ -n "$model" ] && ! agmsg_claude_safe_token "$model"; then
-    echo "spawn: ignoring unsafe Claude model id '$(agmsg_claude_sanitize_for_log "$model")' (must match ^[A-Za-z0-9._-]+\$)" >&2
+  if [ -n "$model" ] && ! agmsg_claude_safe_model_id "$model"; then
+    echo "spawn: ignoring unsafe Claude model id '$(agmsg_claude_sanitize_for_log "$model")' (must match ^[A-Za-z0-9._-]+(\\[[A-Za-z0-9._-]+\\])?\$)" >&2
     model=""
   fi
   if [ -n "$effort" ] && ! agmsg_claude_safe_token "$effort"; then
