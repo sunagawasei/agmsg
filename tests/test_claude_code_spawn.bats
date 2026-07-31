@@ -135,14 +135,19 @@ emit_run_write() {
 
 case "$layout" in
   consultant)
+    printf '%s' "$token-consultant-scratch" > "$scratch_target"
     emit_pair c1 Bash "$token-consultant-scratch" false "completed" "$scratch_command"
-    emit_pair c2 Bash "$token-repo-bash" false "Permission denied by sandbox" "$repo_bash_command"
+    emit_pair c2 Bash "$token-repo-bash" true \
+      "(eval):1: operation not permitted: $repo_bash_target" "$repo_bash_command"
     if [ "${FAKE_PROBE_MODE:-complete}" != missing ] \
       && { [ "${FAKE_PROBE_MODE:-complete}" != missing-first ] || [ "$n" -gt 1 ]; }; then
       emit_run_write c3
     fi
     ;;
   implementer)
+    printf '%s' "$token-repo-bash" > "$repo_bash_target"
+    printf '%s' "CHANGED $token" > "$edit_target"
+    printf '%s' "$token-repo-write" > "$repo_write_target"
     emit_pair i1 Bash "$token-repo-bash" false "completed" "$repo_bash_command"
     emit_pair i2 Edit "$token-repo-edit" false "completed" "$edit_target"
     emit_pair i3 Write "$token-repo-write" false "completed" "$repo_write_target"
@@ -152,26 +157,46 @@ case "$layout" in
     fi
     ;;
   reviewer)
-    emit_pair r1 Bash "$token-repo-bash" false "Permission denied by sandbox" "$repo_bash_command"
+    emit_pair r1 Bash "$token-repo-bash" true \
+      "(eval):1: operation not permitted: $repo_bash_target" "$repo_bash_command"
     emit_pair r2read Read "$token-edit-prereq-read" false "completed" "$edit_target"
     if [ "${FAKE_PROBE_MODE:-complete}" = edit-precondition ]; then
       emit_pair r2 Edit "$token-repo-edit" true "<tool_use_error>File has not been read yet</tool_use_error>" "$edit_target"
     else
-      emit_pair r2 Edit "$token-repo-edit" true "Permission denied by policy" "$edit_target"
+      emit_pair r2 Edit "$token-repo-edit" true \
+        "Claude requested permissions to write to $edit_target, but you haven’t granted it yet." "$edit_target"
     fi
-    emit_pair r3 Write "$token-repo-write" true "Permission denied by policy" "$repo_write_target"
+    emit_pair r3 Write "$token-repo-write" true \
+      "Claude requested permissions to write to $repo_write_target, but you haven’t granted it yet." "$repo_write_target"
+    case "${FAKE_PROBE_MODE:-complete}" in
+      reviewer-edit-side-effect)
+        printf '%s' "CHANGED $token" > "$edit_target" ;;
+      reviewer-write-side-effect)
+        printf '%s' "$token-repo-write" > "$repo_write_target" ;;
+      reviewer-bash-side-effect)
+        printf '%s' "$token-repo-bash" > "$repo_bash_target" ;;
+    esac
     case "${FAKE_PROBE_MODE:-complete}" in
       sensitive-read-success)
         emit_pair r4 Read "$token-sensitive-read" false "synthetic read succeeded" "$sensitive_target" ;;
+      sensitive-error-only)
+        emit_pair r4 Read "$token-sensitive-read" true "synthetic tool error" "$sensitive_target" ;;
       sensitive-cwd-override)
-        emit_pair r4 Read "$token-sensitive-read" true "Permission denied by policy" "$PWD/.not-the-sentinel" ;;
+        emit_pair r4 Read "$token-sensitive-read" true \
+          "Claude requested permissions to read from $sensitive_target, but you haven’t granted it yet." \
+          "$PWD/.not-the-sentinel" ;;
       sensitive-prefix)
-        emit_pair r4 Read "$token-sensitive-read" true "Permission denied by policy" "${sensitive_target}.backup" ;;
+        emit_pair r4 Read "$token-sensitive-read" true \
+          "Claude requested permissions to read from $sensitive_target, but you haven’t granted it yet." \
+          "${sensitive_target}.backup" ;;
       sensitive-other-field)
-        emit_pair r4 Read "$token-sensitive-read" true "Permission denied by policy" \
+        emit_pair r4 Read "$token-sensitive-read" true \
+          "Claude requested permissions to read from $sensitive_target, but you haven’t granted it yet." \
           "$PWD/.not-the-sentinel" "$sensitive_target" ;;
       *)
-        emit_pair r4 Read "$token-sensitive-read" true "Permission denied by policy" "$sensitive_target" ;;
+        emit_pair r4 Read "$token-sensitive-read" true \
+          "Claude requested permissions to read from $sensitive_target, but you haven’t granted it yet." \
+          "$sensitive_target" ;;
     esac
     if [ "${FAKE_PROBE_MODE:-complete}" != missing ] \
       && { [ "${FAKE_PROBE_MODE:-complete}" != missing-first ] || [ "$n" -gt 1 ]; }; then
@@ -368,6 +393,25 @@ assert_json_array_unique() {
   [ "$total" = "$distinct" ]
 }
 
+assert_permission_rule_shapes() {
+  local file="$1" rule
+  while IFS= read -r rule; do
+    case "$rule" in
+      Write\(*|NotebookEdit\(*) return 1 ;;
+      *"(///"*) return 1 ;;
+      *"(/"*)
+        case "$rule" in *"(//"*) ;; *) return 1 ;; esac
+        ;;
+    esac
+  done < <(
+    sqlite_mem "
+      SELECT value FROM json_each(readfile('$(rf "$file")'), '\$.permissions.allow')
+      UNION ALL
+      SELECT value FROM json_each(readfile('$(rf "$file")'), '\$.permissions.deny');
+    "
+  )
+}
+
 physical_path() {
   local path="$1" physical
   if physical="$(cd "$path" 2>/dev/null && pwd -P)" && [ -n "$physical" ]; then
@@ -440,8 +484,25 @@ policy_shape() {
   local reviewer_scratch="$logical_skill/run/claude-code-team-alias-reviewer-cwd"
   local settings scratch raw path missing_tmp missing_settings
 
+  run bash -c "
+    SCRIPT_DIR='$SCRIPTS'
+    SKILL_DIR='${SCRIPTS%/scripts}'
+    . \"\$SCRIPT_DIR/lib/resolve-project.sh\"
+    . \"\$SCRIPT_DIR/drivers/types/claude-code/_spawn.sh\"
+    agmsg_claude_tool_rule Read /tmp/
+    printf '\\n'
+    agmsg_claude_tool_rule Read //tmp/
+    printf '\\n'
+    agmsg_claude_tool_rule Read /
+    printf '\\n'
+    agmsg_claude_tool_rule Read //
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'Read(//tmp/**)\nRead(//tmp/**)\nRead(//**)\nRead(//**)')" ]
+
   for settings in "$consultant" "$implementer" "$reviewer"; do
     [ "$(sqlite_mem "SELECT json_valid(readfile('$(rf "$settings")'));")" = 1 ]
+    assert_permission_rule_shapes "$settings"
     assert_json_array_unique "$settings" '$.sandbox.filesystem.allowWrite'
     assert_json_array_unique "$settings" '$.sandbox.filesystem.allowRead'
     for raw in "$logical_skill/db" "$logical_skill/teams" "$logical_skill/run" \
@@ -498,10 +559,30 @@ policy_shape() {
   json_array_has "$consultant" '$.sandbox.filesystem.denyWrite' "$logical_project"
   json_array_has "$reviewer" '$.sandbox.filesystem.denyWrite' "$logical_project"
   json_array_has "$reviewer" '$.sandbox.filesystem.denyRead' "/"
-  json_array_has "$consultant" '$.permissions.deny' "Edit($logical_project/**)"
-  json_array_has "$consultant" '$.permissions.deny' "Write($logical_project/**)"
-  json_array_has "$reviewer" '$.permissions.deny' "Edit($logical_project/**)"
-  json_array_has "$reviewer" '$.permissions.deny' "Write($logical_project/**)"
+  json_array_has "$consultant" '$.permissions.allow' "Read(/$consultant_scratch/**)"
+  ! json_array_has "$consultant" '$.permissions.allow' "Read($consultant_scratch/**)"
+  json_array_has "$consultant" '$.permissions.deny' "Edit(/$logical_project/**)"
+  ! json_array_has "$consultant" '$.permissions.deny' "Edit($logical_project/**)"
+  json_array_has "$implementer" '$.permissions.allow' "Read(/$logical_project/**)"
+  json_array_has "$implementer" '$.permissions.allow' "Edit(/$logical_project/**)"
+  [ "$(json_array_count "$implementer" '$.permissions.allow' \
+    "Edit(/$logical_project/**)")" -eq 1 ]
+  json_array_has "$reviewer" '$.permissions.allow' "Read(/$logical_project/**)"
+  ! json_array_has "$reviewer" '$.permissions.allow' "Read($logical_project/**)"
+  json_array_has "$reviewer" '$.permissions.allow' "Read(/$logical_inherited/**)"
+  ! json_array_has "$reviewer" '$.permissions.allow' "Read($logical_inherited/**)"
+  json_array_has "$reviewer" '$.permissions.deny' "Edit(/$logical_project/**)"
+  ! json_array_has "$reviewer" '$.permissions.deny' "Edit($logical_project/**)"
+  json_array_has "$reviewer" '$.permissions.deny' "Read(/$HOME/.ssh/**)"
+  ! grep -Fq 'Write(' "$consultant"
+  ! grep -Fq 'Write(' "$implementer"
+  ! grep -Fq 'Write(' "$reviewer"
+  ! grep -Fq 'NotebookEdit(' "$consultant"
+  ! grep -Fq 'NotebookEdit(' "$implementer"
+  ! grep -Fq 'NotebookEdit(' "$reviewer"
+  ! grep -Fq '(///' "$consultant"
+  ! grep -Fq '(///' "$implementer"
+  ! grep -Fq '(///' "$reviewer"
   [ "$(grep -Fxc 'ARG=--disallowedTools' "$CAPTURE/bridge.args.alias-reviewer")" -eq 1 ]
   grep -Fxq 'ARG=Edit,Write,NotebookEdit' "$CAPTURE/bridge.args.alias-reviewer"
   ! grep -Fq 'ARG=--disallowedTools' "$CAPTURE/probe.args.3"
@@ -528,6 +609,7 @@ policy_shape() {
     '$.sandbox.filesystem.allowRead' "$missing_tmp")" -eq 0 ]
   assert_json_array_unique "$missing_settings" '$.sandbox.filesystem.allowWrite'
   assert_json_array_unique "$missing_settings" '$.sandbox.filesystem.allowRead'
+  assert_permission_rule_shapes "$missing_settings"
 }
 
 @test "claude-code manifest advertises headless capability and consultant spawn has exact artifacts/env/cwd" {
@@ -602,8 +684,10 @@ policy_shape() {
   grep -Fxq "ARG=$PROJ" "$CAPTURE/bridge.args.impl"
   grep -Fxq 'ARG=--role-file' "$CAPTURE/bridge.args.impl"
   [ "$(cat "$base.role")" = "IMPLEMENTER ROLE" ]
-  json_array_has "$settings" '$.permissions.allow' "Edit($PROJ/**)"
-  json_array_has "$settings" '$.permissions.allow' "Write($PROJ/**)"
+  json_array_has "$settings" '$.permissions.allow' "Edit(/$PROJ/**)"
+  ! json_array_has "$settings" '$.permissions.allow' "Edit($PROJ/**)"
+  ! grep -Fq 'Write(' "$settings"
+  ! grep -Fq 'NotebookEdit(' "$settings"
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$PROJ"
 }
 
@@ -620,7 +704,7 @@ policy_shape() {
   local settings="$base.settings.json"
   local runtime_without_outer="$TEST_SKILL_DIR/runtime-policy"
   local probe_policy="$TEST_SKILL_DIR/probe-policy"
-  local sentinel_target
+  local sentinel_target probe_token repo_bash_target repo_edit_target repo_write_target
   policy_shape "$CAPTURE/bridge.args.review" \
     | awk '$0=="ARG=--disallowedTools" { getline; next } { print }' \
     > "$runtime_without_outer"
@@ -633,21 +717,31 @@ policy_shape() {
   run diff -u "$CAPTURE/probe.env.1" "$CAPTURE/bridge.env.review"
   [ "$status" -eq 0 ]
 
-  json_array_has "$settings" '$.permissions.deny' "Edit($PROJ/**)"
-  json_array_has "$settings" '$.permissions.deny' "Write($PROJ/**)"
+  json_array_has "$settings" '$.permissions.allow' "Read(/$PROJ/**)"
+  ! json_array_has "$settings" '$.permissions.allow' "Read($PROJ/**)"
+  json_array_has "$settings" '$.permissions.deny' "Edit(/$PROJ/**)"
+  ! json_array_has "$settings" '$.permissions.deny' "Edit($PROJ/**)"
+  ! grep -Fq 'Write(' "$settings"
+  ! grep -Fq 'NotebookEdit(' "$settings"
+  ! grep -Fq '(///' "$settings"
   ! json_array_has "$settings" '$.permissions.deny' "Read"
   json_array_has "$settings" '$.sandbox.filesystem.denyWrite' "$PROJ"
   json_array_has "$settings" '$.sandbox.filesystem.denyRead' "/"
   json_array_has "$settings" '$.sandbox.filesystem.allowRead' "$PROJ"
   json_array_has "$settings" '$.sandbox.filesystem.allowRead' "$TEST_SKILL_DIR"
   json_array_has "$settings" '$.sandbox.filesystem.allowRead' "/nix"
-  grep -Fq 'Read(**/*credentials*/**)' "$settings"
-  grep -Fq "$TEST_SKILL_DIR/db/claude-worker-home/projects/**" "$settings"
+  json_array_has "$settings" '$.permissions.deny' 'Read(//**/*credentials*)'
+  json_array_has "$settings" '$.permissions.deny' 'Read(//**/*credentials*/**)'
+  ! json_array_has "$settings" '$.permissions.deny' 'Read(**/*credentials*)'
+  ! json_array_has "$settings" '$.permissions.deny' 'Read(**/*credentials*/**)'
+  json_array_has "$settings" '$.permissions.deny' \
+    "Read(/$TEST_SKILL_DIR/db/claude-worker-home/projects/**)"
   grep -Fq "sensitive-read-target=$TEST_SKILL_DIR/db/claude-worker-home/projects/" \
     "$CAPTURE/probe.prompt.1"
   sentinel_target="$(sed -n 's/^sensitive-read-target=//p' \
     "$CAPTURE/probe.prompt.1" | head -1)"
-  json_array_has "$settings" '$.permissions.deny' "Read($sentinel_target)"
+  json_array_has "$settings" '$.permissions.deny' "Read(/$sentinel_target)"
+  ! json_array_has "$settings" '$.permissions.deny' "Read($sentinel_target)"
   [ ! -e "$sentinel_target" ]
   ! grep -Fq "sensitive-read-target=$TEST_SKILL_DIR/run/claude-code-team-review-cwd/" \
     "$CAPTURE/probe.prompt.1"
@@ -656,7 +750,22 @@ policy_shape() {
   grep -Fq '"id":"r2read","name":"Read","input":{"file_path":"'"$PROJ"'/.agmsg-probe-' \
     "$CAPTURE/probe.events.1"
   grep -Fq '"id":"r2","name":"Edit"' "$CAPTURE/probe.events.1"
-  grep -Fq '"content":"Permission denied by policy"' "$CAPTURE/probe.events.1"
+  probe_token="$(grep -Eo 'agmsg-probe-[0-9]+' "$CAPTURE/probe.prompt.1" | head -1)"
+  repo_bash_target="$PROJ/.${probe_token}-repo-bash"
+  repo_edit_target="$PROJ/.${probe_token}-repo-edit"
+  repo_write_target="$PROJ/.${probe_token}-repo-write"
+  grep -Fq \
+    "\"content\":\"(eval):1: operation not permitted: $repo_bash_target\"" \
+    "$CAPTURE/probe.events.1"
+  grep -Fq \
+    "\"content\":\"Claude requested permissions to write to $repo_edit_target, but you haven’t granted it yet.\"" \
+    "$CAPTURE/probe.events.1"
+  grep -Fq \
+    "\"content\":\"Claude requested permissions to write to $repo_write_target, but you haven’t granted it yet.\"" \
+    "$CAPTURE/probe.events.1"
+  grep -Fq \
+    "\"content\":\"Claude requested permissions to read from $sentinel_target, but you haven’t granted it yet.\"" \
+    "$CAPTURE/probe.events.1"
 }
 
 @test "inherit add-dirs defaults off and obeys global then per-name overrides through shared collector" {
@@ -849,6 +958,14 @@ policy_shape() {
     "$CAPTURE/probe.events.1"
 
   printf '0\n' > "$CAPTURE/probe-count"
+  export FAKE_PROBE_MODE=sensitive-error-only
+  run spawn_claude sensitive-error-only --reviewer
+  [ "$status" -ne 0 ]
+  [ ! -e "$CAPTURE/bridge.args.sensitive-error-only" ]
+  grep -Fq '"is_error":true,"content":"synthetic tool error"' \
+    "$CAPTURE/probe.events.1"
+
+  printf '0\n' > "$CAPTURE/probe-count"
   export FAKE_PROBE_MODE=sensitive-cwd-override
   run spawn_claude sensitive-cwd --reviewer
   [ "$status" -ne 0 ]
@@ -870,6 +987,22 @@ policy_shape() {
   [ ! -e "$CAPTURE/bridge.args.sensitive-other" ]
   grep -Fq '"file_path":"'"$TEST_SKILL_DIR"'/run/claude-code-team-sensitive-other-cwd/.not-the-sentinel","note":"'"$TEST_SKILL_DIR"'/db/claude-worker-home/projects/' \
     "$CAPTURE/probe.events.1"
+}
+
+@test "reviewer denial messages cannot mask repo Edit, Write, or Bash side effects" {
+  local mode name
+  for mode in \
+    reviewer-edit-side-effect \
+    reviewer-write-side-effect \
+    reviewer-bash-side-effect; do
+    printf '0\n' > "$CAPTURE/probe-count"
+    export FAKE_PROBE_MODE="$mode"
+    name="${mode#reviewer-}"
+    run spawn_claude "$name" --reviewer
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"did not produce every required correlated tool event"* ]]
+    [ ! -e "$CAPTURE/bridge.args.$name" ]
+  done
 }
 
 @test "probe and bridge scrub hostile shell state and exact run-file proof rejects wrong temp writes" {
@@ -954,6 +1087,7 @@ HOSTILE
   [ -f "$keep_base.probe.prompt" ]
   [ -f "$keep_base.probe.jsonl" ]
   [ -f "$keep_base.probe.stderr" ]
+  [ ! -s "$keep_base.probe.stderr" ]
   [ "$(find "$TEST_SKILL_DIR/run" -maxdepth 1 \
     -name 'claude-code-bridge.team.edit-keep*' | wc -l | tr -d ' ')" -eq 4 ]
   grep -Fq '"id":"r2read"' "$keep_base.probe.jsonl"

@@ -174,9 +174,34 @@ agmsg_claude_emit_json_array() {
   printf ']'
 }
 
+agmsg_claude_permission_path() {
+  local path="$1"
+  case "$path" in
+    /*)
+      while [ "${path#/}" != "$path" ]; do path="${path#/}"; done
+      while [ -n "$path" ] && [ "${path%/}" != "$path" ]; do
+        path="${path%/}"
+      done
+      printf '//%s' "$path"
+      ;;
+    *) printf '%s' "$path" ;;
+  esac
+}
+
 agmsg_claude_tool_rule() {
-  local tool="$1" path="$2"
-  printf '%s(%s/**)' "$tool" "${path%/}"
+  local tool="$1" path="$2" permission_path
+  permission_path="$(agmsg_claude_permission_path "$path")" || return 1
+  if [ "$permission_path" = // ]; then
+    printf '%s(//**)' "$tool"
+  else
+    printf '%s(%s/**)' "$tool" "$permission_path"
+  fi
+}
+
+agmsg_claude_exact_tool_rule() {
+  local tool="$1" path="$2" permission_path
+  permission_path="$(agmsg_claude_permission_path "$path")" || return 1
+  printf '%s(%s)' "$tool" "$permission_path"
 }
 
 agmsg_claude_physical_path() {
@@ -235,7 +260,6 @@ agmsg_claude_generate_settings() {
       allow_read_candidates+=("$project")
       allow_rules+=("$(agmsg_claude_tool_rule Read "$project")")
       allow_rules+=("$(agmsg_claude_tool_rule Edit "$project")")
-      allow_rules+=("$(agmsg_claude_tool_rule Write "$project")")
       ;;
     reviewer)
       allow_read_candidates+=("$project")
@@ -243,12 +267,11 @@ agmsg_claude_generate_settings() {
       deny_read+=("/")
       allow_rules+=("$(agmsg_claude_tool_rule Read "$project")")
       deny_rules+=("$(agmsg_claude_tool_rule Edit "$project")")
-      deny_rules+=("$(agmsg_claude_tool_rule Write "$project")")
-      deny_rules+=("Read($HOME/.ssh/**)")
-      deny_rules+=("Read(**/*credentials*)")
-      deny_rules+=("Read(**/*credentials*/**)")
-      deny_rules+=("Read(${worker_home%/}/projects/**)")
-      deny_rules+=("Read($sentinel)")
+      deny_rules+=("$(agmsg_claude_tool_rule Read "$HOME/.ssh")")
+      deny_rules+=("Read(//**/*credentials*)")
+      deny_rules+=("Read(//**/*credentials*/**)")
+      deny_rules+=("$(agmsg_claude_tool_rule Read "$worker_home/projects")")
+      deny_rules+=("$(agmsg_claude_exact_tool_rule Read "$sentinel")")
       for path in "${inherited[@]}"; do
         [ -n "$path" ] || continue
         allow_read_candidates+=("$path")
@@ -258,7 +281,6 @@ agmsg_claude_generate_settings() {
     consultant)
       allow_rules+=("$(agmsg_claude_tool_rule Read "$scratch")")
       deny_rules+=("$(agmsg_claude_tool_rule Edit "$project")")
-      deny_rules+=("$(agmsg_claude_tool_rule Write "$project")")
       deny_write+=("$project")
       ;;
     *) return 1 ;;
@@ -346,10 +368,21 @@ agmsg_claude_probe_event_count() {
   case "$outcome" in
     success)
       condition="COALESCE(r.is_error,0)=0" ;;
-    denied)
-      condition="(lower(COALESCE(r.body,'')) LIKE '%denied%' OR lower(COALESCE(r.body,'')) LIKE '%permission%' OR lower(COALESCE(r.body,'')) LIKE '%not allowed%')" ;;
     denied-error)
-      condition="r.is_error=1 AND (lower(COALESCE(r.body,'')) LIKE '%permission denied%' OR lower(COALESCE(r.body,'')) LIKE '%denied by %' OR lower(COALESCE(r.body,'')) LIKE '%access denied%' OR lower(COALESCE(r.body,'')) LIKE '%not allowed%')" ;;
+      condition="r.is_error=1 AND (
+        lower(COALESCE(r.body,'')) LIKE '%permission denied%'
+        OR lower(COALESCE(r.body,'')) LIKE '%denied by %'
+        OR lower(COALESCE(r.body,'')) LIKE '%access denied%'
+        OR lower(COALESCE(r.body,'')) LIKE '%not allowed%'
+        OR lower(COALESCE(r.body,'')) LIKE '%operation not permitted%'
+        OR (
+          lower(COALESCE(r.body,'')) LIKE '%requested permissions to %'
+          AND (
+            lower(COALESCE(r.body,'')) LIKE '%haven’t granted it yet.%'
+            OR lower(COALESCE(r.body,'')) LIKE '%haven''t granted it yet.%'
+          )
+        )
+      )" ;;
     *) return 1 ;;
   esac
   agmsg_sqlite_mem "
@@ -405,11 +438,11 @@ agmsg_claude_probe_complete() {
   [ -f "$trace" ] && [ ! -L "$trace" ] || return 1
   case "$layout" in
     consultant)
-      specs=$'Bash\tconsultant-scratch\tsuccess\tscratch\nBash\trepo-bash\tdenied\trepo-bash\nBash\trun-write\tsuccess\trun-write' ;;
+      specs=$'Bash\tconsultant-scratch\tsuccess\tscratch\nBash\trepo-bash\tdenied-error\trepo-bash\nBash\trun-write\tsuccess\trun-write' ;;
     implementer)
       specs=$'Bash\trepo-bash\tsuccess\trepo-bash\nEdit\trepo-edit\tsuccess\trepo-edit\nWrite\trepo-write\tsuccess\trepo-write\nBash\trun-write\tsuccess\trun-write' ;;
     reviewer)
-      specs=$'Bash\trepo-bash\tdenied\trepo-bash\nRead\tedit-prereq-read\tsuccess\trepo-edit\nEdit\trepo-edit\tdenied-error\trepo-edit\nWrite\trepo-write\tdenied-error\trepo-write\nRead\tsensitive-read\tdenied-error\tsentinel\nBash\trun-write\tsuccess\trun-write' ;;
+      specs=$'Bash\trepo-bash\tdenied-error\trepo-bash\nRead\tedit-prereq-read\tsuccess\trepo-edit\nEdit\trepo-edit\tdenied-error\trepo-edit\nWrite\trepo-write\tdenied-error\trepo-write\nRead\tsensitive-read\tdenied-error\tsentinel\nBash\trun-write\tsuccess\trun-write' ;;
     *) return 1 ;;
   esac
   while IFS=$'\t' read -r tool marker outcome target_kind; do
@@ -447,6 +480,38 @@ agmsg_claude_probe_complete() {
       "$trace" "$tool" "$token-$marker" "$outcome" "$expected_input" || true)"
     case "$count" in ''|*[!0-9]*|0) return 1 ;; esac
   done <<< "$specs"
+
+  # Correlated tool results prove which operation Claude attempted and which
+  # policy layer rejected it. Exact filesystem effects are the primary proof:
+  # a denial-looking message must never hide a write that actually occurred.
+  case "$layout" in
+    consultant)
+      [ -f "$scratch_write" ] && [ ! -L "$scratch_write" ] || return 1
+      [ "$(cat "$scratch_write" 2>/dev/null || true)" = \
+        "$token-consultant-scratch" ] || return 1
+      [ ! -e "$repo_bash" ] && [ ! -L "$repo_bash" ] || return 1
+      ;;
+    implementer)
+      [ -f "$repo_bash" ] && [ ! -L "$repo_bash" ] || return 1
+      [ "$(cat "$repo_bash" 2>/dev/null || true)" = \
+        "$token-repo-bash" ] || return 1
+      [ -f "$repo_edit" ] && [ ! -L "$repo_edit" ] || return 1
+      [ "$(cat "$repo_edit" 2>/dev/null || true)" = \
+        "CHANGED $token" ] || return 1
+      [ -f "$repo_write" ] && [ ! -L "$repo_write" ] || return 1
+      [ "$(cat "$repo_write" 2>/dev/null || true)" = \
+        "$token-repo-write" ] || return 1
+      ;;
+    reviewer)
+      [ -f "$repo_edit" ] && [ ! -L "$repo_edit" ] || return 1
+      [ "$(cat "$repo_edit" 2>/dev/null || true)" = \
+        "ORIGINAL $token" ] || return 1
+      [ ! -e "$repo_write" ] && [ ! -L "$repo_write" ] || return 1
+      [ ! -e "$repo_bash" ] && [ ! -L "$repo_bash" ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+
   [ -f "$run_write" ] && [ ! -L "$run_write" ] || return 1
   [ "$(cat "$run_write" 2>/dev/null || true)" = "$token-run-write" ] || return 1
   return 0
