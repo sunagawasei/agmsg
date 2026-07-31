@@ -349,6 +349,46 @@ json_array_has() {
   [ "$(sqlite_mem "SELECT COUNT(*) FROM json_each(readfile('$(rf "$file")'), '$path') WHERE value='$value_sql';")" -gt 0 ]
 }
 
+json_array_count() {
+  local file="$1" path="$2" value="$3" value_sql
+  value_sql="$(printf '%s' "$value" | sed "s/'/''/g")"
+  sqlite_mem "SELECT COUNT(*) FROM json_each(readfile('$(rf "$file")'), '$path') WHERE value='$value_sql';"
+}
+
+json_array_index() {
+  local file="$1" path="$2" value="$3" value_sql
+  value_sql="$(printf '%s' "$value" | sed "s/'/''/g")"
+  sqlite_mem "SELECT MIN(CAST(key AS INTEGER)) FROM json_each(readfile('$(rf "$file")'), '$path') WHERE value='$value_sql';"
+}
+
+assert_json_array_unique() {
+  local file="$1" path="$2" total distinct
+  total="$(sqlite_mem "SELECT COUNT(*) FROM json_each(readfile('$(rf "$file")'), '$path');")"
+  distinct="$(sqlite_mem "SELECT COUNT(DISTINCT value) FROM json_each(readfile('$(rf "$file")'), '$path');")"
+  [ "$total" = "$distinct" ]
+}
+
+physical_path() {
+  local path="$1" physical
+  if physical="$(cd "$path" 2>/dev/null && pwd -P)" && [ -n "$physical" ]; then
+    printf '%s' "$physical"
+  else
+    printf '%s' "$path"
+  fi
+}
+
+assert_json_path_alias() {
+  local file="$1" path="$2" raw="$3" physical raw_index physical_index
+  physical="$(physical_path "$raw")"
+  [ "$(json_array_count "$file" "$path" "$raw")" -eq 1 ]
+  if [ "$physical" != "$raw" ]; then
+    [ "$(json_array_count "$file" "$path" "$physical")" -eq 1 ]
+    raw_index="$(json_array_index "$file" "$path" "$raw")"
+    physical_index="$(json_array_index "$file" "$path" "$physical")"
+    [ "$raw_index" -lt "$physical_index" ]
+  fi
+}
+
 policy_shape() {
   awk '
     $0 == "ARG=--model" || $0 == "ARG=--effort" ||
@@ -358,6 +398,136 @@ policy_shape() {
       if (getline > 0) print
     }
   ' "$1"
+}
+
+@test "claude-code sandbox path aliases preserve narrow role scopes and order" {
+  local physical_skill="$TEST_SKILL_DIR"
+  local logical_skill="$BATS_TEST_TMPDIR/skill-logical"
+  local physical_project="$TEST_SKILL_DIR/alias-project-physical"
+  local logical_project="$BATS_TEST_TMPDIR/project-logical"
+  local physical_tmp="$TEST_SKILL_DIR/process-tmp-physical"
+  local logical_tmp="$BATS_TEST_TMPDIR/process-tmp-logical"
+  local physical_inherited="$TEST_SKILL_DIR/inherited-physical"
+  local logical_inherited="$BATS_TEST_TMPDIR/inherited-logical"
+  mkdir -p "$physical_project/.claude" "$physical_tmp" "$physical_inherited"
+  ln -s "$physical_skill" "$logical_skill"
+  ln -s "$physical_project" "$logical_project"
+  ln -s "$physical_tmp" "$logical_tmp"
+  ln -s "$physical_inherited" "$logical_inherited"
+  printf '{"permissions":{"additionalDirectories":["%s"]}}\n' \
+    "$logical_inherited" > "$physical_project/.claude/settings.local.json"
+
+  export SCRIPTS="$logical_skill/scripts"
+  export PROJ="$logical_project"
+  export TMPDIR="$logical_tmp"
+  bash "$SCRIPTS/config.sh" set spawn.claude_inherit_add_dirs true
+
+  run spawn_claude alias-consultant
+  [ "$status" -eq 0 ]
+  wait_bridge_capture alias-consultant
+  run spawn_claude alias-implementer --implementer
+  [ "$status" -eq 0 ]
+  wait_bridge_capture alias-implementer
+  run spawn_claude alias-reviewer --reviewer
+  [ "$status" -eq 0 ]
+  wait_bridge_capture alias-reviewer
+
+  local consultant="$TEST_SKILL_DIR/run/claude-code-bridge.team.alias-consultant.settings.json"
+  local implementer="$TEST_SKILL_DIR/run/claude-code-bridge.team.alias-implementer.settings.json"
+  local reviewer="$TEST_SKILL_DIR/run/claude-code-bridge.team.alias-reviewer.settings.json"
+  local consultant_scratch="$logical_skill/run/claude-code-team-alias-consultant-cwd"
+  local implementer_scratch="$logical_skill/run/claude-code-team-alias-implementer-cwd"
+  local reviewer_scratch="$logical_skill/run/claude-code-team-alias-reviewer-cwd"
+  local settings scratch raw path missing_tmp missing_settings
+
+  for settings in "$consultant" "$implementer" "$reviewer"; do
+    [ "$(sqlite_mem "SELECT json_valid(readfile('$(rf "$settings")'));")" = 1 ]
+    assert_json_array_unique "$settings" '$.sandbox.filesystem.allowWrite'
+    assert_json_array_unique "$settings" '$.sandbox.filesystem.allowRead'
+    for raw in "$logical_skill/db" "$logical_skill/teams" "$logical_skill/run" \
+      "/tmp"; do
+      assert_json_path_alias "$settings" '$.sandbox.filesystem.allowWrite' "$raw"
+    done
+    for raw in "$logical_skill" "/tmp" "/bin" "/usr/bin" "/usr/lib" \
+      "/System" "/Library" "/nix" "/opt/homebrew" "/usr/local"; do
+      assert_json_path_alias "$settings" '$.sandbox.filesystem.allowRead' "$raw"
+    done
+    [ "$(json_array_count "$settings" '$.sandbox.filesystem.allowRead' "/nix")" -eq 1 ]
+    for path in '$.sandbox.filesystem.allowWrite' '$.sandbox.filesystem.allowRead'; do
+      ! json_array_has "$settings" "$path" "$logical_tmp"
+      ! json_array_has "$settings" "$path" "$physical_tmp"
+    done
+    ! json_array_has "$settings" '$.sandbox.filesystem.allowWrite' \
+      "$logical_skill/db/claude-worker-home"
+    ! json_array_has "$settings" '$.sandbox.filesystem.allowRead' "$HOME"
+  done
+
+  [ "$(physical_path /nix)" = /nix ]
+  if [ "$(uname -s)" = Darwin ]; then
+    [ "$(physical_path /tmp)" = /private/tmp ]
+    for settings in "$consultant" "$implementer" "$reviewer"; do
+      json_array_has "$settings" '$.sandbox.filesystem.allowWrite' /private/tmp
+      json_array_has "$settings" '$.sandbox.filesystem.allowRead' /private/tmp
+    done
+  fi
+
+  for settings in "$consultant" "$implementer" "$reviewer"; do
+    case "$settings" in
+      "$consultant") scratch="$consultant_scratch" ;;
+      "$implementer") scratch="$implementer_scratch" ;;
+      "$reviewer") scratch="$reviewer_scratch" ;;
+    esac
+    assert_json_path_alias "$settings" '$.sandbox.filesystem.allowWrite' "$scratch"
+    assert_json_path_alias "$settings" '$.sandbox.filesystem.allowWrite' "$scratch/tmp"
+    assert_json_path_alias "$settings" '$.sandbox.filesystem.allowRead' "$scratch"
+  done
+
+  for path in '$.sandbox.filesystem.allowWrite' '$.sandbox.filesystem.allowRead'; do
+    ! json_array_has "$consultant" "$path" "$logical_project"
+    ! json_array_has "$consultant" "$path" "$physical_project"
+  done
+  assert_json_path_alias "$implementer" '$.sandbox.filesystem.allowWrite' "$logical_project"
+  assert_json_path_alias "$implementer" '$.sandbox.filesystem.allowRead' "$logical_project"
+  assert_json_path_alias "$reviewer" '$.sandbox.filesystem.allowRead' "$logical_project"
+  ! json_array_has "$reviewer" '$.sandbox.filesystem.allowWrite' "$logical_project"
+  ! json_array_has "$reviewer" '$.sandbox.filesystem.allowWrite' "$physical_project"
+  assert_json_path_alias "$reviewer" '$.sandbox.filesystem.allowRead' "$logical_inherited"
+  ! json_array_has "$reviewer" '$.sandbox.filesystem.allowWrite' "$logical_inherited"
+  ! json_array_has "$reviewer" '$.sandbox.filesystem.allowWrite' "$physical_inherited"
+
+  json_array_has "$consultant" '$.sandbox.filesystem.denyWrite' "$logical_project"
+  json_array_has "$reviewer" '$.sandbox.filesystem.denyWrite' "$logical_project"
+  json_array_has "$reviewer" '$.sandbox.filesystem.denyRead' "/"
+  json_array_has "$consultant" '$.permissions.deny' "Edit($logical_project/**)"
+  json_array_has "$consultant" '$.permissions.deny' "Write($logical_project/**)"
+  json_array_has "$reviewer" '$.permissions.deny' "Edit($logical_project/**)"
+  json_array_has "$reviewer" '$.permissions.deny' "Write($logical_project/**)"
+  [ "$(grep -Fxc 'ARG=--disallowedTools' "$CAPTURE/bridge.args.alias-reviewer")" -eq 1 ]
+  grep -Fxq 'ARG=Edit,Write,NotebookEdit' "$CAPTURE/bridge.args.alias-reviewer"
+  ! grep -Fq 'ARG=--disallowedTools' "$CAPTURE/probe.args.3"
+
+  missing_tmp="$BATS_TEST_TMPDIR/missing-process-tmp"
+  missing_settings="$BATS_TEST_TMPDIR/missing-settings.json"
+  [ ! -e "$missing_tmp" ]
+  (
+    export TMPDIR="$missing_tmp"
+    SCRIPT_DIR="$SCRIPTS"
+    SKILL_DIR="${SCRIPTS%/scripts}"
+    . "$SCRIPT_DIR/lib/resolve-project.sh"
+    . "$SCRIPT_DIR/drivers/types/claude-code/_spawn.sh"
+    agmsg_claude_generate_settings "$missing_settings" consultant \
+      "$logical_project" "$consultant_scratch" "$logical_skill/db" \
+      "$logical_skill/db/claude-worker-home" \
+      "$logical_skill/db/claude-worker-home/projects/missing-sentinel" \
+      "$consultant_scratch/tmp"
+  )
+  [ "$(sqlite_mem "SELECT json_valid(readfile('$(rf "$missing_settings")'));")" = 1 ]
+  [ "$(json_array_count "$missing_settings" \
+    '$.sandbox.filesystem.allowWrite' "$missing_tmp")" -eq 0 ]
+  [ "$(json_array_count "$missing_settings" \
+    '$.sandbox.filesystem.allowRead' "$missing_tmp")" -eq 0 ]
+  assert_json_array_unique "$missing_settings" '$.sandbox.filesystem.allowWrite'
+  assert_json_array_unique "$missing_settings" '$.sandbox.filesystem.allowRead'
 }
 
 @test "claude-code manifest advertises headless capability and consultant spawn has exact artifacts/env/cwd" {

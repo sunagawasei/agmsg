@@ -179,6 +179,26 @@ agmsg_claude_tool_rule() {
   printf '%s(%s/**)' "$tool" "${path%/}"
 }
 
+agmsg_claude_physical_path() {
+  local path="$1" physical
+  if type agmsg_canonical_path >/dev/null 2>&1 \
+    && physical="$(agmsg_canonical_path "$path")" \
+    && [ -n "$physical" ]; then
+    printf '%s' "$physical"
+  else
+    printf '%s' "$path"
+  fi
+}
+
+agmsg_claude_path_in_list() {
+  local needle="$1" candidate
+  shift
+  for candidate in "$@"; do
+    [ "$candidate" = "$needle" ] && return 0
+  done
+  return 1
+}
+
 agmsg_claude_create_exclusive_file() {
   local path="$1" content="$2"
   (
@@ -195,22 +215,30 @@ agmsg_claude_generate_settings() {
   local -a inherited=("$@")
   local -a allow_rules=("Bash(*)")
   local -a deny_rules=()
-  local -a allow_write=("$storage_dir" "$SKILL_DIR/teams" "$SKILL_DIR/run" "$child_tmp" "/tmp" "$scratch")
+  local -a allow_write_candidates=(
+    "$storage_dir" "$SKILL_DIR/teams" "$SKILL_DIR/run"
+    "$child_tmp" "/tmp" "$scratch"
+  )
   local -a deny_write=()
-  local -a allow_read=("$scratch" "$SKILL_DIR" "/bin" "/usr/bin" "/usr/lib" "/System" "/Library" "/nix" "/opt/homebrew" "/usr/local")
+  local -a allow_read_candidates=(
+    "$scratch" "$SKILL_DIR" "/tmp" "/bin" "/usr/bin" "/usr/lib"
+    "/System" "/Library" "/nix" "/opt/homebrew" "/usr/local"
+  )
+  local -a allow_write=()
+  local -a allow_read=()
   local -a deny_read=()
-  local path tmp="${settings_file}.tmp.$$" tmp_sql valid
+  local path physical tmp="${settings_file}.tmp.$$" tmp_sql valid
 
   case "$layout" in
     implementer)
-      allow_write+=("$project")
-      allow_read+=("$project")
+      allow_write_candidates+=("$project")
+      allow_read_candidates+=("$project")
       allow_rules+=("$(agmsg_claude_tool_rule Read "$project")")
       allow_rules+=("$(agmsg_claude_tool_rule Edit "$project")")
       allow_rules+=("$(agmsg_claude_tool_rule Write "$project")")
       ;;
     reviewer)
-      allow_read+=("$project")
+      allow_read_candidates+=("$project")
       deny_write+=("$project")
       deny_read+=("/")
       allow_rules+=("$(agmsg_claude_tool_rule Read "$project")")
@@ -223,7 +251,7 @@ agmsg_claude_generate_settings() {
       deny_rules+=("Read($sentinel)")
       for path in "${inherited[@]}"; do
         [ -n "$path" ] || continue
-        allow_read+=("$path")
+        allow_read_candidates+=("$path")
         allow_rules+=("$(agmsg_claude_tool_rule Read "$path")")
       done
       ;;
@@ -235,6 +263,29 @@ agmsg_claude_generate_settings() {
       ;;
     *) return 1 ;;
   esac
+
+  # Seatbelt evaluates resolved filesystem paths, so retain each logical root
+  # first and add its physical alias under the same permission.
+  for path in "${allow_write_candidates[@]}"; do
+    [ -n "$path" ] || continue
+    agmsg_claude_path_in_list "$path" "${allow_write[@]}" \
+      || allow_write+=("$path")
+    physical="$(agmsg_claude_physical_path "$path")"
+    if [ -n "$physical" ] && [ "$physical" != "$path" ]; then
+      agmsg_claude_path_in_list "$physical" "${allow_write[@]}" \
+        || allow_write+=("$physical")
+    fi
+  done
+  for path in "${allow_read_candidates[@]}"; do
+    [ -n "$path" ] || continue
+    agmsg_claude_path_in_list "$path" "${allow_read[@]}" \
+      || allow_read+=("$path")
+    physical="$(agmsg_claude_physical_path "$path")"
+    if [ -n "$physical" ] && [ "$physical" != "$path" ]; then
+      agmsg_claude_path_in_list "$physical" "${allow_read[@]}" \
+        || allow_read+=("$physical")
+    fi
+  done
 
   {
     printf '{\n  "permissions": {\n    "allow": '
