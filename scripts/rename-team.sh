@@ -17,9 +17,12 @@ if [ "$OLD_TEAM" = "$NEW_TEAM" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/registry-lock.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/team-config-audit.sh"
 # Reject team names that would escape teams/ as a path segment, on either side
 # of the rename (#140).
 # shellcheck disable=SC1091
@@ -102,6 +105,7 @@ agmsg_lock_release
 # the now-empty dir. A concurrent join to the old name after this point
 # legitimately creates a fresh team there.
 rmdir "$OLD_DIR" 2>/dev/null || true
+agmsg_team_config_audit "$OLD_TEAM" rename-team "" "$NEW_TEAM" || true
 echo "Renamed team $OLD_TEAM → $NEW_TEAM"
 echo
 echo "Note: existing members in other projects/sessions still see the old"

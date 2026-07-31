@@ -10,6 +10,7 @@ AGENT_ID="${2:?Missing agent_id}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEAMS_DIR="$SCRIPT_DIR/../teams"
+SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Reject team names that would escape teams/ as a path segment (#140), and
 # agent names that would misroute the $.agents.<name> JSON path below (#87
@@ -20,6 +21,8 @@ source "$SCRIPT_DIR/lib/validate.sh"
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/registry-lock.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/team-config-audit.sh"
 agmsg_validate_team_name "$TEAM" || exit 1
 agmsg_validate_agent_name "$AGENT_ID" || exit 1
 
@@ -70,9 +73,11 @@ if [ "$AGENT_COUNT" -eq 0 ]; then
   rm -f "$TEAM_CONFIG"
   agmsg_lock_release
   rmdir "$TEAMS_DIR/$TEAM" 2>/dev/null || true
+  agmsg_team_config_audit "$TEAM" leave "$AGENT_ID" "" || true
   echo "Left team $TEAM (team removed — no members left)"
 else
   agmsg_write_atomic "$TEAM_CONFIG" "$UPDATED"
   agmsg_lock_release
+  agmsg_team_config_audit "$TEAM" leave "$AGENT_ID" "" || true
   echo "Left team $TEAM"
 fi

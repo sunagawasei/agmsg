@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: reset.sh <project_path> <type> [agent_id] [session_id]
+# Usage: reset.sh [--team <team>] <project_path> <type> [agent_id] [session_id]
 #
 # Removes registrations for the given project/type across all teams.
 # If agent_id is omitted, it is resolved from whoami.sh for the current project/type.
@@ -10,14 +10,51 @@ set -euo pipefail
 # returns the role to the pool so peer sessions can pick it up immediately
 # without waiting for stale-lock GC.
 
-PROJECT_PATH="${1:?Usage: reset.sh <project_path> <type> [agent_id] [session_id]}"
-AGENT_TYPE="${2:?Usage: reset.sh <project_path> <type> [agent_id] [session_id]}"
-TARGET_AGENT="${3:-}"
-SESSION_ID="${4:-}"
+RESET_POSITIONAL=()
+TEAM_SCOPE=""
+TEAM_SCOPE_SET=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --team)
+      if [ "$#" -lt 2 ]; then
+        echo "Usage: reset.sh [--team <team>] <project_path> <type> [agent_id] [session_id]" >&2
+        exit 1
+      fi
+      if [ "$TEAM_SCOPE_SET" -ne 0 ]; then
+        echo "Usage: reset.sh accepts only one --team option" >&2
+        exit 1
+      fi
+      TEAM_SCOPE="$2"
+      TEAM_SCOPE_SET=1
+      shift 2
+      ;;
+    *)
+      RESET_POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ "${#RESET_POSITIONAL[@]}" -lt 2 ]; then
+  echo "Usage: reset.sh [--team <team>] <project_path> <type> [agent_id] [session_id]" >&2
+  exit 1
+fi
+
+PROJECT_PATH="${RESET_POSITIONAL[0]}"
+AGENT_TYPE="${RESET_POSITIONAL[1]}"
+TARGET_AGENT="${RESET_POSITIONAL[2]:-}"
+SESSION_ID="${RESET_POSITIONAL[3]:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEAMS_DIR="$SKILL_DIR/teams"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/validate.sh"
+# Validate before resolving projects or constructing a target-team path. An
+# invalid scope must never turn into a broader all-team reset.
+if [ "$TEAM_SCOPE_SET" -ne 0 ]; then
+  agmsg_validate_team_name "$TEAM_SCOPE" || exit 1
+fi
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
@@ -26,22 +63,41 @@ source "$SCRIPT_DIR/lib/resolve-project.sh"
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/registry-lock.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/team-config-audit.sh"
 # Agent names that would misroute the $.agents.<name> JSON path below (#87
 # cluster — '.', '/', '\', '"', '[', ']' all have path meaning to json1).
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/validate.sh"
 # Escape as a SQL string literal (parity with join.sh/rename.sh/leave.sh):
 # concatenated into JSON paths below as `'$.agents.' || '<escaped>'` rather
 # than spliced into the path text, so a single quote can't break the
 # statement (#87 cluster).
 _agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
 
+SCOPED_TEAM_CONFIG=""
+if [ "$TEAM_SCOPE_SET" -ne 0 ]; then
+  SCOPED_TEAM_CONFIG="$TEAMS_DIR/$TEAM_SCOPE/config.json"
+fi
+
 # Resolve the session's real project root (see #92) so a drop issued from a
 # subdir/worktree clears the registration on the project the session lives in.
-PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
+# A scoped reset must not let an unrelated team's registration steer this path.
+if [ "$TEAM_SCOPE_SET" -ne 0 ]; then
+  PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE" "$TEAM_SCOPE")"
+else
+  PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
+fi
 # Equivalent path spellings (#268) — a drop must remove a registration stored
 # in any Windows/MSYS form, not just the exact resolved string.
 PROJECT_SQL_IN=$(agmsg_project_sql_in_list "$PROJECT_PATH")
+AGENT_TYPE_SQL=$(_agmsg_sqlesc "$AGENT_TYPE")
+
+# A valid team that does not exist is a scoped no-op. In particular, do not
+# fall through to global whoami resolution, which could report an identity from
+# another team or turn this into an unintended all-team operation.
+if [ "$TEAM_SCOPE_SET" -ne 0 ] && [ ! -f "$SCOPED_TEAM_CONFIG" ]; then
+  echo "No registrations removed."
+  exit 0
+fi
 
 # A drop releases the actas lock keyed under this session's per-process instance
 # id (#93). The template passes a bare $CLAUDE_CODE_SESSION_ID; normalize to the
@@ -53,21 +109,51 @@ if [ -n "$SESSION_ID" ]; then
 fi
 
 if [ -z "$TARGET_AGENT" ]; then
-  WHOAMI=$(bash "$SCRIPT_DIR/whoami.sh" "$PROJECT_PATH" "$AGENT_TYPE")
-  if echo "$WHOAMI" | grep -q '^agent='; then
-    TARGET_AGENT=$(echo "$WHOAMI" | sed -n 's/.*agent=\([^ ]*\).*/\1/p')
-  elif echo "$WHOAMI" | grep -q '^multiple=true'; then
-    echo "Multiple identities match this project/type. Pass an agent_id explicitly." >&2
-    exit 1
+  if [ "$TEAM_SCOPE_SET" -ne 0 ]; then
+    SCOPED_CONFIG_SQL=$(agmsg_sql_readfile_path "$SCOPED_TEAM_CONFIG")
+    SCOPED_MATCHES=$(agmsg_sqlite_mem "
+      WITH raw(json) AS (SELECT CAST(readfile('$SCOPED_CONFIG_SQL') AS TEXT)),
+      cfg(json) AS (SELECT CASE WHEN json_valid(json) THEN json END FROM raw),
+      agents AS (
+        SELECT key AS name,
+          CASE
+            WHEN json_type(json_extract(value, '\$.registrations')) = 'array' THEN json_extract(value, '\$.registrations')
+            ELSE json_array(json_object('type', json_extract(value, '\$.type'), 'project', json_extract(value, '\$.project')))
+          END AS registrations
+        FROM cfg, json_each(json_extract(cfg.json, '\$.agents'))
+      )
+      SELECT DISTINCT name
+      FROM agents, json_each(agents.registrations) AS r
+      WHERE json_extract(r.value, '\$.project') IN ($PROJECT_SQL_IN)
+        AND json_extract(r.value, '\$.type') = '$AGENT_TYPE_SQL'
+      ORDER BY name;
+    ")
+    SCOPED_AGENT_COUNT=$(printf '%s\n' "$SCOPED_MATCHES" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [ "$SCOPED_AGENT_COUNT" -eq 1 ]; then
+      TARGET_AGENT=$(printf '%s\n' "$SCOPED_MATCHES" | sed -n '1p')
+    elif [ "$SCOPED_AGENT_COUNT" -gt 1 ]; then
+      echo "Multiple identities match this project/type in team '$TEAM_SCOPE'. Pass an agent_id explicitly." >&2
+      exit 1
+    else
+      echo "No registered identity found in team '$TEAM_SCOPE' for this project/type." >&2
+      exit 1
+    fi
   else
-    echo "No registered identity found for this project/type." >&2
-    exit 1
+    WHOAMI=$(bash "$SCRIPT_DIR/whoami.sh" "$PROJECT_PATH" "$AGENT_TYPE")
+    if echo "$WHOAMI" | grep -q '^agent='; then
+      TARGET_AGENT=$(echo "$WHOAMI" | sed -n 's/.*agent=\([^ ]*\).*/\1/p')
+    elif echo "$WHOAMI" | grep -q '^multiple=true'; then
+      echo "Multiple identities match this project/type. Pass an agent_id explicitly." >&2
+      exit 1
+    else
+      echo "No registered identity found for this project/type." >&2
+      exit 1
+    fi
   fi
 fi
 
 agmsg_validate_agent_name "$TARGET_AGENT" || exit 1
 TARGET_AGENT_SQL=$(_agmsg_sqlesc "$TARGET_AGENT")
-AGENT_TYPE_SQL=$(_agmsg_sqlesc "$AGENT_TYPE")
 
 if [ ! -d "$TEAMS_DIR" ]; then
   echo "No team registrations found."
@@ -78,7 +164,13 @@ REMOVED=0
 TOUCHED_TEAMS=0
 LOCK_FAILED=0
 
-for TEAM_CONFIG in "$TEAMS_DIR"/*/config.json; do
+if [ "$TEAM_SCOPE_SET" -ne 0 ]; then
+  RESET_CONFIGS=("$TEAMS_DIR/$TEAM_SCOPE/config.json")
+else
+  RESET_CONFIGS=("$TEAMS_DIR"/*/config.json)
+fi
+
+for TEAM_CONFIG in "${RESET_CONFIGS[@]}"; do
   [ -f "$TEAM_CONFIG" ] || continue
   TEAM_DIR="$(dirname "$TEAM_CONFIG")"
   TEAM_NAME="$(basename "$TEAM_DIR")"
@@ -185,6 +277,11 @@ for TEAM_CONFIG in "$TEAMS_DIR"/*/config.json; do
   if [ -n "$SESSION_ID" ]; then
     actas_lock_release "$TEAM_NAME" "$TARGET_AGENT" "$SESSION_ID" 2>/dev/null || true
   fi
+
+  # One logical reset may rewrite or delete several physical records, but it
+  # emits exactly one best-effort audit event for this team after the final
+  # successful config mutation.
+  agmsg_team_config_audit "$TEAM_NAME" reset "$TARGET_AGENT" "$PROJECT_PATH" || true
 done
 
 if [ "$REMOVED" -eq 0 ]; then

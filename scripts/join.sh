@@ -47,6 +47,8 @@ source "$SCRIPT_DIR/lib/resolve-project.sh"
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/registry-lock.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/team-config-audit.sh"
 # Scope resolution to the join target team (#357): a poison registration in an
 # unrelated team must not steer this join's ancestor/git-common fallback.
 # Registering a project AT $HOME or / is deliberately allowed -- both claude and
@@ -117,6 +119,11 @@ EXISTING=$(agmsg_sqlite_mem "
   WHERE key = '$AGENT_ID_SQL';
 ")
 
+# A successful write is still a no-op when this exact registration already
+# exists in the current registrations representation. Legacy single-
+# registration objects are normalized below, so those remain mutations.
+JOIN_CHANGED=1
+
 if [ -z "$EXISTING" ] || [ "$EXISTING" = "null" ]; then
   AGENT_OBJ=$(sqlite3 :memory: "SELECT json_object('registrations', json_array(json('$REGISTRATION_ESCAPED')));")
 else
@@ -148,6 +155,12 @@ else
 
   if [ "$HAS_REGISTRATION" = "1" ]; then
     AGENT_OBJ="$NORMALIZED"
+    EXISTING_REGISTRATIONS_TYPE=$(agmsg_sqlite_mem "
+      SELECT json_type(json_extract('$EXISTING_ESCAPED', '\$.registrations'));
+    ")
+    if [ "$EXISTING_REGISTRATIONS_TYPE" = "array" ]; then
+      JOIN_CHANGED=0
+    fi
   else
     AGENT_OBJ=$(agmsg_sqlite_mem "
       SELECT json_set(
@@ -190,5 +203,9 @@ UPDATED=$(agmsg_sqlite_mem \
   FROM cfg;")
 agmsg_write_atomic "$TEAM_CONFIG" "$UPDATED"
 agmsg_lock_release
+
+if [ "${JOIN_CHANGED:-1}" -ne 0 ]; then
+  agmsg_team_config_audit "$TEAM" join "$AGENT_ID" "$PROJECT_PATH" || true
+fi
 
 echo "Joined team $TEAM as $AGENT_ID"

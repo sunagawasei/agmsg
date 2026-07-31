@@ -10,9 +10,12 @@ OLD_NAME="${2:?Missing old agent name}"
 NEW_NAME="${3:?Missing new agent name}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/registry-lock.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/team-config-audit.sh"
 # Reject team names that would escape teams/ as a path segment (#140), and
 # agent names that would misroute the $.agents.<name> JSON path below (#87
 # cluster — '.', '/', '\', '"', '[', ']' all have path meaning to json1).
@@ -104,4 +107,5 @@ if [ -f "$DB" ]; then
 fi
 
 agmsg_lock_release
+agmsg_team_config_audit "$TEAM" rename-agent "$OLD_NAME" "$NEW_NAME" || true
 echo "Renamed $OLD_NAME → $NEW_NAME in team $TEAM"
