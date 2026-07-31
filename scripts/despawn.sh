@@ -64,6 +64,23 @@ case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout must be a whole number of seconds
 
 SPAWN_REC="$(agmsg_spawn_path "$TEAM" "$NAME")"
 
+# A plain/non-watchdog despawn is an intentional stop and therefore invalidates
+# a pending watchdog recovery reservation before any force/graceful branch can
+# return. A watchdog-scoped call carries its owner token and never invalidates
+# an intent here; after compare-and-act, watchdog removes only the reservation
+# that still matches its exact owner/record stamp. Only a plain caller performs
+# invalidation. This mechanism does not alter reset/kill/record cleanup.
+WATCHDOG_TOKEN="${AGMSG_WATCHDOG_INTENT_TOKEN:-}"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/validate.sh"
+if agmsg_validate_team_name "$TEAM" >/dev/null 2>&1 \
+    && agmsg_validate_agent_name "$NAME" >/dev/null 2>&1; then
+  WATCHDOG_INTENT="$SKILL_DIR/run/watchdog.$TEAM.$NAME.intent"
+  if [ -z "$WATCHDOG_TOKEN" ]; then
+    rm -f -- "$WATCHDOG_INTENT" 2>/dev/null || true
+  fi
+fi
+
 # Headless codex workers (recorded as pid:<n>) have no watcher to answer a
 # ctrl:despawn — the graceful path's free-lock branch would just drop the record
 # and leave the bridge running. Promote to the force path so we actually stop it.
@@ -89,8 +106,13 @@ fi
 # SIGKILL fallback.
 kill_headless_pid() {
   local pid="$1" team="$2" name="$3" type="${4:-codex}" meta meta_pid n=0 args identity_key
+  local kill_poll_interval kill_poll_max
   local -a argv=() arg
   local bridge_token=0 identity_token=0 expect_identity=0
+  kill_poll_interval="$(agmsg_wait_knob_resolve \
+    "${AGMSG_KILL_POLL_INTERVAL-}" 1 0.01 60 decimal)"
+  kill_poll_max="$(agmsg_wait_knob_resolve \
+    "${AGMSG_KILL_POLL_MAX-}" 5 1 10000 integer)"
   meta="$SKILL_DIR/run/$type-bridge.$team.$name.meta"
   [ -f "$meta" ] && meta_pid="$(sed -n 's/^pid=//p' "$meta" 2>/dev/null)"
   kill -0 "$pid" 2>/dev/null || return 0
@@ -124,7 +146,10 @@ kill_headless_pid() {
     fi
   fi
   kill "$pid" 2>/dev/null || true
-  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 5 ]; do sleep 1; n=$((n + 1)); done
+  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt "$kill_poll_max" ]; do
+    sleep "$kill_poll_interval"
+    n=$((n + 1))
+  done
   if kill -0 "$pid" 2>/dev/null; then
     kill -9 "$pid" 2>/dev/null || true
     echo "despawn: bridge pid $pid did not exit on SIGTERM — sent SIGKILL" >&2
@@ -199,7 +224,8 @@ if [ "$FORCE" = "1" ]; then
   kill_recorded_placement "$rec"
   # Drop the member's registration, and release its (now-stale) lock.
   if [ -n "${_proj:-}" ] && [ -n "${_type:-}" ]; then
-    "$SCRIPT_DIR/reset.sh" "$_proj" "$_type" "$NAME" >/dev/null 2>&1 || true
+    # Internal teardown must not remove an equivalent registration in another team.
+    "$SCRIPT_DIR/reset.sh" --team "$TEAM" "$_proj" "$_type" "$NAME" >/dev/null 2>&1 || true
   fi
   owner="$(actas_lock_owner "$TEAM" "$NAME")"
   [ -n "$owner" ] && actas_lock_release "$TEAM" "$NAME" "$owner" 2>/dev/null || true
@@ -226,19 +252,52 @@ esac
 
 "$SCRIPT_DIR/send.sh" "$TEAM" "$FROM" "$NAME" "ctrl:despawn" >/dev/null
 
-waited=0
+despawn_poll_interval="$(agmsg_wait_knob_resolve \
+  "${AGMSG_DESPAWN_WAIT_POLL_INTERVAL-}" 1 0.01 60 decimal)"
+wait_started=""
+wait_last=""
+wait_now=""
+wait_elapsed=0
 while true; do
   state="$(actas_lock_state "$TEAM" "$NAME" "" 2>/dev/null || echo free)"
   [ "$state" = "free" ] && break
-  if [ "$waited" -ge "$TIMEOUT" ]; then
-    echo "status=timeout name=$NAME team=$TEAM after=${TIMEOUT}s"
+  if ! wait_now="$(_agmsg_wait_epoch_seconds)"; then
+    echo "status=timeout name=$NAME team=$TEAM after=${wait_elapsed}s"
+    echo "despawn: '$NAME' could not read wall-clock time while waiting for teardown" >&2
+    exit 3
+  fi
+  if [ -z "$wait_started" ]; then
+    wait_started="$wait_now"
+    wait_last="$wait_now"
+    wait_elapsed=0
+  elif [ "$wait_now" -lt "$wait_last" ]; then
+    # A backward wall-clock adjustment resets the local baseline instead of
+    # retaining a future deadline that could wedge graceful teardown.
+    wait_started="$wait_now"
+    wait_last="$wait_now"
+    wait_elapsed=0
+  else
+    wait_last="$wait_now"
+    wait_elapsed=$((wait_now - wait_started))
+  fi
+  if [ "$wait_elapsed" -ge "$TIMEOUT" ]; then
+    echo "status=timeout name=$NAME team=$TEAM after=${wait_elapsed}s"
     echo "despawn: '$NAME' did not tear down within ${TIMEOUT}s — its watcher may be dead. Retry with --force." >&2
     exit 3
   fi
-  sleep 1
-  waited=$((waited + 1))
+  sleep "$despawn_poll_interval"
 done
 
 rm -f "$SPAWN_REC" 2>/dev/null || true
 gc_bridge_state
-echo "status=ok name=$NAME team=$TEAM after=${waited}s"
+# Refresh telemetry after a successful state transition when the clock is
+# still readable; success itself must not be turned into a failure by a clock
+# error after the member released its role.
+if [ -n "$wait_started" ] && wait_now="$(_agmsg_wait_epoch_seconds)"; then
+  if [ "$wait_now" -lt "$wait_last" ]; then
+    wait_elapsed=0
+  else
+    wait_elapsed=$((wait_now - wait_started))
+  fi
+fi
+echo "status=ok name=$NAME team=$TEAM after=${wait_elapsed}s"

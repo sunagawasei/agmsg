@@ -78,6 +78,11 @@ if [ -n "$SNAPSHOT_PATH" ]; then
   done
 fi
 
+# Publish the intentional teardown before detaching the slow cleanup worker. A
+# watchdog recovery that races this hook must see one team-scoped owner stamp;
+# the worker removes it only when the stamp still belongs to this instance.
+printf '%s\n' "$INSTANCE_ID" >"$RUN_DIR/watchdog.$STEAM.tombstone" 2>/dev/null || true
+
 # Detach the cleanup so it survives this hook returning AND CC exiting. Prefer
 # setsid (a clean new session) where present; macOS has no setsid binary, so fall
 # back to nohup + & — the same pattern spawn.sh uses to launch the codex bridge,

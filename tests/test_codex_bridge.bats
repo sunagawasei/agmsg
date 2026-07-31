@@ -2,6 +2,14 @@
 
 load test_helper
 
+socket_is_ready() {
+  [ -S "$1" ]
+}
+
+file_is_nonempty() {
+  [ -s "$1" ]
+}
+
 setup() {
   setup_test_env
   export PROJ="$TEST_SKILL_DIR/proj"
@@ -245,10 +253,7 @@ EOF
 
   node "$fake" "$sock" "$log" 3>&- &
   local server_pid="$!"
-  for _ in {1..50}; do
-    [ -S "$sock" ] && break
-    sleep 0.1
-  done
+  wait_until 5 socket_is_ready "$sock"
 
   run node "$TYPES/codex/codex-bridge.js" \
     --project "$PROJ" --team team --name alice --thread thread-existing \
@@ -378,10 +383,7 @@ EOF
 
   node "$fake" "$portfile" "$log" 3>&- &
   local server_pid="$!"
-  for _ in {1..50}; do
-    [ -s "$portfile" ] && break
-    sleep 0.1
-  done
+  wait_until 5 file_is_nonempty "$portfile"
   local port
   port="$(cat "$portfile")"
 
@@ -430,10 +432,7 @@ EOF
 
   node "$fake" "$portfile" "$log" 3>&- &
   local server_pid="$!"
-  for _ in {1..50}; do
-    [ -s "$portfile" ] && break
-    sleep 0.1
-  done
+  wait_until 5 file_is_nonempty "$portfile"
   local port
   port="$(cat "$portfile")"
   local runner
@@ -498,10 +497,7 @@ EOF
 
   node "$fake" "$portfile" "$log" 3>&- &
   local server_pid="$!"
-  for _ in {1..50}; do
-    [ -s "$portfile" ] && break
-    sleep 0.1
-  done
+  wait_until 5 file_is_nonempty "$portfile"
   local port
   port="$(cat "$portfile")"
   local runner
@@ -1386,54 +1382,33 @@ EOF
   [[ "$output" =~ "stopping to avoid a repeated wakeup loop" ]]
 }
 
-@test "codex-bridge: stops after the configured watch-once failure limit" {
-  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
-  if [ "$status" -ne 0 ]; then
-    skip "node child_process.spawn is not available in this sandbox"
-  fi
+@test "codex-bridge: watch-once failures use staged backoff and ten-minute continuous threshold" {
+  local probe="$TEST_SKILL_DIR/watch-backoff-probe.js"
+  cat >"$probe" <<'EOF'
+const bridge = require(process.argv[2]);
+let now = 0;
+const logs = [];
+const controller = new bridge.WatchFailureBackoff({ now: () => now, log: (line) => logs.push(line) });
+const delays = [];
+for (let i = 0; i < 7; i += 1) delays.push(controller.failure().delayMs);
+if (JSON.stringify(delays) !== JSON.stringify([1000, 5000, 25000, 60000, 60000, 60000, 60000])) process.exit(1);
+if (logs.length !== 4 || !logs[3].includes("60s")) process.exit(2);
+if (controller.failure().stop) process.exit(3);
 
-  local fake="$TEST_SKILL_DIR/fake-app-server-watch-fail.js"
-  cat >"$fake" <<'EOF'
-const readline = require("readline");
-const rl = readline.createInterface({ input: process.stdin });
+controller.success();
+now = 1000;
+if (controller.failure().delayMs !== 1000 || logs.length !== 5) process.exit(4);
 
-function send(value) {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
-}
-
-rl.on("line", (line) => {
-  const message = JSON.parse(line);
-  if (message.method === "initialize") {
-    send({ jsonrpc: "2.0", id: message.id, result: {} });
-  } else if (message.method === "thread/start") {
-    send({ jsonrpc: "2.0", id: message.id, result: { thread: { id: "thread-1", status: { type: "idle" } } } });
-  } else if (message.method === "process/spawn") {
-    send({ jsonrpc: "2.0", id: message.id, result: {} });
-    setTimeout(() => {
-      send({
-        jsonrpc: "2.0",
-        method: "process/exited",
-        params: {
-          processHandle: message.params.processHandle,
-          exitCode: 1,
-          stdout: "",
-          stderr: "fake watch failure",
-        },
-      });
-    }, 10);
-  } else if (message.method === "process/kill") {
-    send({ jsonrpc: "2.0", id: message.id, result: {} });
-  }
-});
+controller.success();
+now = 5000;
+if (controller.failure().stop) process.exit(5);
+now = 5000 + bridge.WATCH_FAILURE_STOP_MS - 1;
+if (controller.failure().stop) process.exit(6);
+now += 1;
+if (!controller.failure().stop) process.exit(7);
 EOF
-
-  AGMSG_CODEX_APP_SERVER_CMD="node $fake" run node "$TYPES/codex/codex-bridge.js" \
-    --project "$PROJ" --team team --name alice --timeout 1 --interval 1 \
-    --request-timeout-ms 1000 --watch-failure-limit 1
-
-  [ "$status" -eq 1 ]
-  [[ "$output" =~ "watch-once failed with exit 1: fake watch failure" ]]
-  [[ "$output" =~ "stopping after 1 consecutive watch-once failure" ]]
+  run node "$probe" "$TYPES/codex/codex-bridge.js"
+  [ "$status" -eq 0 ]
 }
 
 @test "codex-bridge: watch-once timeout exit does not count toward failure limit" {

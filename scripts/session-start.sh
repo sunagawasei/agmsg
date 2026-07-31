@@ -77,6 +77,13 @@ fi
 SESSION_TEAM=""
 [ "$TYPE" = "claude-code" ] && SESSION_TEAM="$(agmsg_session_team_name_from_id "$SESSION_ID")"
 
+# SessionEnd publishes an intentional-teardown tombstone before detaching its
+# worker. Clear only this session's marker on its next start; other session
+# teams may still be tearing down and must remain protected from recovery.
+if [ -n "$SESSION_TEAM" ]; then
+  rm -f "$RUN_DIR/watchdog.$SESSION_TEAM.tombstone" 2>/dev/null || true
+fi
+
 # Synthetic fallback for the watcher instance id only (keeps the directive
 # actionable outside the hook flow); deliberately AFTER team resolution so it
 # never feeds the session team.

@@ -40,7 +40,7 @@ Options:
   --request-timeout-ms <ms>
                           Max wait for each app-server request (default: 30000).
   --watch-failure-limit <n>
-                          Stop after n consecutive watch-once failures; 0 disables (default: 3).
+                          Deprecated compatibility option; staged retry/backoff is always used.
   --app-server <url>      Connect through an existing app-server endpoint.
                           Supports unix://PATH or ws://host:port over WebSocket.
   --thread <id|current|loaded>
@@ -182,6 +182,50 @@ function parseArgs(argv) {
     die(`project path is not a directory: ${opts.project}`);
   }
   return opts;
+}
+
+const WATCH_FAILURE_DELAYS_MS = [1000, 5000, 25000, 60000];
+const WATCH_FAILURE_STOP_MS = 10 * 60 * 1000;
+
+function monotonicNowMs() {
+  return Number(process.hrtime.bigint() / 1000000n);
+}
+
+// Tracks one continuous watch-once failure episode. The clock is injected so
+// tests can exercise the ten-minute boundary without sleeping; production uses
+// process.hrtime, which cannot wedge when wall time moves backward.
+class WatchFailureBackoff {
+  constructor({ now = monotonicNowMs, log = () => {} } = {}) {
+    this.now = now;
+    this.log = log;
+    this.startedAt = null;
+    this.stage = 0;
+    this.loggedStage = -1;
+  }
+
+  success() {
+    this.startedAt = null;
+    this.stage = 0;
+    this.loggedStage = -1;
+  }
+
+  failure() {
+    const current = this.now();
+    if (this.startedAt === null) this.startedAt = current;
+    const elapsedMs = Math.max(0, current - this.startedAt);
+    if (elapsedMs >= WATCH_FAILURE_STOP_MS) {
+      return { stop: true, elapsedMs, delayMs: 0, stage: this.stage };
+    }
+
+    const stage = Math.min(this.stage, WATCH_FAILURE_DELAYS_MS.length - 1);
+    const delayMs = WATCH_FAILURE_DELAYS_MS[stage];
+    if (stage !== this.loggedStage) {
+      this.log(`codex-bridge: watch-once backoff stage ${stage + 1}: retrying in ${delayMs / 1000}s`);
+      this.loggedStage = stage;
+    }
+    this.stage = Math.min(stage + 1, WATCH_FAILURE_DELAYS_MS.length - 1);
+    return { stop: false, elapsedMs, delayMs, stage };
+  }
 }
 
 function runScript(script, args) {
@@ -820,7 +864,9 @@ class CodexBridge {
     this.wakeCount = 0;
     this.lastWakeMaxId = 0;
     this.staleWakeCount = 0;
-    this.watchFailureCount = 0;
+    this.watchFailureBackoff = new WatchFailureBackoff({
+      log: (message) => console.error(message),
+    });
     this.watchRearmTimer = null;
     this.inlineInboxText = "";
     // inline-inbox consumption tracking. turn/start's RESPONSE carries no turn id
@@ -1075,7 +1121,7 @@ class CodexBridge {
     this.watchHandle = null;
 
     if (params.exitCode === 0) {
-      this.watchFailureCount = 0;
+      this.watchFailureBackoff.success();
       const maxId = parseMaxId(params.stdout);
       if (this.isStaleWake(maxId)) {
         await this.shutdown();
@@ -1089,30 +1135,28 @@ class CodexBridge {
     }
 
     if (params.exitCode === 2) {
-      this.watchFailureCount = 0;
+      this.watchFailureBackoff.success();
       await this.armWatch();
       return;
     }
 
-    this.watchFailureCount += 1;
     const detail = [params.stderr, params.stdout].filter(Boolean).join("\n").trim();
     console.error(`codex-bridge: watch-once failed with exit ${params.exitCode}${detail ? `: ${detail}` : ""}`);
-    if (this.opts.watchFailureLimit > 0 && this.watchFailureCount >= this.opts.watchFailureLimit) {
-      console.error(
-        `codex-bridge: stopping after ${this.watchFailureCount} consecutive watch-once failure(s)`,
-      );
+    const retry = this.watchFailureBackoff.failure();
+    if (retry.stop) {
+      console.error("codex-bridge: stopping after 10 minutes of continuous watch-once failure");
       await this.shutdown();
       process.exit(1);
     }
-    this.scheduleWatchRearm();
+    this.scheduleWatchRearm(retry.delayMs);
   }
 
-  scheduleWatchRearm() {
+  scheduleWatchRearm(delayMs = 5000) {
     if (this.stopping || this.watchHandle || this.watchRearmTimer) return;
     this.watchRearmTimer = setTimeout(() => {
       this.watchRearmTimer = null;
       this.armWatch().catch((error) => this.failClientHandler("process/exited", error));
-    }, 5000);
+    }, delayMs);
   }
 
   clearWatchRearmTimer() {
@@ -1772,4 +1816,9 @@ if (require.main === module) {
   main().catch((error) => die(error.message));
 }
 
-module.exports = { toPosixPath };
+module.exports = {
+  toPosixPath,
+  WatchFailureBackoff,
+  WATCH_FAILURE_DELAYS_MS,
+  WATCH_FAILURE_STOP_MS,
+};

@@ -40,10 +40,17 @@ SNAPSHOT_PATH="${5-}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
+STEAM="s-${SESSION_ID%%.*}"
+WATCHDOG_TOMBSTONE="$RUN_DIR/watchdog.$STEAM.tombstone"
 cleanup_snapshot() {
+  local current
+  current="$(cat "$WATCHDOG_TOMBSTONE" 2>/dev/null || true)"
+  [ "$current" = "$INSTANCE_ID" ] && rm -f "$WATCHDOG_TOMBSTONE" 2>/dev/null || true
   [ -n "$SNAPSHOT_PATH" ] && rm -f -- "$SNAPSHOT_PATH" 2>/dev/null || true
 }
 trap cleanup_snapshot EXIT
+trap 'exit 0' HUP INT TERM
+
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
@@ -55,44 +62,9 @@ source "$SCRIPT_DIR/lib/session-team.sh"
 # a session that persists across /clear keeps its marker until the process dies.
 agmsg_marker_gc_stale 2>/dev/null || true
 
-# session-team mode: tear down THIS session's headless workers so they do not
-# linger after the session ends — but ONLY if this is the last live instance of the
-# session. Parallel --continue/--resume processes share the bare-session team
-# s-<uuid> (and its workers); if a sibling is still alive, killing the workers
-# would break its in-flight asks. The team config and message history
-# are kept regardless, so a later resume lazily re-spawns a codex.
-#
-# A missing or empty snapshot means there were no spawn records at hook time.
-# Only pid:* placements are headless and eligible; interactive tmux/herdr records
-# stay intact. Pass each hook-time record to despawn --expect-record so one
-# worker's replacement cannot block unrelated workers from being reaped.
-if [ "$TYPE" = "claude-code" ] && agmsg_session_team_enabled && [ -s "$SNAPSHOT_PATH" ]; then
-  STEAM="s-${SESSION_ID%%.*}"
-  self_pid=""
-  agmsg_instance_is_composite "$INSTANCE_ID" && self_pid="${INSTANCE_ID##*.}"
-  sibling_alive=0
-  for f in "$RUN_DIR"/cc-instance.*; do
-    [ -f "$f" ] || continue
-    p=${f##*.}
-    case "$p" in ''|*[!0-9]*) continue ;; esac
-    [ -n "$self_pid" ] && [ "$p" = "$self_pid" ] && continue
-    _agmsg_pid_alive "$p" || continue
-    s="$(cat "$f" 2>/dev/null || true)"
-    [ "${s%%.*}" = "${SESSION_ID%%.*}" ] && { sibling_alive=1; break; }
-  done
-  if [ "$sibling_alive" -eq 0 ]; then
-    while IFS=$'\t' read -r NAME RECORD || [ -n "${NAME:-}${RECORD:-}" ]; do
-      PLACEMENT="${RECORD%%$'\t'*}"
-      case "$PLACEMENT" in
-        pid:*)
-          "$SCRIPT_DIR/despawn.sh" "$STEAM" claude "$NAME" --force \
-            --expect-record "$RECORD" >/dev/null 2>&1 || true
-          ;;
-      esac
-    done < "$SNAPSHOT_PATH"
-  fi
-fi
-
+# Stop this session's watcher before entering the headless despawn loop. The
+# watcher can otherwise observe the records while teardown is in progress and
+# recover a worker after the loop has already decided to reap it.
 PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
 if [ -f "$PIDFILE" ]; then
   pid=$(cat "$PIDFILE" 2>/dev/null || true)
@@ -107,6 +79,46 @@ if [ -f "$PIDFILE" ]; then
     esac
   fi
   rm -f "$PIDFILE"
+fi
+
+# session-team mode: tear down THIS session's headless workers so they do not
+# linger after the session ends — but ONLY if this is the last live instance of the
+# session. Parallel --continue/--resume processes share the bare-session team
+# s-<uuid> (and its workers); if a sibling is still alive, killing the workers
+# would break its in-flight asks. The team config and message history
+# are kept regardless, so a later resume lazily re-spawns a codex.
+#
+# A missing or empty snapshot means there were no spawn records at hook time.
+# Only pid:* placements are headless and eligible; interactive tmux/herdr records
+# stay intact. Pass each hook-time record to despawn --expect-record so one
+# worker's replacement cannot block unrelated workers from being reaped.
+session_team_mode=0
+if [ "$TYPE" = "claude-code" ] && agmsg_session_team_enabled; then
+  session_team_mode=1
+  self_pid=""
+  agmsg_instance_is_composite "$INSTANCE_ID" && self_pid="${INSTANCE_ID##*.}"
+  sibling_alive=0
+  for f in "$RUN_DIR"/cc-instance.*; do
+    [ -f "$f" ] || continue
+    p=${f##*.}
+    case "$p" in ''|*[!0-9]*) continue ;; esac
+    [ -n "$self_pid" ] && [ "$p" = "$self_pid" ] && continue
+    _agmsg_pid_alive "$p" || continue
+    s="$(cat "$f" 2>/dev/null || true)"
+    [ "${s%%.*}" = "${SESSION_ID%%.*}" ] && { sibling_alive=1; break; }
+  done
+fi
+
+if [ "$session_team_mode" -eq 1 ] && [ "$sibling_alive" -eq 0 ] && [ -s "$SNAPSHOT_PATH" ]; then
+  while IFS=$'\t' read -r NAME RECORD || [ -n "${NAME:-}${RECORD:-}" ]; do
+    PLACEMENT="${RECORD%%$'\t'*}"
+    case "$PLACEMENT" in
+      pid:*)
+        "$SCRIPT_DIR/despawn.sh" "$STEAM" claude "$NAME" --force \
+          --expect-record "$RECORD" >/dev/null 2>&1 || true
+        ;;
+    esac
+  done < "$SNAPSHOT_PATH"
 fi
 
 # Drop the per-session stream watermark (see #107) — the session is ending, so
