@@ -155,6 +155,38 @@ assert_claude_artifacts_absent() {
   printf '%s\n' "$output" | grep -Fxq "$TEAM"$'\t'"$sibling"
 }
 
+@test "despawn resets the recorded claude-code scratch project despite an ambient marker" {
+  skip_on_windows "process argv faking via exec -a (#349)"
+  local name='marker-reset' scratch="$RUN/claude-code-$TEAM-marker-reset-cwd"
+  local agent_pid bridge_pid
+  mkdir -p "$scratch"
+  AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" \
+    "$TEAM" "$name" claude-code "$PROJ" >/dev/null
+  AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" \
+    "$TEAM" "$name" claude-code "$scratch" >/dev/null
+
+  test_fixture_start_agent "2.1.199" --bg-spare
+  agent_pid="$TEST_FIXTURE_PID"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/resolve-project.sh"
+  agmsg_write_project_marker "$agent_pid" "$PROJ"
+
+  start_sleep_process
+  bridge_pid="$LAST_PID"
+  write_record "$TEAM" "$name" "$bridge_pid" "$scratch"
+  write_meta "$TEAM" "$name" "$bridge_pid"
+
+  run env AGMSG_AGENT_PID="$agent_pid" AGMSG_RESOLVE_PROJECT=1 \
+    bash "$SCRIPTS/despawn.sh" "$TEAM" leader "$name" --force
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"status=forced"* ]]
+  run bash "$SCRIPTS/identities.sh" "$scratch" claude-code
+  ! printf '%s\n' "$output" | grep -Fxq "$TEAM"$'\t'"$name"
+  run bash "$SCRIPTS/identities.sh" "$PROJ" claude-code
+  printf '%s\n' "$output" | grep -Fxq "$TEAM"$'\t'"$name"
+  test_fixture_cleanup
+}
+
 @test "despawn meta-absent argv guard kills only exact claude-code identity" {
   local correct='argv-correct' wrong='argv-wrong' wrong_bridge='argv-wrong-bridge'
   local key_suffix='argv-key-suffix' missing='argv-missing'

@@ -225,7 +225,12 @@ if [ "$FORCE" = "1" ]; then
   # Drop the member's registration, and release its (now-stale) lock.
   if [ -n "${_proj:-}" ] && [ -n "${_type:-}" ]; then
     # Internal teardown must not remove an equivalent registration in another team.
-    "$SCRIPT_DIR/reset.sh" --team "$TEAM" "$_proj" "$_type" "$NAME" >/dev/null 2>&1 || true
+    if [ "$_type" = "claude-code" ]; then
+      AGMSG_RESOLVE_PROJECT=0 \
+        "$SCRIPT_DIR/reset.sh" --team "$TEAM" "$_proj" "$_type" "$NAME" >/dev/null 2>&1 || true
+    else
+      "$SCRIPT_DIR/reset.sh" --team "$TEAM" "$_proj" "$_type" "$NAME" >/dev/null 2>&1 || true
+    fi
   fi
   owner="$(actas_lock_owner "$TEAM" "$NAME")"
   [ -n "$owner" ] && actas_lock_release "$TEAM" "$NAME" "$owner" 2>/dev/null || true

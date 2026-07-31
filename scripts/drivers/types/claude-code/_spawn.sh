@@ -521,6 +521,7 @@ agmsg_claude_prepare_child_env() {
   local worker_home="$1" child_tmp="$2"
   export CLAUDE_CONFIG_DIR="$worker_home"
   export TMPDIR="$child_tmp"
+  export AGMSG_RESOLVE_PROJECT=0
   unset CLAUDE_CODE_SESSION_ID CLAUDECODE CLAUDE_CODE_CHILD_SESSION
   # Do not let caller-controlled non-interactive shell startup/wrapper state
   # pre-execute or redirect a probe/bridge Bash command.

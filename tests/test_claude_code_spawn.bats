@@ -70,10 +70,11 @@ shellopts_exported=unset
 bashopts_exported=unset
 env | grep -q '^SHELLOPTS=' && shellopts_exported=set
 env | grep -q '^BASHOPTS=' && bashopts_exported=set
-printf 'cwd=%s\nconfig=%s\nsid=%s\nclaudecode=%s\nchild=%s\ntmpdir=%s\nbash_env=%s\nenv=%s\nprompt_command=%s\ncdpath=%s\nzdotdir=%s\nclaude_env_file=%s\nshellopts_exported=%s\nbashopts_exported=%s\n' \
+printf 'cwd=%s\nconfig=%s\nsid=%s\nclaudecode=%s\nchild=%s\ntmpdir=%s\nresolve_project=%s\nbash_env=%s\nenv=%s\nprompt_command=%s\ncdpath=%s\nzdotdir=%s\nclaude_env_file=%s\nshellopts_exported=%s\nbashopts_exported=%s\n' \
   "$PWD" "${CLAUDE_CONFIG_DIR:-<unset>}" \
   "${CLAUDE_CODE_SESSION_ID:-<unset>}" "${CLAUDECODE:-<unset>}" \
   "${CLAUDE_CODE_CHILD_SESSION:-<unset>}" "${TMPDIR:-<unset>}" \
+  "${AGMSG_RESOLVE_PROJECT:-<unset>}" \
   "${BASH_ENV:-<unset>}" "${ENV:-<unset>}" "${PROMPT_COMMAND:-<unset>}" \
   "${CDPATH:-<unset>}" "${ZDOTDIR:-<unset>}" "${CLAUDE_ENV_FILE:-<unset>}" \
   "$shellopts_exported" "$bashopts_exported" > "$env_file"
@@ -230,10 +231,11 @@ shellopts_exported=unset
 bashopts_exported=unset
 env | grep -q '^SHELLOPTS=' && shellopts_exported=set
 env | grep -q '^BASHOPTS=' && bashopts_exported=set
-printf 'cwd=%s\nconfig=%s\nsid=%s\nclaudecode=%s\nchild=%s\ntmpdir=%s\nbash_env=%s\nenv=%s\nprompt_command=%s\ncdpath=%s\nzdotdir=%s\nclaude_env_file=%s\nshellopts_exported=%s\nbashopts_exported=%s\n' \
+printf 'cwd=%s\nconfig=%s\nsid=%s\nclaudecode=%s\nchild=%s\ntmpdir=%s\nresolve_project=%s\nbash_env=%s\nenv=%s\nprompt_command=%s\ncdpath=%s\nzdotdir=%s\nclaude_env_file=%s\nshellopts_exported=%s\nbashopts_exported=%s\n' \
   "$PWD" "${CLAUDE_CONFIG_DIR:-<unset>}" \
   "${CLAUDE_CODE_SESSION_ID:-<unset>}" "${CLAUDECODE:-<unset>}" \
   "${CLAUDE_CODE_CHILD_SESSION:-<unset>}" "${TMPDIR:-<unset>}" \
+  "${AGMSG_RESOLVE_PROJECT:-<unset>}" \
   "${BASH_ENV:-<unset>}" "${ENV:-<unset>}" "${PROMPT_COMMAND:-<unset>}" \
   "${CDPATH:-<unset>}" "${ZDOTDIR:-<unset>}" "${CLAUDE_ENV_FILE:-<unset>}" \
   "$shellopts_exported" "$bashopts_exported" > "$FAKE_CAPTURE/bridge.env.$name"
@@ -645,6 +647,7 @@ policy_shape() {
   grep -Fxq 'claudecode=<unset>' "$CAPTURE/probe.env.1"
   grep -Fxq 'child=<unset>' "$CAPTURE/probe.env.1"
   grep -Fxq "tmpdir=$scratch/tmp" "$CAPTURE/probe.env.1"
+  grep -Fxq 'resolve_project=0' "$CAPTURE/probe.env.1"
   grep -Fxq 'bash_env=<unset>' "$CAPTURE/probe.env.1"
   grep -Fxq 'env=<unset>' "$CAPTURE/probe.env.1"
   grep -Fxq 'prompt_command=<unset>' "$CAPTURE/probe.env.1"
@@ -655,6 +658,7 @@ policy_shape() {
   grep -Fxq 'bashopts_exported=unset' "$CAPTURE/probe.env.1"
   grep -Fxq "cwd=$scratch" "$CAPTURE/bridge.env.consultant"
   grep -Fxq "tmpdir=$scratch/tmp" "$CAPTURE/bridge.env.consultant"
+  grep -Fxq 'resolve_project=0' "$CAPTURE/bridge.env.consultant"
   grep -Fxq 'ARG=--output-format' "$CAPTURE/bridge.args.consultant"
   grep -Fxq 'ARG=json' "$CAPTURE/bridge.args.consultant"
   grep -Fxq 'ARG=--identity-key' "$CAPTURE/bridge.args.consultant"

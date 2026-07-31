@@ -207,7 +207,7 @@ JSON
 
 # --- marker precedence (forced via function overrides) ---
 
-@test "resolve: a valid marker wins over the ancestor walk" {
+@test "resolve: an interactive session keeps marker precedence when the headless opt-out exists" {
   reg T alice "$ROOT"
   local markroot="$(mktemp -d)"
   # Force a marker lookup that succeeds for a synthetic pid.
@@ -215,7 +215,7 @@ JSON
   agmsg_pid_is_agent() { return 0; }
   agmsg_write_project_marker 4242 "$markroot"
 
-  result="$(agmsg_resolve_project "$ROOT/sub/deep" claude-code)"
+  result="$(AGMSG_RESOLVE_PROJECT=1 agmsg_resolve_project "$ROOT/sub/deep" claude-code)"
   [ "$result" = "$markroot" ]
   rm -rf "$markroot"
 }

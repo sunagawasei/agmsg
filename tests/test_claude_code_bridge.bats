@@ -230,6 +230,37 @@ session_file() {
   [ ! -e "$RUN/claude-code-bridge.team.worker.role" ]
 }
 
+@test "claude-code bridge keeps its deliberate scratch project with an ambient interactive marker" {
+  skip_on_windows "process argv faking via exec -a (#349)"
+  local team='scratch-team' name='scratch-worker'
+  local scratch="$RUN/claude-code-$team-$name-cwd"
+  local marker_project="$PROJ" agent_pid
+  mkdir -p "$scratch"
+  AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" \
+    "$team" "$name" claude-code "$scratch" >/dev/null
+
+  test_fixture_start_agent "2.1.199" --bg-spare
+  agent_pid="$TEST_FIXTURE_PID"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/resolve-project.sh"
+  agmsg_write_project_marker "$agent_pid" "$marker_project"
+  [ "$(AGMSG_AGENT_PID="$agent_pid" AGMSG_RESOLVE_PROJECT=1 \
+    agmsg_resolve_project "$scratch" claude-code)" = "$marker_project" ]
+
+  printf '%s' 'scratch canary' \
+    | bash "$SCRIPTS/send.sh" "$team" alice "$name" --stdin --force >/dev/null
+  export FAKE_MODE=no-outbound
+  run env AGMSG_AGENT_PID="$agent_pid" AGMSG_RESOLVE_PROJECT=0 \
+    bash "$TYPES/claude-code/claude-code-bridge.sh" \
+      --project "$scratch" --team "$team" --name "$name" \
+      --identity-key scratch-key. --once --watch-timeout 1 \
+      --interval 1 --turn-timeout 5
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"claude-code-bridge: wakeup 1 for $team/$name"* ]]
+  grep -Fq 'scratch canary' "$CAPTURE/prompt.1"
+  test_fixture_cleanup
+}
+
 @test "runtime disallowedTools values are forwarded and remain absent when probe policy omits them" {
   send_to_worker alice "review runtime"
   run bridge \
