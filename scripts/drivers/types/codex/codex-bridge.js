@@ -186,6 +186,7 @@ function parseArgs(argv) {
 
 const WATCH_FAILURE_DELAYS_MS = [1000, 5000, 25000, 60000];
 const WATCH_FAILURE_STOP_MS = 10 * 60 * 1000;
+const WATCH_TIMEOUT_REARM_DELAY_MS = 1000;
 
 function monotonicNowMs() {
   return Number(process.hrtime.bigint() / 1000000n);
@@ -867,6 +868,7 @@ class CodexBridge {
     this.watchFailureBackoff = new WatchFailureBackoff({
       log: (message) => console.error(message),
     });
+    this.watchTimeoutKillCount = 0;
     this.watchRearmTimer = null;
     this.inlineInboxText = "";
     // inline-inbox consumption tracking. turn/start's RESPONSE carries no turn id
@@ -1137,6 +1139,19 @@ class CodexBridge {
     if (params.exitCode === 2) {
       this.watchFailureBackoff.success();
       await this.armWatch();
+      return;
+    }
+
+    if (params.exitCode === 124) {
+      this.watchFailureBackoff.success();
+      this.watchTimeoutKillCount += 1;
+      console.error(
+        `codex-bridge: watch-once failed with exit 124 (benign app-server timeout; count=${this.watchTimeoutKillCount}); re-arming in ${WATCH_TIMEOUT_REARM_DELAY_MS / 1000}s`,
+      );
+      // The app-server normally reports 124 only at the outer watch deadline.
+      // Keep a floor here so an unexpectedly fast 124 cannot create a tight
+      // process/spawn loop, without letting it accumulate a fatal episode.
+      this.scheduleWatchRearm(WATCH_TIMEOUT_REARM_DELAY_MS);
       return;
     }
 
@@ -1817,6 +1832,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  CodexBridge,
   toPosixPath,
   WatchFailureBackoff,
   WATCH_FAILURE_DELAYS_MS,

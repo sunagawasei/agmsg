@@ -1411,6 +1411,105 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+@test "codex-bridge: exit 124 stays visible but cannot accumulate a fatal watch episode" {
+  local fake="$TEST_SKILL_DIR/fake-app-server-held-open.js"
+  cat >"$fake" <<'EOF'
+setInterval(() => {}, 1000);
+EOF
+
+  local probe="$TEST_SKILL_DIR/watch-124-episode-probe.js"
+  cat >"$probe" <<'EOF'
+const bridgeModule = require(process.argv[2]);
+const assert = require("assert");
+
+let now = 0;
+const bridge = new bridgeModule.CodexBridge({
+  project: process.argv[3],
+  type: "codex",
+  timeout: 300,
+  interval: 2,
+  requestTimeoutMs: 0,
+  pairs: [],
+}, [{ team: "team", name: "alice" }]);
+bridge.watchFailureBackoff = new bridgeModule.WatchFailureBackoff({ now: () => now });
+const rearmDelays = [];
+bridge.scheduleWatchRearm = (delayMs) => rearmDelays.push(delayMs);
+let armed = 0;
+bridge.armWatch = async () => { armed += 1; };
+bridge.client.start();
+
+async function watchExited(exitCode) {
+  bridge.watchHandle = "watch";
+  await bridge.onProcessExited({ processHandle: "watch", exitCode, stdout: "", stderr: "" });
+}
+
+(async () => {
+  bridge.turnActive = true;
+  bridge.threadIdle = false;
+  await bridge.onTurnEnded();
+  assert.strictEqual(armed, 1);
+  assert.strictEqual(bridge.turnActive, false);
+  assert.strictEqual(bridge.threadIdle, true);
+
+  await watchExited(1);
+  assert.strictEqual(bridge.watchFailureBackoff.startedAt, 0);
+  rearmDelays.length = 0;
+  now = bridgeModule.WATCH_FAILURE_STOP_MS;
+  for (let i = 0; i < 3; i += 1) await watchExited(124);
+  assert.strictEqual(bridge.watchTimeoutKillCount, 3);
+  assert.strictEqual(bridge.watchFailureBackoff.startedAt, null);
+  assert.deepStrictEqual(rearmDelays, [1000, 1000, 1000]);
+  assert.strictEqual(bridge.stopping, false);
+  assert.strictEqual(bridge.turnActive, false);
+  assert.strictEqual(bridge.threadIdle, true);
+  assert.ok(bridge.client.child && !bridge.client.child.killed);
+
+  rearmDelays.length = 0;
+  now = 0;
+  await watchExited(1);
+  now = bridgeModule.WATCH_FAILURE_STOP_MS - 1;
+  await watchExited(1);
+  assert.strictEqual(bridge.stopping, false);
+  assert.strictEqual(bridge.client.child.killed, false);
+
+  const childStopped = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("stdio app-server did not stop")), 2000);
+    bridge.client.child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+  const realExit = process.exit;
+  let requestedExit = null;
+  process.exit = (code) => { requestedExit = code; };
+  now += 1;
+  try {
+    await watchExited(1);
+  } finally {
+    process.exit = realExit;
+  }
+  assert.strictEqual(requestedExit, 1);
+  assert.strictEqual(bridge.stopping, true);
+  assert.strictEqual(bridge.client.child.killed, true);
+  await childStopped;
+})().catch((error) => {
+  bridge.client.stop();
+  console.error(error);
+  process.exit(17);
+});
+EOF
+
+  AGMSG_CODEX_APP_SERVER_CMD="exec node $fake" \
+    run node "$probe" "$TYPES/codex/codex-bridge.js" "$PROJ"
+
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | grep -c 'watch-once failed with exit 124')" -eq 3 ]
+  [[ "$output" == *"count=1"* ]]
+  [[ "$output" == *"count=2"* ]]
+  [[ "$output" == *"count=3"* ]]
+  [[ "$output" == *"stopping after 10 minutes of continuous watch-once failure"* ]]
+}
+
 @test "codex-bridge: watch-once timeout exit does not count toward failure limit" {
   run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
   if [ "$status" -ne 0 ]; then
