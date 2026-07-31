@@ -519,9 +519,21 @@ agmsg storage paths; the user-level config alone may not be enough.
 
 ## Tests
 
+Use the fast suite while iterating. It skips only tests explicitly tagged
+`slow`:
+
 ```bash
-bats tests/    # requires bats-core: brew install bats-core
+bats --filter-tags "!slow" tests/*.bats
 ```
+
+Run the full suite before submitting a change:
+
+```bash
+bats tests/*.bats
+```
+
+Both commands require bats-core (the repository test environment uses Bats
+1.12).
 
 ## Architecture
 

@@ -35,6 +35,56 @@
 
 _actas_lock_dir() { printf '%s/run' "$SKILL_DIR"; }
 
+# Resolve a bounded wait knob without exposing malformed input to shell
+# arithmetic or sleep. The five arguments are:
+#
+#   raw default minimum maximum kind
+#
+# kind is "decimal" for a polling interval or "integer" for a count. Bounds
+# are inclusive and caller-owned, which lets despawn reuse this unchanged for
+# both its kill-poll interval and maximum poll count. Defaults and bounds are
+# trusted constants; an unset or malformed raw value always prints default.
+agmsg_wait_knob_resolve() {
+  local raw="${1-}" default="${2-}" minimum="${3-}" maximum="${4-}" kind="${5-}"
+
+  if LC_ALL=C awk \
+      -v value="$raw" -v minimum="$minimum" -v maximum="$maximum" -v kind="$kind" '
+        BEGIN {
+          if (kind == "decimal")
+            valid = value ~ /^[0-9]+([.][0-9]+)?$/
+          else if (kind == "integer")
+            valid = value ~ /^[0-9]+$/
+          else
+            valid = 0
+
+          if (!valid || value + 0 < minimum + 0 || value + 0 > maximum + 0)
+            exit 1
+        }
+      ' </dev/null
+  then
+    # Canonicalize integer counts so a later arithmetic context cannot treat a
+    # caller's leading zero as an octal prefix. Decimal sleep values are
+    # returned byte-for-byte after validation.
+    if [ "$kind" = "integer" ]; then
+      while [ "$raw" != "0" ] && [ "${raw#0}" != "$raw" ]; do
+        raw="${raw#0}"
+      done
+    fi
+    printf '%s\n' "$raw"
+  else
+    printf '%s\n' "$default"
+  fi
+}
+
+# Portable integer wall-clock sample used by bounded polling. A command that
+# prints digits and then exits non-zero is a failed sample, not valid time.
+_agmsg_wait_epoch_seconds() {
+  local now
+  now="$(date +%s 2>/dev/null)" || return 1
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$now"
+}
+
 # Encode a team or agent name into a filesystem-safe form. Anything outside
 # [A-Za-z0-9._-] is percent-encoded byte-by-byte (UTF-8 safe, reversible).
 # An earlier underscore-replacement scheme was lossy: "foo bar" and "foo_bar"
@@ -119,7 +169,11 @@ _agmsg_placement_lock_path() {
 # seconds). Callers fail-open on acquire timeout — despawn's --expect-record
 # compare is the backstop that still refuses to act on a changed record.
 agmsg_placement_lock_acquire() {
-  local team="$1" agent="$2" timeout="${3:-10}" lock waited=0 stale_match=""
+  local team="$1" agent="$2" timeout="${3:-10}" lock stale_match=""
+  local poll_interval now="" started="" last="" elapsed=0
+  case "$timeout" in ''|*[!0-9]*) return 1 ;; esac
+  poll_interval="$(agmsg_wait_knob_resolve \
+    "${AGMSG_PLACEMENT_LOCK_POLL_INTERVAL-}" 1 0.01 60 decimal)"
   lock="$(_agmsg_placement_lock_path "$team" "$agent")"
   mkdir -p "$(_actas_lock_dir)" 2>/dev/null || true
   while :; do
@@ -131,8 +185,27 @@ agmsg_placement_lock_acquire() {
       rmdir "$lock" 2>/dev/null || true
     fi
     mkdir "$lock" 2>/dev/null && return 0
-    [ "$waited" -ge "$timeout" ] && return 1
-    sleep 1; waited=$((waited + 1))
+
+    # Start the clock only after the first failed atomic acquisition, so an
+    # uncontended early success does not depend on date(1). Timeout remains
+    # seconds even when the independent polling interval is fractional.
+    now="$(_agmsg_wait_epoch_seconds)" || return 1
+    if [ -z "$started" ]; then
+      started="$now"
+      last="$now"
+      elapsed=0
+    elif [ "$now" -lt "$last" ]; then
+      # Wall-clock time can move backward. Reset the local baseline instead of
+      # retaining a future deadline that could wedge this acquisition.
+      started="$now"
+      last="$now"
+      elapsed=0
+    else
+      last="$now"
+      elapsed=$((now - started))
+    fi
+    [ "$elapsed" -ge "$timeout" ] && return 1
+    sleep "$poll_interval"
   done
 }
 

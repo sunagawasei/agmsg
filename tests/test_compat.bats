@@ -13,6 +13,22 @@ skip_unless_msys() {
   esac
 }
 
+_stub_cmdline_visible() (
+  local cmd stub_name="${_STUB##*/}"
+  # Exercise the same forced-CIM observation seam used by the fallback cases;
+  # setup readiness must not be satisfied by /proc while CIM is still stale.
+  _AGMSG_COMPAT_NO_PROC=1
+  export _AGMSG_COMPAT_NO_PROC
+  unset _AGMSG_COMPAT_NO_CIM
+  cmd="$(compat_get_cmdline "$_STUB_PID" 2>/dev/null || true)"
+  # Require the full fixture path as one command-line token, not a substring
+  # from a still-starting parent command.
+  case " $cmd " in
+    *"/$stub_name"[[:space:]]*) return 0 ;;
+  esac
+  return 1
+)
+
 setup() {
   setup_test_env
   skip_unless_msys
@@ -25,11 +41,11 @@ setup() {
 
   bash "$_STUB" 3>&- &
   _STUB_PID=$!
-  # Brief pause so the process is visible to ps / CIM.
-  sleep 1
-
   # shellcheck disable=SC1090
   source "$SCRIPTS/lib/compat.sh"
+  # Poll until the actual compat command-line lookup sees the fixture, so the
+  # MSYS / CIM path is ready without a fixed startup delay.
+  wait_until 5 _stub_cmdline_visible
 }
 
 teardown() {

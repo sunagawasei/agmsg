@@ -491,9 +491,19 @@ Codexのランタイムや自動化の一部は、単一の実行に対して管
 
 ## テスト
 
+開発中の反復には fast suite を使う。`slow` と明示されたテストだけを除外する。
+
 ```bash
-bats tests/    # bats-coreが必要: brew install bats-core
+bats --filter-tags "!slow" tests/*.bats
 ```
+
+変更を提出する前に full suite を実行する。
+
+```bash
+bats tests/*.bats
+```
+
+どちらのコマンドにも bats-core が必要となる（リポジトリのテスト環境では Bats 1.12 を使用する）。
 
 ## アーキテクチャ
 

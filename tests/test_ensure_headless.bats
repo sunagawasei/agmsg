@@ -136,14 +136,17 @@ STUB
   grep -q -- "codex worker --team s-sess-WRONG --project $PROJ --headless" "$TEST_SKILL_DIR/spawn.args"
 }
 
-@test "ensure-headless: concurrent fresh-lock contenders allow one spawn" {
+@test "ensure-headless: concurrent fresh lock contenders allow one spawn" {
   local stub_bin="$TEST_SKILL_DIR/stub-bin" pid1 pid2 status1 status2
+  local spawn_release="$TEST_SKILL_DIR/spawn.release"
   mkdir -p "$stub_bin"
+  mkfifo "$spawn_release"
   write_pgrep_stub miss >/dev/null
   cat > "$SCRIPTS/spawn.sh" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$TEST_SKILL_DIR/spawn.args"
-sleep 1
+: > "$TEST_SKILL_DIR/spawn.entered"
+IFS= read -r _ < "${spawn_release}"
 exit 0
 STUB
   chmod +x "$SCRIPTS/spawn.sh"
@@ -151,16 +154,23 @@ STUB
   env PATH="$stub_bin:$PATH" CLAUDE_CODE_SESSION_ID=sess-FRESH \
     bash "$SCRIPTS/ensure-headless.sh" codex "$PROJ" >"$TEST_SKILL_DIR/out1" 2>&1 &
   pid1=$!
+  # Establish pid1 as the winner before introducing the second contender.
+  wait_for_file "$TEST_SKILL_DIR/spawn.entered"
   env PATH="$stub_bin:$PATH" CLAUDE_CODE_SESSION_ID=sess-FRESH \
     bash "$SCRIPTS/ensure-headless.sh" codex "$PROJ" >"$TEST_SKILL_DIR/out2" 2>&1 &
   pid2=$!
-  status1=0; wait "$pid1" || status1=$?
+  # pid1 remains blocked in the FIFO while pid2 observes the fresh lock.
+  wait_for_file_contains "$TEST_SKILL_DIR/out2" "spawn already in flight"
   status2=0; wait "$pid2" || status2=$?
+  [ "$status2" -eq 0 ]
+  kill -0 "$pid1" 2>/dev/null
+  printf '\n' > "$spawn_release"
+  status1=0; wait "$pid1" || status1=$?
 
   [ "$status1" -eq 0 ]
-  [ "$status2" -eq 0 ]
   [ "$(grep -c '^codex codex ' "$TEST_SKILL_DIR/spawn.args")" -eq 1 ]
-  grep -q "spawn already in flight" "$TEST_SKILL_DIR/out1" "$TEST_SKILL_DIR/out2"
+  grep -q "spawned headless codex 'codex'" "$TEST_SKILL_DIR/out1"
+  grep -q "spawn already in flight" "$TEST_SKILL_DIR/out2"
 }
 
 @test "ensure-headless: stale lock is reclaimed before spawning" {

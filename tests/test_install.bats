@@ -143,16 +143,13 @@ teardown() {
 # got overwritten). watch.sh now self-cleans the previous holder of its
 # pidfile at startup. See #66.
 wait_for_pidfile_pid() {
+  wait_until 10 _wait_pidfile_value "$1" "$2"
+}
+
+_wait_pidfile_value() {
   local file="$1" expected="$2"
-  local i actual
-  for i in $(seq 1 30); do
-    if [ -f "$file" ]; then
-      actual="$(cat "$file")"
-      [ "$actual" = "$expected" ] && return 0
-    fi
-    sleep 0.1
-  done
-  return 1
+  [ -f "$file" ] || return 1
+  [ "$(cat "$file")" = "$expected" ]
 }
 
 @test "install: drops a Copilot SKILL.md when ~/.copilot exists" {
@@ -340,8 +337,7 @@ PS1
   # actually run — poll for its exit rather than checking the instant the
   # pidfile changes (a single check raced this and flaked, see #124; same
   # fix already applied to the equivalent check in test_watch.bats).
-  local i
-  for i in $(seq 1 30); do kill -0 "$first" 2>/dev/null || break; sleep 0.1; done
+  wait_for_pid_exit "$first"
   run kill -0 "$first"
   [ "$status" -ne 0 ]
 

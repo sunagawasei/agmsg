@@ -2,6 +2,10 @@
 
 load test_helper
 
+_capture_nonempty() {
+  [ -s "$CAPTURE" ]
+}
+
 setup() {
   setup_test_env
 
@@ -909,7 +913,7 @@ EOF
 
   # The bridge runs in the background (nohup &); wait for its capture to land.
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *"--type codex"* ]]
   [[ "$output" == *$'--pair myteam\treviewer'* ]]
@@ -973,11 +977,7 @@ STUB
   [ "$status" -eq 0 ]
   [[ "$output" == *"spawned headless codex 'aaa'"* ]]
   [[ "$output" != *"already running"* ]]
-  local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    grep -qF -- "--identity-key $short_key" "$CAPTURE" 2>/dev/null && break
-    sleep 0.2
-  done
+  wait_for_file_contains "$CAPTURE" "--identity-key $short_key"
   grep -qF -- "--identity-key $short_key" "$CAPTURE"
 }
 
@@ -1025,11 +1025,7 @@ STUB
   [ "$status" -eq 0 ]
   [[ "$output" == *"spawned headless cursor reviewer 'aaa'"* ]]
   [[ "$output" != *"already running"* ]]
-  local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    grep -qF -- "--identity-key $short_key" "$CAPTURE" 2>/dev/null && break
-    sleep 0.2
-  done
+  wait_for_file_contains "$CAPTURE" "--identity-key $short_key"
   grep -qF -- "--identity-key $short_key" "$CAPTURE"
 }
 
@@ -1046,7 +1042,7 @@ STUB
   [ "$status" -eq 0 ]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   local args appcmd
   args="$(sed -n 's/^ARGS: //p' "$CAPTURE")"
   appcmd="$(sed -n 's/^APPCMD: //p' "$CAPTURE")"
@@ -1089,7 +1085,7 @@ STUB
   [[ "$output" == *"spawned headless reviewer codex 'rv'"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *$'--pair myteam\trv'* ]]
   [[ "$output" == *"--project $PROJ"* ]]                  # cwd = the real repo
@@ -1124,7 +1120,7 @@ STUB
   [[ "$output" == *"spawned headless reviewer codex 'rv'"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *"default_permissions=agmsg-reviewer"* ]]
   [[ "$output" != *"sandbox_mode=workspace-write"* ]]
@@ -1165,7 +1161,7 @@ STUB
   [[ "$output" == *"spawned headless implementer codex 'impl'"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *$'--pair myteam\timpl'* ]]
   [[ "$output" == *"--project $PROJ"* ]]                  # cwd = the real repo
@@ -1196,7 +1192,7 @@ STUB
   [[ "$output" == *"spawned headless implementer codex 'impl2'"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *"default_permissions=agmsg-implementer"* ]]
   [[ "$output" != *"sandbox_mode=workspace-write"* ]]
@@ -1214,7 +1210,7 @@ STUB
   [[ "$output" == *"spawned headless reviewer codex 'rvw'"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *"default_permissions=agmsg-reviewer"* ]]
   [[ "$output" != *"sandbox_mode=workspace-write"* ]]
@@ -1232,7 +1228,7 @@ STUB
   [[ "$output" != *"implementer"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *"codex-myteam-cwd"* ]]                # scratch cwd, not the repo
   [[ "$output" == *"default_permissions=agmsg-consultant"* ]]
@@ -1268,7 +1264,7 @@ STUB
   [[ "$output" == *"spawned headless implementer codex 'implm'"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *"default_permissions=agmsg-implementer"* ]]   # confirms the implementer branch built appcmd
   [[ "$output" == *'model="gpt-5.6-sol"'* ]]
@@ -1290,7 +1286,7 @@ STUB
   [[ "$output" == *"spawned headless codex 'worker+3'"* ]]   # consultant, not implementer
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *"codex-myteam-cwd"* ]]                 # scratch cwd, not the repo
   [[ "$output" != *"default_permissions=agmsg-reviewer"* ]]
@@ -1368,7 +1364,7 @@ CODEX_STUB
   [ "$status" -eq 0 ]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *"\"$adddir\"=\"read\""* ]]        # the add-dir is granted READ
   [[ "$output" == *"default_permissions=agmsg-reviewer"* ]]
@@ -1385,7 +1381,7 @@ CODEX_STUB
     bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
   [ "$status" -eq 0 ]
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *"default_permissions=agmsg-reviewer"* ]]   # reviewer still active
   [[ "$output" != *"$adddir"* ]]                              # but the add-dir is not granted
@@ -1402,7 +1398,7 @@ CODEX_STUB
     bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
   [ "$status" -eq 0 ]                                          # a stale add-dir never bricks the spawn
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"/no/such/dir/xyz"* ]]
 }
@@ -1423,7 +1419,7 @@ CODEX_STUB
     bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
   [ "$status" -eq 0 ]                                       # launches on the base profile
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"PWNED"* ]]                              # payload never reached the launch command
   [ ! -e "$TEST_SKILL_DIR/PWNED" ]                          # and nothing executed it
@@ -1440,7 +1436,7 @@ CODEX_STUB
     bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
   [ "$status" -eq 0 ]
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"\"$PROJ\"=\"read\""* ]]   # already :workspace_roots — not re-granted
 }
@@ -1456,7 +1452,7 @@ CODEX_STUB
   [ "$status" -eq 0 ]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"GH_CONFIG_DIR"* ]]
 }
@@ -1472,7 +1468,7 @@ CODEX_STUB
   [ "$status" -eq 0 ]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *"\"$ghdir\"=\"read\""* ]]
   [[ "$output" == *"shell_environment_policy.set.GH_CONFIG_DIR=\"$ghdir\""* ]]
@@ -1489,7 +1485,7 @@ CODEX_STUB
   [[ "$output" == *"ignoring invalid codex GH config dir"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"GH_CONFIG_DIR"* ]]
   [[ "$output" != *"relative/gh-config"* ]]
@@ -1507,7 +1503,7 @@ CODEX_STUB
   [[ "$output" == *"ignoring invalid codex GH config dir"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"GH_CONFIG_DIR"* ]]
   [[ "$output" != *"$ghdir"* ]]
@@ -1525,7 +1521,7 @@ CODEX_STUB
   [[ "$output" == *"ignoring invalid codex GH config dir"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"GH_CONFIG_DIR"* ]]
   [[ "$output" != *"$ghdir"* ]]
@@ -1543,7 +1539,7 @@ CODEX_STUB
   [[ "$output" != *"codex GH config dir"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"GH_CONFIG_DIR"* ]]
   [[ "$output" != *"$ghdir"* ]]
@@ -1576,7 +1572,7 @@ CODEX_STUB
   [[ "$output" == *"spawned headless reviewer codex 'rv'"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"GH_CONFIG_DIR"* ]]
   [[ "$output" != *"$GH_TEST_REJECT_DIR"* ]]
@@ -1598,14 +1594,14 @@ CODEX_STUB
     bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless
   [ "$status" -eq 0 ]
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   [ "$(sed -n 's/^TURN_TIMEOUT: //p' "$CAPTURE")" = "180" ]
 
   rm -f "$CAPTURE"
   run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
     bash "$SCRIPTS/spawn.sh" codex otherworker --project "$PROJ" --headless
   [ "$status" -eq 0 ]
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   [ "$(sed -n 's/^TURN_TIMEOUT: //p' "$CAPTURE")" = "45" ]
 }
 
@@ -1618,7 +1614,7 @@ CODEX_STUB
   [ "$status" -eq 0 ]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *'model="gpt-5.6-sol"'* ]]
 }
@@ -1633,7 +1629,7 @@ CODEX_STUB
   [[ "$output" == *"spawned headless reviewer codex 'rv'"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *"default_permissions=agmsg-reviewer"* ]]   # confirms the reviewer branch built appcmd
   [[ "$output" == *'model="gpt-5.6-sol"'* ]]
@@ -1649,7 +1645,7 @@ CODEX_STUB
   [ "$status" -eq 0 ]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *'model="gpt-5.6-sol"'* ]]
 
@@ -1658,7 +1654,7 @@ CODEX_STUB
   run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
     bash "$SCRIPTS/spawn.sh" codex otherworker --project "$PROJ" --headless
   [ "$status" -eq 0 ]
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"model="* ]]
 }
@@ -1673,7 +1669,7 @@ CODEX_STUB
   [ "$status" -eq 0 ]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *'model="gpt-5-from-flag"'* ]]
   [[ "$output" != *"gpt-5-from-config"* ]]
@@ -1689,7 +1685,7 @@ CODEX_STUB
   [ "$status" -eq 0 ]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *'model_reasoning_effort="high"'* ]]
 }
@@ -1704,7 +1700,7 @@ CODEX_STUB
   [[ "$output" == *"ignoring unsafe codex model id"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"foo;rm"* ]]                # payload never reached appcmd
   [[ "$output" != *" -c model="* ]]            # no override clause at all
@@ -1753,7 +1749,7 @@ CODEX_STUB
   [ "$status" -eq 0 ]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"pwned"* ]]
   [[ "$output" != *"model_reasoning_effort="* ]]
@@ -1780,7 +1776,7 @@ CODEX_STUB
   [[ "$output" == *"spawn.codex_model.<name>/spawn.codex_effort.<name>"* ]]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *" -c model="* ]]
   [[ "$output" != *"gpt-5.6-decoy"* ]]           # the decoy's value never leaked in
@@ -1794,7 +1790,7 @@ CODEX_STUB
   [ "$status" -eq 0 ]
   [[ "$output" == *"not a safe config-key segment"* ]]
 
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *'model="gpt-5.6-sol"'* ]]
 }
@@ -1821,7 +1817,7 @@ CODEX_STUB
   [ "$status" -eq 0 ]
 
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$CAPTURE" ] && break; sleep 0.2; done
+  wait_until 10 _capture_nonempty
   local appcmd
   appcmd="$(sed -n 's/^APPCMD: //p' "$CAPTURE")"
   [ -n "$appcmd" ]

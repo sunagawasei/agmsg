@@ -21,11 +21,7 @@ unread_count() {
 # Wait until the script under test has displayed and is paused before its
 # mark UPDATE (barrier .reached appears), with a bounded wait.
 await_barrier_reached() {
-  for _ in $(seq 1 100); do
-    [ -e "$BARRIER.reached" ] && return 0
-    sleep 0.05
-  done
-  return 1
+  wait_for_file "$BARRIER.reached"
 }
 
 # --- inbox.sh -----------------------------------------------------------

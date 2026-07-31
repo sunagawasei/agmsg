@@ -16,6 +16,8 @@ setup() {
   # Interactive placement is part of the test input, never ambient host state.
   # A host tmux/herdr session would otherwise bypass the terminal fixture.
   unset TMUX HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID
+  unset BASH_ENV ENV PROMPT_COMMAND CDPATH ZDOTDIR CLAUDE_ENV_FILE
+  unset AGMSG_CLAUDE_KEEP_PROBE FAKE_WRONG_RUN_PATH
   hash -r 2>/dev/null || true
 
   cat > "$FAKE_CLAUDE" <<'STUB'
@@ -64,10 +66,17 @@ for arg in "$@"; do
   [ "$previous" = "--settings" ] && settings="$arg"
   previous="$arg"
 done
-printf 'cwd=%s\nconfig=%s\nsid=%s\nclaudecode=%s\nchild=%s\n' \
+shellopts_exported=unset
+bashopts_exported=unset
+env | grep -q '^SHELLOPTS=' && shellopts_exported=set
+env | grep -q '^BASHOPTS=' && bashopts_exported=set
+printf 'cwd=%s\nconfig=%s\nsid=%s\nclaudecode=%s\nchild=%s\ntmpdir=%s\nbash_env=%s\nenv=%s\nprompt_command=%s\ncdpath=%s\nzdotdir=%s\nclaude_env_file=%s\nshellopts_exported=%s\nbashopts_exported=%s\n' \
   "$PWD" "${CLAUDE_CONFIG_DIR:-<unset>}" \
   "${CLAUDE_CODE_SESSION_ID:-<unset>}" "${CLAUDECODE:-<unset>}" \
-  "${CLAUDE_CODE_CHILD_SESSION:-<unset>}" > "$env_file"
+  "${CLAUDE_CODE_CHILD_SESSION:-<unset>}" "${TMPDIR:-<unset>}" \
+  "${BASH_ENV:-<unset>}" "${ENV:-<unset>}" "${PROMPT_COMMAND:-<unset>}" \
+  "${CDPATH:-<unset>}" "${ZDOTDIR:-<unset>}" "${CLAUDE_ENV_FILE:-<unset>}" \
+  "$shellopts_exported" "$bashopts_exported" > "$env_file"
 cat > "$prompt_file"
 [ -n "$settings" ] && cp "$settings" "$FAKE_CAPTURE/probe.settings.$n"
 
@@ -78,6 +87,17 @@ esac
 layout="$(sed -n '1s/.*layout=\([^ .]*\).*/\1/p' "$prompt_file")"
 token="$(grep -Eo 'agmsg-probe-[0-9]+' "$prompt_file" | head -1)"
 [ -n "$layout" ] && [ -n "$token" ] || exit 8
+run_target="$(sed -n 's/^run-write-target=//p' "$prompt_file" | head -1)"
+repo_bash_target="$(sed -n 's/^repo-bash-target=//p' "$prompt_file" | head -1)"
+edit_target="$(sed -n 's/^edit-target=//p' "$prompt_file" | head -1)"
+repo_write_target="$(sed -n 's/^repo-write-target=//p' "$prompt_file" | head -1)"
+scratch_target="$(sed -n 's/^scratch-write-target=//p' "$prompt_file" | head -1)"
+sensitive_target="$(sed -n 's/^sensitive-read-target=//p' "$prompt_file" | head -1)"
+scratch_command="$(sed -n 's/^scratch-write-command=//p' "$prompt_file" | head -1)"
+repo_bash_command="$(sed -n 's/^repo-bash-command=//p' "$prompt_file" | head -1)"
+run_write_command="$(sed -n 's/^run-write-command=//p' "$prompt_file" | head -1)"
+events_file="$FAKE_CAPTURE/probe.events.$n"
+: > "$events_file"
 
 if [ "${FAKE_VERBOSE_EVENTS:-0}" = 1 ]; then
   printf '{"type":"system","subtype":"init","session_id":"verbose-noise"}\n'
@@ -87,40 +107,75 @@ fi
 
 emit_pair() {
   local id="$1" tool="$2" marker="$3" is_error="$4" body="$5"
-  local result_id="$id"
+  local actual_input="${6:-}" other_field="${7:-}" result_id="$id"
+  local actual_json other_json
   [ "${FAKE_PROBE_MODE:-complete}" = uncorrelated ] && result_id="${id}-wrong"
-  printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"%s","name":"%s","input":{"marker":"%s"}}]}}\n' \
-    "$id" "$tool" "$marker"
+  actual_json="$(printf '%s' "$actual_input" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  other_json="$(printf '%s' "$other_field" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  if [ "$tool" = Bash ]; then
+    printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"%s","name":"%s","input":{"command":"%s","note":"%s"}}]}}\n' \
+      "$id" "$tool" "$actual_json" "$other_json" | tee -a "$events_file"
+  else
+    printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"%s","name":"%s","input":{"file_path":"%s","note":"%s"}}]}}\n' \
+      "$id" "$tool" "$actual_json" "$other_json" | tee -a "$events_file"
+  fi
   printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"%s","is_error":%s,"content":"%s"}]}}\n' \
-    "$result_id" "$is_error" "$body"
+    "$result_id" "$is_error" "$body" | tee -a "$events_file"
+}
+
+emit_run_write() {
+  local target="$run_target"
+  if [ "${FAKE_PROBE_MODE:-complete}" = wrong-run-path ]; then
+    target="${FAKE_WRONG_RUN_PATH:?FAKE_WRONG_RUN_PATH is required}"
+  fi
+  printf '%s' "$token-run-write" > "$target"
+  printf 'run_path=%s\n' "$target" >> "$FAKE_CAPTURE/probe.effects.$n"
+  emit_pair "${1:?}" Bash "$token-run-write" false "completed" "$run_write_command"
 }
 
 case "$layout" in
   consultant)
-    emit_pair c1 Bash "$token-consultant-scratch" false "completed"
-    emit_pair c2 Bash "$token-repo-bash" false "Permission denied by sandbox"
+    emit_pair c1 Bash "$token-consultant-scratch" false "completed" "$scratch_command"
+    emit_pair c2 Bash "$token-repo-bash" false "Permission denied by sandbox" "$repo_bash_command"
     if [ "${FAKE_PROBE_MODE:-complete}" != missing ] \
       && { [ "${FAKE_PROBE_MODE:-complete}" != missing-first ] || [ "$n" -gt 1 ]; }; then
-      emit_pair c3 Bash "$token-run-write" false "completed"
+      emit_run_write c3
     fi
     ;;
   implementer)
-    emit_pair i1 Bash "$token-repo-bash" false "completed"
-    emit_pair i2 Edit "$token-repo-edit" false "completed"
-    emit_pair i3 Write "$token-repo-write" false "completed"
+    emit_pair i1 Bash "$token-repo-bash" false "completed" "$repo_bash_command"
+    emit_pair i2 Edit "$token-repo-edit" false "completed" "$edit_target"
+    emit_pair i3 Write "$token-repo-write" false "completed" "$repo_write_target"
     if [ "${FAKE_PROBE_MODE:-complete}" != missing ] \
       && { [ "${FAKE_PROBE_MODE:-complete}" != missing-first ] || [ "$n" -gt 1 ]; }; then
-      emit_pair i4 Bash "$token-run-write" false "completed"
+      emit_run_write i4
     fi
     ;;
   reviewer)
-    emit_pair r1 Bash "$token-repo-bash" false "Permission denied by sandbox"
-    emit_pair r2 Edit "$token-repo-edit" true "Permission denied by policy"
-    emit_pair r3 Write "$token-repo-write" true "Permission denied by policy"
-    emit_pair r4 Read "$token-sensitive-read" true "Permission denied by policy"
+    emit_pair r1 Bash "$token-repo-bash" false "Permission denied by sandbox" "$repo_bash_command"
+    emit_pair r2read Read "$token-edit-prereq-read" false "completed" "$edit_target"
+    if [ "${FAKE_PROBE_MODE:-complete}" = edit-precondition ]; then
+      emit_pair r2 Edit "$token-repo-edit" true "<tool_use_error>File has not been read yet</tool_use_error>" "$edit_target"
+    else
+      emit_pair r2 Edit "$token-repo-edit" true "Permission denied by policy" "$edit_target"
+    fi
+    emit_pair r3 Write "$token-repo-write" true "Permission denied by policy" "$repo_write_target"
+    case "${FAKE_PROBE_MODE:-complete}" in
+      sensitive-read-success)
+        emit_pair r4 Read "$token-sensitive-read" false "synthetic read succeeded" "$sensitive_target" ;;
+      sensitive-cwd-override)
+        emit_pair r4 Read "$token-sensitive-read" true "Permission denied by policy" "$PWD/.not-the-sentinel" ;;
+      sensitive-prefix)
+        emit_pair r4 Read "$token-sensitive-read" true "Permission denied by policy" "${sensitive_target}.backup" ;;
+      sensitive-other-field)
+        emit_pair r4 Read "$token-sensitive-read" true "Permission denied by policy" \
+          "$PWD/.not-the-sentinel" "$sensitive_target" ;;
+      *)
+        emit_pair r4 Read "$token-sensitive-read" true "Permission denied by policy" "$sensitive_target" ;;
+    esac
     if [ "${FAKE_PROBE_MODE:-complete}" != missing ] \
       && { [ "${FAKE_PROBE_MODE:-complete}" != missing-first ] || [ "$n" -gt 1 ]; }; then
-      emit_pair r5 Bash "$token-run-write" false "completed"
+      emit_run_write r5
     fi
     ;;
   *) exit 9 ;;
@@ -146,10 +201,17 @@ capture="$FAKE_CAPTURE/bridge.args.$name"
 : > "$capture"
 printf '%s\n' "$$" >> "$FAKE_CAPTURE/bridge-launches"
 for arg in "$@"; do printf 'ARG=%s\n' "$arg" >> "$capture"; done
-printf 'cwd=%s\nconfig=%s\nsid=%s\nclaudecode=%s\nchild=%s\n' \
+shellopts_exported=unset
+bashopts_exported=unset
+env | grep -q '^SHELLOPTS=' && shellopts_exported=set
+env | grep -q '^BASHOPTS=' && bashopts_exported=set
+printf 'cwd=%s\nconfig=%s\nsid=%s\nclaudecode=%s\nchild=%s\ntmpdir=%s\nbash_env=%s\nenv=%s\nprompt_command=%s\ncdpath=%s\nzdotdir=%s\nclaude_env_file=%s\nshellopts_exported=%s\nbashopts_exported=%s\n' \
   "$PWD" "${CLAUDE_CONFIG_DIR:-<unset>}" \
   "${CLAUDE_CODE_SESSION_ID:-<unset>}" "${CLAUDECODE:-<unset>}" \
-  "${CLAUDE_CODE_CHILD_SESSION:-<unset>}" > "$FAKE_CAPTURE/bridge.env.$name"
+  "${CLAUDE_CODE_CHILD_SESSION:-<unset>}" "${TMPDIR:-<unset>}" \
+  "${BASH_ENV:-<unset>}" "${ENV:-<unset>}" "${PROMPT_COMMAND:-<unset>}" \
+  "${CDPATH:-<unset>}" "${ZDOTDIR:-<unset>}" "${CLAUDE_ENV_FILE:-<unset>}" \
+  "$shellopts_exported" "$bashopts_exported" > "$FAKE_CAPTURE/bridge.env.$name"
 
 [ "${FAKE_BRIDGE_MODE:-live}" = live ] || exit 9
 base="$FAKE_RUN/claude-code-bridge.$team.$name"
@@ -221,11 +283,12 @@ STUB
 }
 
 teardown() {
-  local pidfile pid
+  local pidfile pid terminated=""
   if [ -f "$CAPTURE/bridge-launches" ]; then
     while IFS= read -r pid; do
       case "$pid" in ''|*[!0-9]*) continue ;; esac
       kill "$pid" 2>/dev/null || true
+      terminated="$terminated $pid"
     done < "$CAPTURE/bridge-launches"
   fi
   for pidfile in "$TEST_SKILL_DIR"/run/claude-code-bridge.*.pid; do
@@ -233,8 +296,11 @@ teardown() {
     pid="$(cat "$pidfile" 2>/dev/null || true)"
     case "$pid" in ''|*[!0-9]*) continue ;; esac
     kill "$pid" 2>/dev/null || true
+    terminated="$terminated $pid"
   done
-  sleep 0.1
+  for pid in $terminated; do
+    wait_for_pid_exit "$pid"
+  done
   teardown_test_env
 }
 
@@ -310,6 +376,7 @@ policy_shape() {
   [ "$(json_scalar "$settings" "json_extract(j,'\$.sandbox.failIfUnavailable')")" = 1 ]
   [ "$(json_scalar "$settings" "json_extract(j,'\$.sandbox.allowUnsandboxedCommands')")" = 0 ]
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$scratch"
+  json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$scratch/tmp"
   ! json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$PROJ"
   ! grep -Fxq 'ARG=--add-dir' "$CAPTURE/bridge.args.consultant"
 
@@ -325,7 +392,17 @@ policy_shape() {
   grep -Fxq 'sid=<unset>' "$CAPTURE/probe.env.1"
   grep -Fxq 'claudecode=<unset>' "$CAPTURE/probe.env.1"
   grep -Fxq 'child=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq "tmpdir=$scratch/tmp" "$CAPTURE/probe.env.1"
+  grep -Fxq 'bash_env=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq 'env=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq 'prompt_command=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq 'cdpath=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq 'zdotdir=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq 'claude_env_file=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq 'shellopts_exported=unset' "$CAPTURE/probe.env.1"
+  grep -Fxq 'bashopts_exported=unset' "$CAPTURE/probe.env.1"
   grep -Fxq "cwd=$scratch" "$CAPTURE/bridge.env.consultant"
+  grep -Fxq "tmpdir=$scratch/tmp" "$CAPTURE/bridge.env.consultant"
   grep -Fxq 'ARG=--output-format' "$CAPTURE/bridge.args.consultant"
   grep -Fxq 'ARG=json' "$CAPTURE/bridge.args.consultant"
   grep -Fxq 'ARG=--identity-key' "$CAPTURE/bridge.args.consultant"
@@ -373,6 +450,7 @@ policy_shape() {
   local settings="$base.settings.json"
   local runtime_without_outer="$TEST_SKILL_DIR/runtime-policy"
   local probe_policy="$TEST_SKILL_DIR/probe-policy"
+  local sentinel_target
   policy_shape "$CAPTURE/bridge.args.review" \
     | awk '$0=="ARG=--disallowedTools" { getline; next } { print }' \
     > "$runtime_without_outer"
@@ -395,6 +473,20 @@ policy_shape() {
   json_array_has "$settings" '$.sandbox.filesystem.allowRead' "/nix"
   grep -Fq 'Read(**/*credentials*/**)' "$settings"
   grep -Fq "$TEST_SKILL_DIR/db/claude-worker-home/projects/**" "$settings"
+  grep -Fq "sensitive-read-target=$TEST_SKILL_DIR/db/claude-worker-home/projects/" \
+    "$CAPTURE/probe.prompt.1"
+  sentinel_target="$(sed -n 's/^sensitive-read-target=//p' \
+    "$CAPTURE/probe.prompt.1" | head -1)"
+  json_array_has "$settings" '$.permissions.deny' "Read($sentinel_target)"
+  [ ! -e "$sentinel_target" ]
+  ! grep -Fq "sensitive-read-target=$TEST_SKILL_DIR/run/claude-code-team-review-cwd/" \
+    "$CAPTURE/probe.prompt.1"
+  grep -Fq '"id":"r2read","name":"Read"' "$CAPTURE/probe.events.1"
+  grep -Fq 'marker agmsg-probe-' "$CAPTURE/probe.events.1"
+  grep -Fq '"id":"r2read","name":"Read","input":{"file_path":"'"$PROJ"'/.agmsg-probe-' \
+    "$CAPTURE/probe.events.1"
+  grep -Fq '"id":"r2","name":"Edit"' "$CAPTURE/probe.events.1"
+  grep -Fq '"content":"Permission denied by policy"' "$CAPTURE/probe.events.1"
 }
 
 @test "inherit add-dirs defaults off and obeys global then per-name overrides through shared collector" {
@@ -573,6 +665,309 @@ policy_shape() {
   run spawn_claude unrelated --reviewer
   [ "$status" -ne 0 ]
   [ ! -e "$CAPTURE/bridge.args.unrelated" ]
+}
+
+@test "reviewer sensitive Read targets the outside-cwd sentinel and fails closed on success or target substitution" {
+  export FAKE_PROBE_MODE=sensitive-read-success
+  run spawn_claude sensitive-success --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"did not produce every required correlated tool event"* ]]
+  [ ! -e "$CAPTURE/bridge.args.sensitive-success" ]
+  grep -Fq '"name":"Read","input":{"file_path":"'"$TEST_SKILL_DIR"'/db/claude-worker-home/projects/' \
+    "$CAPTURE/probe.events.1"
+  grep -Fq '"is_error":false,"content":"synthetic read succeeded"' \
+    "$CAPTURE/probe.events.1"
+
+  printf '0\n' > "$CAPTURE/probe-count"
+  export FAKE_PROBE_MODE=sensitive-cwd-override
+  run spawn_claude sensitive-cwd --reviewer
+  [ "$status" -ne 0 ]
+  [ ! -e "$CAPTURE/bridge.args.sensitive-cwd" ]
+  grep -Fq '"file_path":"'"$TEST_SKILL_DIR"'/run/claude-code-team-sensitive-cwd-cwd/.not-the-sentinel"' \
+    "$CAPTURE/probe.events.1"
+
+  printf '0\n' > "$CAPTURE/probe-count"
+  export FAKE_PROBE_MODE=sensitive-prefix
+  run spawn_claude sensitive-prefix --reviewer
+  [ "$status" -ne 0 ]
+  [ ! -e "$CAPTURE/bridge.args.sensitive-prefix" ]
+  grep -Fq -- '-sensitive.backup","note":""' "$CAPTURE/probe.events.1"
+
+  printf '0\n' > "$CAPTURE/probe-count"
+  export FAKE_PROBE_MODE=sensitive-other-field
+  run spawn_claude sensitive-other --reviewer
+  [ "$status" -ne 0 ]
+  [ ! -e "$CAPTURE/bridge.args.sensitive-other" ]
+  grep -Fq '"file_path":"'"$TEST_SKILL_DIR"'/run/claude-code-team-sensitive-other-cwd/.not-the-sentinel","note":"'"$TEST_SKILL_DIR"'/db/claude-worker-home/projects/' \
+    "$CAPTURE/probe.events.1"
+}
+
+@test "probe and bridge scrub hostile shell state and exact run-file proof rejects wrong temp writes" {
+  local hostile_tmp="$TEST_SKILL_DIR/hostile-tmp"
+  local hostile_env="$TEST_SKILL_DIR/hostile-bash-env"
+  local hostile_marker="$CAPTURE/hostile-wrapper-ran"
+  mkdir -p "$hostile_tmp"
+  cat > "$hostile_env" <<'HOSTILE'
+if [ "${0:-}" = "${FAKE_CLAUDE:-}" ] && [ "${1:-}" != "--version" ]; then
+  printf 'hostile wrapper ran\n' > "$HOSTILE_WRAPPER_MARKER"
+  export TMPDIR="$HOSTILE_TMPDIR"
+fi
+HOSTILE
+  export HOSTILE_WRAPPER_MARKER="$hostile_marker"
+  export HOSTILE_TMPDIR="$hostile_tmp"
+  export TMPDIR="$hostile_tmp"
+  export BASH_ENV="$hostile_env"
+  export ENV="$hostile_env"
+  export PROMPT_COMMAND='printf hostile-prompt-command'
+  export CDPATH="$hostile_tmp"
+  export ZDOTDIR="$hostile_tmp"
+  export CLAUDE_ENV_FILE="$hostile_tmp/claude-env"
+  export SHELLOPTS BASHOPTS
+
+  run spawn_claude hostile-env --reviewer
+  [ "$status" -eq 0 ]
+  wait_bridge_capture hostile-env
+  local scratch="$TEST_SKILL_DIR/run/claude-code-team-hostile-env-cwd"
+  local settings="$TEST_SKILL_DIR/run/claude-code-bridge.team.hostile-env.settings.json"
+  [ ! -e "$hostile_marker" ]
+  grep -Fxq "tmpdir=$scratch/tmp" "$CAPTURE/probe.env.1"
+  grep -Fxq "tmpdir=$scratch/tmp" "$CAPTURE/bridge.env.hostile-env"
+  grep -Fxq 'bash_env=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq 'env=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq 'prompt_command=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq 'cdpath=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq 'zdotdir=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq 'claude_env_file=<unset>' "$CAPTURE/probe.env.1"
+  grep -Fxq 'shellopts_exported=unset' "$CAPTURE/probe.env.1"
+  grep -Fxq 'bashopts_exported=unset' "$CAPTURE/probe.env.1"
+  run diff -u "$CAPTURE/probe.env.1" "$CAPTURE/bridge.env.hostile-env"
+  [ "$status" -eq 0 ]
+  json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$scratch/tmp"
+  ! json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$hostile_tmp"
+  grep -Fq "run_path=$TEST_SKILL_DIR/run/.agmsg-probe-" \
+    "$CAPTURE/probe.effects.1"
+
+  printf '0\n' > "$CAPTURE/probe-count"
+  export FAKE_PROBE_MODE=wrong-run-path
+  export FAKE_WRONG_RUN_PATH="$hostile_tmp/wrong-run"
+  run spawn_claude wrong-run --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"did not produce every required correlated tool event"* ]]
+  [ "$(cat "$hostile_tmp/wrong-run")" = "$(grep -Eo 'agmsg-probe-[0-9]+' "$CAPTURE/probe.prompt.1" | head -1)-run-write" ]
+  [ ! -e "$CAPTURE/bridge.args.wrong-run" ]
+}
+
+@test "Edit precondition error is rejected and KEEP_PROBE preserves only owned failure diagnostics" {
+  export FAKE_PROBE_MODE=edit-precondition
+  run spawn_claude edit-clean --reviewer
+  [ "$status" -ne 0 ]
+  local clean_base="$TEST_SKILL_DIR/run/claude-code-bridge.team.edit-clean"
+  [ ! -e "$clean_base.settings.json" ]
+  [ ! -e "$clean_base.probe.prompt" ]
+  [ ! -e "$clean_base.probe.jsonl" ]
+  [ ! -e "$clean_base.probe.stderr" ]
+  [ ! -e "$CAPTURE/bridge.args.edit-clean" ]
+  [ -z "$(find "$PROJ" -maxdepth 1 -name '.agmsg-probe-*-repo-edit' -print -quit)" ]
+  [ -z "$(find "$TEST_SKILL_DIR/db/claude-worker-home/projects" \
+    -maxdepth 1 -name '.agmsg-probe-*-sensitive' -print -quit 2>/dev/null)" ]
+
+  printf '0\n' > "$CAPTURE/probe-count"
+  export AGMSG_CLAUDE_KEEP_PROBE=1
+  run spawn_claude edit-keep --reviewer
+  [ "$status" -ne 0 ]
+  local keep_base="$TEST_SKILL_DIR/run/claude-code-bridge.team.edit-keep"
+  [[ "$output" == *"prompt: $keep_base.probe.prompt"* ]]
+  [[ "$output" == *"trace: $keep_base.probe.jsonl"* ]]
+  [[ "$output" == *"stderr: $keep_base.probe.stderr"* ]]
+  [[ "$output" == *"settings: $keep_base.settings.json"* ]]
+  [ -f "$keep_base.settings.json" ]
+  [ -f "$keep_base.probe.prompt" ]
+  [ -f "$keep_base.probe.jsonl" ]
+  [ -f "$keep_base.probe.stderr" ]
+  [ "$(find "$TEST_SKILL_DIR/run" -maxdepth 1 \
+    -name 'claude-code-bridge.team.edit-keep*' | wc -l | tr -d ' ')" -eq 4 ]
+  grep -Fq '"id":"r2read"' "$keep_base.probe.jsonl"
+  grep -Fq '<tool_use_error>File has not been read yet</tool_use_error>' \
+    "$keep_base.probe.jsonl"
+  [ ! -e "$keep_base.log" ]
+  [ ! -e "$CAPTURE/bridge.args.edit-keep" ]
+  [ -z "$(find "$PROJ" -maxdepth 1 -name '.agmsg-probe-*-repo-edit' -print -quit)" ]
+  [ -z "$(find "$TEST_SKILL_DIR/db/claude-worker-home/projects" \
+    -maxdepth 1 -name '.agmsg-probe-*-sensitive' -print -quit 2>/dev/null)" ]
+
+  printf '0\n' > "$CAPTURE/probe-count"
+  export FAKE_PROBE_MODE=complete
+  run spawn_claude keep-success --reviewer
+  [ "$status" -eq 0 ]
+  local success_base="$TEST_SKILL_DIR/run/claude-code-bridge.team.keep-success"
+  [ -f "$success_base.settings.json" ]
+  [ ! -e "$success_base.probe.prompt" ]
+  [ ! -e "$success_base.probe.jsonl" ]
+  [ ! -e "$success_base.probe.stderr" ]
+}
+
+@test "pre-existing probe-target collisions fail closed without deleting foreign files" {
+  local collision_env="$TEST_SKILL_DIR/collision-bash-env"
+  local name=foreign-collision
+  local scratch="$TEST_SKILL_DIR/run/claude-code-team-$name-cwd"
+  cat > "$collision_env" <<'COLLISION'
+if [ "${0:-}" = "${SPAWN_SCRIPT_FOR_COLLISION:-}" ]; then
+  collision_token="agmsg-probe-$$"
+  collision_scratch="$FAKE_RUN/claude-code-team-$COLLISION_NAME-cwd"
+  mkdir -p "$collision_scratch"
+  printf 'foreign repo bash\n' > "$PROJ/.${collision_token}-repo-bash"
+  printf 'foreign repo write\n' > "$PROJ/.${collision_token}-repo-write"
+  printf 'foreign scratch\n' > "$collision_scratch/.${collision_token}-consultant-scratch"
+  printf 'foreign run\n' > "$FAKE_RUN/.${collision_token}-run-write"
+fi
+COLLISION
+  export SPAWN_SCRIPT_FOR_COLLISION="$SCRIPTS/spawn.sh"
+  export COLLISION_NAME="$name"
+  export BASH_ENV="$collision_env"
+
+  run spawn_claude "$name"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"owner-scoped probe target collision"* ]]
+  [ ! -e "$CAPTURE/probe-count" ]
+  [ ! -e "$CAPTURE/bridge.args.$name" ]
+  [ ! -e "$TEST_SKILL_DIR/run/claude-code-bridge.team.$name.settings.json" ]
+
+  local repo_bash repo_write scratch_write run_write
+  repo_bash="$(find "$PROJ" -maxdepth 1 -name '.agmsg-probe-*-repo-bash' -print -quit)"
+  repo_write="$(find "$PROJ" -maxdepth 1 -name '.agmsg-probe-*-repo-write' -print -quit)"
+  scratch_write="$(find "$scratch" -maxdepth 1 -name '.agmsg-probe-*-consultant-scratch' -print -quit)"
+  run_write="$(find "$TEST_SKILL_DIR/run" -maxdepth 1 -name '.agmsg-probe-*-run-write' -print -quit)"
+  [ "$(cat "$repo_bash")" = "foreign repo bash" ]
+  [ "$(cat "$repo_write")" = "foreign repo write" ]
+  [ "$(cat "$scratch_write")" = "foreign scratch" ]
+  [ "$(cat "$run_write")" = "foreign run" ]
+}
+
+@test "dangling symlink probe collisions and exclusive owner creation never follow links" {
+  local symlink_env="$TEST_SKILL_DIR/symlink-bash-env"
+  local output_victim="$TEST_SKILL_DIR/output-victim"
+  local sentinel_victim="$TEST_SKILL_DIR/sentinel-victim"
+  local edit_victim="$TEST_SKILL_DIR/edit-victim"
+  local prompt_victim="$TEST_SKILL_DIR/prompt-victim"
+  local trace_victim="$TEST_SKILL_DIR/trace-victim"
+  local stderr_victim="$TEST_SKILL_DIR/stderr-victim"
+  cat > "$symlink_env" <<'SYMLINKS'
+if [ "${0:-}" = "${SPAWN_SCRIPT_FOR_SYMLINK:-}" ]; then
+  symlink_token="agmsg-probe-$$"
+  case "${2:-}" in
+    link-output)
+      symlink_path="$PROJ/.${symlink_token}-repo-bash"
+      ln -s "$OUTPUT_LINK_VICTIM" "$symlink_path"
+      ;;
+    link-sentinel)
+      mkdir -p "$TEST_SKILL_DIR/db/claude-worker-home/projects"
+      symlink_path="$TEST_SKILL_DIR/db/claude-worker-home/projects/.${symlink_token}-sensitive"
+      ln -s "$SENTINEL_LINK_VICTIM" "$symlink_path"
+      ;;
+    link-edit)
+      symlink_path="$PROJ/.${symlink_token}-repo-edit"
+      ln -s "$EDIT_LINK_VICTIM" "$symlink_path"
+      ;;
+    link-prompt)
+      symlink_path="$FAKE_RUN/claude-code-bridge.team.link-prompt.probe.prompt"
+      ln -s "$PROMPT_LINK_VICTIM" "$symlink_path"
+      ;;
+    link-trace)
+      symlink_path="$FAKE_RUN/claude-code-bridge.team.link-trace.probe.jsonl"
+      ln -s "$TRACE_LINK_VICTIM" "$symlink_path"
+      ;;
+    link-stderr)
+      symlink_path="$FAKE_RUN/claude-code-bridge.team.link-stderr.probe.stderr"
+      ln -s "$STDERR_LINK_VICTIM" "$symlink_path"
+      ;;
+    regular-prompt)
+      symlink_path="$FAKE_RUN/claude-code-bridge.team.regular-prompt.probe.prompt"
+      printf 'preserved prompt\n' > "$symlink_path"
+      ;;
+    *) return 0 ;;
+  esac
+  printf '%s\n' "$symlink_path" > "$CAPTURE/symlink-path.${2:-unknown}"
+fi
+SYMLINKS
+  export SPAWN_SCRIPT_FOR_SYMLINK="$SCRIPTS/spawn.sh"
+  export OUTPUT_LINK_VICTIM="$output_victim"
+  export SENTINEL_LINK_VICTIM="$sentinel_victim"
+  export EDIT_LINK_VICTIM="$edit_victim"
+  export PROMPT_LINK_VICTIM="$prompt_victim"
+  export TRACE_LINK_VICTIM="$trace_victim"
+  export STDERR_LINK_VICTIM="$stderr_victim"
+  export BASH_ENV="$symlink_env"
+
+  run spawn_claude link-output
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"owner-scoped probe target collision"* ]]
+  local output_link
+  output_link="$(cat "$CAPTURE/symlink-path.link-output")"
+  [ -L "$output_link" ]
+  [ "$(readlink "$output_link")" = "$output_victim" ]
+  [ ! -e "$output_victim" ]
+  [ ! -e "$CAPTURE/probe-count" ]
+
+  run spawn_claude link-sentinel --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"synthetic reviewer sentinel collision"* ]]
+  local sentinel_link
+  sentinel_link="$(cat "$CAPTURE/symlink-path.link-sentinel")"
+  [ -L "$sentinel_link" ]
+  [ "$(readlink "$sentinel_link")" = "$sentinel_victim" ]
+  [ ! -e "$sentinel_victim" ]
+  [ ! -e "$CAPTURE/probe-count" ]
+
+  run spawn_claude link-edit --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"owner-scoped Edit probe target collision"* ]]
+  local edit_link
+  edit_link="$(cat "$CAPTURE/symlink-path.link-edit")"
+  [ -L "$edit_link" ]
+  [ "$(readlink "$edit_link")" = "$edit_victim" ]
+  [ ! -e "$edit_victim" ]
+  [ ! -e "$CAPTURE/probe-count" ]
+
+  local diagnostic_name diagnostic_link diagnostic_victim
+  for diagnostic_name in link-prompt link-trace link-stderr; do
+    case "$diagnostic_name" in
+      link-prompt) diagnostic_victim="$prompt_victim" ;;
+      link-trace) diagnostic_victim="$trace_victim" ;;
+      link-stderr) diagnostic_victim="$stderr_victim" ;;
+    esac
+    run spawn_claude "$diagnostic_name"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Claude probe diagnostic collision"* ]]
+    diagnostic_link="$(cat "$CAPTURE/symlink-path.$diagnostic_name")"
+    [ -L "$diagnostic_link" ]
+    [ "$(readlink "$diagnostic_link")" = "$diagnostic_victim" ]
+    [ ! -e "$diagnostic_victim" ]
+    [ ! -e "$CAPTURE/probe-count" ]
+    [ ! -e "$CAPTURE/bridge.args.$diagnostic_name" ]
+  done
+
+  run spawn_claude regular-prompt
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Claude probe diagnostic collision"* ]]
+  local regular_prompt
+  regular_prompt="$(cat "$CAPTURE/symlink-path.regular-prompt")"
+  [ ! -L "$regular_prompt" ]
+  [ "$(cat "$regular_prompt")" = "preserved prompt" ]
+  [ ! -e "$CAPTURE/probe-count" ]
+  [ ! -e "$CAPTURE/bridge.args.regular-prompt" ]
+
+  local helper_link="$TEST_SKILL_DIR/helper-link"
+  local helper_victim="$TEST_SKILL_DIR/helper-victim"
+  ln -s "$helper_victim" "$helper_link"
+  run env SCRIPTS_UNDER_TEST="$SCRIPTS" bash -c '
+    SCRIPT_DIR="$SCRIPTS_UNDER_TEST"
+    . "$SCRIPT_DIR/drivers/types/claude-code/_spawn.sh"
+    agmsg_claude_create_exclusive_file "$1" owned
+  ' _ "$helper_link"
+  [ "$status" -ne 0 ]
+  [ -L "$helper_link" ]
+  [ "$(readlink "$helper_link")" = "$helper_victim" ]
+  [ ! -e "$helper_victim" ]
 }
 
 @test "concurrent same-identity spawns run one probe and bridge while winner artifacts survive" {

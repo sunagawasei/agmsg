@@ -19,7 +19,8 @@ Open an issue on [`fujibee/agmsg`](https://github.com/fujibee/agmsg/issues). Inc
 
 1. Discuss substantial changes in an issue first.
 2. Branch from `main`. Keep PRs focused — one logical change per PR.
-3. Run the test suite: `bats tests/`.
+3. Run `bats --filter-tags "!slow" tests/*.bats` while iterating, then run the
+   full `bats tests/*.bats` suite before submitting.
 4. Match the surrounding code style. Bash is the primary language; use `set -euo pipefail` at the top of every script.
 5. Update docs if the change is user-visible.
 

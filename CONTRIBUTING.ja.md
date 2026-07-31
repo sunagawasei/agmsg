@@ -19,7 +19,7 @@
 
 1. 大きな変更はまず issue で議論する。
 2. `main` からブランチを切る。PR は焦点を絞ること — 1 PR につき論理的な変更 1 つ。
-3. テストスイートを実行する: `bats tests/`。
+3. 開発中は `bats --filter-tags "!slow" tests/*.bats` を実行し、提出前に full suite の `bats tests/*.bats` を実行する。
 4. 周囲のコードスタイルに合わせる。Bash が主要言語であり、すべてのスクリプトの先頭で `set -euo pipefail` を使うこと。
 5. ユーザーから見える変更であれば、ドキュメントも更新する。
 

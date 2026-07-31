@@ -211,6 +211,8 @@ done
 
 case "$SPLIT" in h|v) ;; *) die "--split must be 'h' or 'v'" ;; esac
 case "$READY_TIMEOUT" in ''|*[!0-9]*) die "--ready-timeout must be a whole number of seconds" ;; esac
+READY_POLL_INTERVAL="$(agmsg_wait_knob_resolve \
+  "${AGMSG_SPAWN_READY_POLL_INTERVAL-}" 1 0.01 60 decimal)"
 
 # Headless/reviewer worker modes are a type-specific capability (manifest
 # `headless=yes`). A capable type ships a scripts/drivers/types/<type>/_spawn.sh
@@ -853,15 +855,47 @@ fi
 place_and_launch
 
 if [ "$WAIT_READY" = "1" ]; then
-  waited=0
+  wait_started=""
+  wait_last=""
+  wait_now=""
+  wait_elapsed=0
   while [ ! -e "$READY_PATH" ]; do
-    if [ "$waited" -ge "$READY_TIMEOUT" ]; then
-      echo "status=timeout name=${NAME} team=${TEAM} after=${READY_TIMEOUT}s"
+    if ! wait_now="$(_agmsg_wait_epoch_seconds)"; then
+      echo "status=timeout name=${NAME} team=${TEAM} after=${wait_elapsed}s"
+      echo "spawn: '${NAME}' could not read wall-clock time while waiting for readiness" >&2
+      exit 3
+    fi
+    if [ -z "$wait_started" ]; then
+      wait_started="$wait_now"
+      wait_last="$wait_now"
+      wait_elapsed=0
+    elif [ "$wait_now" -lt "$wait_last" ]; then
+      # A backward wall-clock adjustment resets the process-local baseline.
+      # Retaining the old future baseline could otherwise wedge readiness.
+      wait_started="$wait_now"
+      wait_last="$wait_now"
+      wait_elapsed=0
+    else
+      wait_last="$wait_now"
+      wait_elapsed=$((wait_now - wait_started))
+    fi
+    if [ "$wait_elapsed" -ge "$READY_TIMEOUT" ]; then
+      echo "status=timeout name=${NAME} team=${TEAM} after=${wait_elapsed}s"
       echo "spawn: '${NAME}' did not signal ready within ${READY_TIMEOUT}s — it may still be booting; re-spawn or raise --ready-timeout" >&2
       exit 3
     fi
-    sleep 1
-    waited=$((waited + 1))
+    sleep "$READY_POLL_INTERVAL"
   done
-  echo "status=ready name=${NAME} team=${TEAM} after=${waited}s"
+
+  # Refresh the elapsed value after a sentinel appears during sleep. If the
+  # clock sample itself fails, readiness still wins and the last verified
+  # elapsed value remains valid telemetry.
+  if [ -n "$wait_started" ] && wait_now="$(_agmsg_wait_epoch_seconds)"; then
+    if [ "$wait_now" -lt "$wait_last" ]; then
+      wait_elapsed=0
+    else
+      wait_elapsed=$((wait_now - wait_started))
+    fi
+  fi
+  echo "status=ready name=${NAME} team=${TEAM} after=${wait_elapsed}s"
 fi

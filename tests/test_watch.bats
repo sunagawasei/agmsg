@@ -220,11 +220,7 @@ _max_message_id() {
     >/dev/null 2>&1 3>&- &
   local w=$!
   # Wait for the watcher to attach and signal readiness.
-  local i
-  for i in $(seq 1 50); do
-    [ -e "$ready" ] && break
-    sleep 0.1
-  done
+  wait_for_file "$ready"
   [ -e "$ready" ]
   kill "$w" 2>/dev/null || true
   wait "$w" 2>/dev/null || true
@@ -244,8 +240,8 @@ _max_message_id() {
   local ready="$TEST_SKILL_DIR/run/ready.team__alice"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-own" "$PROJ" claude-code alice \
     >/dev/null 2>&1 3>&- &
-  local w=$! i
-  for i in $(seq 1 50); do [ -e "$ready" ] && break; sleep 0.1; done
+  local w=$!
+  wait_for_file "$ready"
   # watch.sh stamps the instance id (composite under an agent ancestor).
   [ "$(cat "$ready")" = "$(_iid sess-own)" ]
   kill "$w" 2>/dev/null || true
@@ -256,8 +252,8 @@ _max_message_id() {
   local ready="$TEST_SKILL_DIR/run/ready.team__alice"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-old" "$PROJ" claude-code alice \
     >/dev/null 2>&1 3>&- &
-  local w=$! i
-  for i in $(seq 1 50); do [ -e "$ready" ] && break; sleep 0.1; done
+  local w=$!
+  wait_for_file "$ready"
   # A successor watcher overwrites the sentinel with its own id.
   printf 'sess-new\n' > "$ready"
   kill "$w" 2>/dev/null || true
@@ -327,12 +323,11 @@ _max_message_id() {
 
 # Poll up to ~3s for <pidfile> to record <want_pid>.
 _wait_pidfile() {
-  local pf="$1" want="$2" i
-  for i in $(seq 1 30); do
-    [ -f "$pf" ] && [ "$(cat "$pf" 2>/dev/null)" = "$want" ] && return 0
-    sleep 0.1
-  done
-  return 1
+  wait_until 10 _pidfile_matches "$1" "$2"
+}
+
+_pidfile_matches() {
+  [ -f "$1" ] && [ "$(cat "$1" 2>/dev/null)" = "$2" ]
 }
 
 @test "watch: stale composite adopts a live AGMSG_AGENT_PID before creating artifacts" {
@@ -423,7 +418,7 @@ _wait_pidfile() {
   # and then writes its own pid, so the pidfile can flip to w2 a beat before w1's
   # TERM trap has run — poll for w1's exit rather than checking the instant the
   # pidfile changes (the old single check raced this and flaked).
-  local i; for i in $(seq 1 30); do kill -0 "$w1" 2>/dev/null || break; sleep 0.1; done
+  wait_for_pid_exit "$w1"
   run kill -0 "$w1"; [ "$status" -ne 0 ]
 
   kill "$w2" "$sesspid" 2>/dev/null || true
@@ -491,11 +486,8 @@ _wait_pidfile() {
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "" "$PROJ" claude-code alice >"$out" 2>&1 3>&- &
   local pid=$!
   # A fallback id means a watch.agmsg-*.pid appears under run/ as the watcher arms.
-  local i started=0
-  for i in $(seq 1 50); do
-    if ls "$TEST_SKILL_DIR/run"/watch.agmsg-*.pid >/dev/null 2>&1; then started=1; break; fi
-    sleep 0.1
-  done
+  local started=0
+  if wait_until 10 _any_generated_watch_pidfile; then started=1; fi
   kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
   [ "$started" -eq 1 ]
   ! grep -q "Usage: watch.sh" "$out"
@@ -545,11 +537,8 @@ _wait_pidfile() {
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" - "$PROJ" claude-code alice >"$out" 2>&1 3>&- &
   local pid=$!
   # Folded to empty => a generated fallback id, so a watch.agmsg-*.pid appears.
-  local i started=0
-  for i in $(seq 1 50); do
-    if ls "$TEST_SKILL_DIR/run"/watch.agmsg-*.pid >/dev/null 2>&1; then started=1; break; fi
-    sleep 0.1
-  done
+  local started=0
+  if wait_until 10 _any_generated_watch_pidfile; then started=1; fi
   kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
   [ "$started" -eq 1 ]
   # No literal "-" session id leaked into the run dir key space.
@@ -564,6 +553,14 @@ _read_at_for_body() {
     source "$SCRIPTS/lib/storage.sh"
     agmsg_sqlite "$(agmsg_db_path)" \
       "SELECT read_at FROM messages WHERE body='$1' ORDER BY id DESC LIMIT 1;" )
+}
+
+_any_generated_watch_pidfile() {
+  compgen -G "$TEST_SKILL_DIR/run/watch.agmsg-*.pid" >/dev/null
+}
+
+_read_at_nonempty() {
+  [ -n "$(_read_at_for_body "$1")" ]
 }
 
 
@@ -587,12 +584,8 @@ _read_at_for_body() {
     || { kill "$w" 2>/dev/null || true; false; }
   # ...and read_at follows shortly after delivery — poll instead of a fixed
   # sleep for the same flakiness reason.
-  local i got=""
-  for i in $(seq 1 50); do
-    got="$(_read_at_for_body "M-readat-check")"
-    [ -n "$got" ] && break
-    sleep 0.1
-  done
+  wait_until 10 _read_at_nonempty "M-readat-check"
+  local got="$(_read_at_for_body "M-readat-check")"
   kill "$w" 2>/dev/null || true
   wait "$w" 2>/dev/null || true
 
@@ -625,12 +618,8 @@ _read_at_for_body() {
     || { kill "$w" 2>/dev/null || true; false; }
 
   # ...but only bob's (no exclusive owner) gets marked read by this watcher.
-  local i got_bob=""
-  for i in $(seq 1 50); do
-    got_bob="$(_read_at_for_body "M-broad-guard-bob")"
-    [ -n "$got_bob" ] && break
-    sleep 0.1
-  done
+  wait_until 10 _read_at_nonempty "M-broad-guard-bob"
+  local got_bob="$(_read_at_for_body "M-broad-guard-bob")"
   kill "$w" 2>/dev/null || true
   wait "$w" 2>/dev/null || true
 
@@ -676,16 +665,12 @@ _despawn_under_herdr() {
   AGMSG_WATCH_INTERVAL=1 env -u TMUX_PANE "$@" PATH="$stub_bin:$PATH" \
     bash "$SCRIPTS/watch.sh" sess-herdr "$PROJ" claude-code alice \
     >/dev/null 2>"$errlog" 3>&- &
-  local wpid=$! i
-  for i in $(seq 1 50); do
-    [ -e "$TEST_SKILL_DIR/run/ready.team__alice" ] && break; sleep 0.1
-  done
+  local wpid=$!
+  wait_for_file "$TEST_SKILL_DIR/run/ready.team__alice"
   [ -e "$TEST_SKILL_DIR/run/ready.team__alice" ]
 
   bash "$SCRIPTS/send.sh" team bob alice "ctrl:despawn" >/dev/null
-  for i in $(seq 1 50); do
-    kill -0 "$wpid" 2>/dev/null || break; sleep 0.1
-  done
+  wait_for_pid_exit "$wpid"
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
 }
 

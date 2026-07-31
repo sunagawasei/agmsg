@@ -99,7 +99,12 @@ case "${FAKE_MODE:-success}" in
       echo overlap >> "$FAKE_CAPTURE/overlap"
     fi
     printf '%s\n' "$$" > "$FAKE_CAPTURE/started.$n"
-    sleep 2
+    waited=0
+    while [ ! -e "$FAKE_CAPTURE/slow.release" ] && [ "$waited" -lt 100 ]; do
+      sleep "$AGMSG_SPAWN_READY_POLL_INTERVAL"
+      waited=$((waited + 1))
+    done
+    [ -e "$FAKE_CAPTURE/slow.release" ] || exit 10
     rmdir "$FAKE_CAPTURE/active" 2>/dev/null || true
     make_transcript
     send_outbound
@@ -108,9 +113,10 @@ case "${FAKE_MODE:-success}" in
     : > "$FAKE_CAPTURE/barrier.started"
     waited=0
     while [ ! -e "$FAKE_CAPTURE/barrier.release" ] && [ "$waited" -lt 100 ]; do
-      sleep 0.05
+      sleep "$AGMSG_SPAWN_READY_POLL_INTERVAL"
       waited=$((waited + 1))
     done
+    [ -e "$FAKE_CAPTURE/barrier.release" ] || exit 10
     make_transcript
     send_outbound
     ;;
@@ -506,6 +512,7 @@ STUB
   run bridge
   [ "$status" -ne 0 ]
   [[ "$output" == *"already running"* ]]
+  : > "$CAPTURE/slow.release"
   wait "$first_bridge"
 
   [ "$(cat "$CAPTURE/call-count")" -eq 1 ]

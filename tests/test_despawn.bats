@@ -41,9 +41,9 @@ teardown() {
   AGMSG_WATCH_INTERVAL=1 env -u TMUX_PANE -u HERDR_PANE_ID -u HERDR_ENV \
     bash "$SCRIPTS/watch.sh" sess-m "$PROJ" claude-code alice \
     >/dev/null 2>&1 3>&- &
-  local wpid=$! i
+  local wpid=$!
   # Wait for the watcher to attach (it claims the lock + writes the ready sentinel).
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$RUN/ready.team__alice" ] && break; sleep 0.5; done
+  wait_for_file "$RUN/ready.team__alice"
   [ -e "$RUN/ready.team__alice" ]
   [ -f "$RUN/actas.team__alice.session" ]
 
@@ -74,8 +74,8 @@ _read_at_for_body() {
 
   AGMSG_WATCH_INTERVAL=1 env -u TMUX_PANE bash "$SCRIPTS/watch.sh" sess-m "$PROJ" claude-code alice \
     >/dev/null 2>&1 3>&- &
-  local wpid=$! i
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$RUN/ready.team__alice" ] && break; sleep 0.5; done
+  local wpid=$!
+  wait_for_file "$RUN/ready.team__alice"
   [ -e "$RUN/ready.team__alice" ]
 
   run bash "$SCRIPTS/despawn.sh" team leader alice --timeout 10
@@ -136,11 +136,13 @@ _read_at_for_body() {
   AGMSG_WATCH_INTERVAL=1 env -u TMUX_PANE -u HERDR_PANE_ID -u HERDR_ENV \
     bash "$SCRIPTS/watch.sh" sess-broad "$PROJ" claude-code \
     >/dev/null 2>&1 3>&- &
-  local wpid=$! i
-  for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$wpid" 2>/dev/null && break; sleep 0.5; done
+  local wpid=$!
+  wait_until 10 kill -0 "$wpid"
 
   # Deliver a despawn aimed at alice straight into the stream.
   bash "$SCRIPTS/send.sh" team boss alice "ctrl:despawn" >/dev/null
+  # Retained negative window: no completion event exists to poll; this must
+  # exceed the watcher's one-second cadence before asserting it stayed alive.
   sleep 2
 
   kill -0 "$wpid" 2>/dev/null            # watcher still alive — did NOT self-destruct

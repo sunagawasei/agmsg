@@ -13,6 +13,18 @@ teardown() {
   teardown_test_env
 }
 
+_wait_for_ping() {
+  sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
+    "SELECT 1 FROM messages WHERE team = 'team' AND from_agent = 'alice' AND to_agent = 'bob' AND body = 'ping' LIMIT 1;" \
+    | grep -q '^1$'
+}
+
+_send_after_ping() {
+  local to="$1" body="$2"
+  wait_until 5 _wait_for_ping || return
+  bash "$SCRIPTS/send.sh" team bob "$to" "$body" >/dev/null
+}
+
 @test "send: plain send is unchanged (no --wait, returns immediately)" {
   run bash "$SCRIPTS/send.sh" team alice bob "hello"
   [ "$status" -eq 0 ]
@@ -29,8 +41,9 @@ teardown() {
 }
 
 @test "send --wait: returns the reply when <to> replies to <from>" {
-  # bob replies shortly after alice begins waiting.
-  ( sleep 1; bash "$SCRIPTS/send.sh" team bob alice "pong" >/dev/null ) &
+  # bob replies after the foreground send is committed; the bounded condition
+  # preserves the fresh-reply ordering without a fixed delay.
+  ( _send_after_ping alice "pong" ) &
   run bash "$SCRIPTS/send.sh" team alice bob "ping" --wait --timeout 5 --interval 1
   wait
   [ "$status" -eq 0 ]
@@ -40,7 +53,7 @@ teardown() {
 }
 
 @test "send --wait: ignores a message addressed to a different agent" {
-  ( sleep 1; bash "$SCRIPTS/send.sh" team bob carol "not for alice" >/dev/null ) &
+  ( _send_after_ping carol "not for alice" ) &
   run bash "$SCRIPTS/send.sh" team alice bob "ping" --wait --timeout 3 --interval 1
   wait
   [ "$status" -eq 2 ]
@@ -57,7 +70,7 @@ teardown() {
 }
 
 @test "send --wait: does not mark the reply read (inbox.sh stays the read cursor)" {
-  ( sleep 1; bash "$SCRIPTS/send.sh" team bob alice "pong" >/dev/null ) &
+  ( _send_after_ping alice "pong" ) &
   run bash "$SCRIPTS/send.sh" team alice bob "ping" --wait --timeout 5 --interval 1
   wait
   [ "$status" -eq 0 ]
@@ -69,7 +82,7 @@ teardown() {
 }
 
 @test "send --wait: returns a reply containing quotes and emoji intact" {
-  ( sleep 1; bash "$SCRIPTS/send.sh" team bob alice 'done "ok" 確認 🚀' >/dev/null ) &
+  ( _send_after_ping alice 'done "ok" 確認 🚀' ) &
   run bash "$SCRIPTS/send.sh" team alice bob "ping" --wait --timeout 5 --interval 1
   wait
   [ "$status" -eq 0 ]
@@ -77,7 +90,7 @@ teardown() {
 }
 
 @test "send --wait: flattens newlines in the reply to a single line" {
-  ( sleep 1; bash "$SCRIPTS/send.sh" team bob alice $'line1\nline2' >/dev/null ) &
+  ( _send_after_ping alice $'line1\nline2' ) &
   run bash "$SCRIPTS/send.sh" team alice bob "ping" --wait --timeout 5 --interval 1
   wait
   [ "$status" -eq 0 ]

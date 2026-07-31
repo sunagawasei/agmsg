@@ -623,7 +623,7 @@ has_session_end() {
 @test "session-end.sh kills the watcher matching session_id and removes pidfile" {
   # The fixture must be a REAL watcher. session-end.sh only kills a pid whose
   # command line still looks like watch.sh (pid-recycling safety, see its
-  # comment), so the `sleep 30` stand-in this used to launch could never be
+  # comment), so the fixed-delay stand-in this used to launch could never be
   # killed — and the assertion passed anyway, so the test never checked what its
   # name claims. Converting the wait to a poll is what surfaced it: polling
   # reports the process is still there, where the single post-sleep check did
@@ -793,10 +793,7 @@ EOF
   AGMSG_TEST_LOG="$log" \
     env -u CODEX_THREAD_ID bash "$SCRIPTS/session-start.sh" codex "$linkproj" >/dev/null
 
-  for _ in {1..20}; do
-    [ -f "$log" ] && break
-    sleep 0.1
-  done
+  wait_for_file "$log"
 
   [ -f "$log" ]
   grep -q -- "--thread thread-sym" "$log"
@@ -1009,7 +1006,7 @@ JSON
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'bob', 'new-for-bob');"
   # new-for-bob is the LAST row inserted, so by the time it has been delivered
   # the watcher has necessarily scanned past new-for-alice. That is what makes
-  # the "alice never arrived" assertion below a real check; the fixed `sleep 3`
+  # the "alice never arrived" assertion below a real check; the fixed delay
   # it replaces only assumed enough poll iterations had gone by.
   wait_for_file_contains /tmp/agmsg-as-bob "new-for-bob"
   kill -TERM "$pid" 2>/dev/null
@@ -1227,7 +1224,7 @@ JSON
   [[ "$output" =~ "Killed 2 watch" ]]
   # BOTH watchers must be waited for. `stop` sends TERM to each and returns;
   # the order they actually die in is not guaranteed, so waiting only on A and
-  # asserting B in the same breath races B's exit trap. The `sleep 1` this
+  # asserting B in the same breath races B's exit trap. The fixed delay this
   # replaced happened to cover both — the two other project-scoped tests above
   # wait on one pid only because their second watcher is asserted to still be
   # ALIVE, which needs no grace period.
@@ -1643,10 +1640,7 @@ EOF
   CODEX_THREAD_ID="thread-123" \
     bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null
 
-  for _ in {1..20}; do
-    [ -f "$log" ] && break
-    sleep 0.1
-  done
+  wait_for_file "$log"
 
   [ -f "$log" ]
   grep -q -- "--project $TEST_PROJECT" "$log"
@@ -1953,7 +1947,7 @@ EOF
   AGMSG_TEST_LOG="$log" \
     env -u CODEX_THREAD_ID bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null
 
-  for _ in {1..20}; do [ -f "$log" ] && break; sleep 0.1; done
+  wait_for_file "$log"
   [ -f "$log" ]
   grep -q -- "--thread rollout-thread-999" "$log"
 }
@@ -1999,7 +1993,7 @@ EOF
   AGMSG_TEST_LOG="$log" \
     env -u CODEX_THREAD_ID bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null
 
-  for _ in {1..20}; do [ -f "$log" ] && break; sleep 0.1; done
+  wait_for_file "$log"
   [ -f "$log" ]
   grep -q -- "--thread stale-by-name-uuid" "$log"
 }

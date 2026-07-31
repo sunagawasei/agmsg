@@ -21,6 +21,17 @@ teardown() {
 
 enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/null; }
 
+_db_body_present() {
+  local body="$1" result
+  result="$(sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
+    "SELECT 1 FROM messages WHERE body='$body' LIMIT 1;")" || return 1
+  [ "$result" = 1 ]
+}
+
+wait_for_db_body() {
+  wait_until 5 _db_body_present "$1"
+}
+
 # --- whoami: current-team resolution ---------------------------------------
 
 @test "session-team off: whoami uses project->team (unchanged)" {
@@ -73,12 +84,12 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   # AFTER taking its watermark). Sending before that would, under load, let the
   # watcher take its mark past our message and skip it as "history".
   local ready="$TEST_SKILL_DIR/run/ready.s-AAA__claude"
-  for _ in $(seq 1 40); do [ -e "$ready" ] && break; sleep 0.25; done
+  wait_for_file "$ready"
 
   bash "$SCRIPTS/send.sh" s-AAA peer claude "MSG-in-AAA" >/dev/null
   bash "$SCRIPTS/send.sh" s-BBB peer claude "MSG-in-BBB" >/dev/null
   # Poll for delivery of the in-team message (robust to load).
-  for _ in $(seq 1 24); do grep -q "MSG-in-AAA" "$TEST_SKILL_DIR/w.log" && break; sleep 0.25; done
+  wait_for_file_contains "$TEST_SKILL_DIR/w.log" "MSG-in-AAA"
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
 
@@ -97,9 +108,9 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   AGMSG_SEND_WAIT_INTERVAL=1 bash "$SCRIPTS/send.sh" s-AAA claude codex "Q" --wait --timeout 12 \
     >"$TEST_SKILL_DIR/ask.log" 2>/dev/null &
   local pid=$!
-  sleep 1.5
+  wait_for_file_contains "$TEST_SKILL_DIR/ask.log" "Sent to codex in team s-AAA"
   bash "$SCRIPTS/send.sh" s-BBB codex claude "wrong-team-reply" >/dev/null  # other session team
-  sleep 1.5
+  wait_for_db_body "wrong-team-reply"
   bash "$SCRIPTS/send.sh" s-AAA codex claude "right-reply" >/dev/null       # our team
   wait "$pid" 2>/dev/null || true
 
@@ -328,6 +339,8 @@ STUB
   sleep 300 & local sib=$!
   printf 'sessSIB.%s\n' "$sib" > "$TEST_SKILL_DIR/run/cc-instance.$sib"
   printf '{"session_id":"sessSIB"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
+  # Retained negative window: sibling preservation has no completion artifact
+  # to poll, so keep one watchdog cadence before asserting survival.
   sleep 1
   kill -0 "$fake" 2>/dev/null                          # NOT torn down (sibling alive)
   kill "$fake" "$sib" 2>/dev/null || true
@@ -354,7 +367,7 @@ STUB
   printf 'pid=%s\nidentities=s-DEADCA/codex\ntype=codex\n' "$fake" > "$TEST_SKILL_DIR/run/codex-bridge.s-DEADCA.codex.meta"
   # A live (different) session start runs the GC pass.
   printf '{"session_id":"sess-gc-self"}' | bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
-  sleep 1
+  wait_for_pid_exit "$fake"
   ! kill -0 "$fake" 2>/dev/null
 }
 

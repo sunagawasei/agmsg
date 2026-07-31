@@ -2,6 +2,37 @@
 
 load test_helper
 
+port_readiness_trace() {
+  [ -z "${PORT_READINESS_TRACE:-}" ] ||
+    printf '%s\n' "$1" >> "$PORT_READINESS_TRACE"
+}
+
+port_file_is_ready() {
+  local value
+  if [ ! -s "$1" ]; then
+    port_readiness_trace empty || return 2
+    return 1
+  fi
+  value="$(<"$1")"
+  case "$value" in
+    ''|*[!0-9]*)
+      port_readiness_trace invalid || return 2
+      return 1
+      ;;
+  esac
+  if [ "${#value}" -gt 5 ]; then
+    port_readiness_trace invalid || return 2
+    return 1
+  fi
+  value=$((10#$value))
+  if [ "$value" -ge 1 ] && [ "$value" -le 65535 ]; then
+    port_readiness_trace ready || return 2
+    return 0
+  fi
+  port_readiness_trace invalid || return 2
+  return 1
+}
+
 setup() {
   setup_test_env
   export TEST_PROJECT="$(mktemp -d)"
@@ -69,6 +100,40 @@ teardown() {
 }
 
 # --- fail-open (A) ---
+
+@test "codex-monitor: port readiness waits for complete numeric content" {
+  local portf="$TEST_PROJECT/delayed.port"
+  local release="$TEST_PROJECT/write-port"
+  export PORT_READINESS_TRACE="$TEST_PROJECT/port-readiness.trace"
+  : > "$portf"
+
+  (
+    wait_for_file "$release"
+    printf '54321' > "$portf"
+  ) &
+  local writer_pid=$!
+
+  run wait_until 0.1 port_file_is_ready "$portf"
+  [ "$status" -eq 2 ]
+  [ "$output" = "wait: invalid timeout/interval for condition command (timeout=0.1 interval=$_WAIT_INTERVAL)" ]
+  [ ! -e "$PORT_READINESS_TRACE" ]
+
+  run wait_until 1 port_file_is_ready "$portf"
+  [ "$status" -eq 1 ]
+  [ "$output" = "wait: timeout after 1s waiting for condition command" ]
+  grep -q '^empty$' "$PORT_READINESS_TRACE"
+  ! grep -q '^ready$' "$PORT_READINESS_TRACE"
+
+  printf '12x' > "$portf"
+  ! port_file_is_ready "$portf"
+  grep -q '^invalid$' "$PORT_READINESS_TRACE"
+
+  : > "$release"
+  wait_until 2 port_file_is_ready "$portf"
+  [ "$(<"$portf")" = "54321" ]
+  grep -q '^ready$' "$PORT_READINESS_TRACE"
+  wait "$writer_pid"
+}
 
 @test "codex-monitor: fails open to plain codex when the app-server won't start (#170)" {
   run env FAKE_CODEX_MODE=broken AGMSG_REAL_CODEX="$FAKE_CODEX" \
@@ -145,7 +210,7 @@ while True:
         pass
 ' "$portf" 3>&- &
   local foreign_pid=$!
-  while [ ! -s "$portf" ]; do sleep 0.05; done
+  wait_until 10 port_file_is_ready "$portf"
   local foreign_port; foreign_port="$(cat "$portf")"
 
   # Seed the run artifacts to point the reuse logic at that foreign process.

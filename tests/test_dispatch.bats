@@ -16,6 +16,19 @@ teardown() {
   teardown_test_env
 }
 
+_db_request_seen() {
+  local body="$1" result
+  result="$(sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
+    "SELECT 1 FROM messages WHERE team='demo' AND from_agent='alice' AND to_agent='bob' AND body='$body' LIMIT 1;")" || return 1
+  [ "$result" = 1 ]
+}
+
+reply_after_request() {
+  local body="$1"
+  wait_until 5 _db_request_seen "$body" || return 1
+  bash "$SCRIPTS/send.sh" demo bob alice "pong" >/dev/null
+}
+
 @test "dispatch: explicit team and agent can check inbox" {
   run bash "$SCRIPTS/windows/dispatch.sh" --type codex --project "$PROJECT_BOB" --team demo --agent bob -- inbox
   [ "$status" -eq 0 ]
@@ -62,7 +75,7 @@ teardown() {
 }
 
 @test "dispatch: ask returns the reply when bob replies to alice" {
-  ( sleep 1; bash "$SCRIPTS/send.sh" demo bob alice "pong" >/dev/null ) &
+  ( reply_after_request ping ) &
   run bash "$SCRIPTS/windows/dispatch.sh" --type codex --project "$PROJECT_ALICE" --team demo --agent alice -- ask bob "ping" --timeout 5 --interval 1
   wait
   [ "$status" -eq 0 ]
@@ -72,7 +85,7 @@ teardown() {
 }
 
 @test "dispatch: ask separates --timeout from a multi-word message body" {
-  ( sleep 1; bash "$SCRIPTS/send.sh" demo bob alice "pong" >/dev/null ) &
+  ( reply_after_request "check the server please" ) &
   run bash "$SCRIPTS/windows/dispatch.sh" --type codex --project "$PROJECT_ALICE" --team demo --agent alice -- ask bob check the server please --timeout 5 --interval 1
   wait
   [ "$status" -eq 0 ]
@@ -82,7 +95,7 @@ teardown() {
 }
 
 @test "dispatch: ask keeps a --timeout literal inside the message body (only trailing options are peeled)" {
-  ( sleep 1; bash "$SCRIPTS/send.sh" demo bob alice "pong" >/dev/null ) &
+  ( reply_after_request "set --timeout 5 in the config" ) &
   run bash "$SCRIPTS/windows/dispatch.sh" --type codex --project "$PROJECT_ALICE" --team demo --agent alice -- ask bob set --timeout 5 in the config --timeout 5 --interval 1
   wait
   [ "$status" -eq 0 ]
@@ -99,7 +112,7 @@ teardown() {
 }
 
 @test "dispatch: ask -- delimiter sends a body that itself ends with flag-like tokens" {
-  ( sleep 1; bash "$SCRIPTS/send.sh" demo bob alice "pong" >/dev/null ) &
+  ( reply_after_request "raw body --interval 9 --timeout 9" ) &
   run bash "$SCRIPTS/windows/dispatch.sh" --type codex --project "$PROJECT_ALICE" --team demo --agent alice -- ask bob --timeout 5 -- raw body --interval 9 --timeout 9
   wait
   [ "$status" -eq 0 ]

@@ -11,6 +11,34 @@
 
 load test_helper
 
+_test_agent_argv0() {
+  local pid="$1" expected="$2" cmd
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd="$(compat_get_cmdline "$pid" 2>/dev/null || true)"
+  # Readiness is the exact leading argv token, with a real argument boundary.
+  # A parent `bash -c 'exec -a ...'` payload therefore cannot satisfy it.
+  case "$cmd" in
+    "$expected"|"$expected"[[:space:]]*) return 0 ;;
+  esac
+  return 1
+}
+
+_make_watch_poll_probe() {
+  local bindir="$BATS_TEST_TMPDIR/watch-probe-bin"
+  mkdir -p "$bindir"
+  export AGMSG_TEST_WATCH_POLL_MARKER="$BATS_TEST_TMPDIR/watch-poll.marker"
+  export AGMSG_TEST_REAL_SQLITE="$(command -v sqlite3)"
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'case "$*" in' \
+    '  *"WHERE id >"*) : > "$AGMSG_TEST_WATCH_POLL_MARKER" ;;' \
+    'esac' \
+    'exec "$AGMSG_TEST_REAL_SQLITE" "$@"' \
+    >"$bindir/sqlite3"
+  chmod +x "$bindir/sqlite3"
+  export AGMSG_TEST_WATCH_PATH="$bindir:$PATH"
+}
+
 setup() {
   setup_test_env
   export SKILL_DIR="$TEST_SKILL_DIR"
@@ -248,15 +276,34 @@ JSON
   [ "$status" -ne 0 ]
 }
 
+@test "pid readiness ignores an exec-a needle in the parent bash payload" {
+  skip_on_windows "process argv faking via exec -a (#349)"
+  local gate="$BATS_TEST_TMPDIR/pid-ready.gate"
+  local started="$BATS_TEST_TMPDIR/pid-ready.started"
+  mkfifo "$gate"
+  # Keep the parent bash -c command (which contains the intended identity)
+  # blocked before exec. Only releasing the FIFO permits the exact argv0.
+  test_fixture_start_gated_agent "$gate" "$started" "2.1.199"
+  local p="$TEST_FIXTURE_PID"
+  wait_for_file "$started"
+  run _test_agent_argv0 "$p" "2.1.199"
+  [ "$status" -ne 0 ]
+  printf '\n' > "$gate"
+  wait_for_file "$TEST_FIXTURE_STARTED_PATH"
+  wait_until 5 _test_agent_argv0 "$p" "2.1.199"
+  test_fixture_cleanup
+}
+
 # --- Claude Code 2.1.x daemon architecture (#349) ---
 
 @test "pid-is-agent: excludes a 'claude daemon run' process even though argv0 matches" {
   skip_on_windows "process argv faking via exec -a (#349)"
-  bash -c 'exec -a "claude daemon run --json-path /tmp/agmsg-test-daemon.json" sleep 5' 3>&- &
-  local p=$!
-  sleep 0.3
+  test_fixture_start_agent "claude" daemon run \
+    --json-path /tmp/agmsg-test-daemon.json
+  local p="$TEST_FIXTURE_PID"
+  wait_until 5 _test_agent_argv0 "$p" "claude"
   run agmsg_pid_is_agent "$p" claude-code
-  kill "$p" 2>/dev/null || true
+  test_fixture_cleanup
   [ "$status" -ne 0 ]
 }
 
@@ -266,41 +313,41 @@ JSON
   # so it must NOT be an exclusion signal on its own — only "daemon run"
   # identifies the daemon. This is the actual reported shape:
   # ".../claude/versions/2.1.199 --bg-spare ...".
-  bash -c 'exec -a "2.1.199 --bg-spare" sleep 5' 3>&- &
-  local p=$!
-  sleep 0.3
+  test_fixture_start_agent "2.1.199" --bg-spare
+  local p="$TEST_FIXTURE_PID"
+  wait_until 5 _test_agent_argv0 "$p" "2.1.199"
   run agmsg_pid_is_agent "$p" claude-code
-  kill "$p" 2>/dev/null || true
+  test_fixture_cleanup
   [ "$status" -eq 0 ]
 }
 
 @test "pid-is-agent: accepts a version-named claude-code session binary" {
   skip_on_windows "process argv faking via exec -a (#349)"
-  bash -c 'exec -a "2.1.199" sleep 5' 3>&- &
-  local p=$!
-  sleep 0.3
+  test_fixture_start_agent "2.1.199"
+  local p="$TEST_FIXTURE_PID"
+  wait_until 5 _test_agent_argv0 "$p" "2.1.199"
   run agmsg_pid_is_agent "$p" claude-code
-  kill "$p" 2>/dev/null || true
+  test_fixture_cleanup
   [ "$status" -eq 0 ]
 }
 
 @test "pid-is-agent: accepts a version-named session binary under a full versions/ path" {
   skip_on_windows "process argv faking via exec -a (#349)"
-  bash -c 'exec -a "/home/x/.local/share/claude/versions/2.1.199" sleep 5' 3>&- &
-  local p=$!
-  sleep 0.3
+  test_fixture_start_agent "/home/x/.local/share/claude/versions/2.1.199"
+  local p="$TEST_FIXTURE_PID"
+  wait_until 5 _test_agent_argv0 "$p" "/home/x/.local/share/claude/versions/2.1.199"
   run agmsg_pid_is_agent "$p" claude-code
-  kill "$p" 2>/dev/null || true
+  test_fixture_cleanup
   [ "$status" -eq 0 ]
 }
 
 @test "pid-is-agent: a version-named binary is NOT accepted for a non-claude-code type" {
   skip_on_windows "process argv faking via exec -a (#349)"
-  bash -c 'exec -a "2.1.199" sleep 5' 3>&- &
-  local p=$!
-  sleep 0.3
+  test_fixture_start_agent "2.1.199"
+  local p="$TEST_FIXTURE_PID"
+  wait_until 5 _test_agent_argv0 "$p" "2.1.199"
   run agmsg_pid_is_agent "$p" codex
-  kill "$p" 2>/dev/null || true
+  test_fixture_cleanup
   [ "$status" -ne 0 ]
 }
 
@@ -355,16 +402,26 @@ JSON
   reg T alice "$ROOT"
   # Launch the actas watcher (ACTIVE_NAME=alice) from a subdir; without
   # resolution it would see no registration and exit immediately.
-  bash "$SKILL_DIR/scripts/watch.sh" sid-w "$ROOT/sub/deep" claude-code alice \
+  # The ready sentinel is written only after project/team subscription and
+  # watermark setup, so it distinguishes a resolving watcher from one that
+  # exits early with no registration.
+  source "$SKILL_DIR/scripts/lib/actas-lock.sh"
+  _make_watch_poll_probe
+  local ready; ready="$(agmsg_ready_path T alice)"
+  local wpid
+  PATH="$AGMSG_TEST_WATCH_PATH" bash "$SKILL_DIR/scripts/watch.sh" sid-w "$ROOT/sub/deep" claude-code alice \
     >"$BATS_TEST_TMPDIR/w.out" 2>&1 3>&- &
-  local wpid=$!
-  sleep 1
-  # A resolving watcher is still alive in its poll loop; an unresolved one has
-  # already exited.
+  wpid=$!
+  test_fixture_register_owned_pid "$wpid"
+  wait_for_file "$ready"
+  # The wrapper marker is emitted only by the main poll query (WHERE id >),
+  # after resolution, watermark setup, and readiness signaling.
+  wait_for_file "$AGMSG_TEST_WATCH_POLL_MARKER"
   local alive=0
   kill -0 "$wpid" 2>/dev/null && alive=1
   kill "$wpid" 2>/dev/null || true
   wait "$wpid" 2>/dev/null || true
+  test_fixture_cleanup
 
   [ "$alive" -eq 1 ]
   run cat "$BATS_TEST_TMPDIR/w.out"

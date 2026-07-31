@@ -49,14 +49,15 @@ fake_session() {
   local result_b="$BATS_TEST_TMPDIR/placement.b"
   local ready_a="$BATS_TEST_TMPDIR/placement.ready.a"
   local ready_b="$BATS_TEST_TMPDIR/placement.ready.b"
+  local release="$BATS_TEST_TMPDIR/placement.release"
 
   placement_contender() {
     local result="$1" ready="$2"
     : > "$ready"
-    while [ ! -e "$go" ]; do sleep 0.01; done
+    wait_for_file "$go" || return 1
     if agmsg_placement_lock_acquire T alice 0; then
       printf 'acquired\n' > "$result"
-      sleep 1
+      wait_for_file "$release" || return 1
       agmsg_placement_lock_release T alice
     else
       printf 'blocked\n' > "$result"
@@ -70,6 +71,9 @@ fake_session() {
   wait_for_file "$ready_a"
   wait_for_file "$ready_b"
   : > "$go"
+  wait_for_file "$result_a"
+  wait_for_file "$result_b"
+  : > "$release"
   wait "$pid_a"
   wait "$pid_b"
 
@@ -186,8 +190,8 @@ fake_session() {
   AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" "sid-mine" /tmp/p1 claude-code \
     >/dev/null 2> "$BATS_TEST_TMPDIR/watch.err" 3>&- &
   local wpid=$!
-  # Give it just enough time to resolve subscription and print stderr.
-  sleep 1
+  wait_for_file_contains "$BATS_TEST_TMPDIR/watch.err" \
+    "skipping pairs held by other sessions"
   kill "$wpid" 2>/dev/null || true
   wait "$wpid" 2>/dev/null || true
 
@@ -217,9 +221,7 @@ fake_session() {
   AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" "sid-me" /tmp/p1 claude-code alice \
     >/dev/null 2> "$BATS_TEST_TMPDIR/watch.err" 3>&- &
   local wpid=$!
-  sleep 1
-
-  # Should now own the lock.
+  wait_for_file "$(actas_lock_path T alice)"
   [ "$(actas_lock_owner T alice)" = "sid-me" ]
 
   kill "$wpid" 2>/dev/null || true
