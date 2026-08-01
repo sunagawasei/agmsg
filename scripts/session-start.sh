@@ -43,6 +43,8 @@ source "$SCRIPT_DIR/lib/hash.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/team-lifecycle.sh"
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/type-registry.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/session-team.sh"
@@ -273,7 +275,17 @@ if [ -n "$CC_PID" ]; then
       fi
     fi
   fi
+  # Serialize publication with SessionEnd's final sibling check and teardown.
+  # Failing closed is safer than publishing outside the lock: an unlocked write
+  # could arrive after the worker's sibling check and before its force action.
+  _lifecycle_team="s-${SESSION_ID%%.*}"
+  if ! agmsg_team_lifecycle_lock_acquire "$_lifecycle_team" \
+      "${AGMSG_LIFECYCLE_LOCK_TIMEOUT:-10}"; then
+    echo "agmsg: could not serialize SessionStart registration for $_lifecycle_team" >&2
+    exit 0
+  fi
   printf '%s\n' "$INSTANCE_ID" > "$STATE"
+  agmsg_team_lifecycle_lock_release "$_lifecycle_team"
 fi
 
 # --- Orphan headless GC (session-team mode). ---

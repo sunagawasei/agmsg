@@ -111,6 +111,7 @@ case "${FAKE_MODE:-success}" in
     ;;
   barrier-success)
     : > "$FAKE_CAPTURE/barrier.started"
+    printf '%s\n' "$$" > "$FAKE_CAPTURE/barrier.pid"
     waited=0
     while [ ! -e "$FAKE_CAPTURE/barrier.release" ] && [ "$waited" -lt 100 ]; do
       sleep "$AGMSG_SPAWN_READY_POLL_INTERVAL"
@@ -182,6 +183,124 @@ db_scalar() {
 
 session_file() {
   printf '%s/claude-code-bridge.team.worker.session' "$RUN"
+}
+
+publish_drain_fence() {
+  local now tmp="$RUN/drain.team.fence.tmp-test"
+  now="$(date +%s)"
+  printf 'nonce=test-drain\nowner=test-owner\nteam=team\nlease_epoch=%s\n' "$now" > "$tmp"
+  mv "$tmp" "$RUN/drain.team.fence"
+}
+
+@test "claude-code bridge exits from watch wait on USR2 without leaving a duplicate watch" {
+  local bridge_pid marker log="$TEST_SKILL_DIR/watch-drain.log"
+  bash "$TYPES/claude-code/claude-code-bridge.sh" \
+    --project "$PROJ" --team team --name worker --identity-key test-key. \
+    --watch-timeout 30 --interval 1 --turn-timeout 5 > "$log" 2>&1 &
+  bridge_pid=$!
+  test_fixture_register_owned_pid "$bridge_pid"
+  wait_for_file "$RUN/claude-code-bridge.team.worker.meta"
+  wait_for_file_contains "$log" 'claude-code-bridge: armed team/worker'
+  grep -Fxq 'drain_capable=1' "$RUN/claude-code-bridge.team.worker.meta"
+
+  publish_drain_fence
+  kill -USR2 "$bridge_pid"
+  marker="$RUN/draining.team__worker.$bridge_pid"
+  wait_for_file "$marker"
+  wait "$bridge_pid"
+
+  [ "$(grep -c 'claude-code-bridge: armed team/worker' "$log")" -eq 1 ]
+  grep -Fxq 'nonce=test-drain' "$marker"
+  [ ! -e "$RUN/claude-code-bridge.team.worker.pid" ]
+}
+
+@test "claude-code bridge observes a fence on watch timeout without USR2" {
+  local bridge_pid marker log="$TEST_SKILL_DIR/no-nudge-drain.log"
+  bash "$TYPES/claude-code/claude-code-bridge.sh" \
+    --project "$PROJ" --team team --name worker --identity-key test-key. \
+    --watch-timeout 1 --interval 1 --turn-timeout 5 > "$log" 2>&1 &
+  bridge_pid=$!
+  test_fixture_register_owned_pid "$bridge_pid"
+  wait_for_file_contains "$log" 'claude-code-bridge: armed team/worker'
+
+  publish_drain_fence
+  marker="$RUN/draining.team__worker.$bridge_pid"
+  wait_for_file "$marker"
+  wait "$bridge_pid"
+
+  grep -Fxq 'nonce=test-drain' "$marker"
+  [ "$(grep -c 'claude-code-bridge: armed team/worker' "$log")" -eq 1 ]
+}
+
+@test "claude-code bridge keeps the same active turn child through USR2 then drains" {
+  local bridge_pid fake_pid marker log="$TEST_SKILL_DIR/active-drain.log"
+  export FAKE_MODE=barrier-success
+  send_to_worker alice "finish before drain"
+  bash "$TYPES/claude-code/claude-code-bridge.sh" \
+    --project "$PROJ" --team team --name worker --identity-key test-key. \
+    --once --watch-timeout 5 --interval 1 --turn-timeout 20 > "$log" 2>&1 &
+  bridge_pid=$!
+  test_fixture_register_owned_pid "$bridge_pid"
+  wait_for_file "$CAPTURE/barrier.started"
+  fake_pid="$(cat "$CAPTURE/barrier.pid")"
+
+  publish_drain_fence
+  kill -USR2 "$bridge_pid"
+  marker="$RUN/draining.team__worker.$bridge_pid"
+  wait_for_file "$marker"
+  sleep 0.2
+  kill -0 "$bridge_pid" 2>/dev/null
+  kill -0 "$fake_pid" 2>/dev/null
+
+  : > "$CAPTURE/barrier.release"
+  wait "$bridge_pid"
+  run kill -0 "$fake_pid"
+  [ "$status" -ne 0 ]
+  grep -q 'completed turn on session' "$log"
+  [ ! -e "$RUN/claude-code-bridge.team.worker.pid" ]
+}
+
+@test "claude-code bridge finishes an admission already reading when USR2 arrives" {
+  local bridge_pid marker log="$TEST_SKILL_DIR/admitting-drain.log"
+  mv "$SCRIPTS/inbox.sh" "$SCRIPTS/inbox.sh.real"
+  cat > "$SCRIPTS/inbox.sh" <<'WRAPPER'
+#!/usr/bin/env bash
+set -e
+"$(dirname "$0")/inbox.sh.real" "$@" > "$AGMSG_TEST_INBOX_RESULT"
+: > "$AGMSG_TEST_INBOX_BLOCKED"
+while [ ! -e "$AGMSG_TEST_INBOX_RELEASE" ]; do sleep 0.02; done
+cat "$AGMSG_TEST_INBOX_RESULT"
+WRAPPER
+  chmod +x "$SCRIPTS/inbox.sh"
+  export AGMSG_TEST_INBOX_RESULT="$TEST_SKILL_DIR/inbox.result"
+  export AGMSG_TEST_INBOX_BLOCKED="$TEST_SKILL_DIR/inbox.blocked"
+  export AGMSG_TEST_INBOX_RELEASE="$TEST_SKILL_DIR/inbox.release"
+  send_to_worker alice "consumed admission must finish"
+
+  bash "$TYPES/claude-code/claude-code-bridge.sh" \
+    --project "$PROJ" --team team --name worker --identity-key test-key. \
+    --once --watch-timeout 5 --interval 1 --turn-timeout 20 > "$log" 2>&1 &
+  bridge_pid=$!
+  test_fixture_register_owned_pid "$bridge_pid"
+  wait_for_file "$AGMSG_TEST_INBOX_BLOCKED"
+  # inbox.sh has completed its read, but exact mark-read is deliberately held
+  # behind the wrapper. ADMITTING keeps this whole unit alive through USR2.
+  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE team='team' AND to_agent='worker' AND read_at IS NULL;")" -eq 1 ]
+
+  publish_drain_fence
+  kill -USR2 "$bridge_pid"
+  marker="$RUN/draining.team__worker.$bridge_pid"
+  sleep 0.2
+  kill -0 "$bridge_pid" 2>/dev/null
+  [ ! -e "$CAPTURE/call-count" ]
+
+  : > "$AGMSG_TEST_INBOX_RELEASE"
+  wait_for_file "$marker"
+  wait "$bridge_pid"
+  [ "$(cat "$CAPTURE/call-count")" -eq 1 ]
+  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE team='team' AND to_agent='worker' AND read_at IS NULL;")" -eq 0 ]
+  grep -q 'consumed admission must finish' "$CAPTURE/prompt.1"
+  grep -q 'completed turn on session' "$log"
 }
 
 @test "claude-code bridge lifecycle, stdin, env, cwd, role, args, and mark timing" {

@@ -19,6 +19,23 @@ const RUN_DIR = path.join(SKILL_DIR, "run");
 // context); honour the same overrides delivery.sh's windows_wrap uses.
 const BASH_BIN = process.env.GIT_BASH || process.env.AGMSG_BASH || "bash";
 
+function encodeRunKey(value) {
+  return Array.from(Buffer.from(String(value), "utf8"), (byte) => {
+    const char = String.fromCharCode(byte);
+    return /[A-Za-z0-9._-]/.test(char) ? char : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }).join("");
+}
+
+function drainLeaseStaleSeconds() {
+  const envValue = Number(process.env.AGMSG_DRAIN_LEASE_STALE_S || "");
+  if (Number.isInteger(envValue) && envValue > 0) return envValue;
+  const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, "config.sh"), "get", "drain.lease_stale_s", "120"], {
+    encoding: "utf8",
+  });
+  const configured = Number(String(result.stdout || "").trim());
+  return Number.isInteger(configured) && configured > 0 ? configured : 120;
+}
+
 function usage() {
   console.log(`Usage: codex-bridge.js --project <path> [--type codex] [--team <team>] [--name <agent>]
 
@@ -860,6 +877,7 @@ class CodexBridge {
     this.threadIdle = true;
     this.turnActive = false;
     this.turnTimer = null;
+    this.authoritativeIdle = true;
     this.pendingWake = false;
     this.watchHandle = null;
     this.wakeCount = 0;
@@ -870,6 +888,8 @@ class CodexBridge {
     });
     this.watchTimeoutKillCount = 0;
     this.watchRearmTimer = null;
+    this.drainRecheckTimer = null;
+    this.drainHeldAssumedEnd = false;
     this.inlineInboxText = "";
     // inline-inbox consumption tracking. turn/start's RESPONSE carries no turn id
     // in this protocol (result: {}), so each started turn gets a local, monotonic
@@ -889,6 +909,12 @@ class CodexBridge {
       : crypto.createHash("sha1").update(identities.map((p) => `${p.team}\t${p.name}`).join("\n")).digest("hex");
     this.pidfile = path.join(RUN_DIR, `codex-bridge.${key}.pid`);
     this.metafile = path.join(RUN_DIR, `codex-bridge.${key}.meta`);
+    this.drainFence = path.join(RUN_DIR, `drain.${encodeRunKey(this.identity.team)}.fence`);
+    this.drainMarker = path.join(
+      RUN_DIR,
+      `draining.${encodeRunKey(this.identity.team)}__${encodeRunKey(this.identity.name)}.${process.pid}`,
+    );
+    this.drainLeaseStaleSeconds = drainLeaseStaleSeconds();
     // Failure notices whose send failed, persisted so they survive a restart and
     // are retried before each new turn (cursor-bridge's outbound-first rule).
     // Keep the spool keyed by the worker name even though bridge PID state is
@@ -902,8 +928,11 @@ class CodexBridge {
   async run() {
     fs.mkdirSync(RUN_DIR, { recursive: true });
     this.ensureSingleInstance();
-    this.writeMeta();
     this.installSignals();
+    // Publish drain_capable only after SIGUSR2 is safe to receive. Otherwise a
+    // teardown worker can observe capability and hit the signal's default action
+    // during this startup window.
+    this.writeMeta();
     // Deliver failure notices a previous bridge run spooled (send.sh was failing
     // when it stopped) before doing anything else.
     this.flushOutbound();
@@ -922,6 +951,8 @@ class CodexBridge {
     this.client.on("turn/started", this.clientHandler("turn/started", (params) => {
       this.turnActive = true;
       this.threadIdle = false;
+      this.authoritativeIdle = false;
+      this.drainHeldAssumedEnd = false;
       this.bindTurnId(params && params.turn && params.turn.id);
       // This turn was not started by tryStartTurn() -- e.g. a TUI-driven turn
       // on a thread the bridge shares -- so nothing else will arm a watchdog
@@ -950,6 +981,7 @@ class CodexBridge {
     await this.client.ready?.();
     await this.initialize();
     await this.ensureThread();
+    if (await this.handleDrainCheckpoint()) return;
     await this.armWatch();
   }
 
@@ -977,6 +1009,7 @@ class CodexBridge {
         `project=${this.opts.project}`,
         `identities=${this.identities.map((p) => `${p.team}/${p.name}`).join(",")}`,
         `type=${this.opts.type}`,
+        "drain_capable=1",
       ].join("\n") + "\n",
     );
   }
@@ -987,6 +1020,18 @@ class CodexBridge {
     };
     process.on("SIGINT", stop);
     process.on("SIGTERM", stop);
+    try {
+      process.on("SIGUSR2", () => {
+        // SIGUSR2 is only a nudge. Git Bash/Windows may not deliver it; the same
+        // fence is checked on the next watch/admission path, so correctness does
+        // not depend on signal delivery.
+        this.handleDrainCheckpoint().catch((error) =>
+          console.error(`codex-bridge: drain signal handling failed: ${error.message}`),
+        );
+      });
+    } catch (_) {
+      // Unsupported signal name on this platform; watch checkpoints still drain.
+    }
     process.on("exit", () => {
       this.client.stop();
       this.cleanupMeta();
@@ -1058,6 +1103,7 @@ class CodexBridge {
         console.error(`codex-bridge: thread/resume failed (${err.message}); proceeding without resume`);
         this.threadIdle = true;
         this.turnActive = false;
+        this.authoritativeIdle = true;
         return;
       }
       if (!response.thread || response.thread.id !== this.threadId) {
@@ -1066,6 +1112,7 @@ class CodexBridge {
       const type = response.thread.status && response.thread.status.type;
       this.threadIdle = type !== "active";
       this.turnActive = type === "active";
+      this.authoritativeIdle = type !== "active";
       // The thread can already be active on resume (e.g. a stuck approval
       // predating this bridge, or a co-resident TUI turn) with no bridge-owned
       // turn/start to hang a watchdog off of. Arm one here too so a pending
@@ -1121,6 +1168,10 @@ class CodexBridge {
   async onProcessExited(params) {
     if (params.processHandle !== this.watchHandle) return;
     this.watchHandle = null;
+
+    // A missing SIGUSR2 (notably under Git Bash/Windows) merely delays fence
+    // observation until this deterministic watch completion checkpoint.
+    if (await this.handleDrainCheckpoint()) return;
 
     if (params.exitCode === 0) {
       this.watchFailureBackoff.success();
@@ -1186,6 +1237,8 @@ class CodexBridge {
     if (type === "active") {
       this.turnActive = true;
       this.threadIdle = false;
+      this.authoritativeIdle = false;
+      this.drainHeldAssumedEnd = false;
       // See the identical comment on the "turn/started" handler in run() --
       // this transition can also happen without tryStartTurn() ever calling
       // startTurnWatchdog() itself. See #299.
@@ -1196,7 +1249,7 @@ class CodexBridge {
       this.threadIdle = true;
       // The real app-server signals idle but may never send turn/completed;
       // treat idle as the end of the turn so detection resumes. See #41.
-      this.onTurnEnded().catch((error) =>
+      this.onTurnEnded({ authoritative: true }).catch((error) =>
         console.error(`codex-bridge: resume on idle failed: ${error.message}`),
       );
     }
@@ -1259,7 +1312,7 @@ class CodexBridge {
     } else if (turnId) {
       console.error(`codex-bridge: turn/completed for unknown turn ${turnId}; no snapshot to settle`);
     }
-    await this.onTurnEnded();
+    await this.onTurnEnded({ authoritative: true });
   }
 
   // turn/failed: in inline-inbox mode the messages were already consumed (marked
@@ -1286,7 +1339,7 @@ class CodexBridge {
         `codex-bridge: turn/failed for ${turnId ? `turn ${turnId}` : "the last turn"} has no pending snapshot (already settled or orphan-drained); nothing to notify`,
       );
     }
-    await this.onTurnEnded();
+    await this.onTurnEnded({ authoritative: true });
   }
 
   // Send a compensation notice to every sender in a consumption snapshot;
@@ -1307,10 +1360,25 @@ class CodexBridge {
   // turn/completed, turn/failed, thread/status idle, OR the turn watchdog. The
   // real app-server does not reliably deliver turn/completed, so a bridge that
   // gates re-arm on it never re-arms and sleeps after one message. See #41.
-  async onTurnEnded() {
+  async onTurnEnded({ authoritative = false } = {}) {
     this.clearTurnWatchdog();
+    const drainFence = !authoritative ? this.readDrainFence() : null;
+    if (drainFence) {
+      // The local inactivity watchdog is only an assumed end. During a drain,
+      // keep the turn active until the server emits completed/failed/idle; the
+      // worker deadline owns the fallback for a permanently ambiguous turn.
+      this.publishDrainingMarker(drainFence);
+      this.turnActive = true;
+      this.threadIdle = false;
+      this.authoritativeIdle = false;
+      this.drainHeldAssumedEnd = true;
+      return;
+    }
+    this.drainHeldAssumedEnd = false;
     this.turnActive = false;
     this.threadIdle = true;
+    this.authoritativeIdle = authoritative;
+    if (await this.handleDrainCheckpoint()) return;
     if (this.opts.maxWakes && this.wakeCount >= this.opts.maxWakes) {
       await this.shutdown();
       process.exit(0);
@@ -1332,6 +1400,10 @@ class CodexBridge {
   }
 
   async tryStartTurn() {
+    // Synchronous inbox consumption below runs without event-loop interruption.
+    // This leading check is therefore the admission boundary: once it returns
+    // fence-free, read/mark/turn-start completes as one admitted unit.
+    if (this.handleDrainCheckpointSync()) return;
     if (!this.pendingWake || this.turnActive || !this.threadIdle) return;
     // Retry spooled failure notices BEFORE burning a new turn (outbound-first).
     this.flushOutbound();
@@ -1357,6 +1429,8 @@ class CodexBridge {
     const prompt = this.buildPrompt();
     this.turnActive = true;
     this.threadIdle = false;
+    this.authoritativeIdle = false;
+    this.drainHeldAssumedEnd = false;
     // Register this turn's consumption under a fresh local epoch BEFORE the
     // request: turn/started (which binds the server's turn id to this epoch)
     // can arrive while the request is still in flight.
@@ -1407,7 +1481,7 @@ class CodexBridge {
       console.error(
         `codex-bridge: no turn activity within ${this.opts.turnTimeout}s; assuming the turn ended and resuming`,
       );
-      this.onTurnEnded().catch((error) =>
+      this.onTurnEnded({ authoritative: false }).catch((error) =>
         console.error(`codex-bridge: resume after turn timeout failed: ${error.message}`),
       );
     }, this.opts.turnTimeout * 1000);
@@ -1419,6 +1493,122 @@ class CodexBridge {
       clearTimeout(this.turnTimer);
       this.turnTimer = null;
     }
+  }
+
+  readDrainFence() {
+    try {
+      const stat = fs.lstatSync(this.drainFence);
+      if (!stat.isFile() || stat.isSymbolicLink()) return null;
+      const lines = fs.readFileSync(this.drainFence, "utf8").split(/\r?\n/);
+      if (lines[lines.length - 1] === "") lines.pop();
+      if (lines.length !== 4) return null;
+      const values = new Map();
+      for (const line of lines) {
+        const split = line.indexOf("=");
+        if (split <= 0) return null;
+        const key = line.slice(0, split);
+        const value = line.slice(split + 1);
+        if (!value || /[\u0000-\u0020\u007f]/.test(value) || values.has(key)) return null;
+        values.set(key, value);
+      }
+      if (values.size !== 4 || !["nonce", "owner", "team", "lease_epoch"].every((key) => values.has(key))) {
+        return null;
+      }
+      if (values.get("team") !== this.identity.team) return null;
+      const leaseEpoch = Number(values.get("lease_epoch"));
+      const now = Math.floor(Date.now() / 1000);
+      if (!Number.isSafeInteger(leaseEpoch) || leaseEpoch < 0 || now < leaseEpoch) return null;
+      if (now - leaseEpoch > this.drainLeaseStaleSeconds) return null;
+      return {
+        nonce: values.get("nonce"),
+        owner: values.get("owner"),
+        team: values.get("team"),
+        leaseEpoch,
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  publishDrainingMarker(fence) {
+    if (!fence || !fence.nonce) return;
+    let tmp = "";
+    try {
+      try {
+        fs.lstatSync(this.drainMarker);
+        return; // write-once telemetry for this bridge pid
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") return;
+      }
+      tmp = `${this.drainMarker}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, `nonce=${fence.nonce}\npid=${process.pid}\n`, { mode: 0o600 });
+      try {
+        fs.lstatSync(this.drainMarker);
+        fs.unlinkSync(tmp);
+        return;
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
+      fs.renameSync(tmp, this.drainMarker);
+    } catch (error) {
+      if (tmp) {
+        try { fs.unlinkSync(tmp); } catch (_) { /* best effort */ }
+      }
+      console.error(`codex-bridge: could not publish drain marker: ${error.message}`);
+    }
+  }
+
+  scheduleDrainRecheck() {
+    if (this.stopping || this.drainRecheckTimer) return;
+    this.drainRecheckTimer = setTimeout(() => {
+      this.drainRecheckTimer = null;
+      this.handleDrainCheckpoint().then((draining) => {
+        if (draining || this.stopping) return;
+        if (this.pendingWake) {
+          this.tryStartTurn().catch((error) => this.failClientHandler("drain/recheck", error));
+        } else if (!this.turnActive && this.threadIdle) {
+          this.armWatch().catch((error) => this.failClientHandler("drain/recheck", error));
+        }
+      }).catch((error) => this.failClientHandler("drain/recheck", error));
+    }, 1000);
+    if (this.drainRecheckTimer.unref) this.drainRecheckTimer.unref();
+  }
+
+  clearDrainRecheck() {
+    if (!this.drainRecheckTimer) return;
+    clearTimeout(this.drainRecheckTimer);
+    this.drainRecheckTimer = null;
+  }
+
+  handleDrainCheckpointSync() {
+    const fence = this.readDrainFence();
+    if (!fence) {
+      this.clearDrainRecheck();
+      if (this.drainHeldAssumedEnd) {
+        this.drainHeldAssumedEnd = false;
+        this.turnActive = false;
+        this.threadIdle = true;
+        this.authoritativeIdle = false;
+      }
+      return false;
+    }
+    this.publishDrainingMarker(fence);
+    if (!this.turnActive && this.threadIdle && this.authoritativeIdle) {
+      // Begin the existing cleanup path, but do not yield at the admission
+      // boundary. tryStartTurn() must proceed from a fence-free check through
+      // its synchronous consume/admission section without an event-loop gap.
+      this.shutdown().then(() => process.exit(0)).catch((error) => {
+        console.error(`codex-bridge: drain shutdown failed: ${error.message}`);
+        process.exit(1);
+      });
+      return true;
+    }
+    this.scheduleDrainRecheck();
+    return true;
+  }
+
+  async handleDrainCheckpoint() {
+    return this.handleDrainCheckpointSync();
   }
 
   onServerError(params) {
@@ -1647,6 +1837,7 @@ class CodexBridge {
     this.stopping = true;
     this.clearWatchRearmTimer();
     this.clearTurnWatchdog();
+    this.clearDrainRecheck();
     if (this.watchHandle) {
       try {
         await this.client.request("process/kill", { processHandle: this.watchHandle });

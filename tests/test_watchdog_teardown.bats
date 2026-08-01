@@ -85,6 +85,8 @@ EOF
   TEST_PIDS="$TEST_PIDS $watch_pid"
   printf '%s\n' "$watch_pid" > "$RUN/watch.$instance.pid"
   printf 'worker\tpid:123\t%s\tcodex\n' "$PROJ" > "$snapshot"
+  printf 'pid:123\t%s\tcodex\n' "$PROJ" \
+    > "$RUN/spawn.s-D0E0-WATCH-001__worker"
 
   cat > "$SCRIPTS/despawn.sh" <<'EOF'
 #!/usr/bin/env bash

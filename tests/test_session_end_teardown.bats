@@ -104,6 +104,10 @@ write_snapshot_row() {
     "$(printf 'pid:not-a-number\t%s\tcodex' "$PROJ")"
   write_snapshot_row "$snapshot" good \
     "$(printf 'pid:202\t%s\tcursor' "$PROJ")"
+  printf 'pid:not-a-number\t%s\tcodex\n' "$PROJ" \
+    > "$(agmsg_spawn_path "$STEAM" bad)"
+  printf 'pid:202\t%s\tcursor\n' "$PROJ" \
+    > "$(agmsg_spawn_path "$STEAM" good)"
 
   mv "$SCRIPTS/despawn.sh" "$SCRIPTS/despawn.sh.real"
   printf '%s\n' \

@@ -91,6 +91,104 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+@test "codex-bridge: drain keeps an assumed-end turn active until an authoritative terminal event" {
+  run node - "$TYPES/codex/codex-bridge.js" "$PROJ" <<'NODE'
+const { CodexBridge } = require(process.argv[2]);
+const project = process.argv[3];
+const bridge = new CodexBridge({
+  project,
+  type: "codex",
+  requestTimeoutMs: 0,
+  turnTimeout: 0,
+  maxWakes: 0,
+}, [{ team: "team", name: "alice" }]);
+bridge.turnActive = true;
+bridge.threadIdle = false;
+bridge.authoritativeIdle = false;
+bridge.readDrainFence = () => ({ nonce: "test-nonce" });
+bridge.publishDrainingMarker = () => {};
+let authoritativeChecks = 0;
+(async () => {
+  await bridge.onTurnEnded({ authoritative: false });
+  if (!bridge.turnActive || bridge.threadIdle || bridge.authoritativeIdle) process.exit(1);
+  bridge.handleDrainCheckpoint = async () => { authoritativeChecks += 1; return true; };
+  await bridge.onTurnEnded({ authoritative: true });
+  if (bridge.turnActive || !bridge.threadIdle || !bridge.authoritativeIdle) process.exit(2);
+  if (authoritativeChecks !== 1) process.exit(3);
+})().catch(() => process.exit(4));
+NODE
+  [ "$status" -eq 0 ]
+}
+
+@test "codex-bridge: a valid fence at admission leaves the inline inbox unread" {
+  local fence="$TEST_SKILL_DIR/run/drain.unit-drain-team.fence" now
+  now="$(date +%s)"
+  printf 'nonce=unit-nonce\nowner=unit-owner\nteam=unit-drain-team\nlease_epoch=%s\n' "$now" > "$fence"
+  run node - "$TYPES/codex/codex-bridge.js" "$PROJ" <<'NODE'
+const { CodexBridge } = require(process.argv[2]);
+const project = process.argv[3];
+const bridge = new CodexBridge({
+  project,
+  type: "codex",
+  requestTimeoutMs: 0,
+  turnTimeout: 0,
+  maxWakes: 0,
+  inlineInbox: true,
+}, [{ team: "unit-drain-team", name: "unit-worker" }]);
+bridge.pendingWake = true;
+bridge.turnActive = false;
+bridge.threadIdle = true;
+// Model an earlier local watchdog estimate: a valid fence must block admission
+// but cannot self-exit until a server terminal event makes idle authoritative.
+bridge.authoritativeIdle = false;
+let reads = 0;
+bridge.readInboxForPrompt = () => { reads += 1; return "must not be read"; };
+bridge.publishDrainingMarker = () => {};
+(async () => {
+  await bridge.tryStartTurn();
+  bridge.clearDrainRecheck();
+  if (reads !== 0 || !bridge.pendingWake) process.exit(1);
+})().catch(() => process.exit(2));
+NODE
+  [ "$status" -eq 0 ]
+}
+
+@test "codex-bridge: fence check and synchronous consume have no event-loop gap" {
+  run node - "$TYPES/codex/codex-bridge.js" "$PROJ" <<'NODE'
+const { CodexBridge } = require(process.argv[2]);
+const project = process.argv[3];
+const bridge = new CodexBridge({
+  project,
+  type: "codex",
+  requestTimeoutMs: 0,
+  turnTimeout: 0,
+  maxWakes: 0,
+  inlineInbox: true,
+}, [{ team: "team", name: "alice" }]);
+bridge.pendingWake = true;
+bridge.threadId = "thread-1";
+let microtaskRan = false;
+bridge.handleDrainCheckpointSync = () => {
+  queueMicrotask(() => { microtaskRan = true; });
+  return false;
+};
+bridge.readInboxForPrompt = () => {
+  if (microtaskRan) throw new Error("event loop yielded between fence check and consume");
+  bridge.pendingConsumption = new Map([["sender", [1]]]);
+  return "message";
+};
+bridge.buildPrompt = () => "message";
+bridge.flushOutbound = () => {};
+bridge.client.request = () => Promise.resolve({});
+(async () => {
+  await bridge.tryStartTurn();
+  bridge.clearTurnWatchdog();
+  if (!bridge.turnActive || bridge.pendingWake) process.exit(1);
+})().catch(() => process.exit(2));
+NODE
+  [ "$status" -eq 0 ]
+}
+
 @test "codex-bridge: resolve-only prints the selected identity" {
   skip_on_windows "codex bridge identity resolution on Windows (#182)"
   run node "$TYPES/codex/codex-bridge.js" --project "$PROJ" --team team --name alice --resolve-only

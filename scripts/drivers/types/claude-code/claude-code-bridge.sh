@@ -39,6 +39,8 @@ MAX_WAKES=0
 ONCE=0
 ADD_DIRS=()
 DISALLOWED_TOOLS=()
+ADD_DIRS_SET=0
+DISALLOWED_TOOLS_SET=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -50,11 +52,11 @@ while [ "$#" -gt 0 ]; do
     --effort) EFFORT="${2:?--effort needs a value}"; shift 2 ;;
     --settings|--settings-file) SETTINGS="${2:?--settings needs a value}"; shift 2 ;;
     --output-format) OUTPUT_FORMAT="${2:?--output-format needs a value}"; shift 2 ;;
-    --add-dir) ADD_DIRS+=("${2:?--add-dir needs a path}"); shift 2 ;;
-    --disallowedTools) DISALLOWED_TOOLS+=("${2:?--disallowedTools needs a value}"); shift 2 ;;
+    --add-dir) ADD_DIRS+=("${2:?--add-dir needs a path}"); ADD_DIRS_SET=1; shift 2 ;;
+    --disallowedTools) DISALLOWED_TOOLS+=("${2:?--disallowedTools needs a value}"); DISALLOWED_TOOLS_SET=1; shift 2 ;;
     --add-dirs-file)
       while IFS= read -r _add_dir; do
-        [ -n "$_add_dir" ] && ADD_DIRS+=("$_add_dir")
+        if [ -n "$_add_dir" ]; then ADD_DIRS+=("$_add_dir"); ADD_DIRS_SET=1; fi
       done < "${2:?--add-dirs-file needs a path}"
       shift 2 ;;
     --role-file) ROLE_FILE="${2:?--role-file needs a path}"; shift 2 ;;
@@ -91,6 +93,8 @@ RUN_DIR="$SKILL_DIR/run"
 source "$SCRIPTS_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPTS_DIR/lib/actas-lock.sh"
+# shellcheck disable=SC1091
+source "$SCRIPTS_DIR/lib/team-lifecycle.sh"
 # shellcheck disable=SC1091
 source "$SCRIPTS_DIR/lib/resolve-project.sh"
 # shellcheck disable=SC1091
@@ -199,8 +203,16 @@ if [ -n "$old_pid" ] && [ "$old_pid" != "$$" ] && pid_alive "$old_pid"; then
   exit 1
 fi
 
+DRAIN_SIGNAL=0
+on_drain_signal() {
+  # A USR2 trap must not inspect files, mutate admission state, or touch either
+  # child. wait-preserving checkpoints below do that outside the trap context.
+  DRAIN_SIGNAL=1
+}
+trap on_drain_signal USR2
+
 printf '%s\n' "$$" > "$PIDFILE"
-printf 'pid=%s\nproject=%s\nteam=%s\nname=%s\ntype=claude-code\n' \
+printf 'pid=%s\nproject=%s\nteam=%s\nname=%s\ntype=claude-code\ndrain_capable=1\n' \
   "$$" "$PROJECT" "$TEAM" "$NAME" > "$METAFILE"
 : >> "$LOGFILE"
 
@@ -209,6 +221,15 @@ printf 'pid=%s\nproject=%s\nteam=%s\nname=%s\ntype=claude-code\n' \
 CHILD_PID=""
 WATCH_PID=""
 STOPPING=0
+ADMITTING=0
+ACTIVE=0
+DRAIN_LEASE_STALE_S="${AGMSG_DRAIN_LEASE_STALE_S:-}"
+[ -n "$DRAIN_LEASE_STALE_S" ] \
+  || DRAIN_LEASE_STALE_S="$("$SCRIPTS_DIR/config.sh" get drain.lease_stale_s 120 2>/dev/null || echo 120)"
+case "$DRAIN_LEASE_STALE_S" in ''|*[!0-9]*) DRAIN_LEASE_STALE_S=120 ;; esac
+[ "$DRAIN_LEASE_STALE_S" -gt 0 ] 2>/dev/null || DRAIN_LEASE_STALE_S=120
+DRAIN_FENCE="$(agmsg_drain_fence_path "$TEAM")"
+DRAIN_MARKER="$(agmsg_drain_marker_path "$TEAM" "$NAME" "$$")"
 
 kill_inflight() {
   local pid="${CHILD_PID:-}" n=0
@@ -262,6 +283,37 @@ on_signal() {
 
 trap cleanup EXIT
 trap on_signal INT TERM
+
+drain_checkpoint() {
+  DRAIN_SIGNAL=0
+  if ! agmsg_drain_fence_is_live "$DRAIN_FENCE" "$TEAM" "$DRAIN_LEASE_STALE_S"; then
+    return 1
+  fi
+  agmsg_drain_marker_publish "$DRAIN_MARKER" "$AGMSG_DRAIN_FENCE_NONCE" "$$" || true
+  if [ "$ADMITTING" -eq 0 ] && [ "$ACTIVE" -eq 0 ]; then
+    STOPPING=1
+  fi
+  return 0
+}
+
+# A trapped signal can make bash wait return >128 while the child still runs.
+# Always wait for the same PID again so neither a watch helper nor a turn group
+# becomes untracked or orphaned.
+wait_tracked_pid() {
+  local pid="$1" kind="$2" rc
+  while :; do
+    if wait "$pid" 2>/dev/null; then rc=0; else rc=$?; fi
+    if [ "$rc" -gt 128 ] && [ "$DRAIN_SIGNAL" -eq 1 ]; then
+      drain_checkpoint || true
+      if [ "$kind" = watch ] && [ "$STOPPING" -eq 1 ]; then
+        kill "$pid" 2>/dev/null || true
+      fi
+      continue
+    fi
+    WAIT_TRACKED_RC="$rc"
+    return 0
+  done
+}
 
 uuid_new() {
   local value="" hex=""
@@ -387,7 +439,7 @@ reject_poison_row() {
 # Fetch a prefix of unread rows whose complete rendered prompt is <= 1 MiB.
 # Combined overflow stops at the first deferred row. A row that cannot fit by
 # itself is terminally compensated, after which scanning continues in this wake.
-prepare_batch() {
+prepare_batch_admitted() {
   local eligible line bytes ids selected_before terminal_count=0
   rm -f "$ROWS_FILE" "$SELECTED_FILE" "$CONSUMED_FILE" \
     "$PROMPT_FILE" "$SELECTED_FILE.next" "$PROMPT_FILE.next" 2>/dev/null || true
@@ -439,6 +491,23 @@ prepare_batch() {
     return 1
   fi
   return 0
+}
+
+prepare_batch() {
+  local rc=0
+  # This check precedes the first eligibility/inbox DB read. After it succeeds,
+  # ADMITTING defines the indivisible read/mark/turn-admission region; USR2 only
+  # sets a flag until that admitted unit either starts its child or fails.
+  if drain_checkpoint; then
+    return 5
+  fi
+  ADMITTING=1
+  prepare_batch_admitted || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    ADMITTING=0
+    [ "$DRAIN_SIGNAL" -eq 0 ] || drain_checkpoint || true
+  fi
+  return "$rc"
 }
 
 spool_valid() {
@@ -637,7 +706,8 @@ sys.exit(os.WEXITSTATUS(status))
       < "$PROMPT_FILE" > "$STDOUT_FILE" 2> "$STDERR_FILE" &
   fi
   CHILD_PID=$!
-  if wait "$CHILD_PID" 2>/dev/null; then rc=0; else rc=$?; fi
+  wait_tracked_pid "$CHILD_PID" turn
+  rc="$WAIT_TRACKED_RC"
   CHILD_PID=""
   cat "$STDERR_FILE" >&2 2>/dev/null || true
   return "$rc"
@@ -662,11 +732,15 @@ run_cli_attempt() {
   [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
   [ -n "$SETTINGS" ] && args+=(--settings "$SETTINGS")
   local add_dir
-  for add_dir in "${ADD_DIRS[@]}"; do args+=(--add-dir "$add_dir"); done
+  if [ "$ADD_DIRS_SET" -eq 1 ]; then
+    for add_dir in "${ADD_DIRS[@]}"; do args+=(--add-dir "$add_dir"); done
+  fi
   local disallowed_tools
-  for disallowed_tools in "${DISALLOWED_TOOLS[@]}"; do
-    args+=(--disallowedTools "$disallowed_tools")
-  done
+  if [ "$DISALLOWED_TOOLS_SET" -eq 1 ]; then
+    for disallowed_tools in "${DISALLOWED_TOOLS[@]}"; do
+      args+=(--disallowedTools "$disallowed_tools")
+    done
+  fi
   if [ "$mode" = resume ]; then
     args+=(--resume "$sid")
   else
@@ -699,6 +773,14 @@ run_cli_attempt() {
   esac
 }
 
+finish_admitted_turn() {
+  ADMITTING=0
+  ACTIVE=0
+  # A completed CLI process (or a pre-start compensated failure) is an
+  # authoritative idle point. Re-read the fence even if SIGUSR2 was unavailable.
+  drain_checkpoint || true
+}
+
 process_wake() {
   local prep_rc=0 sid="" mode=fresh rc=0
   reclassify_candidate
@@ -706,10 +788,11 @@ process_wake() {
 
   prepare_batch || prep_rc=$?
   case "$prep_rc" in
-    0) ;;
+    0) ADMITTING=0; ACTIVE=1 ;;
     2) log "wakeup had no unread rows after eligibility re-check"; return 0 ;;
     3) log "no message fits within the $BATCH_CAP-byte stdin cap"; return 0 ;;
     4) log "wakeup terminally rejected undeliverable rows; no processable rows remain"; return 0 ;;
+    5) log "drain fence stopped admission before inbox consumption"; return 0 ;;
     *) log "could not prepare an exact consumed snapshot"; return 1 ;;
   esac
 
@@ -728,6 +811,7 @@ process_wake() {
     sid="$(uuid_new)" || {
       notify_consumed "could not generate a session UUID"
       rm -f "$CONSUMED_FILE" 2>/dev/null || true
+      finish_admitted_turn
       return 1
     }
     printf '%s\n' "$sid" > "$CANDIDATE_FILE"
@@ -750,6 +834,7 @@ process_wake() {
     sid="$(uuid_new)" || {
       notify_consumed "resume was rejected and a fresh session UUID could not be generated"
       rm -f "$CONSUMED_FILE" 2>/dev/null || true
+      finish_admitted_turn
       return 1
     }
     printf '%s\n' "$sid" > "$CANDIDATE_FILE"
@@ -761,6 +846,7 @@ process_wake() {
 
   if [ "$rc" -eq 70 ]; then
     rm -f "$CONSUMED_FILE" 2>/dev/null || true
+    finish_admitted_turn
     return 0
   fi
 
@@ -771,6 +857,7 @@ process_wake() {
       notify_consumed "Claude CLI exited nonzero (rc=$TURN_PROCESS_RC); outcome is unknown and the turn was not rerun" "turn outcome unknown"
     fi
     rm -f "$CONSUMED_FILE" 2>/dev/null || true
+    finish_admitted_turn
     return 0
   fi
 
@@ -781,6 +868,7 @@ process_wake() {
     else
       notify_consumed "Claude exited 0 but no transcript exists for session $sid"
       rm -f "$CONSUMED_FILE" 2>/dev/null || true
+      finish_admitted_turn
       return 0
     fi
   fi
@@ -803,6 +891,7 @@ process_wake() {
       rm -f "$CONSUMED_FILE" 2>/dev/null || true
       ;;
   esac
+  finish_admitted_turn
   return 0
 }
 
@@ -810,7 +899,13 @@ reclassify_candidate
 flush_outbound || true
 wake_count=0
 
+# A fence can predate bridge startup or its signal handler. An idle bridge exits
+# through the same main-loop cleanup path without arming a new watch.
+drain_checkpoint || true
+
 while [ "$STOPPING" -eq 0 ]; do
+  drain_checkpoint || true
+  [ "$STOPPING" -eq 0 ] || break
   log "armed $TEAM/$NAME"
   rm -f "$WATCH_FILE" 2>/dev/null || true
   bash "$SCRIPT_DIR/watch-once.sh" "$PROJECT" "$TYPE" \
@@ -818,9 +913,12 @@ while [ "$STOPPING" -eq 0 ]; do
     --timeout "$WATCH_TIMEOUT" --interval "$INTERVAL" \
     > "$WATCH_FILE" 2>&1 &
   WATCH_PID=$!
-  watch_rc=0
-  if wait "$WATCH_PID" 2>/dev/null; then watch_rc=0; else watch_rc=$?; fi
+  wait_tracked_pid "$WATCH_PID" watch
+  watch_rc="$WAIT_TRACKED_RC"
   WATCH_PID=""
+  # On Git Bash/Windows SIGUSR2 may be unavailable. A normal wake/timeout still
+  # observes the fence here; correctness never depends on nudge delivery.
+  drain_checkpoint || true
   [ "$STOPPING" -eq 0 ] || break
 
   case "$watch_rc" in
@@ -828,6 +926,7 @@ while [ "$STOPPING" -eq 0 ]; do
       wake_count=$((wake_count + 1))
       log "wakeup $wake_count for $TEAM/$NAME"
       process_wake || true
+      [ "$STOPPING" -eq 0 ] || break
       if [ "$MAX_WAKES" -gt 0 ] && [ "$wake_count" -ge "$MAX_WAKES" ]; then
         break
       fi

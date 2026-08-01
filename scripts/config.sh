@@ -193,6 +193,14 @@ delivery:
   # session_team: false
   # Days before a dead session's team dir is garbage-collected (default 7):
   # session_team_ttl_days: 7
+
+drain:
+  # SessionEnd cooperative bridge-drain deadline, seconds.
+  deadline_s: 600
+  # Fence/tombstone lease refresh cadence, seconds.
+  lease_interval_s: 30
+  # A fence whose content lease_epoch is older than this is reclaimable.
+  lease_stale_s: 120
 YAML
 }
 
