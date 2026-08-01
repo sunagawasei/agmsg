@@ -288,3 +288,102 @@ while True:
 
   kill "$foreign_pid" 2>/dev/null || true
 }
+
+
+# --- which pid space (#567) ---
+#
+# Both tests below model Git Bash: MSYSTEM set, and a `tasklist` that answers as
+# the real one does for a pid it has no record of -- nothing. The app-server pid
+# is minted by $! in codex-monitor.sh, so it lives in the MSYS pid space and
+# tasklist never reports it; a probe that asks tasklist calls a running server
+# dead. Setting MSYSTEM does not otherwise disturb a POSIX run: compat.sh picks
+# its platform from `uname -s`, and the only other reader is a pid-range bound.
+
+# Answers nothing, like tasklist asked about a pid it does not know.
+_stub_tasklist() {
+  local dir="$1"
+  mkdir -p "$dir"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$dir/tasklist"
+  chmod +x "$dir/tasklist"
+}
+
+@test "codex-monitor: waits for the port when tasklist cannot see the app-server (#567)" {
+  skip_on_windows "stubs tasklist to model Git Bash; the real one is authoritative there"
+  run node -e 'const net = require("net"); if (!net) process.exit(1);'
+  if [ "$status" -ne 0 ]; then
+    skip "node net module is not available in this sandbox"
+  fi
+
+  local stubdir="$TEST_PROJECT/stub-bin"
+  _stub_tasklist "$stubdir"
+
+  # Reaching the liveness probe is fixed by ORDER, not by a delay. Each pass of
+  # the wait loop reads the log with sed and only probes when that came back
+  # empty, so a server that has already announced itself breaks out on the first
+  # pass and the probe never runs -- against which this test would pass whatever
+  # the probe answered. An earlier revision leaned on a 600ms banner delay for
+  # that, which is a race: deschedule the parent past it and the seam is gone.
+  #
+  # The shim forces the first port-extracting sed to come back empty, so the
+  # first pass always reaches the probe, and hands every later call to the real
+  # sed so the second pass finds the banner. It matches on the argument rather
+  # than on being the first sed of the run: other sed calls in this script would
+  # otherwise consume the one intercept and the seam would miss silently.
+  export SED_SHIM_MARKER="$TEST_PROJECT/sed-shim-fired"
+  local real_sed; real_sed="$(command -v sed)"
+  cat > "$stubdir/sed" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *"listening on"*)
+    if [ ! -e "\$SED_SHIM_MARKER" ]; then
+      : > "\$SED_SHIM_MARKER"
+      exit 0
+    fi
+    ;;
+esac
+exec "$real_sed" "\$@"
+EOF
+  chmod +x "$stubdir/sed"
+
+  run env MSYSTEM=MINGW64 PATH="$stubdir:$PATH" AGMSG_REAL_CODEX="$FAKE_CODEX" \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex --
+  [ "$status" -eq 0 ]
+  # The seam was actually taken. Without this the assertions below could hold
+  # for the wrong reason -- a run that never entered the loop body at all.
+  [ -e "$SED_SHIM_MARKER" ]
+  # Bridged, not the fail-open: the wait outlasted a probe that could not see
+  # the process.
+  grep -q 'plain-codex <--remote> <ws://127\.0\.0\.1:[0-9][0-9]*>' "$CALL_LOG"
+  [[ "$output" != *"did not report a listening port"* ]]
+}
+
+@test "codex-monitor: reuses a live app-server when tasklist cannot see it (#567)" {
+  skip_on_windows "stubs tasklist to model Git Bash; the real one is authoritative there"
+  skip_on_windows "spawns a python socket listener; flaky on the Windows runner"
+
+  local stubdir="$TEST_PROJECT/stub-bin"
+  _stub_tasklist "$stubdir"
+
+  # First launch records port + pid; the recorded pid is this file's own $!.
+  run env FAKE_CODEX_VERSION=0.142.2 AGMSG_REAL_CODEX="$FAKE_CODEX" \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex --
+  [ "$status" -eq 0 ]
+  local resolved hash base first_pid first_port
+  resolved="$(cd "$TEST_PROJECT" && pwd)"
+  hash="$(printf '%s' "$resolved" | ( . "$SCRIPTS/lib/hash.sh"; agmsg_sha1 ))"
+  base="$TEST_SKILL_DIR/run/codex-app-server.$hash"
+  first_pid="$(cat "$base.pid")"
+  first_port="$(cat "$base.port")"
+  [ -n "$first_pid" ] && [ -n "$first_port" ]
+
+  # Second launch, now under Git Bash's pid rules. Reading the pid back out of a
+  # pidfile does not move it into the Windows pid space, so a probe that asks
+  # tasklist calls the live server dead and starts another one beside it.
+  run env FAKE_CODEX_VERSION=0.142.2 MSYSTEM=MINGW64 PATH="$stubdir:$PATH" \
+    AGMSG_REAL_CODEX="$FAKE_CODEX" \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex --
+  [ "$status" -eq 0 ]
+  # Same server: same pid on record, same port in the handoff.
+  [ "$(cat "$base.pid")" = "$first_pid" ]
+  grep -q "plain-codex <--remote> <ws://127\.0\.0\.1:$first_port>" "$CALL_LOG"
+}
