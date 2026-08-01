@@ -58,24 +58,22 @@ source "$SCRIPT_DIR/lib/actas-lock.sh"
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 INSTANCE_ID="$(agmsg_instance_id "$SESSION_ID" "$TYPE")"
 
-# Snapshot every session-team spawn record. Use the exact encoded-team prefix
-# that agmsg_spawn_path writes, strip only that known prefix, then decode the
-# remaining worker name. One temp file keeps the detached argv small even when
-# several headless workers belong to the session.
-STEAM="s-${SESSION_ID%%.*}"
-mkdir -p "$RUN_DIR" 2>/dev/null || true
-SNAPSHOT_PATH="$(mktemp "$RUN_DIR/.session-end-snapshot.XXXXXX" 2>/dev/null || true)"
-if [ -n "$SNAPSHOT_PATH" ]; then
-  ENCODED_STEAM="$(_actas_lock_encode "$STEAM")"
-  SPAWN_PREFIX="$RUN_DIR/spawn.${ENCODED_STEAM}__"
-  for SPAWN_FILE in "${SPAWN_PREFIX}"*; do
-    [ -f "$SPAWN_FILE" ] || continue
-    ENCODED_NAME="${SPAWN_FILE#"$SPAWN_PREFIX"}"
-    [ "$ENCODED_NAME" != "$SPAWN_FILE" ] || continue
-    NAME="$(_actas_lock_decode "$ENCODED_NAME")"
-    RECORD="$(cat "$SPAWN_FILE" 2>/dev/null || true)"
-    printf '%s\t%s\n' "$NAME" "$RECORD" >>"$SNAPSHOT_PATH" 2>/dev/null || true
-  done
+PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
+if [ -f "$PIDFILE" ]; then
+  pid=$(cat "$PIDFILE" 2>/dev/null || true)
+  # _agmsg_pid_alive_local: EPERM-aware, so a live watcher still gets cleaned --
+  # and no tasklist, which cannot see the $$ watch.sh recorded (#567).
+  if [ -n "$pid" ] && _agmsg_pid_alive_local "$pid"; then
+    # Defensive: only kill if the pid's command line still looks like our
+    # watch.sh. Pids can be recycled — a stale pidfile could point at an
+    # unrelated process that took the same pid.
+    cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
+    case "$cmd" in
+      *"$SKILL_DIR/scripts/watch.sh"*) kill "$pid" 2>/dev/null || true ;;
+      *) ;;
+    esac
+  fi
+  rm -f "$PIDFILE"
 fi
 
 # Publish the intentional teardown before detaching the slow cleanup worker. A

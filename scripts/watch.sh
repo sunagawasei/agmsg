@@ -197,17 +197,30 @@ DB="$(agmsg_db_path)"
 RUN_DIR="$SKILL_DIR/run"
 PIDFILE="$RUN_DIR/watch.$SESSION_ID.pid"
 mkdir -p "$RUN_DIR" 2>/dev/null || true
-WATCH_OWNER_SCOPE="watch|$SESSION_ID|$PROJECT_PATH|$AGENT_TYPE"
-if agmsg_process_assert_bootstrap watch "$PIDFILE" "$WATCH_OWNER_SCOPE"; then
-  WATCH_OWNER_SCOPE_HASH="$AGMSG_PROCESS_SCOPE_HASH"
-else
-  _owner_bootstrap_rc=$?
-  [ "$_owner_bootstrap_rc" -eq 75 ] || exit "$_owner_bootstrap_rc"
-  exec "$SCRIPT_DIR/internal/process-owner-launch.sh" \
-    --kind watch --pidfile "$PIDFILE" --scope "$WATCH_OWNER_SCOPE" --replace-owned \
-    --legacy-needle "$SCRIPT_DIR/watch.sh" --legacy-needle "$SESSION_ID" \
-    --legacy-needle "$PROJECT_PATH" --legacy-needle "$AGENT_TYPE" \
-    -- "$SCRIPT_DIR/watch.sh" "${WATCH_ORIGINAL_ARGS[@]}"
+
+# Sequential re-invocation of Monitor for this same session_id leaves the
+# previous watch.sh running but loses track of it (pidfile gets clobbered).
+# Stop the prior holder before claiming the slot. ps args check defends
+# against pid recycling — only touch processes whose cmdline still matches
+# our watch.sh. See #66.
+#
+# When ps is unavailable (e.g. Claude Code sandbox), fall back to _agmsg_pid_alive
+# which confirms the pid is alive but cannot validate the cmdline. It is EPERM-aware
+# so a live-but-unsignalable sibling watcher isn't misread as dead and left running.
+if [ -f "$PIDFILE" ]; then
+  prev_pid=$(cat "$PIDFILE" 2>/dev/null || true)
+  if [ -n "$prev_pid" ] && [ "$prev_pid" != "$$" ] && _agmsg_pid_alive_local "$prev_pid"; then
+    prev_cmd=$(compat_get_cmdline "$prev_pid" 2>/dev/null || true)
+    if [ -n "$prev_cmd" ]; then
+      case "$prev_cmd" in
+        *"$SKILL_DIR/scripts/watch.sh"*) kill "$prev_pid" 2>/dev/null || true ;;
+      esac
+    else
+      # ps unavailable (sandboxed) — skip cmdline validation, rely on the
+      # _agmsg_pid_alive check above
+      kill "$prev_pid" 2>/dev/null || true
+    fi
+  fi
 fi
 
 # The acquire-then-exec bootstrap above is the single-owner claim.  Do not add
