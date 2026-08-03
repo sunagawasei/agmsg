@@ -295,6 +295,7 @@ while True:
   [ "$(cat "$base.pid")" != "$foreign_pid" ]
 
   kill "$foreign_pid" 2>/dev/null || true
+  wait "$foreign_pid" 2>/dev/null || true
 }
 
 
