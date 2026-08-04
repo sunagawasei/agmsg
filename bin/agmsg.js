@@ -77,8 +77,12 @@ function readVersion() {
 //     of this comment claimed only precision could degrade; that was wrong,
 //     and it was wrong for exactly the entries most likely to rot.
 //
-// test_bin_agmsg.bats pins every value against the repo's scripts/. Adding a
-// verb is free; renaming a script fails the suite.
+// test_bin_agmsg.bats pins every value against the repo's scripts/ — the
+// list is asserted non-empty, not at a fixed size, so adding a verb here
+// costs nothing while renaming a script fails the suite.
+//
+// That pin is about THIS repo. It cannot speak for the tree on a user's
+// disk, so printNotACommand checks the actual file there before naming it.
 const SCRIPT_FOR_VERB = {
   send: 'send.sh', history: 'history.sh', inbox: 'inbox.sh', join: 'join.sh',
   team: 'team.sh', key: 'key.sh', remote: 'remote.sh', whoami: 'whoami.sh',
@@ -94,27 +98,49 @@ function defaultSkillDir() {
   return path.join(os.homedir(), '.agents', 'skills', 'agmsg');
 }
 
+function exists(p) {
+  try {
+    return fs.existsSync(p);
+  } catch (_) {
+    return false;
+  }
+}
+
 function printNotACommand(verb, skillDirForTest) {
   const dir = skillDirForTest || defaultSkillDir();
-  let installed = false;
-  try {
-    installed = fs.existsSync(path.join(dir, 'scripts'));
-  } catch (_) {
-    installed = false;
-  }
   const skill = '~/.agents/skills/agmsg/scripts';
   const script = Object.prototype.hasOwnProperty.call(SCRIPT_FOR_VERB, verb)
     ? SCRIPT_FOR_VERB[verb]
     : null;
+  const scriptsDir = path.join(dir, 'scripts');
+
+  // The contract differs by what is about to be printed, and that is the
+  // point (review P1, co1):
+  //
+  //   naming ONE script  -> that script file must exist. The repo-side pin
+  //     proves the map matches THIS repo; it says nothing about the tree on
+  //     the user's disk, which can be an old version, a partial update, or a
+  //     broken install. Checking only that scripts/ exists reproduces the
+  //     previous P1 one layer out — a directory is not the file.
+  //   naming the DIRECTORY -> the directory must exist. Nothing more is
+  //     claimed, so nothing more is checked.
+  const haveScripts = exists(scriptsDir);
+  const usable = script ? exists(path.join(scriptsDir, script)) : haveScripts;
+
   const lines = ['agmsg: `agmsg ' + verb + '` is not a command.', ''];
 
-  if (!installed) {
-    // Two different situations, kept apart on purpose: "never installed" and
-    // "installed under another name" need different next steps, and folding
-    // them into one sentence leaves whoever is in the first one without a
-    // recovery step.
-    lines.push('agmsg does not look installed on this machine — this package is');
-    lines.push('the installer for it. Install first:');
+  if (!usable) {
+    // Three situations that need different next steps, kept apart: never
+    // installed, installed but without this command, and installed under
+    // another name. Folding them together leaves someone without a recovery
+    // step — which is what the first version of this message did.
+    if (haveScripts) {
+      lines.push('Your agmsg install does not contain that command. It may be an');
+      lines.push('older version — update it:');
+    } else {
+      lines.push('agmsg does not look installed on this machine — this package is');
+      lines.push('the installer for it. Install first:');
+    }
     lines.push('');
     lines.push('  npx agmsg install');
     lines.push('');

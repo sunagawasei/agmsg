@@ -57,8 +57,11 @@ BIN="$BATS_TEST_DIRNAME/../bin/agmsg.js"
     console.log("checked " + Object.keys(SCRIPT_FOR_VERB).length);
   ' "$BIN"
   [ "$status" -eq 0 ]
-  # The count is echoed so a map emptied to {} cannot pass as "nothing missing".
-  [[ "$output" =~ "checked 16" ]]
+  # Non-empty, not an exact count (co1): pinning the number would mean adding
+  # a legitimate verb to the map fails this test, which makes the map harder
+  # to extend for no safety gained. What must not pass is a map emptied to {}
+  # reporting "nothing missing".
+  [[ "$output" =~ checked\ [1-9] ]]
 }
 
 # The person this package exists for has NOT installed yet, and they reach
@@ -76,13 +79,44 @@ BIN="$BATS_TEST_DIRNAME/../bin/agmsg.js"
   [[ "$output" =~ "scripts/send.sh" ]]
 }
 
-@test "bin/agmsg.js: with an install present, it does not tell you to install" {
+@test "bin/agmsg.js: with the script present, it names it and says nothing about installing" {
   local home="$BATS_TEST_TMPDIR/has-install"
   mkdir -p "$home/.agents/skills/agmsg/scripts"
+  # The FILE, not just the directory. An earlier version of this test created
+  # an empty scripts/ and accepted advice pointing at a send.sh that was not
+  # there — the same defect as the map pin, one layer out (review P1, co1).
+  touch "$home/.agents/skills/agmsg/scripts/send.sh"
   run env HOME="$home" node "$BIN" send hello
   [ "$status" -eq 2 ]
   [[ ! "$output" =~ "does not look installed" ]]
+  [[ ! "$output" =~ "does not contain that command" ]]
   [[ "$output" =~ "scripts/send.sh" ]]
+}
+
+# An install that exists but lacks the command — an old version, or a partial
+# update. The repo-side pin cannot see this: it proves the map matches THIS
+# repo, not the tree on someone's disk. Distinct from "never installed"
+# because the recovery is update, not install.
+@test "bin/agmsg.js: an install without that script says update, not install" {
+  local home="$BATS_TEST_TMPDIR/stale-install"
+  mkdir -p "$home/.agents/skills/agmsg/scripts"
+  touch "$home/.agents/skills/agmsg/scripts/history.sh"   # some other command
+  run env HOME="$home" node "$BIN" send hello
+  [ "$status" -eq 2 ]
+  [[ "$output" =~ "does not contain that command" ]]
+  [[ ! "$output" =~ "does not look installed" ]]
+  [[ "$output" =~ "npx agmsg install" ]]
+}
+
+# An unmapped verb names the DIRECTORY, so the directory is all that is
+# checked — the contract matches what is printed.
+@test "bin/agmsg.js: an unmapped verb is satisfied by the directory alone" {
+  local home="$BATS_TEST_TMPDIR/dir-only"
+  mkdir -p "$home/.agents/skills/agmsg/scripts"
+  run env HOME="$home" node "$BIN" storage list
+  [ "$status" -eq 2 ]
+  [[ ! "$output" =~ "does not look installed" ]]
+  [[ "$output" =~ "ls " ]]
 }
 
 @test "bin/agmsg.js: toBashPath converts backslashes to forward slashes (#262)" {
