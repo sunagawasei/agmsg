@@ -1,5 +1,6 @@
 ---
 description: Agent messaging — check inbox, send messages, view history
+argument-hint: "[send|ask|team|history|spawn|despawn|mode|config|reset|…]"
 ---
 
 Agent messaging command. **IMPORTANT: Always use the provided scripts. NEVER directly read or edit config files, DB, or team data. There is NO register.sh — use join.sh to join a team.**
