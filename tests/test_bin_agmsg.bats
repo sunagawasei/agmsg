@@ -39,6 +39,52 @@ BIN="$BATS_TEST_DIRNAME/../bin/agmsg.js"
   [[ "$output" =~ "scripts/" ]]
 }
 
+# EVERY entry in the map, not the one verb a hand-written test happened to
+# pick (review P1, co1). The map is allowed to be incomplete — a new verb
+# missing from it costs nothing — but an entry that is PRESENT and stale makes
+# the message name a path that does not exist, which is worse than the general
+# advice it replaced. Completeness is not pinned; correctness of what is
+# listed is.
+@test "bin/agmsg.js: every mapped verb names a script that exists" {
+  run node -e '
+    const { SCRIPT_FOR_VERB } = require(process.argv[1]);
+    const fs = require("fs"), path = require("path");
+    const dir = path.join(path.dirname(process.argv[1]), "..", "scripts");
+    const missing = Object.entries(SCRIPT_FOR_VERB)
+      .filter(([, s]) => !fs.existsSync(path.join(dir, s)))
+      .map(([v, s]) => v + " -> " + s);
+    if (missing.length) { console.error(missing.join("\n")); process.exit(1); }
+    console.log("checked " + Object.keys(SCRIPT_FOR_VERB).length);
+  ' "$BIN"
+  [ "$status" -eq 0 ]
+  # The count is echoed so a map emptied to {} cannot pass as "nothing missing".
+  [[ "$output" =~ "checked 16" ]]
+}
+
+# The person this package exists for has NOT installed yet, and they reach
+# this same branch (review P1, co1). Telling them to `bash <install path>` is
+# telling them to run a command that fails. HOME is redirected to an empty
+# directory; nothing here touches the network.
+@test "bin/agmsg.js: with nothing installed, it says to install first" {
+  local fresh="$BATS_TEST_TMPDIR/fresh-home"
+  mkdir -p "$fresh"
+  run env HOME="$fresh" node "$BIN" send hello
+  [ "$status" -eq 2 ]
+  [[ "$output" =~ "does not look installed" ]]
+  [[ "$output" =~ "npx agmsg install" ]]
+  # Still names the eventual command, so the person knows where they are going.
+  [[ "$output" =~ "scripts/send.sh" ]]
+}
+
+@test "bin/agmsg.js: with an install present, it does not tell you to install" {
+  local home="$BATS_TEST_TMPDIR/has-install"
+  mkdir -p "$home/.agents/skills/agmsg/scripts"
+  run env HOME="$home" node "$BIN" send hello
+  [ "$status" -eq 2 ]
+  [[ ! "$output" =~ "does not look installed" ]]
+  [[ "$output" =~ "scripts/send.sh" ]]
+}
+
 @test "bin/agmsg.js: toBashPath converts backslashes to forward slashes (#262)" {
   run node -e 'const { toBashPath } = require(process.argv[1]); const input = String.raw`C:\Users\me\AppData\Local\Temp\agmsg-bootstrap-abc123\setup.sh`; const expected = "C:/Users/me/AppData/Local/Temp/agmsg-bootstrap-abc123/setup.sh"; if (toBashPath(input) !== expected) process.exit(1);' "$BIN"
   [ "$status" -eq 0 ]

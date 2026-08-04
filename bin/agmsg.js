@@ -65,11 +65,20 @@ function readVersion() {
 // Saying only "unknown argument" leaves the person exactly where they were.
 // It has to name what to type instead.
 //
-// The verb→script map is a HINT and is allowed to be incomplete. This package
-// does not ship scripts/, so it cannot enumerate them, and a hardcoded list
-// will drift. Nothing depends on it being complete: a verb that is not here
-// still gets the general form, which is always correct. Only the extra
-// precision degrades, never the answer.
+// The verb→script map is a HINT, and the two halves of that are tested
+// differently (review P1, co1):
+//
+//   NOT promised: that it is complete. This package does not ship scripts/,
+//     so it cannot enumerate them. A verb missing from here falls through to
+//     the general form, which stays correct.
+//   PROMISED: that every entry present is real. A renamed or deleted script
+//     would otherwise make this print a specific path that does not exist —
+//     WORSE than the general form, not merely less precise. The first version
+//     of this comment claimed only precision could degrade; that was wrong,
+//     and it was wrong for exactly the entries most likely to rot.
+//
+// test_bin_agmsg.bats pins every value against the repo's scripts/. Adding a
+// verb is free; renaming a script fails the suite.
 const SCRIPT_FOR_VERB = {
   send: 'send.sh', history: 'history.sh', inbox: 'inbox.sh', join: 'join.sh',
   team: 'team.sh', key: 'key.sh', remote: 'remote.sh', whoami: 'whoami.sh',
@@ -77,13 +86,46 @@ const SCRIPT_FOR_VERB = {
   watch: 'watch.sh', spawn: 'spawn.sh', version: 'version.sh', api: 'api.sh',
 };
 
-function printNotACommand(verb) {
+// The default install location. Checked because this package's whole job is
+// to install agmsg, so a person who has never run it reaches this branch too
+// (review P1, co1) — and for them every path below is a command that fails.
+// Advice that assumes the install is advice they cannot follow.
+function defaultSkillDir() {
+  return path.join(os.homedir(), '.agents', 'skills', 'agmsg');
+}
+
+function printNotACommand(verb, skillDirForTest) {
+  const dir = skillDirForTest || defaultSkillDir();
+  let installed = false;
+  try {
+    installed = fs.existsSync(path.join(dir, 'scripts'));
+  } catch (_) {
+    installed = false;
+  }
   const skill = '~/.agents/skills/agmsg/scripts';
-  const lines = ['agmsg: `agmsg ' + verb + '` is not a command.', ''];
   const script = Object.prototype.hasOwnProperty.call(SCRIPT_FOR_VERB, verb)
     ? SCRIPT_FOR_VERB[verb]
     : null;
-  if (script) {
+  const lines = ['agmsg: `agmsg ' + verb + '` is not a command.', ''];
+
+  if (!installed) {
+    // Two different situations, kept apart on purpose: "never installed" and
+    // "installed under another name" need different next steps, and folding
+    // them into one sentence leaves whoever is in the first one without a
+    // recovery step.
+    lines.push('agmsg does not look installed on this machine — this package is');
+    lines.push('the installer for it. Install first:');
+    lines.push('');
+    lines.push('  npx agmsg install');
+    lines.push('');
+    lines.push('After that, ' + (script ? 'that command is:' : 'the commands are:'));
+    lines.push('');
+    lines.push(script ? '  bash ' + skill + '/' + script + ' …'
+                      : '  bash ' + skill + '/<name>.sh …');
+    lines.push('');
+    lines.push('(Already installed under a different name? Substitute it for');
+    lines.push('`agmsg` in that path — nothing is put on your PATH.)');
+  } else if (script) {
     lines.push('This package only installs agmsg. That one lives in your install:');
     lines.push('');
     lines.push('  bash ' + skill + '/' + script + ' …');
@@ -93,13 +135,12 @@ function printNotACommand(verb) {
     lines.push('  ls ' + skill + '/');
     lines.push('  bash ' + skill + '/<name>.sh …');
   }
+
   lines.push('');
   // The skill command is the path most people actually want — it is what the
   // install sets up, and it needs no paths.
   lines.push('Or ask your agent: run the agmsg skill command (/agmsg in Claude Code).');
-  lines.push('');
-  lines.push('If you installed with a different name, substitute it for `agmsg` in');
-  lines.push('the path above. `npx agmsg --help` covers what THIS package does.');
+  lines.push('`npx agmsg --help` covers what THIS package does.');
   console.error(lines.join('\n'));
 }
 
@@ -208,4 +249,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { toBashPath };
+module.exports = { toBashPath, SCRIPT_FOR_VERB, printNotACommand };
