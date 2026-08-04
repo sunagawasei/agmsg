@@ -56,6 +56,53 @@ function readVersion() {
   }
 }
 
+// `agmsg <verb>` is the single most common wrong guess about this project,
+// and it is a guess the documentation taught: a sweep of docs/design and
+// docs/spec found 34 backticked commands written as `agmsg send …`,
+// `agmsg key show …`, `agmsg team list …`. There is no such CLI. This package
+// installs agmsg; the commands are scripts inside the install.
+//
+// Saying only "unknown argument" leaves the person exactly where they were.
+// It has to name what to type instead.
+//
+// The verb→script map is a HINT and is allowed to be incomplete. This package
+// does not ship scripts/, so it cannot enumerate them, and a hardcoded list
+// will drift. Nothing depends on it being complete: a verb that is not here
+// still gets the general form, which is always correct. Only the extra
+// precision degrades, never the answer.
+const SCRIPT_FOR_VERB = {
+  send: 'send.sh', history: 'history.sh', inbox: 'inbox.sh', join: 'join.sh',
+  team: 'team.sh', key: 'key.sh', remote: 'remote.sh', whoami: 'whoami.sh',
+  leave: 'leave.sh', rename: 'rename.sh', export: 'export.sh', config: 'config.sh',
+  watch: 'watch.sh', spawn: 'spawn.sh', version: 'version.sh', api: 'api.sh',
+};
+
+function printNotACommand(verb) {
+  const skill = '~/.agents/skills/agmsg/scripts';
+  const lines = ['agmsg: `agmsg ' + verb + '` is not a command.', ''];
+  const script = Object.prototype.hasOwnProperty.call(SCRIPT_FOR_VERB, verb)
+    ? SCRIPT_FOR_VERB[verb]
+    : null;
+  if (script) {
+    lines.push('This package only installs agmsg. That one lives in your install:');
+    lines.push('');
+    lines.push('  bash ' + skill + '/' + script + ' …');
+  } else {
+    lines.push('This package only installs agmsg. The commands live in your install:');
+    lines.push('');
+    lines.push('  ls ' + skill + '/');
+    lines.push('  bash ' + skill + '/<name>.sh …');
+  }
+  lines.push('');
+  // The skill command is the path most people actually want — it is what the
+  // install sets up, and it needs no paths.
+  lines.push('Or ask your agent: run the agmsg skill command (/agmsg in Claude Code).');
+  lines.push('');
+  lines.push('If you installed with a different name, substitute it for `agmsg` in');
+  lines.push('the path above. `npx agmsg --help` covers what THIS package does.');
+  console.error(lines.join('\n'));
+}
+
 function printHelp() {
   process.stdout.write([
     'agmsg — npm bootstrapper for cross-agent messaging',
@@ -152,8 +199,7 @@ function main() {
     process.stdout.write('canonical project: ' + REPO_URL + '\n');
     process.exit(0);
   } else {
-    console.error('agmsg: unknown argument: ' + args[0]);
-    console.error('Run `npx agmsg --help` for usage.');
+    printNotACommand(args[0]);
     process.exit(2);
   }
 }
