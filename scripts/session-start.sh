@@ -50,12 +50,10 @@ source "$SCRIPT_DIR/lib/type-registry.sh"
 source "$SCRIPT_DIR/lib/session-team.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/role-session.sh"  # role->session reverse lookup (#339)
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/process-identity.sh"
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/pending-teardown.sh"
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/inflight.sh"
+# Only DEFINES agmsg_close_inherited_fds; nothing is closed here. The type
+# plug calls it inside a subshell around its own long-lived spawn, so this
+# shell's descriptors are untouched. See lib/close-fds.sh.
+source "$SCRIPT_DIR/lib/close-fds.sh"
 
 # Read the hook input JSON (stdin) up-front. The hook's session_id is the
 # authoritative source for the session team, and stdin can be read only once —

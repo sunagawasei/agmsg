@@ -183,19 +183,27 @@ EOF
   fi
   local storage_dir
   storage_dir="$(agmsg_storage_dir)"
-  nohup "$SKILL_DIR/scripts/internal/process-owner-launch.sh" \
-    --kind codex-bridge --pidfile "$pidfile" --scope "$bridge_scope" \
-    --legacy-needle codex-bridge --legacy-needle "$bridge_key" -- \
-    "${bridge_run[@]}" \
-    --project "$PROJECT" \
-    --workspace-root "$storage_dir" \
-    --workspace-root "$SKILL_DIR/teams" \
-    --workspace-root "$SKILL_DIR/run" \
-    --type "$TYPE" \
-    "${bridge_pairs[@]}" \
-    --thread "$thread_id" \
-    --app-server "$app_server" \
-    --inline-inbox \
-    >>"$log" 2>&1 3>&- 4>&- &
+  # The bridge outlives this hook, so it must not carry the harness's
+  # descriptors — the same leak that hung a macOS CI shard from the launcher.
+  #
+  # This file is SOURCED into session-start.sh's global context, so calling the
+  # close here directly would shut descriptors belonging to the shell that
+  # sourced us. The subshell is what makes it safe: the close applies to the
+  # forked child, which is the process that goes on to become the bridge, and
+  # the parent keeps everything it had (review P1, co1).
+  (
+    agmsg_close_inherited_fds
+    nohup "${bridge_run[@]}" \
+      --project "$PROJECT" \
+      --workspace-root "$storage_dir" \
+      --workspace-root "$SKILL_DIR/teams" \
+      --workspace-root "$SKILL_DIR/run" \
+      --type "$TYPE" \
+      "${bridge_pairs[@]}" \
+      --thread "$thread_id" \
+      --app-server "$app_server" \
+      --inline-inbox \
+      >>"$log" 2>&1 &
+  )
   exit 0
 }
