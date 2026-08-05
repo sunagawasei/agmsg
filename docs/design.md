@@ -170,8 +170,8 @@ Claude Code command is installed separately to `~/.claude/commands/<cmd>.md`.
 
 Dependencies are scoped to the feature that needs them, not installed up
 front as one bundle — a local-only install stays minimal, and each
-additional feature brings only the binaries it personally needs (koit's
-ruling, 2026-07-25: "dependencies stay closed to the scope of the feature
+additional feature brings only the binaries it personally needs (settled
+2026-07-25: "dependencies stay closed to the scope of the feature
 that needs them"; the specific tiers below are that principle applied to
 the facts of the current codebase, checked directly rather than assumed —
 an earlier draft of this section wrongly implied a single linear

@@ -424,7 +424,7 @@ PS1
   # tag landed after the last core v* tag, installs recorded provenance like
   # "app-v0.2.0-26-gHASH" instead of "v1.1.8-27-gHASH", which the desktop
   # app's own version comparison can't parse as semver and treats as
-  # unconditionally outdated. See aggie/koit bug report.
+  # unconditionally outdated. Observed on a real install, not hypothetical.
   # Resolve to the PHYSICAL path: on macOS $BATS_TEST_TMPDIR lands under
   # /var/folders/... which is itself a symlink to /private/var/folders/....
   # install.sh's SCRIPT_DIR uses plain `pwd` (logical, follows the symlink

@@ -169,8 +169,8 @@ one record with a `type` discriminator — and only these two types live in the
 storage axis (team membership does not; see the §2 intro):
 
 ```jsonl
-{"type":"message_sent","id":"0192...","team":"agsuite","from":"aggie-cc","to":"aggie-co","body":"...","at":"2026-05-30T19:00:00Z"}
-{"type":"message_read","id":"0192...","msg_id":"0192...","team":"agsuite","agent":"aggie-co","at":"2026-05-30T19:05:00Z"}
+{"type":"message_sent","id":"0192...","team":"agsuite","from":"alice","to":"bob","body":"...","at":"2026-05-30T19:00:00Z"}
+{"type":"message_read","id":"0192...","msg_id":"0192...","team":"agsuite","agent":"bob","at":"2026-05-30T19:05:00Z"}
 ```
 
 `storage_list_unread <team> <agent>` returns the `message_sent` events addressed

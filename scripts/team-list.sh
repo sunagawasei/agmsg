@@ -4,8 +4,8 @@ set -euo pipefail
 # Usage: team-list.sh [--json] [--scope all|project] [<project_path>]
 #
 # Read-only, secret-free enumeration of every locally known team (ADR 0007
-# family addition — koit-approved OSS interface, same review track as
-# `remote status --json` / `remote pending list|abort`). Unlike
+# family addition — a public OSS interface, carried on the same review
+# track as `remote status --json` / `remote pending list|abort`). Unlike
 # `team.sh <team>` (shows one team's members), this lists every team this
 # device knows about, across every registered project.
 #
@@ -47,8 +47,8 @@ set -euo pipefail
 # as invalid and dropped from the list like any other unreadable config —
 # fail-closed per-entry, never widening the enum silently to fit.
 #
-# schema_version increment convention (mentor-cc ruling, pin this before
-# ever bumping it): adding a NEW field is additive and does NOT bump
+# schema_version increment convention (settled; pin this before ever
+# bumping it): adding a NEW field is additive and does NOT bump
 # schema_version — a consumer MUST ignore fields it doesn't recognize.
 # Only changing or removing an EXISTING field's meaning bumps it. This is
 # why the fields above are limited to ones whose meaning is fully settled
@@ -57,7 +57,7 @@ set -euo pipefail
 # contract silently broke — worse than just not having shipped it yet).
 #
 # onboarding_state/promote_eligible/blocked_reason are deliberately NOT in
-# v1 (mentor-cc ruling): their real meaning depends on ADR 0010
+# v1: their real meaning depends on ADR 0010
 # (local-first onboarding / roster convergence), which hasn't landed, so
 # right now they could only be a fixed/mechanically-derived value with
 # zero information a consumer couldn't already get from binding_state —

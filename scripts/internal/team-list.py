@@ -89,7 +89,7 @@ def _team_row(name, cfg, variants):
     else:
         binding_state = "active"
 
-    # Named remote_team_id, not team_id (mentor-cc ruling): this is the
+    # Named remote_team_id, not team_id: this is the
     # server-assigned id of the remote BINDING, not a stable local identity
     # anchor for the team itself — those are two different things, and a
     # team with no remote binding correctly has none of this at all. ADR
@@ -114,7 +114,7 @@ def _team_row(name, cfg, variants):
                 break
 
     # onboarding_state/promote_eligible/blocked_reason are deliberately NOT
-    # included in v1 (mentor-cc ruling): their real meaning depends on ADR
+    # included in v1: their real meaning depends on ADR
     # 0010 (local-first onboarding / roster convergence), which hasn't
     # landed, so today they could only be a fixed/mechanically-derived
     # placeholder value — zero information a consumer couldn't already get
