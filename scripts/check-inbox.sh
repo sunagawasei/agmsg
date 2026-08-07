@@ -169,14 +169,73 @@ for team in "${TEAM_LIST[@]}"; do
   # ONE guarded boundary for everything that reads or formats — and it must NOT
   # be invoked from a condition context.
   #
-  # Note: AGENT comes from whoami.sh, which returns the first registered
-  # agent for (project, type). It is NOT the session's in-memory actas
-  # role. That asymmetry is the Codex caveat documented in README — if a
-  # Codex session actas'd into <name>, check-inbox is still polling
-  # whatever whoami chose first, not <name>.
-  state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}") || { CLAIM_RC=$?; break; }
-  case "$state" in
-    other:*) continue ;;
+  # `RESULT=$(...) || _rc=$?` looks equivalent and is not. Putting the
+  # substitution on the left of `||` makes the whole thing a tested command, and
+  # errexit is then suppressed for what runs inside it — including the `set -e`
+  # the subshell sets for itself. Measured: storage_init returned 13,
+  # storage_list_unread carried on regardless, the assignment landed empty and
+  # SUCCEEDED, and the `[ -n "" ] || exit 98` two lines later became the
+  # subshell's status. A backend failure arrived at the caller as "this team has
+  # no unread messages", and the poll reported a clean turn.
+  #
+  # A single non-conditional assignment with errexit lifted around it does not
+  # have that property: the subshell's own `set -e` aborts at the first failure
+  # and its status is what `$?` holds. The lift is two lines wide and restored
+  # immediately.
+  #
+  # This is also why the failing operations are not listed with `|| return`
+  # inside: an enumeration is short by one the next time an operation is added,
+  # which is the defect this file exists to fix.
+  #
+  # The first attempt listed the substitutions and guarded each -- and missed
+  # one (`_arr`), which is the whole failure mode this file is about: an
+  # enumeration is short by one and the one it is short by is the defect. A
+  # subshell with its own errexit does not need the list. Anything in here that
+  # fails ends the subshell, and its status is read from `$?` below instead of
+  # ending the script.
+  #
+  # 97 and 98 are the two ordinary reasons to skip a team, carried as statuses
+  # because a subshell cannot `continue` its caller's loop.
+  set +e
+  RESULT=$(
+    set -euo pipefail
+    # Honor actas exclusivity locks. If (team, AGENT) is held by another live
+    # session, that session owns that role's inbox — don't deliver here.
+    # Mirrors watch.sh's per-pair filtering (#62).
+    #
+    # AGENT comes from whoami.sh: the first registered agent for
+    # (project, type), NOT the session's in-memory actas role — the Codex
+    # caveat documented in README.
+    state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}")
+    # The leading `(` is load-bearing, not style. bash 3.2 -- which is /bin/bash
+    # on macOS, and what the macOS CI jobs run -- scans `$( ... )` for its
+    # closing paren without understanding `case`, so an unbalanced pattern paren
+    # ends the substitution early and the `;;` that follows is a syntax error.
+    # The whole file failed to parse; every check-inbox test on macOS died with
+    # "syntax error near unexpected token `;;'". Balancing the paren fixes it and
+    # is identical under bash 5.
+    case "$state" in (other:*) exit 97 ;; esac
+
+    # Unread via the storage facade (§2.1 storage_list_unread = events ∪ legacy),
+    # JSONL parsed in one pass with sqlite's JSON funcs (no jq; cf. lib/hooks-json.sh).
+    # id is kept so the mark step below targets exactly the rows shown.
+    UNREAD_JSONL=$(storage_list_unread "$team" "$AGENT")
+    [ -n "$UNREAD_JSONL" ] || exit 98
+    _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
+    agmsg_sqlite ':memory:' "
+      SELECT json_extract(value,'\$.from') || char(31) ||
+             replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
+             json_extract(value,'\$.at') || char(31) ||
+             json_extract(value,'\$.id')
+      FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
+    "
+  )
+  _rc=$?
+  set -e
+  case "$_rc" in
+    0)     ;;
+    97|98) continue ;;
+    *)     LOOP_RC=$_rc; LOOP_FAILED_TEAM="$team"; break ;;
   esac
 
   RESULT=$(agmsg_sqlite "$DB" "
