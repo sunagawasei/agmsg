@@ -32,13 +32,52 @@ AGMSG_HELD_LOCKS="${AGMSG_HELD_LOCKS:-}"
 # resurrects a team dir that a concurrent leave/reset just removed. Spins with a
 # short sleep up to AGMSG_LOCK_TRIES attempts (default 1000 = ~10s), then fails
 # non-zero so the caller can abort rather than silently skip the team.
+# Who owns the directory and what this process is, for a failure that is about
+# neither the team nor the lock. `ls -ld` and `id` rather than stat(1), whose
+# flags differ between BSD and GNU, and both are already required here.
+_agmsg_lock_describe_dir() {
+  local dir="$1"
+  echo "agmsg:   $(ls -ld "$dir" 2>/dev/null || printf '%s (cannot stat)' "$dir")" >&2
+  echo "agmsg:   running as: $(id 2>/dev/null || echo 'unknown')" >&2
+}
+
 agmsg_lock_acquire() {
-  local team_dir="$1" lock i=0 max="${AGMSG_LOCK_TRIES:-1000}"
+  local team_dir="$1" lock i=0 max="${AGMSG_LOCK_TRIES:-1000}" err=""
   lock="$team_dir/.config.lock"
-  until mkdir "$lock" 2>/dev/null; do
+  until err="$(mkdir "$lock" 2>&1)"; do
+    # WHY mkdir failed decides whether waiting can help, and only one reason
+    # ever clears on its own: somebody holds the lock. Everything else -- no
+    # write permission on the team dir, a read-only mount -- is a standing
+    # condition, and spinning ten seconds on it then reporting a timeout
+    # describes contention that never existed.
+    #
+    # That mattered in the field. A second machine, running as a different OS
+    # account, pointed at the first one's store; the team dir was 0755 and
+    # owned by the other user, so mkdir could never succeed. The message named
+    # a lock, so the search went to processes: an unrelated sync engine was
+    # killed, and when it happened again with no engine running and no lock
+    # directory present, the same sentence was still the only evidence. The
+    # `2>/dev/null` had thrown away the one line that said EACCES.
+    #
+    # Decided from the lock's presence rather than from the error text, which
+    # is locale-dependent. Checked in this order because the lock existing is
+    # the common case and settles it: only when it is absent is the question
+    # "can we write here at all". Absent AND writable is a lost race with a
+    # holder that has already released -- genuinely transient, so it spins.
+    if [ ! -d "$lock" ] && [ ! -w "$team_dir" ]; then
+      echo "agmsg: cannot create the registry lock in $team_dir" >&2
+      echo "agmsg: mkdir: $err" >&2
+      echo "agmsg: nothing is holding the lock — this directory cannot be written to, so waiting will not clear it." >&2
+      _agmsg_lock_describe_dir "$team_dir"
+      return 1
+    fi
     i=$((i + 1))
     if [ "$i" -ge "$max" ]; then
       echo "agmsg: timed out acquiring registry lock for $team_dir" >&2
+      # The reason travels with the timeout too. If the wait was hopeless for
+      # a cause this function did not anticipate, the errno is the only thing
+      # that will say so.
+      [ -n "$err" ] && echo "agmsg: last mkdir error: $err" >&2
       return 1
     fi
     sleep 0.01
