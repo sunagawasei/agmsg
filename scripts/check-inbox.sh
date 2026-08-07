@@ -154,7 +154,14 @@ if [ ! -f "$DB" ]; then exit 0; fi
 # 0 and the text says the poll was partial; only when there is nothing to
 # deliver does the status carry the failure.
 OUTPUT=""
-LOOP_RC=0
+# Messages are marked read per team INSIDE this loop, but emitted only AFTER
+# it. Under errexit, a failure while processing a later team (either command
+# substitution below) would abort between those two points: earlier teams'
+# messages end up read_at-stamped yet never delivered, and never re-offered
+# (#637). So loop failures stop the loop instead of the script — whatever was
+# already accumulated still reaches an emit point, teams after the failing one
+# stay untouched (unread), and the failure status is re-raised on exit.
+CLAIM_RC=0
 IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
 for team in "${TEAM_LIST[@]}"; do
   storage_store_exists "$team" || continue
@@ -162,99 +169,55 @@ for team in "${TEAM_LIST[@]}"; do
   # ONE guarded boundary for everything that reads or formats — and it must NOT
   # be invoked from a condition context.
   #
-  # `RESULT=$(...) || _rc=$?` looks equivalent and is not. Putting the
-  # substitution on the left of `||` makes the whole thing a tested command, and
-  # errexit is then suppressed for what runs inside it — including the `set -e`
-  # the subshell sets for itself. Measured: storage_init returned 13,
-  # storage_list_unread carried on regardless, the assignment landed empty and
-  # SUCCEEDED, and the `[ -n "" ] || exit 98` two lines later became the
-  # subshell's status. A backend failure arrived at the caller as "this team has
-  # no unread messages", and the poll reported a clean turn.
-  #
-  # A single non-conditional assignment with errexit lifted around it does not
-  # have that property: the subshell's own `set -e` aborts at the first failure
-  # and its status is what `$?` holds. The lift is two lines wide and restored
-  # immediately.
-  #
-  # This is also why the failing operations are not listed with `|| return`
-  # inside: an enumeration is short by one the next time an operation is added,
-  # which is the defect this file exists to fix.
-  #
-  # The first attempt listed the substitutions and guarded each -- and missed
-  # one (`_arr`), which is the whole failure mode this file is about: an
-  # enumeration is short by one and the one it is short by is the defect. A
-  # subshell with its own errexit does not need the list. Anything in here that
-  # fails ends the subshell, and its status is read from `$?` below instead of
-  # ending the script.
-  #
-  # 97 and 98 are the two ordinary reasons to skip a team, carried as statuses
-  # because a subshell cannot `continue` its caller's loop.
-  set +e
-  RESULT=$(
-    set -euo pipefail
-    # Honor actas exclusivity locks. If (team, AGENT) is held by another live
-    # session, that session owns that role's inbox — don't deliver here.
-    # Mirrors watch.sh's per-pair filtering (#62).
-    #
-    # AGENT comes from whoami.sh: the first registered agent for
-    # (project, type), NOT the session's in-memory actas role — the Codex
-    # caveat documented in README.
-    state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}")
-    case "$state" in other:*) exit 97 ;; esac
-
-  # Unread via the storage facade (§2.1 storage_list_unread = events ∪ legacy),
-  # JSONL parsed in one pass with sqlite's JSON funcs (no jq; cf. lib/hooks-json.sh).
-  # id is kept so the mark step below targets exactly the rows shown.
-  UNREAD_JSONL=$(storage_list_unread "$team" "$AGENT") || { LOOP_RC=$?; break; }
-  if [ -n "$UNREAD_JSONL" ]; then
-    _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
-    RESULT=$(agmsg_sqlite ':memory:' "
-      SELECT json_extract(value,'\$.from') || char(31) ||
-             replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
-             json_extract(value,'\$.at') || char(31) ||
-             json_extract(value,'\$.id')
-      FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
-    "
-  )
-  _rc=$?
-  set -e
-  case "$_rc" in
-    0)     ;;
-    97|98) continue ;;
-    *)     LOOP_RC=$_rc; LOOP_FAILED_TEAM="$team"; break ;;
+  # Note: AGENT comes from whoami.sh, which returns the first registered
+  # agent for (project, type). It is NOT the session's in-memory actas
+  # role. That asymmetry is the Codex caveat documented in README — if a
+  # Codex session actas'd into <name>, check-inbox is still polling
+  # whatever whoami chose first, not <name>.
+  state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}") || { CLAIM_RC=$?; break; }
+  case "$state" in
+    other:*) continue ;;
   esac
 
-  COUNT=$(printf '%s\n' "$RESULT" | grep -c . || true)
-  OUTPUT+="$COUNT new message(s) in $team:"$'\n'
-  IDS=()
-  while IFS=$'\x1f' read -r from body ts id; do
-    [ -n "$id" ] || continue
-    OUTPUT+="  [$ts] $from: $body"$'\n'
-    IDS+=("$id")
-  done <<< "$RESULT"
-  OUTPUT+=$'\n'
-  # Test seam: a two-file barrier that lets the race regression test land a
-  # message deterministically between display and mark. No-op unless set.
-  if [ -n "${AGMSG_TEST_MARK_BARRIER:-}" ]; then
-    : > "$AGMSG_TEST_MARK_BARRIER.reached"
-    _agmsg_barrier_waited=0
-    while [ ! -e "$AGMSG_TEST_MARK_BARRIER.release" ]; do
-      sleep 0.05
-      _agmsg_barrier_waited=$((_agmsg_barrier_waited + 1))
-      [ "$_agmsg_barrier_waited" -ge 200 ] && break # 10s safety cap
-    done
-  fi
-  # Mark read via the facade (§2.1 storage_mark_read_batch): recipient-scoped,
-  # idempotent; a legacy id records a message_read event without mutating the
-  # legacy row (§2.4). Only the ids collected from the rows actually displayed
-  # above — never a blanket match — so a message that arrives after the SELECT
-  # can never be marked read unseen.
-  if [ "${#IDS[@]}" -gt 0 ]; then
-    storage_mark_read_batch "$team" "$AGENT" "${IDS[@]}" >/dev/null 2>&1 || true
+  RESULT=$(agmsg_sqlite "$DB" "
+    SELECT id || char(31) || from_agent || char(31) || replace(replace(body, char(10), '\n'), char(9), '\t') || char(31) || created_at
+    FROM messages WHERE team='$team_sql' AND to_agent='$AGENT_SQL' AND read_at IS NULL
+    ORDER BY created_at ASC;
+  ") || { CLAIM_RC=$?; break; }
+  if [ -n "$RESULT" ]; then
+    COUNT=$(echo "$RESULT" | wc -l | tr -d ' ')
+    OUTPUT+="$COUNT new message(s) in $team:"$'\n'
+    IDS=""
+    while IFS=$'\x1f' read -r id from body ts; do
+      OUTPUT+="  [$ts] $from: $body"$'\n'
+      case "$id" in
+        ''|*[!0-9]*) ;; # defensive: never splice a non-numeric value into SQL
+        *) IDS="${IDS:+$IDS,}$id" ;;
+      esac
+    done <<< "$RESULT"
+    OUTPUT+=$'\n'
+    # Test seam: a two-file barrier that lets the race regression test land a
+    # message deterministically between display and mark. No-op unless set.
+    if [ -n "${AGMSG_TEST_MARK_BARRIER:-}" ]; then
+      : > "$AGMSG_TEST_MARK_BARRIER.reached"
+      _agmsg_barrier_waited=0
+      while [ ! -e "$AGMSG_TEST_MARK_BARRIER.release" ]; do
+        sleep 0.05
+        _agmsg_barrier_waited=$((_agmsg_barrier_waited + 1))
+        [ "$_agmsg_barrier_waited" -ge 200 ] && break # 10s safety cap
+      done
+    fi
+    # Mark as read — only the ids captured above, so a message that arrives
+    # between the SELECT and this UPDATE is not marked read unseen.
+    if [ -n "$IDS" ]; then
+      agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id IN ($IDS);" 2>/dev/null || true
+    fi
   fi
 done
 
-# No new messages
+# No new messages. Both emit points re-raise a loop failure captured above:
+# exiting 0 here would convert "a team's query failed" into "nothing to
+# deliver", which is the silent half of #637.
 if [ -z "$OUTPUT" ]; then
   # Both exits need the guard, not just the one that carries messages. A loop
   # that stopped on a failure before accumulating anything has not established
@@ -263,7 +226,7 @@ if [ -z "$OUTPUT" ]; then
   # voice, and the hook runtime treats it as a clean turn.
   [ "$LOOP_RC" -eq 0 ] || exit "$LOOP_RC"
   emit_status_json "agmsg: no new messages"
-  exit 0
+  exit "$CLAIM_RC"
 fi
 
 # New messages found
@@ -276,9 +239,5 @@ if [ -n "$OUTPUT" ]; then
   "reason": "$ESCAPED"
 }
 ENDJSON
-  # Delivered first, then the failure is reported. Messages already marked read
-  # reach the operator, and the run still exits non-zero so nothing upstream
-  # reads a partial poll as a complete one.
-  [ "$LOOP_RC" -eq 0 ] || exit "$LOOP_RC"
-  exit 0
+  exit "$CLAIM_RC"
 fi

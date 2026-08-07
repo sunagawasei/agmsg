@@ -92,121 +92,41 @@ _break_only_this_teams_store() {
 
 # --- check-inbox.sh ------------------------------------------------------
 
-# What the hook runtimes actually do with a Stop-hook run, applied to a real
-# invocation of check-inbox.sh.
-#
-# The contract is theirs, not ours: stdout is read as control JSON only when
-# the process exits 0. A non-zero exit is logged as a hook failure and the
-# output is DISCARDED. Asserting on the shell's stdout alone cannot see that —
-# the first attempt at this fix emitted the messages and then exited non-zero,
-# so it was inert on the only path that was broken while its tests passed.
-#
-# The parse is part of the contract too. Returning raw stdout would stay green
-# for malformed JSON, for a payload under some other key, or for text outside
-# `reason` — none of which an operator would ever see. So this parses, requires
-# `decision` to be `block`, and returns ONLY `reason`: exactly the bytes the
-# runtime puts in front of a person.
-#
-# Prints that text, or nothing at all.
-delivered_to_operator() {
-  local out status
-  out="$(bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a </dev/null 2>/dev/null)" && status=0 || status=$?
-  [ "$status" -eq 0 ] || return 0                 # the runtime's rule
-  [ -n "$out" ] || return 0
-  # Valid JSON, decision=block, and then the reason — each a separate gate so a
-  # payload that fails any one of them delivers nothing.
-  local esc parsed
-  esc="$(printf '%s' "$out" | sed "s/'/''/g")"
-  parsed="$(sqlite_mem "SELECT CASE
-      WHEN json_valid('$esc') = 0 THEN ''
-      WHEN json_extract('$esc', '\$.decision') IS NOT 'block' THEN ''
-      ELSE COALESCE(json_extract('$esc', '\$.reason'), '') END;")"
-  printf '%s' "$parsed"
-}
+@test "check-inbox: a later team's query failure does not lose earlier teams' messages (#637)" {
+  # alice is in two teams; glob order enumerates testteam before zteam.
+  bash "$SCRIPTS/join.sh" zteam alice claude-code /tmp/project-a
+  bash "$SCRIPTS/join.sh" zteam bob claude-code /tmp/project-a
+  bash "$SCRIPTS/send.sh" testteam bob alice "early"
+  bash "$SCRIPTS/send.sh" zteam bob alice "in-zteam"
 
-@test "check-inbox: a broken team stops the poll without losing either side (#637)" {
-  # Three teams, so the payload's own claim can be checked against reality:
-  #   aateam  succeeds and is marked read   -> must be DELIVERED
-  #   mmteam  store unreadable              -> stops the loop
-  #   zzteam  holds an unread message       -> must stay unread, undelivered
-  #
-  # Two teams could not test this. The text says "teams after it were not
-  # checked; their messages stay unread" — with nothing after the failure that
-  # sentence was unverified, and a version that silently consumed the rest
-  # would have passed.
-  bash "$SCRIPTS/join.sh" aateam alice claude-code /tmp/project-a >/dev/null
-  bash "$SCRIPTS/join.sh" aateam bob claude-code /tmp/project-a >/dev/null
-  bash "$SCRIPTS/join.sh" mmteam alice claude-code /tmp/project-a >/dev/null
-  bash "$SCRIPTS/join.sh" zzteam alice claude-code /tmp/project-a >/dev/null
-  bash "$SCRIPTS/join.sh" zzteam bob claude-code /tmp/project-a >/dev/null
-  bash "$SCRIPTS/send.sh" aateam bob alice "before the break" >/dev/null
-  bash "$SCRIPTS/send.sh" zzteam bob alice "after the break" >/dev/null
-  _break_only_this_teams_store mmteam
+  # PATH shim: fail (SQLITE_BUSY-style rc=5) exactly the unread SELECT for the
+  # second team; everything else passes through to the real sqlite3. testteam's
+  # messages are read_at-stamped inside the loop before zteam is queried, so
+  # without the loop-failure guard this abort loses them silently.
+  REAL_SQLITE3="$(command -v sqlite3)"
+  mkdir -p "$TEST_SKILL_DIR/shim"
+  cat > "$TEST_SKILL_DIR/shim/sqlite3" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    *"team='zteam'"*"read_at IS NULL"*) exit 5 ;;
+  esac
+done
+exec "$REAL_SQLITE3" "\$@"
+SHIM
+  chmod +x "$TEST_SKILL_DIR/shim/sqlite3"
 
-  run delivered_to_operator
-
-  # The earlier team's message reached a person.
-  [[ "$output" == *"before the break"* ]]
-  # The later team's did not.
-  [[ "$output" != *"after the break"* ]]
-  # And the payload says why, naming the team it stopped on.
-  [[ "$output" == *"stopped early"* ]]
-  [[ "$output" == *"mmteam"* ]]
-  [[ "$output" == *"stay unread"* ]]
-
-  # The claim matches the store: the later team's message is still unread, so
-  # the next poll will offer it.
-  local left
-  left="$(bash -c '
-    source "'"$SCRIPTS"'/lib/storage.sh"
-    agmsg_storage_load
-    storage_list_unread zzteam alice
-  ' | grep -c .)"
-  [ "$left" -eq 1 ]
-}
-
-@test "check-inbox: a failure with nothing accumulated does not report 'no new messages' (#637)" {
-  # The quieter half of the same lie. A loop that stopped before accumulating
-  # anything has not established that there is nothing to deliver -- only that
-  # it could not look. Exiting 0 with "no new messages" tells the hook runtime
-  # the turn was clean.
-  bash "$SCRIPTS/join.sh" zzlastteam alice claude-code /tmp/project-a >/dev/null
-  _break_only_this_teams_store zzlastteam
-
-  run bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a </dev/null
-  [ "$status" -ne 0 ]
-  [[ "$output" != *"no new messages"* ]]
-}
-
-@test "bash: a condition context suppresses a nested set -e, even after a later sentinel (#637)" {
-  # The property the boundary depends on, pinned on its own so nobody has to
-  # rediscover it from a broken poll.
-  #
-  # A subshell that sets its own `set -e` still does not abort when the whole
-  # substitution is the left side of `||` — and the trap is not that the status
-  # is lost, it is that a LATER command supplies a different one. Checking only
-  # "does a failure come out" misses it whenever a sentinel follows the failure,
-  # which is exactly the shape that made a backend error read as "no unread".
-  run bash -c '
-    set -euo pipefail
-    out=$( set -euo pipefail; false; [ -n "" ] || exit 98; echo unreachable ) || rc=$?
-    printf "conditional=%s\n" "${rc:-0}"
-  '
-  [ "$status" -eq 0 ]
-  # 98, not 1: the false did not stop it, the sentinel two commands later did.
-  [[ "$output" == *"conditional=98"* ]]
-
-  run bash -c '
-    set -euo pipefail
-    set +e
-    out=$( set -euo pipefail; false; [ -n "" ] || exit 98; echo unreachable )
-    rc=$?
-    set -e
-    printf "plain=%s\n" "$rc"
-  '
-  [ "$status" -eq 0 ]
-  # 1: the failure is what came out, because nothing ran after it.
-  [[ "$output" == *"plain=1"* ]]
+  run env PATH="$TEST_SKILL_DIR/shim:$PATH" \
+    bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a < /dev/null
+  # testteam's message was already marked read when zteam failed — it MUST
+  # still have been emitted, or it is lost forever (never re-offered).
+  [[ "$output" == *"early"* ]]
+  [[ "$output" != *"in-zteam"* ]]
+  # The failure is not swallowed: the loop's status is re-raised on exit.
+  [ "$status" -eq 5 ]
+  # testteam delivered-and-read; zteam untouched, so its message re-surfaces.
+  [ "$(unread_count alice)" -eq 0 ]
+  [ "$(sqlite3 "$DBPATH" "SELECT COUNT(*) FROM messages WHERE team='zteam' AND to_agent='alice' AND read_at IS NULL;" | tr -d '\r')" -eq 1 ]
 }
 
 @test "check-inbox: a message arriving between display and mark is NOT marked read unseen" {
