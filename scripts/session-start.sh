@@ -415,11 +415,12 @@ done
 # lease for its whole life, so an unheld lease means the recorded pid was reused.
 for f in "$RUN_DIR"/watch.*.pid; do
   [ -f "$f" ] || continue
-  agmsg_process_identity_state watch "$f" ""
-  case "$AGMSG_PROCESS_STATE" in
-    stale|legacy-dead|legacy-foreign-live|degraded-dead|unverified-dead)
-      agmsg_process_cleanup_observed "$f" || true ;;
-  esac
+  pid=$(cat "$f" 2>/dev/null || true)
+  if [ -z "$pid" ]; then
+    rm -f "$f"
+    continue
+  fi
+  _agmsg_pid_alive_local "$pid" || rm -f "$f"
 done
 
 # Garbage-collect actas exclusivity locks whose owner session_id no longer
