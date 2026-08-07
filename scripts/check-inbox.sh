@@ -152,21 +152,50 @@ OUTPUT=""
 LOOP_RC=0
 IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
 for team in "${TEAM_LIST[@]}"; do
-  # Honor actas exclusivity locks. If (team, AGENT) is currently held by
-  # another live session, that session is the owner of that role's inbox —
-  # don't deliver here. Mirrors the per-pair filtering watch.sh does for
-  # CC sessions (#62), giving Stop-hook delivery (codex / claude-code
-  # turn-mode) the same "respect peer locks" guarantee.
+  storage_store_exists "$team" || continue
+
+  # ONE guarded boundary for everything that reads or formats — and it must NOT
+  # be invoked from a condition context.
   #
-  # Note: AGENT comes from whoami.sh, which returns the first registered
-  # agent for (project, type). It is NOT the session's in-memory actas
-  # role. That asymmetry is the Codex caveat documented in README — if a
-  # Codex session actas'd into <name>, check-inbox is still polling
-  # whatever whoami chose first, not <name>.
-  state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}") || { LOOP_RC=$?; break; }
-  case "$state" in
-    other:*) continue ;;
-  esac
+  # `RESULT=$(...) || _rc=$?` looks equivalent and is not. Putting the
+  # substitution on the left of `||` makes the whole thing a tested command, and
+  # errexit is then suppressed for what runs inside it — including the `set -e`
+  # the subshell sets for itself. Measured: storage_init returned 13,
+  # storage_list_unread carried on regardless, the assignment landed empty and
+  # SUCCEEDED, and the `[ -n "" ] || exit 98` two lines later became the
+  # subshell's status. A backend failure arrived at the caller as "this team has
+  # no unread messages", and the poll reported a clean turn.
+  #
+  # A single non-conditional assignment with errexit lifted around it does not
+  # have that property: the subshell's own `set -e` aborts at the first failure
+  # and its status is what `$?` holds. The lift is two lines wide and restored
+  # immediately.
+  #
+  # This is also why the failing operations are not listed with `|| return`
+  # inside: an enumeration is short by one the next time an operation is added,
+  # which is the defect this file exists to fix.
+  #
+  # The first attempt listed the substitutions and guarded each -- and missed
+  # one (`_arr`), which is the whole failure mode this file is about: an
+  # enumeration is short by one and the one it is short by is the defect. A
+  # subshell with its own errexit does not need the list. Anything in here that
+  # fails ends the subshell, and the status arrives at the `||` below instead of
+  # ending the script.
+  #
+  # 97 and 98 are the two ordinary reasons to skip a team, carried as statuses
+  # because a subshell cannot `continue` its caller's loop.
+  set +e
+  RESULT=$(
+    set -euo pipefail
+    # Honor actas exclusivity locks. If (team, AGENT) is held by another live
+    # session, that session owns that role's inbox — don't deliver here.
+    # Mirrors watch.sh's per-pair filtering (#62).
+    #
+    # AGENT comes from whoami.sh: the first registered agent for
+    # (project, type), NOT the session's in-memory actas role — the Codex
+    # caveat documented in README.
+    state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}")
+    case "$state" in other:*) exit 97 ;; esac
 
   # Unread via the storage facade (§2.1 storage_list_unread = events ∪ legacy),
   # JSONL parsed in one pass with sqlite's JSON funcs (no jq; cf. lib/hooks-json.sh).
@@ -180,35 +209,43 @@ for team in "${TEAM_LIST[@]}"; do
              json_extract(value,'\$.at') || char(31) ||
              json_extract(value,'\$.id')
       FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
-    ") || { LOOP_RC=$?; break; }
-    COUNT=$(printf '%s\n' "$RESULT" | wc -l | tr -d ' ') || { LOOP_RC=$?; break; }
-    OUTPUT+="$COUNT new message(s) in $team:"$'\n'
-    IDS=()
-    while IFS=$'\x1f' read -r from body ts id; do
-      [ -n "$id" ] || continue
-      OUTPUT+="  [$ts] $from: $body"$'\n'
-      IDS+=("$id")
-    done <<< "$RESULT"
-    OUTPUT+=$'\n'
-    # Test seam: a two-file barrier that lets the race regression test land a
-    # message deterministically between display and mark. No-op unless set.
-    if [ -n "${AGMSG_TEST_MARK_BARRIER:-}" ]; then
-      : > "$AGMSG_TEST_MARK_BARRIER.reached"
-      _agmsg_barrier_waited=0
-      while [ ! -e "$AGMSG_TEST_MARK_BARRIER.release" ]; do
-        sleep 0.05
-        _agmsg_barrier_waited=$((_agmsg_barrier_waited + 1))
-        [ "$_agmsg_barrier_waited" -ge 200 ] && break # 10s safety cap
-      done
-    fi
-    # Mark read via the facade (§2.1 storage_mark_read_batch): recipient-scoped,
-    # idempotent; a legacy id records a message_read event without mutating the
-    # legacy row (§2.4). Only the ids collected from the rows actually
-    # displayed above — never a blanket match — so a message that arrives
-    # after the SELECT above can never be marked read unseen.
-    if [ "${#IDS[@]}" -gt 0 ]; then
-      storage_mark_read_batch "$team" "$AGENT" "${IDS[@]}" >/dev/null 2>&1 || true
-    fi
+    "
+  )
+  _rc=$?
+  set -e
+  case "$_rc" in
+    0)     ;;
+    97|98) continue ;;
+    *)     LOOP_RC=$_rc; LOOP_FAILED_TEAM="$team"; break ;;
+  esac
+
+  COUNT=$(printf '%s\n' "$RESULT" | grep -c . || true)
+  OUTPUT+="$COUNT new message(s) in $team:"$'\n'
+  IDS=()
+  while IFS=$'\x1f' read -r from body ts id; do
+    [ -n "$id" ] || continue
+    OUTPUT+="  [$ts] $from: $body"$'\n'
+    IDS+=("$id")
+  done <<< "$RESULT"
+  OUTPUT+=$'\n'
+  # Test seam: a two-file barrier that lets the race regression test land a
+  # message deterministically between display and mark. No-op unless set.
+  if [ -n "${AGMSG_TEST_MARK_BARRIER:-}" ]; then
+    : > "$AGMSG_TEST_MARK_BARRIER.reached"
+    _agmsg_barrier_waited=0
+    while [ ! -e "$AGMSG_TEST_MARK_BARRIER.release" ]; do
+      sleep 0.05
+      _agmsg_barrier_waited=$((_agmsg_barrier_waited + 1))
+      [ "$_agmsg_barrier_waited" -ge 200 ] && break # 10s safety cap
+    done
+  fi
+  # Mark read via the facade (§2.1 storage_mark_read_batch): recipient-scoped,
+  # idempotent; a legacy id records a message_read event without mutating the
+  # legacy row (§2.4). Only the ids collected from the rows actually displayed
+  # above — never a blanket match — so a message that arrives after the SELECT
+  # can never be marked read unseen.
+  if [ "${#IDS[@]}" -gt 0 ]; then
+    storage_mark_read_batch "$team" "$AGENT" "${IDS[@]}" >/dev/null 2>&1 || true
   fi
 done
 

@@ -127,6 +127,37 @@ _break_only_this_teams_store() {
   [[ "$output" != *"no new messages"* ]]
 }
 
+@test "bash: a condition context suppresses a nested set -e, even after a later sentinel (#637)" {
+  # The property the boundary depends on, pinned on its own so nobody has to
+  # rediscover it from a broken poll.
+  #
+  # A subshell that sets its own `set -e` still does not abort when the whole
+  # substitution is the left side of `||` — and the trap is not that the status
+  # is lost, it is that a LATER command supplies a different one. Checking only
+  # "does a failure come out" misses it whenever a sentinel follows the failure,
+  # which is exactly the shape that made a backend error read as "no unread".
+  run bash -c '
+    set -euo pipefail
+    out=$( set -euo pipefail; false; [ -n "" ] || exit 98; echo unreachable ) || rc=$?
+    printf "conditional=%s\n" "${rc:-0}"
+  '
+  [ "$status" -eq 0 ]
+  # 98, not 1: the false did not stop it, the sentinel two commands later did.
+  [[ "$output" == *"conditional=98"* ]]
+
+  run bash -c '
+    set -euo pipefail
+    set +e
+    out=$( set -euo pipefail; false; [ -n "" ] || exit 98; echo unreachable )
+    rc=$?
+    set -e
+    printf "plain=%s\n" "$rc"
+  '
+  [ "$status" -eq 0 ]
+  # 1: the failure is what came out, because nothing ran after it.
+  [[ "$output" == *"plain=1"* ]]
+}
+
 @test "check-inbox: a message arriving between display and mark is NOT marked read unseen" {
   bash "$SCRIPTS/send.sh" testteam bob alice "early"
   AGMSG_TEST_MARK_BARRIER="$BARRIER" bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a > "$TEST_SKILL_DIR/check-run.out" 2>/dev/null 3>&- &
