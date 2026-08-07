@@ -26,6 +26,17 @@ teardown() {
   teardown_test_env
 }
 
+# Run watch.sh in the background for <secs> seconds, capturing stdout to <out>.
+# Returns once the watcher has been stopped.
+run_watcher_for() {
+  local sid="$1" out="$2" secs="$3"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
+  local pid=$!
+  sleep "$secs"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 # Run watch.sh in the background until <condition> holds, capturing stdout to
 # <out>, then stop it. Returns non-zero if the condition never arrived.
 #
@@ -310,19 +321,22 @@ _wait_for_file_contains() {
   # An absence cannot be waited for, so wait for positive evidence that the
   # watcher got PAST the point where a sentinel would have been written.
   #
-  # The watermark is not that evidence: watch.sh persists it, then runs the
-  # DB-open healthcheck, and only then writes the ready sentinel — so observing
-  # the watermark and stopping would leave the ready block unreached, and the
-  # absence would hold for the wrong reason. Streamed delivery is the evidence,
-  # because it happens in the main loop, which is after the ready block.
+  # Startup artifacts are not that evidence. The pidfile is written well before
+  # the ready block, so observing it and stopping would leave that block
+  # unreached and the absence would hold for the wrong reason. Streamed delivery
+  # is the evidence, because it happens in the main loop, which is after the
+  # ready block.
   #
-  # The marker is sent only once the watermark exists, so it carries a higher id
-  # than the mark the watcher took at startup and is therefore streamed rather
-  # than absorbed into it.
+  # Upstream sent the marker only after the per-session watermark file appeared,
+  # so that it would carry a higher id than the mark taken at startup. There is
+  # no such file here -- read progress is store-owned under the unified cursor
+  # model -- and the wait is not needed either way: a fresh session delivers
+  # existing unread ("watch: a fresh session delivers existing unread" above),
+  # so the marker is streamed whether it lands before or after the first cursor
+  # read. The wait below is still the evidence; only the ordering crutch is gone.
   local out="$TEST_SKILL_DIR/broad.log"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-broad" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- &
   local w=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.$(_iid sess-broad).watermark"
   bash "$SCRIPTS/send.sh" team bob alice "M-broad-marker" >/dev/null
   wait_for_file_contains "$out" "M-broad-marker"
 
