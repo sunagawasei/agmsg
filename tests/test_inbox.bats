@@ -72,7 +72,60 @@ await_barrier_reached() {
   [ "$(unread_count alice)" -eq 0 ]
 }
 
+
+# Make ONE team's store unreadable without touching any other team's.
+#
+# Teams share a single store until they are partitioned, so corrupting the file
+# a team resolves to by default breaks every team at once -- and then the FIRST
+# team fails, which is the harmless case, not the one under test. Switching this
+# team to its own partition first is what makes the failure land where the
+# defect needs it: after an earlier team has already been marked read.
+_break_only_this_teams_store() {
+  local team="$1" cfg="$TEST_SKILL_DIR/teams/$1/config.json" updated db
+  updated="$(sqlite_mem "SELECT json_set(CAST(readfile('$(rf "$cfg")') AS TEXT), '\$.drivers.partition', 'per-team');")"
+  printf '%s' "$updated" > "$cfg"
+  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_storage_load; agmsg_db_path '"$team" 2>/dev/null)"
+  [ -n "$db" ] || return 1
+  mkdir -p "$(dirname "$db")"
+  printf 'not a database' > "$db"
+}
+
 # --- check-inbox.sh ------------------------------------------------------
+
+@test "check-inbox: a later team's failure does not swallow an earlier team's messages (#637)" {
+  # Marking happens inside the loop; emitting happens after it. Under set -e an
+  # unguarded substitution ended the script the moment a LATER team failed --
+  # after an EARLIER team's rows were stamped read_at and before either emit
+  # point. Those messages were read, undelivered, and never offered again.
+  #
+  # The failing team is named to sort AFTER the one holding the message: the
+  # loop walks teams in order, and the whole defect is a failure that lands
+  # after an earlier team was already marked read. A name that sorted first
+  # would fail before anything was accumulated -- a different, harmless case.
+  bash "$SCRIPTS/join.sh" zzlastteam alice claude-code /tmp/project-a >/dev/null
+  bash "$SCRIPTS/send.sh" testteam bob alice "first team message" >/dev/null
+  _break_only_this_teams_store zzlastteam
+
+  run bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a </dev/null
+
+  # The failure is still reported -- this is not "carry on regardless".
+  [ "$status" -ne 0 ]
+  # And the message that was marked read reached the operator.
+  [[ "$output" == *"first team message"* ]]
+}
+
+@test "check-inbox: a failure with nothing accumulated does not report 'no new messages' (#637)" {
+  # The quieter half of the same lie. A loop that stopped before accumulating
+  # anything has not established that there is nothing to deliver -- only that
+  # it could not look. Exiting 0 with "no new messages" tells the hook runtime
+  # the turn was clean.
+  bash "$SCRIPTS/join.sh" zzlastteam alice claude-code /tmp/project-a >/dev/null
+  _break_only_this_teams_store zzlastteam
+
+  run bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a </dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"no new messages"* ]]
+}
 
 @test "check-inbox: a message arriving between display and mark is NOT marked read unseen" {
   bash "$SCRIPTS/send.sh" testteam bob alice "early"

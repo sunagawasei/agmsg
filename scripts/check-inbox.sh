@@ -137,7 +137,19 @@ agmsg_storage_load
 DB="$(agmsg_db_path)"
 if [ ! -f "$DB" ]; then exit 0; fi
 
+# Messages are marked read inside this loop; the whole batch is emitted after
+# it. Under `set -e` an unguarded command substitution ends the script the
+# moment it fails -- and a failure while processing a LATER team lands after
+# an EARLIER team's rows were already stamped read_at, before either emit
+# point. Those messages are read, undelivered, and never offered again.
+# Measured on 8a2fe623: first_deliveries=0 first_read=1 second_unread=1 rc=5.
+#
+# So every substitution in here records the status and stops the loop instead
+# of ending the script. Whatever was already accumulated is emitted below, and
+# the failure is still propagated afterwards -- the run is not pretended to
+# have succeeded, it just stops taking messages down with it.
 OUTPUT=""
+LOOP_RC=0
 IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
 for team in "${TEAM_LIST[@]}"; do
   # Honor actas exclusivity locks. If (team, AGENT) is currently held by
@@ -151,7 +163,7 @@ for team in "${TEAM_LIST[@]}"; do
   # role. That asymmetry is the Codex caveat documented in README — if a
   # Codex session actas'd into <name>, check-inbox is still polling
   # whatever whoami chose first, not <name>.
-  state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}")
+  state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}") || { LOOP_RC=$?; break; }
   case "$state" in
     other:*) continue ;;
   esac
@@ -159,7 +171,7 @@ for team in "${TEAM_LIST[@]}"; do
   # Unread via the storage facade (§2.1 storage_list_unread = events ∪ legacy),
   # JSONL parsed in one pass with sqlite's JSON funcs (no jq; cf. lib/hooks-json.sh).
   # id is kept so the mark step below targets exactly the rows shown.
-  UNREAD_JSONL=$(storage_list_unread "$team" "$AGENT")
+  UNREAD_JSONL=$(storage_list_unread "$team" "$AGENT") || { LOOP_RC=$?; break; }
   if [ -n "$UNREAD_JSONL" ]; then
     _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
     RESULT=$(agmsg_sqlite ':memory:' "
@@ -168,8 +180,8 @@ for team in "${TEAM_LIST[@]}"; do
              json_extract(value,'\$.at') || char(31) ||
              json_extract(value,'\$.id')
       FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
-    ")
-    COUNT=$(printf '%s\n' "$RESULT" | wc -l | tr -d ' ')
+    ") || { LOOP_RC=$?; break; }
+    COUNT=$(printf '%s\n' "$RESULT" | wc -l | tr -d ' ') || { LOOP_RC=$?; break; }
     OUTPUT+="$COUNT new message(s) in $team:"$'\n'
     IDS=()
     while IFS=$'\x1f' read -r from body ts id; do
@@ -202,6 +214,12 @@ done
 
 # No new messages
 if [ -z "$OUTPUT" ]; then
+  # Both exits need the guard, not just the one that carries messages. A loop
+  # that stopped on a failure before accumulating anything has not established
+  # that there is nothing to deliver -- it established that it could not look.
+  # Saying "no new messages" and exiting 0 there is the same lie in a quieter
+  # voice, and the hook runtime treats it as a clean turn.
+  [ "$LOOP_RC" -eq 0 ] || exit "$LOOP_RC"
   emit_status_json "agmsg: no new messages"
   exit 0
 fi
@@ -216,5 +234,9 @@ if [ -n "$OUTPUT" ]; then
   "reason": "$ESCAPED"
 }
 ENDJSON
+  # Delivered first, then the failure is reported. Messages already marked read
+  # reach the operator, and the run still exits non-zero so nothing upstream
+  # reads a partial poll as a complete one.
+  [ "$LOOP_RC" -eq 0 ] || exit "$LOOP_RC"
   exit 0
 fi
