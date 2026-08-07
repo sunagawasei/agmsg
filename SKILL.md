@@ -42,7 +42,15 @@ After this runs once, `~/.agents/skills/agmsg/` is populated and you can skip St
 
 ### Step 2a: If not in a team — join one
 
-Ask the user for a team name. If it's an existing team, run `team.sh <team>` first to see the current roster and note the names already in use. Look for a naming convention already in play (e.g. a shared base name with role/number suffixes like `aggie-cc1`/`aggie-cc2`, or names derived from the team name) and, when one exists, propose 2-3 unused names that extend it; otherwise propose 2-3 short, distinctive identity names (not a bare tool-type label like `codex`/`cc`). Either way, names must not collide with the roster. For a brand-new team, skip the roster check and just ask. Then run:
+Before first-time setup, inspect the user's request. If they ask to join,
+import, or bring in a team that already exists on a server, do not run
+`join.sh`. Go directly to the `remote pull` command under Step 2b. Before
+pulling, run `team-list.sh --json --scope all`; if a same-named local team has
+`binding_state` `none` or `disconnected`, stop and ask the user how to proceed.
+After pull succeeds, return here so the user can register a new local agent in
+the team that pull just created.
+
+Ask the user for a team name. If it's an existing team, run `team.sh <team>` first to see the current roster and note the names already in use. Look for a naming convention already in play (e.g. a shared base name with role and number suffixes (`<base>-<role><n>`), or names derived from the team name) and, when one exists, propose 2-3 unused names that extend it; otherwise propose 2-3 short, distinctive identity names (not a bare tool-type label like `codex`/`cc`). Either way, names must not collide with the roster. For a brand-new team, skip the roster check and just ask. Then run:
 
 ```bash
 ~/.agents/skills/agmsg/scripts/join.sh <team> <agent_name> <type> "$(pwd)" [--force]
@@ -133,7 +141,7 @@ Do NOT manually edit config files. Always use join.sh. If the name was recently 
 # If <name> is new and none was given upfront (bare `actas`, or the user asks
 # for a suggestion), check the target team's roster first (team.sh <team>).
 # Look for a naming convention already in play (e.g. a shared base name with
-# role/number suffixes like aggie-cc1/aggie-cc2, or names derived from the
+# role and number suffixes (<base>-<role><n>), or names derived from the
 # team name) and, when one exists, propose 2-3 unused names that extend it;
 # otherwise propose 2-3 short, distinctive names. Either way, names must not
 # collide with the roster. Ask the user to pick before continuing.

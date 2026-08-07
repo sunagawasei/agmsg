@@ -591,3 +591,41 @@ jobs:
       - name: Rust tests
         if: needs.changes.outputs.app_changed != 'false'
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # Internal team names must not reach what we publish. This runs on EVERY diff,
+  # with no docs-only skip: the docs tree is exactly where prose names people,
+  # and a check that skips the files most likely to carry the problem is
+  # decoration. It costs one node process over `git ls-files`.
+  #
+  # SHAPE ONLY, AND THAT IS A DECISION, NOT AN ACCIDENT.
+  #
+  # Seat names have a shape (<base>-cc<n> / <base>-co<n>), so a pattern catches
+  # the whole class -- including seats nobody has created yet -- while putting
+  # no name into this repository. That half runs here.
+  #
+  # Names with no shape (a person's handle, a project nickname) are NOT checked
+  # by CI. Checking them needs the list of them, and the only way to give CI
+  # that list is to hand it to GitHub as a secret -- publishing, to a third
+  # party, the names the rule exists to keep unpublished. So that half runs
+  # before push, from a private checkout that holds the list, and never here.
+  #
+  # A green here therefore means "no seat-shaped name", not "no internal name".
+  # The script prints that in a banner rather than letting the distinction live
+  # only in this comment. `none` is passed explicitly for the same reason: an
+  # UNSET list is exit 2, so a run that checks half of what it claims can only
+  # happen because someone wrote it down, never because a variable was missing.
+  private-names:
+    name: internal names
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # `none` is written out here on purpose: it is the difference between
+      # "we check the shapes" and "nobody configured anything".
+      - name: Check the shapes we publish (unshaped names are checked before push)
+        run: AGMSG_PRIVATE_NAMES=none node scripts/check-private-names.mjs
