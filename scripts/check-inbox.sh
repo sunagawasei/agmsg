@@ -144,10 +144,15 @@ if [ ! -f "$DB" ]; then exit 0; fi
 # point. Those messages are read, undelivered, and never offered again.
 # Measured on 8a2fe623: first_deliveries=0 first_read=1 second_unread=1 rc=5.
 #
-# So every substitution in here records the status and stops the loop instead
-# of ending the script. Whatever was already accumulated is emitted below, and
-# the failure is still propagated afterwards -- the run is not pretended to
-# have succeeded, it just stops taking messages down with it.
+# So a failure stops the loop instead of ending the script, and what was
+# already accumulated is delivered.
+#
+# The failure is reported IN THE PAYLOAD, not by the exit status. The runtimes
+# read stdout as control JSON only on exit 0, so a non-zero exit throws the
+# delivery away -- which is what the first attempt at this fix did, on exactly
+# the path that was broken. When there are messages to hand over the status is
+# 0 and the text says the poll was partial; only when there is nothing to
+# deliver does the status carry the failure.
 OUTPUT=""
 LOOP_RC=0
 IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
@@ -179,7 +184,7 @@ for team in "${TEAM_LIST[@]}"; do
   # one (`_arr`), which is the whole failure mode this file is about: an
   # enumeration is short by one and the one it is short by is the defect. A
   # subshell with its own errexit does not need the list. Anything in here that
-  # fails ends the subshell, and the status arrives at the `||` below instead of
+  # fails ends the subshell, and its status is read from `$?` below instead of
   # ending the script.
   #
   # 97 and 98 are the two ordinary reasons to skip a team, carried as statuses
