@@ -297,6 +297,14 @@ EOS
   # It must say what it could not read, and name it.
   [[ "$output" == *"could not read"* ]]
   [[ "$output" == *"roster.jsonl"* ]]
+
+  # And it must not name a cause it did not establish. This failure is a mode
+  # bit; the earlier wording said "the file is present, so this is the path
+  # form, not the file", which is exactly wrong here and would send a reader
+  # after cygpath for a chmod. The four assertions above all held under that
+  # wording, so none of them was keeping the promise -- these two do.
+  [[ "$output" == *"permissions"* ]]
+  [[ "$output" != *"not the file"* ]]
 }
 
 @test "roster journal: an empty projection from readable files says so, and does not blame the path (#669)" {
