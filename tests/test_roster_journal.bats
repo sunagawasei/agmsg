@@ -325,6 +325,19 @@ EOS
   #
   # A check that only fires on an empty result cannot see this one. That is the
   # whole point of the test: the dangerous answer is the believable one.
+  #
+  # This is a GUARD, not a repair -- the check was already in the right place
+  # when this test was written, and the commit that added the test claimed
+  # otherwise. What the test pins is the position of the check, which is easy to
+  # "optimise" into the cheaper shape and lose. Measured against a version whose
+  # check runs only after an empty result:
+  #
+  #   before  agents={"alice":{"member_id":"019f...","registrations":[...]}}
+  #   chmod 000 roster.jsonl; project
+  #     status=0, no output on stdout or stderr
+  #   after   agents={}
+  #
+  # It reports success. That is what this test exists to keep out.
   if [ "$(id -u)" = "0" ]; then
     skip "root reads through the mode bits this is about"
   fi
