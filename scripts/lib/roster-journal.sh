@@ -187,8 +187,14 @@ agmsg_roster_project_config() {
     echo "agmsg: sqlite was given: $f_sql" >&2
   done
   if [ "$unreadable" -eq 1 ]; then
-    echo "agmsg: the file is present, so this is the path form, not the file --" >&2
-    echo "agmsg: a native sqlite3 cannot open the /tmp/... form Git Bash uses." >&2
+    # `[ -f ]` passed above, so the file is there and the OPEN is what failed.
+    # Which open failure it was, this cannot say: the path form is the one that
+    # brought us here (#669), and permissions, a lock, and I/O produce the same
+    # NULL. Naming a cause the check did not establish sends the next reader
+    # somewhere the evidence does not.
+    echo "agmsg: the file is present, so the open failed, not the lookup --" >&2
+    echo "agmsg: a path form a native sqlite3 cannot open (Git Bash's /tmp/...)," >&2
+    echo "agmsg: or permissions, a lock, or an I/O error on the file itself." >&2
     echo "agmsg: refusing to project; the roster is left as it is." >&2
     return 1
   fi
@@ -322,15 +328,16 @@ agmsg_roster_project_config() {
                     '\$.agents',json(agents.value),
                     '\$.retired_members',json(retired.value))
       FROM agents,retired;" 2>/dev/null | tr -d '\r')" || return 1
-  # An empty result has more than one cause and they are not the same failure.
-  # readfile() yields NULL for a path it cannot open, that NULL collapses the
-  # whole expression, and what arrives here is the same "" a projection with
-  # nothing to say produces -- so this line reported neither, and join.sh
-  # printed "Created team:" and exited 1 with nothing on stderr (#669).
+  # Empty, after the precheck above already said both files open. Before #669
+  # this line was a bare `return 1` and every way of arriving here looked the
+  # same: join.sh printed "Created team:" and exited with nothing on stderr.
   #
-  # Asked here rather than before the query on purpose: a check up front costs
-  # two extra sqlite invocations on every projection to answer a question that
-  # only matters when something already went wrong.
+  # The precheck is not repeated here for its own sake -- it passed. It is asked
+  # again because "it opened a moment ago" and "it opens now" are different
+  # claims: a lock, a permission change, or an unmounted volume between the two
+  # would land exactly here, and that failure deserves the open-failure message
+  # rather than being reported as bad journal contents. When both still open,
+  # the contents are what is left.
   if [ -z "$updated" ]; then
     local f f_sql named=0
     for f in "$journal" "$config"; do
@@ -345,8 +352,11 @@ agmsg_roster_project_config() {
       echo "agmsg: sqlite was given: $f_sql" >&2
     done
     if [ "$named" -eq 1 ]; then
-      echo "agmsg: the files are present, so this is the path form, not the file --" >&2
-      echo "agmsg: a native sqlite3 cannot open the /tmp/... form Git Bash hands around." >&2
+      # It opened for the precheck and does not open now, so this is a change
+      # under us -- a lock, a mode change, a volume going away. Which one, this
+      # cannot say, and it does not guess.
+      echo "agmsg: it opened moments ago and does not now -- something changed" >&2
+      echo "agmsg: under the run: a lock, permissions, or the volume." >&2
     else
       # Both readable, still nothing. A different failure, and it gets its own
       # sentence rather than borrowing the one above -- saying "could not read"
