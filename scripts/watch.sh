@@ -571,7 +571,37 @@ fi
 # Pairs another session currently holds, so each departure and each return is
 # announced once instead of every cycle. Membership is not a decision -- the
 # lock is -- it only records what has already been said (#683).
+#
+# Held as newline-separated entries and compared as EXACT strings, never as
+# patterns. A team name is arbitrary UTF-8 minus a path deny-list and an agent
+# name minus a JSON-path deny-list (validate.sh), so either may contain glob
+# metacharacters, a sed delimiter, or a space. A `case` pattern or an
+# `s|…|…|` built out of one is a bug that only appears for some names --
+# the class this repo has paid for before with quotes in names (#87). Newline
+# is the one byte a name cannot contain, control characters being rejected, so
+# it is the safe separator.
 HELD_ELSEWHERE=""
+
+_held_elsewhere_has() {
+  local want="$1" line
+  [ -n "$HELD_ELSEWHERE" ] || return 1
+  while IFS= read -r line; do
+    [ "$line" = "$want" ] && return 0
+  done <<< "$HELD_ELSEWHERE"
+  return 1
+}
+
+_held_elsewhere_without() {
+  local drop="$1" line out=""
+  [ -n "$HELD_ELSEWHERE" ] || return 0
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    [ "$line" = "$drop" ] && continue
+    out="${out:+$out
+}$line"
+  done <<< "$HELD_ELSEWHERE"
+  printf '%s' "$out"
+}
 
 while true; do
   # Liveness guard (#67): exit promptly once the originating agent session is
@@ -632,25 +662,21 @@ while true; do
         # Announced on each transition, not each cycle -- a per-cycle message
         # would bury the log, and announcing only the first time would make a
         # second departure invisible.
-        case " $HELD_ELSEWHERE " in
-          *" ${pair_team}/${pair_agent} "*) ;;
-          *)
-            HELD_ELSEWHERE="${HELD_ELSEWHERE:+$HELD_ELSEWHERE }${pair_team}/${pair_agent}"
-            echo "agmsg watch: ${pair_team}/${pair_agent} was claimed by session ${pair_state#other:}; not serving it while they hold it." >&2
-            ;;
-        esac
+        if ! _held_elsewhere_has "${pair_team}/${pair_agent}"; then
+          HELD_ELSEWHERE="${HELD_ELSEWHERE:+$HELD_ELSEWHERE
+}${pair_team}/${pair_agent}"
+          echo "agmsg watch: ${pair_team}/${pair_agent} was claimed by session ${pair_state#other:}; not serving it while they hold it." >&2
+        fi
         continue
         ;;
       *)
         # Free or ours. If we had stepped aside for it, say that we are taking
         # it back -- otherwise the log shows a role leaving and never returning,
         # which reads as a permanent drop.
-        case " $HELD_ELSEWHERE " in
-          *" ${pair_team}/${pair_agent} "*)
-            HELD_ELSEWHERE="$(printf '%s' " $HELD_ELSEWHERE " | sed "s| ${pair_team}/${pair_agent} | |g; s|^ *||; s| *$||")"
-            echo "agmsg watch: ${pair_team}/${pair_agent} is unheld again; serving it here." >&2
-            ;;
-        esac
+        if _held_elsewhere_has "${pair_team}/${pair_agent}"; then
+          HELD_ELSEWHERE="$(_held_elsewhere_without "${pair_team}/${pair_agent}")"
+          echo "agmsg watch: ${pair_team}/${pair_agent} is unheld again; serving it here." >&2
+        fi
         ;;
     esac
     # Per team: with a store per team, "one team has no store yet" is a

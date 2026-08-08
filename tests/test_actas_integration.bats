@@ -397,3 +397,55 @@ fake_session() {
   kill "$broad" 2>/dev/null || true
   wait "$broad" 2>/dev/null || true
 }
+
+# Names are arbitrary UTF-8 minus a deny-list (validate.sh): a team name may
+# contain a regex metacharacter or a sed delimiter. The first version of this
+# bookkeeping tested membership with a `case` glob and removed entries with an
+# `s|…|…|` built from the name, and my first attempt at a test for it did not
+# discriminate -- it used one hostile name, and a removal that failed outright
+# still left the list empty, which looks the same from outside. Measured: the
+# broken version passed it.
+#
+# What separates them is a removal that takes MORE than it was asked for. Two
+# teams whose names differ only where the metacharacter sits, both held
+# elsewhere, and only one released: a regex removal drops both entries, so the
+# still-held one is announced a second time. The lock, not this list, decides
+# delivery -- so the assertion is on the log, which is the only thing the
+# bookkeeping controls.
+@test "watch: releasing one held pair does not forget another whose name it matches (#683)" {
+  skip_on_windows "actas watcher process mgmt under Git Bash (#182)"
+  fake_register 't.m' alice
+  fake_register 'txm' alice
+
+  AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" "sid-broad" /tmp/p1 claude-code \
+    > "$BATS_TEST_TMPDIR/n.out" 2> "$BATS_TEST_TMPDIR/n.err" 3>&- &
+  local broad=$!
+  sleep 1
+
+  sleep 60 &
+  local newpid=$!
+  echo "sid-new" > "$RUN_DIR/cc-instance.$newpid"
+  echo "sid-new" > "$(actas_lock_path 't.m' alice)"
+  echo "sid-new" > "$(actas_lock_path 'txm' alice)"
+  sleep 3
+
+  # Release ONLY t.m. txm stays held, so nothing about it has changed.
+  rm -f "$(actas_lock_path 't.m' alice)"
+  sleep 4
+  kill "$newpid" 2>/dev/null || true
+
+  # t.m came back, exactly once.
+  run cat "$BATS_TEST_TMPDIR/n.err"
+  [[ "$output" == *"t.m/alice is unheld again"* ]]
+  [[ "$output" != *"txm/alice is unheld again"* ]]
+
+  # And txm was announced as held once, not twice: a removal that also dropped
+  # txm from the list makes the next cycle treat it as newly held and say so
+  # again.
+  local claims
+  claims="$(grep -c 'txm/alice was claimed' "$BATS_TEST_TMPDIR/n.err" || true)"
+  [ "$claims" -eq 1 ]
+
+  kill "$broad" 2>/dev/null || true
+  wait "$broad" 2>/dev/null || true
+}
