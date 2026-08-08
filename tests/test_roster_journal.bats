@@ -213,30 +213,88 @@ EOF
 # asked to convert. The record is the assertion -- which paths took the
 # converted route, rather than whether this particular platform happened to
 # need it.
-_record_converted_paths() {   # $1 = dir to put the stub in, $2 = log file
+# The first version of this test recorded what cygpath was asked to convert and
+# asserted the journal appeared in that record. It did not discriminate: the
+# readability guard that ships with the fix converts the same two paths, so
+# putting the value escaper back in the QUERY left the test green. Measured --
+# the mutation was not caught.
+#
+# So read the statement instead. cygpath returns a marked path and sqlite3 is
+# captured rather than run, which makes "the projection query holds a converted
+# path" a thing this test can see directly, on any platform.
+_capture_sql() {   # $1 = stub dir, $2 = capture file
   mkdir -p "$1"
+  # Last argument is the payload in both cases (`cygpath -w <path>`,
+  # `sqlite3 :memory: <sql>`); read it with a loop rather than ${@: -1} so
+  # bash 3.2 handles it too.
   cat > "$1/cygpath" <<EOS
 #!/usr/bin/env bash
-# Identity conversion. Last argument is the path (\`cygpath -w <path>\`); read it
-# with a loop rather than \${@: -1} so bash 3.2 handles it too.
 last=""
 for a in "\$@"; do last="\$a"; done
-printf '%s\n' "\$last" >> "$2"
-printf '%s' "\$last"
+printf 'WINPATH>%s' "\$last"
 EOS
-  chmod +x "$1/cygpath"
+  # One line per STATEMENT, not per line of SQL. These statements are many lines
+  # long, so appending them verbatim would let a later grep match one line of a
+  # statement and miss the rest of it -- which is what the first attempt at this
+  # assertion did.
+  cat > "$1/sqlite3" <<EOS
+#!/usr/bin/env bash
+sql=""
+for a in "\$@"; do sql="\$a"; done
+printf '%s' "\$sql" | tr '\n' ' ' >> "$2"
+printf '\n' >> "$2"
+case "\$sql" in
+  *"IS NOT NULL"*) printf '1\n' ;;    # readability guard: yes, sqlite can open it
+  *)               printf '{}\n' ;;   # anything else: a harmless empty object
+esac
+EOS
+  chmod +x "$1/cygpath" "$1/sqlite3"
 }
 
-@test "roster journal: every path it hands sqlite goes through the path converter (#669)" {
-  local bin="$BATS_TEST_TMPDIR/bin" log="$BATS_TEST_TMPDIR/converted.log"
-  _record_converted_paths "$bin" "$log"
+@test "roster journal: the projection query itself reads a converted path (#669)" {
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local team_dir="$TEST_SKILL_DIR/teams/demo"
 
-  PATH="$bin:$PATH" bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local bin="$BATS_TEST_TMPDIR/bin" cap="$BATS_TEST_TMPDIR/sql.txt"
+  _capture_sql "$bin" "$cap"
+  PATH="$bin:$PATH" bash -c '
+    source "'"$SCRIPTS"'/lib/roster-journal.sh"
+    agmsg_roster_project_config "'"$team_dir"'" "'"$team_dir"'/config.json"
+  ' || true
 
-  # Both files this module reads via readfile() must appear. Asserting on the
-  # journal alone would stay green for a version that converted it and left the
-  # team config on the old route.
-  [ -f "$log" ]
-  grep -q 'roster\.jsonl$' "$log"
-  grep -q 'config\.json$' "$log"
+  # The projection is the statement that rebuilds $.agents and
+  # $.retired_members; the guard issues a different one, and matching on "any
+  # statement" is how the previous version of this test lost its teeth.
+  local proj
+  proj="$(grep 'retired_members' "$cap" | head -1)"
+  [ -n "$proj" ]
+  # Both files, because converting the journal and leaving the team config on
+  # the old route is a state this module was actually in.
+  [[ "$proj" == *"readfile('WINPATH>"*"roster.jsonl')"* ]]
+  [[ "$proj" == *"readfile('WINPATH>"*"config.json')"* ]]
+}
+
+@test "roster journal: a file sqlite cannot read is not answered as an empty roster (#669)" {
+  # The other half of #669. readfile() returns NULL for a path it cannot open
+  # and an empty blob for an empty file, and every projection built on it turns
+  # both into no rows -- so the caller returned 1 with nothing on stderr and the
+  # operator saw a success line followed by silence.
+  #
+  # Unreadability is produced here with a mode bit rather than a path form,
+  # because the path form only misbehaves on Windows. The code path is the same
+  # one: sqlite is handed a path it cannot open.
+  if [ "$(id -u)" = "0" ]; then
+    skip "root reads through the mode bits this is about"
+  fi
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local journal="$TEST_SKILL_DIR/teams/demo/roster.jsonl"
+  chmod 000 "$journal"
+
+  run bash "$SCRIPTS/join.sh" demo bob claude-code /tmp/b
+  chmod 644 "$journal"
+
+  [ "$status" -ne 0 ]
+  # It must say what it could not read, and name it.
+  [[ "$output" == *"could not read"* ]]
+  [[ "$output" == *"roster.jsonl"* ]]
 }

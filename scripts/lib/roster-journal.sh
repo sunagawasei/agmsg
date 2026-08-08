@@ -17,6 +17,10 @@ if ! declare -F agmsg_write_atomic >/dev/null 2>&1; then
   # shellcheck disable=SC1091
   source "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/registry-lock.sh"
 fi
+if ! declare -F agmsg_sql_readfile_path >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  source "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/sqlpath.sh"
+fi
 
 agmsg_roster_journal_path() {
   printf '%s/roster.jsonl\n' "$1"
@@ -26,6 +30,11 @@ agmsg_roster_has_journal() {
   [ -f "$(agmsg_roster_journal_path "$1")" ]
 }
 
+# For VALUES only — a name, a member id, a timestamp. A path bound for
+# readfile() takes agmsg_sql_readfile_path instead: this doubles quotes and
+# converts nothing, so on Git Bash sqlite got an MSYS path it could not open and
+# join.sh exited 1 in silence after creating the team (#669). The two names read
+# alike and do opposite things to a path, which is how the wrong one was picked.
 _agmsg_roster_sqlesc() {
   printf '%s' "$1" | sed "s/'/''/g"
 }
@@ -85,7 +94,7 @@ agmsg_roster_name_owner() {
   local team_dir="$1" name="$2" journal journal_sql name_sql
   journal="$(agmsg_roster_journal_path "$team_dir")"
   [ -f "$journal" ] || return 0
-  journal_sql="$(_agmsg_roster_sqlesc "$journal")"
+  journal_sql="$(agmsg_sql_readfile_path "$journal")"
   name_sql="$(_agmsg_roster_sqlesc "$name")"
   sqlite3 :memory: "
     WITH source(doc) AS (
@@ -119,7 +128,7 @@ agmsg_roster_ensure() {
   journal="$(agmsg_roster_journal_path "$team_dir")"
   [ -f "$journal" ] && return 0
   [ -f "$config" ] || return 0
-  config_sql="$(_agmsg_roster_sqlesc "$config")"
+  config_sql="$(agmsg_sql_readfile_path "$config")"
   team_id="$(sqlite3 :memory: \
     "SELECT COALESCE(json_extract(CAST(readfile('$config_sql') AS TEXT), '\$.team_id'),'');" \
     2>/dev/null | tr -d '\r')"
@@ -153,8 +162,21 @@ agmsg_roster_project_config() {
   journal="$(agmsg_roster_journal_path "$team_dir")"
   [ -f "$journal" ] || return 0
   [ -f "$config" ] || return 1
-  journal_sql="$(_agmsg_roster_sqlesc "$journal")"
-  config_sql="$(_agmsg_roster_sqlesc "$config")"
+  # Both files exist -- `[ -f ]` said so above. Whether SQLITE can open them is
+  # a different question, and the one that was answered silently before: an
+  # unopenable path and an empty file produce the same empty projection, so the
+  # `[ -n "$updated" ]` below returned 1 with nothing said. Ask first, and name
+  # the path that could not be read (#669).
+  local f
+  for f in "$journal" "$config"; do
+    agmsg_sql_readfile_ok "$f" && continue
+    echo "agmsg: sqlite could not read '$f'." >&2
+    echo "agmsg: the file is there, so this is about the path form, not the file --" >&2
+    echo "agmsg: on Git Bash a native sqlite3 cannot open an MSYS path like /tmp/..." >&2
+    return 1
+  done
+  journal_sql="$(agmsg_sql_readfile_path "$journal")"
+  config_sql="$(agmsg_sql_readfile_path "$config")"
   updated="$(sqlite3 :memory: "
     WITH
     source(doc) AS (

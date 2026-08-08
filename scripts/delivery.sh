@@ -212,7 +212,7 @@ agmsg_delivery_status_default() {
   local has_ss=0 has_st=0
   if [ -f "$hf" ]; then
     local sql_hf
-    sql_hf=$(sql_readfile_path "$hf")
+    sql_hf=$(agmsg_sql_readfile_path "$hf")
     has_ss=$(agmsg_sqlite_mem "
       SELECT EXISTS(
         SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.SessionStart')) AS s,
@@ -235,7 +235,7 @@ agmsg_delivery_status_default() {
 
   if [ -f "$hf" ]; then
     local sql_hf count
-    sql_hf=$(sql_readfile_path "$hf")
+    sql_hf=$(agmsg_sql_readfile_path "$hf")
     # readfile() rather than interpolating the file contents into argv —
     # for large settings (#95) the latter hits MAX_ARG_STRLEN on Linux.
     count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hf'), '\$.hooks.SessionStart'));" 2>/dev/null || echo 0)

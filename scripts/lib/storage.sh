@@ -173,16 +173,85 @@ agmsg_sqlite_mem() {
   sqlite3 :memory: "$@" | tr -d '\r'
 }
 
-# Turn a filesystem path into a form sqlite3's readfile() can open, then escape
-# it as a SQL string literal. On Windows, sqlite3.exe is a native binary that
-# can't open a Git Bash path like /d/a/agmsg/x.json — readfile() returns NULL
-# and the surrounding json parse silently yields no rows. cygpath -w converts to
-# the native D:\a\agmsg\x.json form first. No-op off Windows (cygpath absent).
-# Mirrors delivery.sh's sql_readfile_path for the registry readfile() sites.
-agmsg_sql_readfile_path() {
-  local path="$1"
-  if command -v cygpath >/dev/null 2>&1; then
-    path=$(cygpath -w "$path" 2>/dev/null || printf '%s' "$path")
+# agmsg_sql_readfile_path lives in lib/sqlpath.sh — one definition, so the rule
+# "a path bound for SQL goes through this function" has one answer. It used to
+# be defined here and again in hooks-json.sh, and a third caller wrote its own
+# escaper rather than reach for either (#669).
+if ! declare -F agmsg_sql_readfile_path >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  source "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/sqlpath.sh"
+fi
+
+# Escape an arbitrary scalar for safe interpolation into a SQL string literal
+# (double every single quote). Same semantics as the sqlite driver's internal
+# _sqlite_lit / storage_send escaping, but driver-agnostic and available to the
+# registry scripts that still write the legacy messages table directly
+# (rename.sh / rename-team.sh). A team or agent name may legitimately contain a
+# single quote (validate.sh only blocks path traversal), which would otherwise
+# break the INSERT/UPDATE and is an injection surface (#223, #87).
+agmsg_sqlesc() {
+  printf '%s' "$1" | sed "s/'/''/g"
+}
+
+# ── Storage driver facade (storage axis) ─────────────────────────────────────
+# The helpers above resolve the legacy sqlite path and run raw SQL; call sites
+# keep using them until #206 migrates them onto the contract below. The facade
+# resolves the *active* storage driver, sources it, and makes the storage_*
+# contract (docs/spec/driver-interface.md §2 / ADR 0003) available. Driver
+# discovery + trust reuse the axis-generic registry (ADR 0002, driver-registry.sh).
+
+# Path to the machine-wide driver config (spec §4). Overridable for tests.
+_agmsg_storage_config_path() {
+  printf '%s\n' "${AGMSG_CONFIG:-$HOME/.agents/agmsg/config.json}"
+}
+
+# Active storage driver name: env override > config "storage" key > built-in.
+agmsg_storage_driver() {
+  if [ -n "${AGMSG_STORAGE_DRIVER:-}" ]; then
+    printf '%s\n' "$AGMSG_STORAGE_DRIVER"
+    return 0
   fi
-  printf '%s' "$path" | sed "s/'/''/g"
+  local cfg name
+  cfg="$(_agmsg_storage_config_path)"
+  if [ -n "$cfg" ] && [ -f "$cfg" ]; then
+    name="$(sqlite3 :memory: \
+      "SELECT COALESCE(json_extract(readfile('$(agmsg_sql_readfile_path "$cfg")'), '\$.storage'), '')" \
+      2>/dev/null | tr -d '\r')"
+    if [ -n "$name" ] && [ "$name" != "null" ]; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+  fi
+  printf 'sqlite\n'
+}
+
+# Locate and source the active storage driver's storage_* functions. Idempotent.
+# Resolution reuses the registry search bases (in-tree builtins always trusted;
+# external plugin dirs gated by the opt-in trustfile, ADR 0002).
+_AGMSG_STORAGE_LOADED=""
+agmsg_storage_load() {
+  [ -n "$_AGMSG_STORAGE_LOADED" ] && return 0
+  # Pull in the axis-generic registry once (its functions may not be sourced yet).
+  if ! command -v agmsg_driver_bases >/dev/null 2>&1; then
+    local _lib
+    _lib="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    # shellcheck disable=SC1091
+    [ -n "$_lib" ] && . "$_lib/driver-registry.sh"
+  fi
+  local name file kind base
+  name="$(agmsg_storage_driver)"
+  while IFS="$(printf '\t')" read -r kind base; do
+    [ -n "$base" ] || continue
+    file="$base/storage/$name.sh"
+    [ -f "$file" ] || continue
+    if [ "$kind" = external ] && ! agmsg_driver_is_trusted storage "$name" "$file"; then
+      continue
+    fi
+    # shellcheck disable=SC1090
+    . "$file"
+    _AGMSG_STORAGE_LOADED="$name"
+    return 0
+  done < <(agmsg_driver_bases)
+  printf 'agmsg: no trusted storage driver "%s" found\n' "$name" >&2
+  return 1
 }
