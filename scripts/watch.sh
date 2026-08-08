@@ -568,6 +568,10 @@ if [ -n "$ACTIVE_NAME" ]; then
   done <<< "$PAIRS"
 fi
 
+# Pairs this watcher has given up because another session claimed them, so the
+# announcement happens once each rather than every cycle (#683).
+DROPPED_PAIRS=""
+
 while true; do
   # Liveness guard (#67): exit promptly once the originating agent session is
   # gone. A plain pipe gives no portable way to notice a *downstream* consumer
@@ -582,14 +586,58 @@ while true; do
     printf 'agmsg watch: owner token=%s exit_reason=owner-dead\n' "$SESSION_ID" >&2
     exit 0
   fi
-  maybe_run_watchdog
-  if [ -f "$DB" ]; then
-    # Pull messages after the cursor via the storage facade (§2.2). The output is
-    # JSONL: zero or more message_sent records in delivery order, then a trailing
-    # {"type":"cursor","cursor":"<token>"} as the LAST line — the position to
-    # resume from. Parse every record in one pass with sqlite's JSON funcs (the
-    # repo idiom; no jq). Newlines/tabs in the body are escaped to keep one line.
-    OUT="$(storage_watch_after "$LAST" "${SUB_PAIRS[@]}" 2>/dev/null || true)"
+  while IFS=$'\t' read -r pair_team pair_agent; do
+    [ -z "$pair_team" ] && continue
+    # Ownership is re-read every cycle, because it can change under a running
+    # watcher and nothing else notices. The subscription set and the startup
+    # lock check both happen once, above; a session that claims this role
+    # afterwards moves the lock file and starts its own watcher, and this
+    # process would otherwise keep polling the same pair forever.
+    #
+    # That is not a harmless duplicate. The read cursor is one per
+    # (team, agent) and storage_watch_after excludes rows already read, so
+    # whoever polls first TAKES the row and the other sees nothing. When the
+    # one that takes it is this stale process, its printf succeeds -- stdout is
+    # still an open pipe to a live session -- so the id is marked read and the
+    # message is gone, delivered to a stream nobody is reading (#683).
+    #
+    # Only the lock file is read here, not the whole subscription set: losing a
+    # pair is the half a running process can detect for the price of a file
+    # read. Gaining one is the caller's job, at the point it creates the team.
+    pair_state="$(actas_lock_state "$pair_team" "$pair_agent" "$SESSION_ID" 2>/dev/null || echo free)"
+    case "$pair_state" in
+      other:*)
+        if [ -n "$ACTIVE_NAME" ]; then
+          # This watcher exists to serve exactly this role and no longer owns
+          # it. Stop -- and say so: stderr is the only place a reason survives,
+          # and a watcher that ends without one is indistinguishable from one
+          # that crashed.
+          echo "agmsg watch: ${pair_team}/${pair_agent} is now held by session ${pair_state#other:}." >&2
+          echo "agmsg watch: this watcher no longer owns that role and is stopping." >&2
+          echo "agmsg watch: messages for it stay unread and reach the session that claimed it." >&2
+          exit 0
+        fi
+        # Broad subscription: this watcher serves other roles too, so drop the
+        # pair rather than ending the process -- exiting here would take down a
+        # whole session's delivery because one of its roles moved elsewhere.
+        # Announced once per pair; a per-cycle message would bury the log.
+        case " $DROPPED_PAIRS " in
+          *" ${pair_team}/${pair_agent} "*) ;;
+          *)
+            DROPPED_PAIRS="${DROPPED_PAIRS:+$DROPPED_PAIRS }${pair_team}/${pair_agent}"
+            echo "agmsg watch: ${pair_team}/${pair_agent} was claimed by session ${pair_state#other:}; dropping it here." >&2
+            ;;
+        esac
+        continue
+        ;;
+    esac
+    # Per team: with a store per team, "one team has no store yet" is a
+    # normal state, and a single check outside this loop would silence
+    # delivery for every OTHER team as well.
+    storage_store_exists "$pair_team" || continue
+    READ_CURSOR="$(storage_read_cursor_get "$pair_team" "$pair_agent" 2>/dev/null || true)"
+    [ -n "$READ_CURSOR" ] || READ_CURSOR=0
+    OUT="$(storage_watch_after "$READ_CURSOR" "$pair_team:$pair_agent" 2>/dev/null || true)"
     if [ -n "$OUT" ]; then
       _arr="[$(printf '%s' "$OUT" | paste -sd, -)]"
       ROWS="$(agmsg_sqlite ':memory:' "
