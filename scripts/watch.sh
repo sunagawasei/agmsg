@@ -568,9 +568,10 @@ if [ -n "$ACTIVE_NAME" ]; then
   done <<< "$PAIRS"
 fi
 
-# Pairs this watcher has given up because another session claimed them, so the
-# announcement happens once each rather than every cycle (#683).
-DROPPED_PAIRS=""
+# Pairs another session currently holds, so each departure and each return is
+# announced once instead of every cycle. Membership is not a decision -- the
+# lock is -- it only records what has already been said (#683).
+HELD_ELSEWHERE=""
 
 while true; do
   # Liveness guard (#67): exit promptly once the originating agent session is
@@ -617,18 +618,39 @@ while true; do
           echo "agmsg watch: messages for it stay unread and reach the session that claimed it." >&2
           exit 0
         fi
-        # Broad subscription: this watcher serves other roles too, so drop the
+        # Broad subscription: this watcher serves other roles too, so skip the
         # pair rather than ending the process -- exiting here would take down a
         # whole session's delivery because one of its roles moved elsewhere.
-        # Announced once per pair; a per-cycle message would bury the log.
-        case " $DROPPED_PAIRS " in
+        #
+        # Skipped FOR AS LONG AS someone else holds it, not permanently. When
+        # the holder goes away the lock reads free again and this watcher takes
+        # the pair back, which is the same rule the startup filter uses (a
+        # stale lock is free). Dropping it for good would be worse: the role is
+        # still registered to this project, so nobody would deliver for it
+        # until the session restarted.
+        #
+        # Announced on each transition, not each cycle -- a per-cycle message
+        # would bury the log, and announcing only the first time would make a
+        # second departure invisible.
+        case " $HELD_ELSEWHERE " in
           *" ${pair_team}/${pair_agent} "*) ;;
           *)
-            DROPPED_PAIRS="${DROPPED_PAIRS:+$DROPPED_PAIRS }${pair_team}/${pair_agent}"
-            echo "agmsg watch: ${pair_team}/${pair_agent} was claimed by session ${pair_state#other:}; dropping it here." >&2
+            HELD_ELSEWHERE="${HELD_ELSEWHERE:+$HELD_ELSEWHERE }${pair_team}/${pair_agent}"
+            echo "agmsg watch: ${pair_team}/${pair_agent} was claimed by session ${pair_state#other:}; not serving it while they hold it." >&2
             ;;
         esac
         continue
+        ;;
+      *)
+        # Free or ours. If we had stepped aside for it, say that we are taking
+        # it back -- otherwise the log shows a role leaving and never returning,
+        # which reads as a permanent drop.
+        case " $HELD_ELSEWHERE " in
+          *" ${pair_team}/${pair_agent} "*)
+            HELD_ELSEWHERE="$(printf '%s' " $HELD_ELSEWHERE " | sed "s| ${pair_team}/${pair_agent} | |g; s|^ *||; s| *$||")"
+            echo "agmsg watch: ${pair_team}/${pair_agent} is unheld again; serving it here." >&2
+            ;;
+        esac
         ;;
     esac
     # Per team: with a store per team, "one team has no store yet" is a

@@ -342,3 +342,58 @@ fake_session() {
   kill "$broad" 2>/dev/null || true
   wait "$broad" 2>/dev/null || true
 }
+
+# Stepping aside is for as long as someone else holds the role, not forever.
+# The review of the first version caught the opposite claim in my own
+# description: the pair stays in the subscription and comes back when the lock
+# reads free again. Permanence would be the worse behaviour -- the role is still
+# registered to this project, so nobody would deliver for it until the session
+# restarted -- so this pins the return rather than the drop.
+@test "watch: a broad watcher takes a pair back once nobody holds it (#683)" {
+  skip_on_windows "actas watcher process mgmt under Git Bash (#182)"
+  fake_register T alice
+  fake_register T carol
+
+  AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" "sid-broad" /tmp/p1 claude-code \
+    > "$BATS_TEST_TMPDIR/broad.out" 2> "$BATS_TEST_TMPDIR/broad.err" 3>&- &
+  local broad=$!
+  sleep 1
+
+  sleep 60 &
+  local newpid=$!
+  echo "sid-new" > "$RUN_DIR/cc-instance.$newpid"
+  echo "sid-new" > "$(actas_lock_path T alice)"
+  sleep 2
+
+  # It stepped aside while the other session was live.
+  bash "$SKILL_DIR/scripts/send.sh" T carol alice "while it was held" >/dev/null
+  sleep 2
+  run cat "$BATS_TEST_TMPDIR/broad.out"
+  [[ "$output" != *"while it was held"* ]]
+
+  # The holder disappears. The lock file stays behind — a stale owner reads as
+  # free, which is exactly the state the startup filter already treats as
+  # available.
+  kill "$newpid" 2>/dev/null || true
+  wait "$newpid" 2>/dev/null || true
+  rm -f "$RUN_DIR/cc-instance.$newpid"
+  sleep 3
+
+  # Both messages are delivered now: the one that arrived while it was held is
+  # still unread, so taking the pair back means handing it over, not skipping it.
+  bash "$SKILL_DIR/scripts/send.sh" T carol alice "after it was released" >/dev/null
+  sleep 3
+
+  run cat "$BATS_TEST_TMPDIR/broad.out"
+  [[ "$output" == *"while it was held"* ]]
+  [[ "$output" == *"after it was released"* ]]
+
+  # And the log shows both transitions, so a reader is not left thinking the
+  # role went away for good.
+  run cat "$BATS_TEST_TMPDIR/broad.err"
+  [[ "$output" == *"while they hold it"* ]]
+  [[ "$output" == *"unheld again"* ]]
+
+  kill "$broad" 2>/dev/null || true
+  wait "$broad" 2>/dev/null || true
+}
