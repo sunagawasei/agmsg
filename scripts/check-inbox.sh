@@ -56,8 +56,8 @@ if echo "$INPUT" | grep -q '"stop_hook_active"[[:space:]]*:[[:space:]]*true' 2>/
   exit 0
 fi
 
-# Defer to the monitor watcher when one is alive for this session.
-# Avoids double-delivery when delivery.mode = both. The session id field name
+# The session id is still resolved: the actas-ownership check further down
+# needs it. Only the deferral that used to follow it is gone. The field name
 # differs by vendor: Claude Code emits snake_case "session_id"; Grok Build (and
 # Cursor) emit camelCase "sessionId". Try snake first (claude-code unaffected),
 # then camel, then the GROK_SESSION_ID env Grok injects into every hook.
@@ -68,24 +68,37 @@ SESSION_ID=$(printf '%s' "$INPUT" \
   | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
   | head -1)
 [ -z "$SESSION_ID" ] && SESSION_ID="${GROK_SESSION_ID:-}"
-if [ -n "$SESSION_ID" ]; then
-  # The monitor watcher keys its pidfile (and its actas owner, below) on the
-  # per-process instance id (#93), not the bare session_id. Normalize to the
-  # same token so this Stop-hook defers to a live watcher in `both` mode instead
-  # of double-delivering.
-  SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$TYPE")"
-  WATCH_PROJECT="$(agmsg_resolve_project "$PROJECT" "$TYPE")"
-  PIDFILE="$SKILL_DIR/run/watch.$SESSION_ID.pid"
-  if [ -f "$PIDFILE" ]; then
-    WATCH_PID=$(cat "$PIDFILE" 2>/dev/null || true)
-    # _agmsg_pid_alive_local: EPERM-aware, so a sandbox-unsignalable watcher is
-    # still alive -- and it does not ask tasklist, which cannot see a pid watch.sh
-    # minted from its own $$ (#567).
-    if [ -n "$WATCH_PID" ] && _agmsg_pid_alive_local "$WATCH_PID"; then
-      exit 0
-    fi
-  fi
-fi
+# Normalized to the per-process instance id (#93), which is the token the
+# actas owner file is keyed on.
+[ -n "$SESSION_ID" ] && SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$TYPE")"
+
+# No deferral to a live watcher (#694).
+#
+# This used to exit here whenever a watcher process was alive for this session,
+# to avoid double delivery in `both` mode. The condition was LIVENESS, and the
+# failure `both` exists for preserves liveness exactly: a watcher that is alive
+# and delivering nothing. So the one mode advertised as a safety net stood down
+# in front of the one situation it was wanted for. On 2026-08-08 a session with
+# a broken watcher was switched to `both` to recover delivery and nothing
+# changed; what worked was `mode turn`, which stops the watcher, which removes
+# the liveness signal, which lets this hook run.
+#
+# Removing it does not double-deliver, and that is measured rather than
+# assumed. Both sides consume through the same state:
+#
+#   watcher      storage_read_cursor_consume -> inserts a `message_read` event
+#                per delivered id AND advances read_cursors.local_position
+#   this hook    storage_list_unread -> excludes rows at or below that cursor
+#                AND rows with a `message_read` event
+#
+# So a message the watcher has emitted is not offered here. The remaining
+# window is an interleave: this hook SELECTs, the watcher emits and consumes
+# the same row, then this hook marks it read. Bounded by one poll interval, and
+# the trade is explicit -- a rare duplicate line against a mode that silently
+# delivered nothing at all.
+#
+# Deferral was an optimisation, not a correctness requirement. The read state
+# is the correctness requirement, and it was already there.
 
 # Identify agent and teams
 WHOAMI=$("$SCRIPT_DIR/whoami.sh" "$PROJECT" "$TYPE")

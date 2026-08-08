@@ -2950,3 +2950,110 @@ JSON
   [[ "$output" == *"Codex bridge: team/bob has no session recorded (the one loaded thread is already seated by another role)"* ]]
   [[ "$output" != *"That combination is unexpected"* ]]
 }
+
+# --- "stops quietly" is what made a delivery bug expensive (#691, #692, #694) ---
+
+@test "watch: the liveness guard says which session it decided about (#692)" {
+  # The guard is right; the silence is what costs. A watcher launched with a
+  # session id that does not resolve exits here immediately, and a test then
+  # runs against no watcher while looking exactly like one that ran against
+  # one -- twice in a row, during a real investigation.
+  #
+  # A composite id whose agent pid is dead is the shape that fires it.
+  local dead
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  # No `timeout` on macOS, and the suite's own idiom is to run it and wait for
+  # it to end on its own -- which this guard makes it do immediately.
+  bash "$SCRIPTS/watch.sh" "gone-session.$dead" "$TEST_PROJECT" claude-code \
+    >/dev/null 2>/dev/null &
+  wait $! || true
+  # Said, and readable AFTERWARDS -- stderr is /dev/null where this really runs.
+  local log="$TEST_SKILL_DIR/run/watch.gone-session.$dead.log"
+  [ -f "$log" ] || { echo "no log at $log" >&2; return 1; }
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+  grep -q -F -- "gone-session.$dead" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: the log is written even when stderr is discarded (#691)" {
+  # The whole point. Not "we pointed stderr somewhere" -- the process is run
+  # with fd2 closed off exactly as it is in production, and the reason still
+  # has to be readable when it is over.
+  local dead
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  run bash -c \
+    "bash '$SCRIPTS/watch.sh' 'silent-session.$dead' '$TEST_PROJECT' claude-code 2>/dev/null"
+  [ "$status" -eq 0 ] || return 1
+  # Nothing reached the caller, which is the configuration being reproduced.
+  [ -z "$output" ] || { echo "expected no output, got: $output" >&2; return 1; }
+  local log="$TEST_SKILL_DIR/run/watch.silent-session.$dead.log"
+  [ -f "$log" ] || { echo "no log at $log" >&2; return 1; }
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: the log rotates rather than growing without a bound (#691)" {
+  local dead log
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  log="$TEST_SKILL_DIR/run/watch.rot-session.$dead.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  # Already over the cap when the process starts.
+  head -c 400 /dev/zero | tr '\0' 'x' > "$log"
+  AGMSG_WATCH_LOG_MAX_BYTES=200 bash "$SCRIPTS/watch.sh" \
+    "rot-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wait $! || true
+  [ -f "$log.1" ] || { echo "no rotated generation" >&2; return 1; }
+  # And the live file is the new, small one.
+  local size
+  size="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  [ "$size" -lt 400 ] || { echo "live log is $size bytes" >&2; return 1; }
+}
+
+@test "check-inbox: a live watcher no longer stops the turn side (#694)" {
+  # The negative control for `both`. Before this, ANY live watcher pid made
+  # this hook exit 0 -- including a watcher delivering nothing, which is the
+  # one situation `both` is reached for. The watcher here is alive and does
+  # nothing at all, which is precisely the failure.
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" testteam bob claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/send.sh" testteam bob alice "delivered by neither" >/dev/null
+
+  # A watcher that is alive and delivering nothing.
+  mkdir -p "$TEST_SKILL_DIR/run"
+  sleep 60 &
+  local idle=$!
+  printf '%s\n' "$idle" > "$TEST_SKILL_DIR/run/watch.both-session.pid"
+
+  run bash -c "printf '%s' '{\"session_id\":\"both-session\"}' | bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT'"
+  kill "$idle" 2>/dev/null || true
+  [ "$status" -eq 0 ] || return 1
+  printf '%s\n' "$output" | grep -q 'delivered by neither' \
+    || { echo "the turn side still stood down: $output" >&2; return 1; }
+}
+
+@test "check-inbox: what the watcher already took is not offered twice (#694)" {
+  # Why removing the deferral is safe, measured rather than argued. The watcher
+  # consumes through storage_read_cursor_consume, which records a message_read
+  # event per delivered id AND advances the cursor; storage_list_unread
+  # excludes both. Same state, so no duplicate.
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" testteam bob claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/send.sh" testteam bob alice "taken by the watcher" >/dev/null
+
+  # Stand in for the watcher's consume, using the same facade it calls.
+  local id
+  id="$(bash -c ". '$SCRIPTS/lib/storage.sh'; agmsg_storage_load; \
+    storage_list_unread testteam alice" | sed -n 's/.*\"id\":\"\([^\"]*\)\".*/\1/p' | head -1)"
+  [ -n "$id" ] || return 1
+  bash -c ". '$SCRIPTS/lib/storage.sh'; agmsg_storage_load; \
+    storage_read_cursor_consume testteam alice 999999 '$id'" >/dev/null
+
+  run bash -c "printf '%s' '{\"session_id\":\"dup-session\"}' | bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT'"
+  [ "$status" -eq 0 ] || return 1
+  run bash -c "printf '%s\n' \"\$1\" | grep -q 'taken by the watcher'" _ "$output"
+  [ "$status" -ne 0 ] || { echo "the hook re-offered a consumed message" >&2; return 1; }
+}

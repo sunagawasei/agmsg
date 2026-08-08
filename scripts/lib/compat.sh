@@ -132,6 +132,35 @@ compat_uuidgen() {
   fi | tr -d '\r'
 }
 
+# Generate a UUIDv7: 48-bit millisecond timestamp, version 7, RFC 4122
+# variant, and random tail bytes. Keep this in the core dependency tier:
+# /dev/urandom supplies the random bytes without invoking Python or another
+# optional runtime. No counter or other persistent state.
+compat_uuid7() {
+  local ms hex rnd
+  ms=$(( $(date -u +%s) * 1000 ))
+  hex=$(printf '%012x' "$ms")
+  rnd=$(head -c 10 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  printf '%s-%s-7%s-8%s-%s\n' \
+    "${hex:0:8}" "${hex:8:4}" "${rnd:0:3}" "${rnd:3:3}" "${rnd:6:12}"
+}
+
+# Get file size in bytes.
+# Replaces: stat -f %z (macOS) / stat -c %s (Linux/MSYS2)
+#
+# Same split as compat_file_mtime below, and added for the same kind of caller:
+# a bounded log has to know when to rotate, and `wc -c` on a file being
+# appended to is a second read of the whole thing.
+compat_file_size() {
+  local file="$1"
+  [ -z "$file" ] && return 1
+  _agmsg_detect_platform
+  case "$_agmsg_platform" in
+    macos)  stat -f %z "$file" 2>/dev/null ;;
+    *)      stat -c %s "$file" 2>/dev/null ;;
+  esac
+}
+
 # Get file modification time as epoch seconds.
 # Replaces: stat -f %m (macOS) / stat -c %Y (Linux/MSYS2)
 compat_file_mtime() {
