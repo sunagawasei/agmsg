@@ -684,3 +684,24 @@ PY
   grep -q "whoami.sh \"\$(pwd)\" grok-build" "$SK/SKILL.md"
   ! grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
 }
+
+# The Windows leg of the bats matrix selects by test NAME (filter "[Ww]indows"),
+# and until this test existed it ran only the two install-helper checks above --
+# so join.sh, which is the first thing any Windows user runs, executed in no
+# Windows job at all. #669 is exactly what that hole let through: on Git Bash
+# join.sh printed "Created team: <team>" and then exited 1 in silence, because
+# the roster journal handed sqlite an MSYS path readfile() could not open.
+#
+# Asserting the exit status alone would not have caught the earlier shape of
+# this bug, where the team directory appears and the membership does not. So
+# this asserts the membership is actually there afterwards.
+@test "install: on Windows too, join.sh writes the membership it just announced" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+
+  run bash "$SK/scripts/join.sh" wteam alice claude-code /tmp/install-wteam
+  [ "$status" -eq 0 ]
+
+  run bash "$SK/scripts/team.sh" wteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *alice* ]]
+}
