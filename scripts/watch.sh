@@ -211,10 +211,23 @@ LOGFILE="$RUN_DIR/watch.$SESSION_ID.log"
 # Beside the pidfile, because this process already owns that directory and the
 # pair is what a reader wants: which pid, and what it thought it was doing.
 #
-# Bounded by rotation at a fixed size, one generation kept. An unbounded log in
-# a directory nobody prunes is its own defect; two files with a known ceiling
-# can be left alone. Rotation happens before the write, so the cap holds even
-# if this is the last line the process ever emits.
+# Bounded by rotation, one generation kept: an unbounded log in a directory
+# nobody prunes is its own defect. The ceiling is stated exactly, because the
+# first version claimed one it did not deliver -- it compared the size BEFORE
+# the write, so a live log at cap-1 could take one more line and end over the
+# cap, and a live log already past the cap was moved to `.1` still oversized.
+#
+# The decision includes the bytes about to be written, so:
+#
+#   live file    never exceeds cap, EXCEPT when one record is itself larger
+#                than cap -- then the file is exactly that record, because
+#                rotating first and writing it whole is better than dropping
+#                the one line someone is looking for.
+#   `.1`         a former live file, so bounded the same way.
+#   on disk      at most 2 x max(cap, longest single record).
+#
+# A record here is one diagnostic line with a timestamp and a pid; the longest
+# realistic one is a few hundred bytes against a 128 KiB default.
 #
 # Still echoed to stderr: when someone runs watch.sh by hand, stderr IS the
 # place they are looking, and losing that to make the file work would trade one
@@ -225,19 +238,23 @@ WATCH_LOG_MAX_BYTES="${AGMSG_WATCH_LOG_MAX_BYTES:-131072}"
 NO_STORE_REPORTED=""
 
 watch_log() {
-  local msg="$*" size=""
+  local msg="$*" record size=0
   printf 'agmsg watch: %s\n' "$msg" >&2
   mkdir -p "$RUN_DIR" 2>/dev/null || return 0
+  # Built first, so the rotation decision can weigh what is actually going to
+  # be appended rather than only what is already there.
+  record="$(printf '%s [%s] %s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$msg")"
   if [ -f "$LOGFILE" ]; then
     size="$(compat_file_size "$LOGFILE" 2>/dev/null || echo 0)"
     case "$size" in ''|*[!0-9]*) size=0 ;; esac
-    if [ "$size" -ge "$WATCH_LOG_MAX_BYTES" ]; then
+    # +1 for the newline. Rotate when this write WOULD cross the cap, not once
+    # it already has.
+    if [ "$(( size + ${#record} + 1 ))" -gt "$WATCH_LOG_MAX_BYTES" ]; then
       mv -f "$LOGFILE" "$LOGFILE.1" 2>/dev/null || true
     fi
   fi
   # Never fatal: a sandbox that cannot write here must not take delivery down.
-  printf '%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$msg" \
-    >> "$LOGFILE" 2>/dev/null || true
+  printf '%s\n' "$record" >> "$LOGFILE" 2>/dev/null || true
 }
 
 # Resolve poll interval. Env var wins over config, default 5s.

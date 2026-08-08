@@ -2994,23 +2994,52 @@ JSON
   grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
 }
 
-@test "watch: the log rotates rather than growing without a bound (#691)" {
-  local dead log
+@test "watch: one diagnostic cannot carry the log past its cap (#691)" {
+  # The boundary, not the already-over case. A live log UNDER the cap takes one
+  # more line and must not end up over it -- the first version compared only
+  # the size already on disk, so cap-1 plus a record ended oversized and no
+  # rotation ever happened. The ceiling is the reason this design was chosen,
+  # so the ceiling is what gets measured.
+  local dead log cap=200 live rotated
   dead="$(bash -c 'echo $$')"
   wait_for_pid_exit "$dead" || true
   bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
   log="$TEST_SKILL_DIR/run/watch.rot-session.$dead.log"
   mkdir -p "$TEST_SKILL_DIR/run"
-  # Already over the cap when the process starts.
-  head -c 400 /dev/zero | tr '\0' 'x' > "$log"
-  AGMSG_WATCH_LOG_MAX_BYTES=200 bash "$SCRIPTS/watch.sh" \
+  # Just UNDER the cap. One diagnostic is ~60-90 bytes, so the next write
+  # crosses it.
+  head -c 190 /dev/zero | tr '\0' 'x' > "$log"
+
+  AGMSG_WATCH_LOG_MAX_BYTES=$cap bash "$SCRIPTS/watch.sh" \
     "rot-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
   wait $! || true
-  [ -f "$log.1" ] || { echo "no rotated generation" >&2; return 1; }
-  # And the live file is the new, small one.
-  local size
-  size="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
-  [ "$size" -lt 400 ] || { echo "live log is $size bytes" >&2; return 1; }
+
+  [ -f "$log.1" ] || { echo "the boundary was crossed without rotating" >&2; return 1; }
+  live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  rotated="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log.1'")"
+  # Every generation kept is within the ceiling, which is the documented claim.
+  [ "$live" -le "$cap" ] || { echo "live log is $live bytes, cap $cap" >&2; return 1; }
+  [ "$rotated" -le "$cap" ] || { echo "rotated log is $rotated bytes, cap $cap" >&2; return 1; }
+  # And the reason still survived the rotation rather than being dropped.
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: a record larger than the whole cap is kept, not dropped (#691)" {
+  # The stated exception. A single diagnostic bigger than the cap cannot fit
+  # under it; rotating first and writing it whole beats dropping the one line
+  # someone is looking for. Named so the behaviour is a decision, not a
+  # surprise.
+  local dead log
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  log="$TEST_SKILL_DIR/run/watch.tiny-session.$dead.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  AGMSG_WATCH_LOG_MAX_BYTES=1 bash "$SCRIPTS/watch.sh" \
+    "tiny-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wait $! || true
+  [ -f "$log" ] || { echo "the diagnostic was dropped entirely" >&2; return 1; }
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
 }
 
 @test "check-inbox: a live watcher no longer stops the turn side (#694)" {
