@@ -26,21 +26,7 @@ setup() {
   export SKILL_DIR="$TEST_SKILL_DIR"
   export RUN_DIR="$SKILL_DIR/run"; mkdir -p "$RUN_DIR"
   export PROJ="$TEST_SKILL_DIR/proj"; mkdir -p "$PROJ"
-  # Surface join.sh's own diagnosis when it fails. `>/dev/null` discards stdout
-  # and bats reports only the failing line, so a setup failure here says
-  # "join.sh failed" and nothing about why -- which is the whole question when
-  # it fails on one platform only.
-  local _join_out _join_rc=0
-  _join_out="$(bash "$SCRIPTS/join.sh" team alice codex "$PROJ" 2>&1)" || _join_rc=$?
-  if [ "$_join_rc" -ne 0 ]; then
-    printf 'join.sh failed (rc=%s):\n%s\n' "$_join_rc" "$_join_out" >&2
-    # It exits non-zero after "Created team:" and says nothing else, so the
-    # message is not where the failure is. Re-run under trace and keep the tail:
-    # the last command before the exit is the one to look at.
-    printf -- '--- retry under set -x (tail) ---\n' >&2
-    bash -x "$SCRIPTS/join.sh" team alice codex "$PROJ" 2>&1 | tail -40 >&2 || true
-    return 1
-  fi
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
 
   export CAPTURE="$TEST_SKILL_DIR/thread-capture.txt"
   # A leaked AGMSG_CODEX_BRIDGE_CMD from the ambient environment (not this
