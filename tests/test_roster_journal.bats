@@ -298,3 +298,49 @@ EOS
   [[ "$output" == *"could not read"* ]]
   [[ "$output" == *"roster.jsonl"* ]]
 }
+
+@test "roster journal: an empty projection from readable files says so, and does not blame the path (#669)" {
+  # The third answer. Naming a path that could not be read is right only when a
+  # path could not be read; saying it about a file that WAS read sends the
+  # reader after the path form for a defect in the journal's contents. Before
+  # this, all three answers were the same silent `return 1`.
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local team_dir="$TEST_SKILL_DIR/teams/demo"
+  printf 'not json at all\n' > "$team_dir/roster.jsonl"
+
+  run bash -c '. "$1/lib/roster-journal.sh"; agmsg_roster_project_config "$2" "$3"' _ \
+    "$SCRIPTS" "$team_dir" "$team_dir/config.json"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"produced no config"* ]]
+  [[ "$output" != *"could not read"* ]]
+}
+
+@test "roster journal: an unreadable journal does not replace the roster with an empty one (#669)" {
+  # The reason readability is asked BEFORE the query rather than after an empty
+  # result. With the journal unreadable and the config fine, the projection does
+  # not come back empty: readfile(journal) is NULL, the fold sees no events, and
+  # json_set() builds a perfectly valid config with an EMPTY roster. Committing
+  # that would delete every member -- from a file the process could not read.
+  #
+  # A check that only fires on an empty result cannot see this one. That is the
+  # whole point of the test: the dangerous answer is the believable one.
+  if [ "$(id -u)" = "0" ]; then
+    skip "root reads through the mode bits this is about"
+  fi
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local team_dir="$TEST_SKILL_DIR/teams/demo" config="$TEST_SKILL_DIR/teams/demo/config.json"
+  local before
+  before="$(config_field "$config" '$.agents.alice.member_id')"
+  [ -n "$before" ]
+
+  chmod 000 "$team_dir/roster.jsonl"
+  run bash -c '. "$1/lib/roster-journal.sh"; agmsg_roster_project_config "$2" "$3"' _ \
+    "$SCRIPTS" "$team_dir" "$config"
+  chmod 644 "$team_dir/roster.jsonl"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"could not read"* ]]
+  # And the roster is exactly as it was.
+  [ "$(config_field "$config" '$.agents.alice.member_id')" = "$before" ]
+}

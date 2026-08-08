@@ -162,19 +162,36 @@ agmsg_roster_project_config() {
   journal="$(agmsg_roster_journal_path "$team_dir")"
   [ -f "$journal" ] || return 0
   [ -f "$config" ] || return 1
-  # Both files exist -- `[ -f ]` said so above. Whether SQLITE can open them is
-  # a different question, and the one that was answered silently before: an
-  # unopenable path and an empty file produce the same empty projection, so the
-  # `[ -n "$updated" ]` below returned 1 with nothing said. Ask first, and name
-  # the path that could not be read (#669).
-  local f
+  # Readability is checked BEFORE the query, not after it comes back empty.
+  #
+  # Measured: with the journal unreadable and the config fine, this projection
+  # does not return "" -- readfile(journal) is NULL, the fold sees no events,
+  # and json_set() still builds a perfectly valid config from the readable one.
+  # The result is a plausible document with an EMPTY roster, and the write below
+  # would commit it. Diagnosing an empty result only would let that through: the
+  # dangerous case is not the one that returns nothing, it is the one that
+  # returns something believable.
+  #
+  # It costs two sqlite invocations per projection. That is the price of not
+  # having the roster silently replaced by an empty one (#669).
+  local f f_sql unreadable=0
   for f in "$journal" "$config"; do
     agmsg_sql_readfile_ok "$f" && continue
+    unreadable=1
+    f_sql="$(agmsg_sql_readfile_path "$f")"
     echo "agmsg: sqlite could not read '$f'." >&2
-    echo "agmsg: the file is there, so this is about the path form, not the file --" >&2
-    echo "agmsg: on Git Bash a native sqlite3 cannot open an MSYS path like /tmp/..." >&2
-    return 1
+    # The converted form too: on Windows the difference between the two IS the
+    # bug, and a reader who cannot see what sqlite was handed cannot see it.
+    # Off Windows the two are the same string and this line is redundant --
+    # cheap, beside a failure nobody could diagnose at all before.
+    echo "agmsg: sqlite was given: $f_sql" >&2
   done
+  if [ "$unreadable" -eq 1 ]; then
+    echo "agmsg: the file is present, so this is the path form, not the file --" >&2
+    echo "agmsg: a native sqlite3 cannot open the /tmp/... form Git Bash uses." >&2
+    echo "agmsg: refusing to project; the roster is left as it is." >&2
+    return 1
+  fi
   journal_sql="$(agmsg_sql_readfile_path "$journal")"
   config_sql="$(agmsg_sql_readfile_path "$config")"
   updated="$(sqlite3 :memory: "
@@ -305,6 +322,39 @@ agmsg_roster_project_config() {
                     '\$.agents',json(agents.value),
                     '\$.retired_members',json(retired.value))
       FROM agents,retired;" 2>/dev/null | tr -d '\r')" || return 1
-  [ -n "$updated" ] || return 1
+  # An empty result has more than one cause and they are not the same failure.
+  # readfile() yields NULL for a path it cannot open, that NULL collapses the
+  # whole expression, and what arrives here is the same "" a projection with
+  # nothing to say produces -- so this line reported neither, and join.sh
+  # printed "Created team:" and exited 1 with nothing on stderr (#669).
+  #
+  # Asked here rather than before the query on purpose: a check up front costs
+  # two extra sqlite invocations on every projection to answer a question that
+  # only matters when something already went wrong.
+  if [ -z "$updated" ]; then
+    local f f_sql named=0
+    for f in "$journal" "$config"; do
+      agmsg_sql_readfile_ok "$f" && continue
+      named=1
+      f_sql="$(agmsg_sql_readfile_path "$f")"
+      echo "agmsg: sqlite could not read '$f'." >&2
+      # The converted form too: on Windows the difference between the two IS
+      # the bug, and a reader who cannot see what sqlite was handed cannot see
+      # it. Off Windows they are the same string and this line is redundant --
+      # cheap, next to a failure nobody could diagnose at all before.
+      echo "agmsg: sqlite was given: $f_sql" >&2
+    done
+    if [ "$named" -eq 1 ]; then
+      echo "agmsg: the files are present, so this is the path form, not the file --" >&2
+      echo "agmsg: a native sqlite3 cannot open the /tmp/... form Git Bash hands around." >&2
+    else
+      # Both readable, still nothing. A different failure, and it gets its own
+      # sentence rather than borrowing the one above -- saying "could not read"
+      # about a file that was read is how the next person loses an afternoon.
+      echo "agmsg: the roster projection produced no config for '$config'." >&2
+      echo "agmsg: both files were readable, so this is the journal's contents." >&2
+    fi
+    return 1
+  fi
   agmsg_write_atomic "$config" "$updated"
 }
