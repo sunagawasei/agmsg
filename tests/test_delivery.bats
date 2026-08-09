@@ -3024,6 +3024,61 @@ JSON
   grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
 }
 
+@test "watch: the cap is bytes, not characters (#691)" {
+  # `${#record}` counts CHARACTERS in a UTF-8 locale while the cap and stat are
+  # BYTES, so a multibyte diagnostic passes a character check and lands over the
+  # byte ceiling. Team names may legally be Unicode and the storeless notice
+  # puts the name in the record, so this is reachable, not theoretical.
+  #
+  # Two attempts failed to measure it before this one, and both failed the same
+  # way -- the mutation stayed green. First the record was the liveness guard's,
+  # which is pure ASCII. Then the padding was large enough that BOTH counts
+  # crossed the cap, so the two answers agreed. The gap only shows in the window
+  # where chars fit and bytes do not, so the padding is computed from the record
+  # this fixture actually produces rather than guessed.
+  local log db record chars bytes pad cap live
+  bash "$SCRIPTS/join.sh" "境界検査のためのとても長い日本語チーム名" alice claude-code "$TEST_PROJECT" >/dev/null
+  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path 境界検査のためのとても長い日本語チーム名')"
+  rm -f "$db"
+  log="$TEST_SKILL_DIR/run/watch.mb-session.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  # Pass 1: an effectively unlimited cap, purely to observe the record.
+  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=1000000 \
+    bash "$SCRIPTS/watch.sh" mb-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  local wpid=$! waited=0
+  while [ "$waited" -lt 100 ]; do
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  record="$(grep 'no store yet' "$log" | head -1)"
+  [ -n "$record" ] || { echo "the notice naming the team never appeared" >&2; return 1; }
+  chars=${#record}
+  bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]')"
+  # The two answers must actually differ, or this fixture proves nothing.
+  [ "$bytes" -gt "$chars" ] || { echo "record is not multibyte: $chars/$bytes" >&2; return 1; }
+
+  # Pass 2: a cap inside the window -- chars say it fits, bytes say it does not.
+  cap=$(( 120 + chars + 1 ))
+  pad=120
+  rm -f "$log" "$log.1"
+  head -c "$pad" /dev/zero | tr '\0' 'x' > "$log"
+  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=$cap \
+    bash "$SCRIPTS/watch.sh" mb-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wpid=$!; waited=0
+  while [ "$waited" -lt 100 ]; do
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    grep -q 'no store yet' "$log.1" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+
+  live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  [ "$live" -le "$cap" ] \
+    || { echo "live log is $live bytes, cap $cap (chars=$chars bytes=$bytes pad=$pad)" >&2; return 1; }
+}
+
 @test "watch: a record larger than the whole cap is kept, not dropped (#691)" {
   # The stated exception. A single diagnostic bigger than the cap cannot fit
   # under it; rotating first and writing it whole beats dropping the one line

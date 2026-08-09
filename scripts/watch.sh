@@ -238,7 +238,7 @@ WATCH_LOG_MAX_BYTES="${AGMSG_WATCH_LOG_MAX_BYTES:-131072}"
 NO_STORE_REPORTED=""
 
 watch_log() {
-  local msg="$*" record size=0
+  local msg="$*" record size=0 bytes
   printf 'agmsg watch: %s\n' "$msg" >&2
   mkdir -p "$RUN_DIR" 2>/dev/null || return 0
   # Built first, so the rotation decision can weigh what is actually going to
@@ -249,7 +249,17 @@ watch_log() {
     case "$size" in ''|*[!0-9]*) size=0 ;; esac
     # +1 for the newline. Rotate when this write WOULD cross the cap, not once
     # it already has.
-    if [ "$(( size + ${#record} + 1 ))" -gt "$WATCH_LOG_MAX_BYTES" ]; then
+    #
+    # Counted in BYTES, with `wc -c`, because the cap is bytes and so is the
+    # size `stat` returns. `${#record}` counts CHARACTERS in a UTF-8 locale, and
+    # a team or agent name may legally be Unicode -- the storeless and actas
+    # diagnostics put those names in the record. A multibyte line then passes a
+    # character-count check and lands over the byte cap, which is the contract
+    # this rotation exists to hold. One extra process per diagnostic is nothing:
+    # these are emitted a handful of times per watcher, not per poll.
+    bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]')"
+    case "$bytes" in ''|*[!0-9]*) bytes=${#record} ;; esac
+    if [ "$(( size + bytes + 1 ))" -gt "$WATCH_LOG_MAX_BYTES" ]; then
       mv -f "$LOGFILE" "$LOGFILE.1" 2>/dev/null || true
     fi
   fi
