@@ -47,8 +47,12 @@ setup() {
   local groups
   groups="$(printf '%s\n' "$output" | grep -c '^SHARED ')"
   [ "$groups" -ge 3 ]
-  ! [[ "$output" == *"SHARED 0xe "* ]]
-  ! [[ "$output" == *"SHARED pipe "* ]]
+  # `! [[ ]]` is silent on every bash (#670): errexit exempts a negated
+  # command, so this pair never once failed. `grep -F` is the faithful
+  # equivalent of a quoted `[[ == *…* ]]` -- a literal substring -- and
+  # `refute` makes the absence enforced.
+  refute grep -q -F -- 'SHARED 0xe ' <<<"$output"
+  refute grep -q -F -- 'SHARED pipe ' <<<"$output"
 }
 
 @test "pipe-holders: Linux — the two ends of one pipeline are the same pipe" {

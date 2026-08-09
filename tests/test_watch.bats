@@ -252,10 +252,10 @@ _wait_for_file_contains() {
 
   wait_for_missing "$pf" || { kill "$w" 2>/dev/null || true; false; }
   run kill -0 "$w"; [ "$status" -ne 0 ]
-  [ "$first_id" != "$second_id" ]
-  [ "$(cat "$wm")" = "$first_id" ]
-  [ "$(grep -c "^agmsg watch: owner token=$iid exit_reason=owner-dead$" "$err")" -eq 1 ]
-  ! grep -q "M2-undelivered" "$out"
+  [ "$(_read_cursor team alice)" = "$first_cursor" ]
+  refute grep -q "M2-undelivered" "$out"
+  run_watcher_for "after-liveness" "$TEST_SKILL_DIR/liveness-redelivery.log" 2
+  grep -q "M2-undelivered" "$TEST_SKILL_DIR/liveness-redelivery.log"
 }
 
 @test "watch: closed stdout exits without advancing the watermark" {

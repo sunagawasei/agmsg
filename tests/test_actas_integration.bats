@@ -279,7 +279,7 @@ fake_session() {
 
   # It must have stopped. A watcher that keeps running is what consumes the
   # next message too.
-  ! kill -0 "$old" 2>/dev/null
+  refute kill -0 "$old" 2>/dev/null
 
   # And it must say why. Exiting silently is the same defect class -- this
   # watcher's stderr is the only place a reason can survive.

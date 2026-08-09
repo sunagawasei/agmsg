@@ -167,7 +167,7 @@ _wait_pidfile_value() {
   # The Copilot SKILL.md must drive whoami with type=copilot, not codex,
   # otherwise Copilot sessions get mis-identified.
   grep -q "whoami.sh \"\$(pwd)\" copilot" "$copilot_skill"
-  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$copilot_skill"
+  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$copilot_skill"
   # Frontmatter has the substituted skill name.
   grep -q "^name: agmsg" "$copilot_skill"
 }
@@ -187,7 +187,7 @@ _wait_pidfile_value() {
   # Mutate the file so we can verify --update overwrites.
   echo "tampered" > "$copilot_skill"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  ! grep -q "^tampered$" "$copilot_skill"
+  refute grep -q "^tampered$" "$copilot_skill"
   grep -q "whoami.sh \"\$(pwd)\" copilot" "$copilot_skill"
 }
 
@@ -215,7 +215,7 @@ _wait_pidfile_value() {
   # The OpenCode SKILL.md must drive whoami with type=opencode, not codex,
   # otherwise OpenCode sessions get mis-identified.
   grep -q "whoami.sh \"\$(pwd)\" opencode" "$opencode_skill"
-  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$opencode_skill"
+  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$opencode_skill"
   grep -q "^name: agmsg" "$opencode_skill"
 }
 
@@ -232,7 +232,7 @@ _wait_pidfile_value() {
   [ -f "$opencode_skill" ]
   echo "tampered" > "$opencode_skill"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  ! grep -q "^tampered$" "$opencode_skill"
+  refute grep -q "^tampered$" "$opencode_skill"
   grep -q "whoami.sh \"\$(pwd)\" opencode" "$opencode_skill"
 }
 
@@ -396,7 +396,7 @@ PS1
   [ -d "$FAKE_HOME/.agents/skills/agmsg" ]
   grep -q '^rm -rf "\$TMP"$' "$stdin_capture"
   grep -q '^SENTINEL_SURVIVED$' "$stdin_capture"
-  ! grep -q 'rm -rf' "$stdout_capture"
+  refute grep -q 'rm -rf' "$stdout_capture"
   rm -f "$stdin_capture" "$stdout_capture"
 }
 
@@ -532,7 +532,7 @@ EOF
 
   # The empty-array path used to emit `[, "..."]` — a leading comma, which is
   # invalid TOML and broke the user's Codex config.
-  ! grep -Eq '\[[[:space:]]*,' "$FAKE_HOME/.codex/config.toml"
+  refute grep -Eq '\[[[:space:]]*,' "$FAKE_HOME/.codex/config.toml"
   grep -q "$SK/db" "$FAKE_HOME/.codex/config.toml"
   grep -q "$SK/teams" "$FAKE_HOME/.codex/config.toml"
   grep -q "$SK/run" "$FAKE_HOME/.codex/config.toml"
@@ -569,8 +569,8 @@ PY
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
   local hermes_skill="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
   [ -f "$hermes_skill" ]
-  ! grep -q "spawn hermes reviewer" "$hermes_skill"
-  ! grep -q 'must be `claude-code`, `codex`, or `hermes`' "$hermes_skill"
+  refute grep -q "spawn hermes reviewer" "$hermes_skill"
+  refute grep -q 'must be `claude-code`, `codex`, or `hermes`' "$hermes_skill"
   grep -q "hermes.*is not spawnable\|hermes.*not spawnable" "$hermes_skill"
 }
 
@@ -588,8 +588,8 @@ PY
 @test "install: --agent-type hermes makes shared SKILL.md Hermes-typed" {
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type hermes
   grep -q "whoami.sh \"\$(pwd)\" hermes" "$SK/SKILL.md"
-  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
-  ! grep -q "whoami.sh \"\$(pwd)\" gemini" "$SK/SKILL.md"
+  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
+  refute grep -q "whoami.sh \"\$(pwd)\" gemini" "$SK/SKILL.md"
   ! grep -q "whoami.sh \"\$(pwd)\" antigravity" "$SK/SKILL.md"
 }
 
@@ -609,7 +609,7 @@ PY
   [ -f "$hermes_skill" ]
   echo "tampered" > "$hermes_skill"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  ! grep -q "^tampered$" "$hermes_skill"
+  refute grep -q "^tampered$" "$hermes_skill"
   grep -q "whoami.sh \"\$(pwd)\" hermes" "$hermes_skill"
 }
 
@@ -636,7 +636,7 @@ PY
   sed 's#/scripts/drivers/types/codex/#/scripts/codex/#g' "$shim" > "$tmp"
   mv "$tmp" "$shim"
   grep -q '/scripts/codex/codex-shim.sh' "$shim"
-  ! grep -q '/scripts/drivers/types/codex/codex-shim.sh' "$shim"
+  refute grep -q '/scripts/drivers/types/codex/codex-shim.sh' "$shim"
 
   # --update must regenerate it back to the post-move path.
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
@@ -660,7 +660,7 @@ PY
   local grok_skill="$FAKE_HOME/.grok/skills/agmsg/SKILL.md"
   [ -f "$grok_skill" ]
   grep -q "whoami.sh \"\$(pwd)\" grok-build" "$grok_skill"
-  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$grok_skill"
+  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$grok_skill"
   grep -q "^name: agmsg" "$grok_skill"
 }
 

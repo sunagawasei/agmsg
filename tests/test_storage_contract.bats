@@ -291,7 +291,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   local f="$TEST_SKILL_DIR/fc.jsonl"
   storage_export "$f"
   [ "$(grep -c '^$' "$f")" -eq 0 ]          # no blank line leaked by the unknown type
-  ! grep -q 'message_reaction' "$f"
+  refute grep -q 'message_reaction' "$f"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     [ "$(sqlite3 :memory: "SELECT json_valid('$(printf '%s' "$line" | sed "s/'/''/g")')")" = "1" ]

@@ -148,7 +148,7 @@ SH
   owner="$(agmsg_runtime_lock_acquire "$resource" 333 111)"
   [ "$owner" = 222 ]
   agmsg_runtime_lock_verify "$resource" 222
-  ! agmsg_runtime_lock_verify "$resource" 333
+  refute agmsg_runtime_lock_verify "$resource" 333
   agmsg_runtime_lock_release "$resource" 333
   agmsg_runtime_lock_verify "$resource" 222
   agmsg_runtime_lock_release "$resource" 222
@@ -231,4 +231,130 @@ SH
   done
 
   [ "$(wc -l < "$count" | tr -d ' ')" -eq 5 ]
+}
+
+# --- storage partition axis -----------------------------------------------------
+#
+# Which store a team uses is a per-team driver choice. `shared` is the default
+# and is what programs outside agmsg read; `per-team` is what a team moves to
+# when connecting requires it. The tests that matter here are the default (every
+# team in one file, unchanged from before the axis existed) and the isolation a
+# moved team gets.
+
+# Put <team> on the per-team partition the way migrate-team-store.sh does, without
+# copying anything: these tests are about resolution, not migration.
+_use_per_team() {
+  mkdir -p "$TEST_SKILL_DIR/teams/$1"
+  printf '{"name":"%s","drivers":{"partition":"per-team"}}\n' "$1" \
+    > "$TEST_SKILL_DIR/teams/$1/config.json"
+}
+
+@test "storage: every team shares one store by default" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db" SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  # The partition external readers depend on. A team must not leave it by merely
+  # existing — only by something that requires the move.
+  [ "$(agmsg_db_path alpha)" = "$BATS_TEST_TMPDIR/db/messages.db" ]
+  [ "$(agmsg_db_path bravo)" = "$BATS_TEST_TMPDIR/db/messages.db" ]
+  [ "$(agmsg_db_path alpha)" = "$(_agmsg_runtime_db_path)" ]
+}
+
+@test "storage: a team on the per-team partition moves, and only that team" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db" SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  _use_per_team alpha
+  [ "$(agmsg_db_path alpha)" = "$BATS_TEST_TMPDIR/db/teams/alpha/messages.db" ]
+  # Its neighbour is untouched — that is the whole point of choosing per team.
+  [ "$(agmsg_db_path bravo)" = "$BATS_TEST_TMPDIR/db/messages.db" ]
+  # And resolution does not stick: the memoized driver must not leak across teams.
+  [ "$(agmsg_db_path alpha)" = "$BATS_TEST_TMPDIR/db/teams/alpha/messages.db" ]
+}
+
+@test "storage: an unknown partition is an error, not a fallback" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db" SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  mkdir -p "$TEST_SKILL_DIR/teams/gamma"
+  printf '{"name":"gamma","drivers":{"partition":"nope"}}\n' \
+    > "$TEST_SKILL_DIR/teams/gamma/config.json"
+  run agmsg_db_path gamma
+  [ "$status" -ne 0 ]
+  # Falling back to shared would read a real file holding other teams' rows.
+  [[ ! "$output" =~ "messages.db" ]]
+}
+
+@test "storage: a selector that would escape the storage tree is refused" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db" SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  local bad
+  # A real store was found holding a project path as a team name, so this is
+  # reachable from data, not only from a hostile argument.
+  for bad in ".." "." "a/b" "/Users/someone/project"; do
+    run agmsg_db_path "$bad"
+    [ "$status" -ne 0 ]
+    [[ ! "$output" =~ "$BATS_TEST_TMPDIR/db/teams/$bad" ]]
+  done
+}
+
+@test "storage: a moved team's messages are not in the shared store" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db" SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  _use_per_team alpha
+  storage_init alpha >/dev/null
+  storage_init bravo >/dev/null
+  storage_send alpha ann bob "alpha-only" >/dev/null
+  storage_send bravo cid bob "bravo-only" >/dev/null
+
+  [[ "$(storage_list_unread alpha bob)" =~ "alpha-only" ]]
+  [[ ! "$(storage_list_unread alpha bob)" =~ "bravo-only" ]]
+  [[ "$(storage_list_unread bravo bob)" =~ "bravo-only" ]]
+  [[ ! "$(storage_list_unread bravo bob)" =~ "alpha-only" ]]
+
+  # Not just filtered on the way out — the bytes are in different files.
+  refute grep -q "bravo-only" "$(agmsg_db_path alpha)"
+  ! grep -q "alpha-only" "$(agmsg_db_path bravo)"
+}
+
+@test "storage: resolving a store without a selector is an error, not a default" {
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/db"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  run agmsg_db_path
+  [ "$status" -ne 0 ]
+  run agmsg_db_path ""
+  [ "$status" -ne 0 ]
+  # The runtime resolver is the one place a missing selector is correct: its
+  # callers hold project-scoped state and have no team to name.
+  run _agmsg_runtime_db_path
+  [ "$status" -eq 0 ]
+  [ -n "$output" ]
+}
+
+@test "storage: no shipped script resolves a store without a selector" {
+  # The point of requiring the selector is that no half-converted caller is left
+  # to find. A bare call in production is exactly that, so it is swept for
+  # rather than trusted.
+  #
+  # storage_init is here because watching only agmsg_db_path was not enough:
+  # sqlite-sync.sh called storage_init with no team, which reached the resolver
+  # one frame down. It failed to stderr while the command still succeeded, so
+  # nothing went red until a test captured stderr and fed it to jq.
+  local offenders
+  # Bare only: the name closing a substitution, ending a line, or followed by a
+  # redirect or pipe. A call WITH a selector is the thing we want, so it must
+  # not match.
+  # server/ is swept too, because its integration tests drive the client through
+  # embedded bash. One selector-less storage_init lived there through two rounds
+  # of this sweep: it is not a shell file, so watching scripts/ alone never saw
+  # it, and it only failed once a store per team made the empty selector reach
+  # the resolver. tests/ is deliberately excluded — a bare call there is how the
+  # requirement itself is asserted.
+  offenders="$(cd "$BATS_TEST_DIRNAME/.." && grep -rnE '(agmsg_db_path|storage_init) *(\)|\||>|$)' \
+    scripts bin server 2>/dev/null | grep -v ':[0-9]*: *#' | grep -v 'storage_init()' || true)"
+  [ -z "$offenders" ] || { echo "$offenders"; false; }
 }

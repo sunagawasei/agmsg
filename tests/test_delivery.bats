@@ -129,7 +129,7 @@ release_delayed_watch() {
 @test "delivery set off: removes both hooks" {
   bash "$SCRIPTS/delivery.sh" set both claude-code "$TEST_PROJECT"
   bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
-  ! has_session_start "$(settings_file)"
+  refute has_session_start "$(settings_file)"
   ! has_check_inbox "$(settings_file)"
 }
 
@@ -173,7 +173,7 @@ release_delayed_watch() {
 @test "delivery: both -> off clears settings.local.json hooks" {
   bash "$SCRIPTS/delivery.sh" set both claude-code "$TEST_PROJECT"
   bash "$SCRIPTS/delivery.sh" set off  claude-code "$TEST_PROJECT"
-  ! has_session_start "$(settings_file)"
+  refute has_session_start "$(settings_file)"
   ! has_check_inbox "$(settings_file)"
 }
 
@@ -833,8 +833,8 @@ JSON
   [ -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
   wait_for_file "$TEST_SKILL_DIR/run/ready.myteam__alice"
   kill -TERM "$pid"
-  wait_for_pid_exit "$pid"
-  ! kill -0 "$pid" 2>/dev/null
+  sleep 1
+  refute kill -0 "$pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
 }
 
@@ -1014,31 +1014,17 @@ has_session_end() {
 # --- session-end.sh behavior ---
 
 @test "session-end.sh kills the watcher matching session_id and removes pidfile" {
-  # The fixture must be a REAL watcher. session-end.sh only kills a pid whose
-  # command line still looks like watch.sh (pid-recycling safety, see its
-  # comment), so the fixed-delay stand-in this used to launch could never be
-  # killed — and the assertion passed anyway, so the test never checked what its
-  # name claims. Converting the wait to a poll is what surfaced it: polling
-  # reports the process is still there, where the single post-sleep check did
-  # not.
-  agmsg_test_start_session_owner
-  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
-  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
-{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
-JSON
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sess-A "$TEST_PROJECT" claude-code 3>&- &
-  local target_pid=$!
-  local pidfile="$TEST_SKILL_DIR/run/watch.sess-A.$AGMSG_TEST_OWNER_PID.pid"
-  wait_for_file "$pidfile"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  # The cmdline has to look like this install's watch.sh: session-end only
+  # signals a pid that still does, so a bare `sleep` was never killed and the
+  # check for it was silent (#670).
+  local target_pid
+  spawn_decoy_with_cmdline "$SCRIPTS/watch.sh"; target_pid="$DECOY_PID"
+  echo "$target_pid" > "$TEST_SKILL_DIR/run/watch.sess-A.pid"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
-  agmsg_test_stop_session_owner
-  # Teardown is detached; poll for the pidfile removal (its last watcher step).
-  wait_until 8 bash -c "[ ! -f '$pidfile' ]"
-  wait_for_pid_exit "$target_pid"
-  ! kill -0 "$target_pid" 2>/dev/null
-  [ ! -f "$pidfile" ]
-  run kill -0 "$target_pid"; [ "$status" -ne 0 ]   # watcher killed (enforced; bare ! is set-e exempt)
-  kill "$target_pid" 2>/dev/null || true
+  sleep 1
+  refute kill -0 "$target_pid" 2>/dev/null
+  [ ! -f "$TEST_SKILL_DIR/run/watch.sess-A.pid" ]
 }
 
 @test "session-end.sh leaves other sessions' watchers alone" {
@@ -1075,8 +1061,11 @@ JSON
 @test "delivery set monitor: bakes CLAUDE_CODE_SESSION_ID into the directive" {
   CLAUDE_CODE_SESSION_ID="real-uuid-1234" run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [[ "$output" =~ "real-uuid-1234" ]]
-  ! [[ "$output" =~ "\\\$AGMSG_SESSION_ID" ]]
-  ! [[ "$output" =~ "\\\$CLAUDE_CODE_SESSION_ID" ]]
+  # A quoted right-hand side in `[[ =~ ]]` is a literal, so `grep -F` matches
+  # the same thing -- including the backslash: what must be absent is the
+  # ESCAPED form `\$NAME`, not an expanded one. `! [[ ]]` never fired (#670).
+  refute grep -q -F -- '\$AGMSG_SESSION_ID' <<<"$output"
+  refute grep -q -F -- '\$CLAUDE_CODE_SESSION_ID' <<<"$output"
 }
 
 @test "delivery set monitor: falls back to a generated id when env is unset" {
@@ -1085,7 +1074,7 @@ JSON
   run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
   # No placeholder leaked
-  ! [[ "$output" =~ "\\\$AGMSG_SESSION_ID" ]]
+  refute grep -q -F -- '\$AGMSG_SESSION_ID' <<<"$output"
 }
 
 # --- session-start.sh: stale watcher pidfile cleanup ---
@@ -1196,7 +1185,7 @@ JSON
   run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [[ "$output" =~ "already streaming" ]]
-  ! [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
+  refute grep -q -F -- 'AGMSG-DIRECTIVE' <<<"$output"
 
   kill "$live_pid" 2>/dev/null || true
   unset CLAUDE_CODE_SESSION_ID
@@ -1226,7 +1215,7 @@ JSON
     bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [[ "$output" =~ "already streaming" ]]
-  ! [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
+  refute grep -q -F -- 'AGMSG-DIRECTIVE' <<<"$output"
 
   kill "$live_pid" 2>/dev/null || true
   unset CLAUDE_CODE_SESSION_ID
@@ -1521,10 +1510,10 @@ JSON
   bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
 
-  # Orphan: watcher referenced by a cc-instance.<dead-pid> file.
-  sleep 30 3>&- &
-  local orphan_pid=$!
-  test_fixture_register_owned_pid "$orphan_pid"
+  # Orphan: watcher referenced by a cc-instance.<dead-pid> file. Its cmdline
+  # has to look like watch.sh or the reaper declines to signal it (#670).
+  local orphan_pid
+  spawn_decoy_with_cmdline "$SCRIPTS/watch.sh"; orphan_pid="$DECOY_PID"
   echo "$orphan_pid" > "$TEST_SKILL_DIR/run/watch.orphan-sid.pid"
   # Use a PID that's almost certainly not in use as the dead CC ancestor.
   local dead_cc_pid=999999
@@ -1540,7 +1529,7 @@ JSON
   echo "{\"session_id\":\"current-sid\"}" \
     | bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" >/dev/null
 
-  kill -0 "$orphan_pid" 2>/dev/null
+  refute kill -0 "$orphan_pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.orphan-sid.pid" ]
   [ ! -f "$TEST_SKILL_DIR/run/cc-instance.$dead_cc_pid" ]
   # Untracked watcher untouched
@@ -1608,7 +1597,7 @@ JSON
   wait "$pid" 2>/dev/null || true
 
   grep -q "for-alice-static" /tmp/agmsg-static
-  ! grep -q "for-bob-static" /tmp/agmsg-static
+  refute grep -q "for-bob-static" /tmp/agmsg-static
   rm -f /tmp/agmsg-static
 }
 
@@ -1642,7 +1631,7 @@ JSON
   wait_for_pid_exit "$pid_a"
 
   # Target project A: watcher killed, pidfile removed.
-  ! kill -0 "$pid_a" 2>/dev/null
+  refute kill -0 "$pid_a" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sid-a.pid" ]
 
   # Other project B: watcher and its pidfile must survive.
@@ -1678,7 +1667,7 @@ JSON
   [ "$status" -eq 0 ]
   wait_for_pid_exit "$pid_a"
 
-  ! kill -0 "$pid_a" 2>/dev/null
+  refute kill -0 "$pid_a" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.off-a.pid" ]
   kill -0 "$pid_b" 2>/dev/null
   [ -f "$TEST_SKILL_DIR/run/watch.off-b.pid" ]
@@ -1709,16 +1698,9 @@ JSON
 
   run bash "$SCRIPTS/delivery.sh" stop
   [[ "$output" =~ "Killed 2 watch" ]]
-  # BOTH watchers must be waited for. `stop` sends TERM to each and returns;
-  # the order they actually die in is not guaranteed, so waiting only on A and
-  # asserting B in the same breath races B's exit trap. The fixed delay this
-  # replaced happened to cover both — the two other project-scoped tests above
-  # wait on one pid only because their second watcher is asserted to still be
-  # ALIVE, which needs no grace period.
-  wait_for_pid_exit "$pid_a"
-  wait_for_pid_exit "$pid_b"
-  ! kill -0 "$pid_a" 2>/dev/null
-  ! kill -0 "$pid_b" 2>/dev/null
+  sleep 1
+  refute kill -0 "$pid_a" 2>/dev/null
+  refute kill -0 "$pid_b" 2>/dev/null
 
   rm -rf "$proj_b"
 }
@@ -1951,7 +1933,7 @@ JSON
 
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  ! has_check_inbox "$(settings_file)"
+  refute has_check_inbox "$(settings_file)"
   local allow_len
   allow_len=$(sqlite_mem "SELECT json_array_length(json_extract(readfile('$(rf "$(settings_file)")'), '\$.permissions.allow'));")
   [ "$allow_len" = "600" ]
@@ -2613,7 +2595,7 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"Stopped 1 Codex bridge"* ]]
   [[ "$output" == *"shim"* ]]
-  ! kill -0 "$bpid" 2>/dev/null
+  refute kill -0 "$bpid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid" ]
   [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta" ]
   [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.appserver" ]

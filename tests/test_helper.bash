@@ -752,3 +752,51 @@ wait_until() {
   local timeout="$1"; shift
   _wait_poll "$timeout" "$_WAIT_INTERVAL" "condition command" "$@"
 }
+
+# Fail the test when <cmd> SUCCEEDS.
+#
+# `! cmd` cannot do this. POSIX errexit exempts a negated command, on every
+# bash, so `! grep -q needle file` is silent when the needle IS there -- the
+# one outcome it was written to catch. Measured on 3.2.57 and 5.3.15: both
+# report `ok` (#670).
+#
+# Deliberately not `run cmd` + `[ "$status" -ne 0 ]`, which also works: `run`
+# overwrites `$output` and `$status`, so converting an absence check that way
+# silently breaks any assertion after it that still reads `$output`. That is a
+# real bug, not a hypothetical -- it happened twice in #697 -- and 48 sites is
+# too many to hand that to.
+#
+# Says what failed, because a bare `false` leaves the reader to work out which
+# of several absence checks was the one that fired.
+refute() {
+  if "$@"; then
+    echo "refute: '$*' unexpectedly succeeded" >&2
+    return 1
+  fi
+}
+
+# A live process whose command line contains <path>, and nothing else.
+#
+# The kill paths in session-end.sh / session-start.sh only signal a pid whose
+# cmdline still looks like this install's watch.sh -- a deliberate defence
+# against pid recycling. Fixtures used a bare `sleep`, whose cmdline does not
+# match, so the kill never fired and the assertion checking for it was `!
+# kill -0 ...`, which is silent on every bash. The tests passed for years
+# without once exercising the branch they are named after (#670).
+#
+# It runs a script that sleeps; it does NOT exec, which would drop the argument
+# from the command line, and it does NOT start the real watcher -- a live
+# watcher inside a test is how a suite grows processes that outlive it.
+# Sets DECOY_PID rather than printing it: `pid="$(spawn_...)"` runs the `&` in
+# a command substitution's subshell, and the child dies with that subshell. The
+# first version did exactly that, and the tests using it went green because the
+# decoy was already gone -- not because anything had killed it. Returning
+# through a variable keeps the process a child of the test.
+spawn_decoy_with_cmdline() {
+  local path="$1" decoy
+  decoy="$(mktemp -d)/decoy.sh"
+  printf '#!/usr/bin/env bash\nsleep 30\n' > "$decoy"
+  chmod +x "$decoy"
+  bash "$decoy" "$path" 3>&- &
+  DECOY_PID=$!
+}

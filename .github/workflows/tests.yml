@@ -614,6 +614,24 @@ jobs:
   # only in this comment. `none` is passed explicitly for the same reason: an
   # UNSET list is exit 2, so a run that checks half of what it claims can only
   # happen because someone wrote it down, never because a variable was missing.
+  enforced-assertions:
+    name: enforceable assertions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Always runs and always reports, like every other job here: a job that
+    # skips on some diffs is a required context that can sit pending forever
+    # (see the paths-ignore note at the top of this file). It reads only
+    # `tests/*.bats`, so it is cheap enough to run unconditionally rather than
+    # to gate.
+    steps:
+      - uses: actions/checkout@v4
+
+      # No bats, no bash 3.2, no runners: this is a static read of the test
+      # sources. The BEHAVIOUR it encodes was measured on both shells (#670);
+      # what runs here is the count.
+      - name: No new assertion that cannot fail
+        run: .github/scripts/check-enforced-assertions.sh
+
   private-names:
     name: internal names
     runs-on: ubuntu-latest
