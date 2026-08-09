@@ -76,6 +76,22 @@ BASELINE="${BATS_TEST_DIRNAME}/../.github/enforced-assertions-baseline"
   printf '%s\n' "$output" | grep -q '^check-enforced-assertions: 0 '
 }
 
+@test "enforced-assertions: BELOW the baseline fails, and says to lower it" {
+  # The ratchet's whole point, and the branch that was demonstrated by hand but
+  # never pinned: deleting it left all the other cases green. A baseline with
+  # slack in it after a burn-down is how the next violation arrives silently,
+  # so "fewer than expected" is a failure that demands the ceiling come down.
+  fixture="$BATS_TEST_TMPDIR/below"; mkdir -p "$fixture"
+  printf '@test "x" {\n  [[ a == a ]]\n  true\n}\n' > "$fixture/test_x.bats"
+  printf '2\n' > "$BATS_TEST_TMPDIR/base-2"
+  run env AGMSG_ASSERTION_BASELINE="$BATS_TEST_TMPDIR/base-2" bash "$CHECK" "$fixture"
+  [ "$status" -eq 1 ] || { echo "$output" >&2; return 1; }
+  printf '%s\n' "$output" | grep -q 'below the baseline'
+  printf '%s\n' "$output" | grep -q 'Lower the baseline'
+  # And it names the number to lower it TO, so the fix is mechanical.
+  printf '%s\n' "$output" | grep -q ' to 1'
+}
+
 @test "enforced-assertions: scanning nothing is not a pass" {
   # The failure this class is about, applied to the checker itself.
   run bash "$CHECK" "$BATS_TEST_TMPDIR/does-not-exist"

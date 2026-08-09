@@ -1020,6 +1020,13 @@ has_session_end() {
   # check for it was silent (#670).
   local target_pid
   spawn_decoy_with_cmdline "$SCRIPTS/watch.sh"; target_pid="$DECOY_PID"
+  # The fixture's own preconditions, before the action. Without them this test
+  # cannot refuse the false green it exists to fix: the first helper spawned the
+  # decoy inside `$( )`, it died with the subshell, and "the watcher was killed"
+  # passed because nothing was ever alive to kill.
+  kill -0 "$target_pid" 2>/dev/null || { echo "the decoy was not alive" >&2; return 1; }
+  _decoy_cmdline "$target_pid" | grep -q -F -- "$SCRIPTS/watch.sh" \
+    || { echo "the decoy does not look like this install's watch.sh" >&2; return 1; }
   echo "$target_pid" > "$TEST_SKILL_DIR/run/watch.sess-A.pid"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
   sleep 1
@@ -1514,6 +1521,10 @@ JSON
   # has to look like watch.sh or the reaper declines to signal it (#670).
   local orphan_pid
   spawn_decoy_with_cmdline "$SCRIPTS/watch.sh"; orphan_pid="$DECOY_PID"
+  # Same preconditions, same reason.
+  kill -0 "$orphan_pid" 2>/dev/null || { echo "the decoy was not alive" >&2; return 1; }
+  _decoy_cmdline "$orphan_pid" | grep -q -F -- "$SCRIPTS/watch.sh" \
+    || { echo "the decoy does not look like this install's watch.sh" >&2; return 1; }
   echo "$orphan_pid" > "$TEST_SKILL_DIR/run/watch.orphan-sid.pid"
   # Use a PID that's almost certainly not in use as the dead CC ancestor.
   local dead_cc_pid=999999

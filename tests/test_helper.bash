@@ -792,6 +792,15 @@ refute() {
 # first version did exactly that, and the tests using it went green because the
 # decoy was already gone -- not because anything had killed it. Returning
 # through a variable keeps the process a child of the test.
+# The same reader the product uses to decide whether a pid is one of ours, so
+# a fixture's precondition is checked the way session-end.sh checks it rather
+# than by a lookalike.
+_decoy_cmdline() {
+  # shellcheck disable=SC1090
+  . "$SCRIPTS/lib/compat.sh"
+  compat_get_cmdline "$1"
+}
+
 spawn_decoy_with_cmdline() {
   local path="$1" decoy
   decoy="$(mktemp -d)/decoy.sh"
