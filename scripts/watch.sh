@@ -233,13 +233,22 @@ LOGFILE="$RUN_DIR/watch.$SESSION_ID.log"
 # place they are looking, and losing that to make the file work would trade one
 # silence for another.
 WATCH_LOG_MAX_BYTES="${AGMSG_WATCH_LOG_MAX_BYTES:-131072}"
-# Normalized the way INTERVAL above is, and for a sharper reason: this value
-# reaches `$(( ))`, and under `set -u` a non-numeric like `oops` is read there
-# as a variable name and can take down the watcher. Killing delivery over a
-# mistyped log cap is the opposite of what this whole change is for. Anything
-# that is not a positive integer -- empty, words, 0, negative -- becomes the
-# default, so a misconfigured cap degrades to the shipped one rather than to
-# no watcher.
+# Normalized the way INTERVAL above is. What an un-normalized value costs was
+# measured rather than assumed, because the first version of this comment named
+# a failure that does not happen here: the value never enters `$(( ))`, so it
+# cannot be read as a variable name, and this script sets `-u` but not `-e`, so
+# nothing dies.
+#
+# It reaches the right-hand side of `[ ... -gt "$WATCH_LOG_MAX_BYTES" ]`. A
+# word there makes the test error non-fatally and read as false, forever, so
+# rotation simply never fires and the log grows unbounded -- the one property
+# this design was chosen for. A cap of `0` is the opposite failure: every
+# record is over it, so each one rotates and throws the previous generation
+# away, which is the diagnostics this exists to keep.
+#
+# Anything that is not a positive integer -- empty, words, 0, negative --
+# becomes the default, so a misconfigured cap degrades to the shipped bound
+# rather than to no bound or to a one-line window.
 case "$WATCH_LOG_MAX_BYTES" in
   ''|*[!0-9]*) WATCH_LOG_MAX_BYTES=131072 ;;
   *) [ "$WATCH_LOG_MAX_BYTES" -gt 0 ] || WATCH_LOG_MAX_BYTES=131072 ;;

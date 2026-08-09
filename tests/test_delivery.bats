@@ -3167,19 +3167,35 @@ JSON
   grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
 }
 
-@test "watch: a non-numeric log cap still leaves a readable reason (#691)" {
-  # The other half of the contract advisor asked to pin: invalid, not just 0.
-  local dead log
+@test "watch: a non-numeric log cap still rotates at the default (#691)" {
+  # The other half of the contract, as a case that can actually fail. The first
+  # version asserted only that a reason was still readable -- true whether or
+  # not the value is normalized, because an un-normalized word makes `[ -gt ]`
+  # error non-fatally and read as false, and the append then succeeds anyway.
+  # It passed under mutation, so it measured nothing.
+  #
+  # What separates the two: put the live log just under the SHIPPED default and
+  # write one more record. Normalized, `oops` IS the default, so this crosses it
+  # and rotates. Un-normalized, the comparison is false forever and nothing
+  # rotates however large the file gets.
+  local dead log default=131072
   dead="$(bash -c 'echo $$')"
   wait_for_pid_exit "$dead" || true
   bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
   log="$TEST_SKILL_DIR/run/watch.bogus-session.$dead.log"
   mkdir -p "$TEST_SKILL_DIR/run"
-  printf 'previous run\n' > "$log"
+  # 40 bytes short of the default: any diagnostic is longer than that.
+  head -c $(( default - 40 )) /dev/zero | tr '\0' 'x' > "$log"
+
   AGMSG_WATCH_LOG_MAX_BYTES=oops bash "$SCRIPTS/watch.sh" \
     "bogus-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
   wait $! || true
-  [ -f "$log" ] || { echo "the watcher wrote nothing" >&2; return 1; }
+
+  [ -f "$log.1" ] \
+    || { echo "a non-numeric cap did not fall back to the default bound" >&2; return 1; }
+  local live
+  live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  [ "$live" -le "$default" ] || { echo "live log is $live bytes" >&2; return 1; }
   grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
 }
 
