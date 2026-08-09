@@ -3079,6 +3079,110 @@ JSON
     || { echo "live log is $live bytes, cap $cap (chars=$chars bytes=$bytes pad=$pad)" >&2; return 1; }
 }
 
+@test "watch: an unmeasurable record rotates rather than guessing (#691)" {
+  # The fallback used to be `${#record}` -- the character count this had just
+  # been fixed away from, and fail-OPEN: with `wc` missing, the bound quietly
+  # stopped holding. It now rotates when the size cannot be measured.
+  #
+  # The cap has to sit in the window where the character count would NOT
+  # rotate, or the two behaviours agree and the case proves nothing. Same
+  # derivation as the multibyte case: observe the record, then set the cap.
+  local log db record chars bytes cap pad live shim wpid waited
+  bash "$SCRIPTS/join.sh" "境界検査のためのとても長い日本語チーム名" alice claude-code "$TEST_PROJECT" >/dev/null
+  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path 境界検査のためのとても長い日本語チーム名')"
+  rm -f "$db"
+  log="$TEST_SKILL_DIR/run/watch.nowc-session.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=1000000 \
+    bash "$SCRIPTS/watch.sh" nowc-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wpid=$!; waited=0
+  while [ "$waited" -lt 100 ]; do
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  record="$(grep 'no store yet' "$log" | head -1)"
+  [ -n "$record" ] || { echo "no record to size the fixture from" >&2; return 1; }
+  chars=${#record}
+  bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]')"
+  [ "$bytes" -gt "$chars" ] || { echo "record is not multibyte" >&2; return 1; }
+
+  # In the window: the character count fits, the real byte count does not.
+  pad=120
+  cap=$(( pad + chars + 1 ))
+  rm -f "$log" "$log.1"
+  head -c "$pad" /dev/zero | tr '\0' 'x' > "$log"
+
+  # A `wc` that fails, first on PATH -- which is the one the watcher finds.
+  shim="$TEST_SKILL_DIR/shim"; mkdir -p "$shim"
+  printf '#!/bin/sh\nexit 1\n' > "$shim/wc"; chmod +x "$shim/wc"
+
+  PATH="$shim:$PATH" AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=$cap \
+    bash "$SCRIPTS/watch.sh" nowc-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wpid=$!; waited=0
+  while [ "$waited" -lt 100 ]; do
+    [ -f "$log.1" ] && break
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+
+  live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  [ "$live" -le "$cap" ] \
+    || { echo "live log is $live bytes, cap $cap (chars=$chars bytes=$bytes pad=$pad)" >&2; return 1; }
+  # And the diagnostic was not lost to the conservative choice.
+  grep -q 'no store yet' "$log" || { echo "the record was dropped" >&2; cat "$log" >&2; return 1; }
+}
+
+@test "watch: an invalid log cap falls back to the default, not to no bound (#691)" {
+  # `0` is the value that separates the two behaviours. Normalized, it becomes
+  # the 128 KiB default and a small log is left alone. Unnormalized, every
+  # record is "over" a cap of zero and the log rotates on every line, throwing
+  # away the previous generation each time -- the diagnostics this exists to
+  # keep.
+  #
+  # Note on the failure mode: an invalid cap does NOT kill the watcher. The
+  # value never enters `$(( ))`; it is the right-hand side of `[ -gt ]`, which
+  # errors non-fatally because this script sets `-u`, not `-e`. What it does is
+  # quietly stop the comparison from ever being true -- so the real risk is an
+  # unbounded log, and that is what is pinned here.
+  local dead log
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  log="$TEST_SKILL_DIR/run/watch.zerocap-session.$dead.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf 'a previous generation worth keeping\n' > "$log"
+
+  AGMSG_WATCH_LOG_MAX_BYTES=0 bash "$SCRIPTS/watch.sh" \
+    "zerocap-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wait $! || true
+
+  # Treated as the default: nothing was rotated away for a 36-byte file.
+  [ ! -f "$log.1" ] || { echo "a cap of 0 rotated a tiny log" >&2; return 1; }
+  grep -q 'a previous generation worth keeping' "$log" \
+    || { echo "the previous generation was discarded" >&2; cat "$log" >&2; return 1; }
+  # And the run still said why it stopped.
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: a non-numeric log cap still leaves a readable reason (#691)" {
+  # The other half of the contract advisor asked to pin: invalid, not just 0.
+  local dead log
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  log="$TEST_SKILL_DIR/run/watch.bogus-session.$dead.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf 'previous run\n' > "$log"
+  AGMSG_WATCH_LOG_MAX_BYTES=oops bash "$SCRIPTS/watch.sh" \
+    "bogus-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wait $! || true
+  [ -f "$log" ] || { echo "the watcher wrote nothing" >&2; return 1; }
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
 @test "watch: a record larger than the whole cap is kept, not dropped (#691)" {
   # The stated exception. A single diagnostic bigger than the cap cannot fit
   # under it; rotating first and writing it whole beats dropping the one line

@@ -233,6 +233,17 @@ LOGFILE="$RUN_DIR/watch.$SESSION_ID.log"
 # place they are looking, and losing that to make the file work would trade one
 # silence for another.
 WATCH_LOG_MAX_BYTES="${AGMSG_WATCH_LOG_MAX_BYTES:-131072}"
+# Normalized the way INTERVAL above is, and for a sharper reason: this value
+# reaches `$(( ))`, and under `set -u` a non-numeric like `oops` is read there
+# as a variable name and can take down the watcher. Killing delivery over a
+# mistyped log cap is the opposite of what this whole change is for. Anything
+# that is not a positive integer -- empty, words, 0, negative -- becomes the
+# default, so a misconfigured cap degrades to the shipped one rather than to
+# no watcher.
+case "$WATCH_LOG_MAX_BYTES" in
+  ''|*[!0-9]*) WATCH_LOG_MAX_BYTES=131072 ;;
+  *) [ "$WATCH_LOG_MAX_BYTES" -gt 0 ] || WATCH_LOG_MAX_BYTES=131072 ;;
+esac
 
 # Pairs already reported as storeless, so the notice is once per process.
 NO_STORE_REPORTED=""
@@ -257,8 +268,13 @@ watch_log() {
     # character-count check and lands over the byte cap, which is the contract
     # this rotation exists to hold. One extra process per diagnostic is nothing:
     # these are emitted a handful of times per watcher, not per poll.
-    bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]')"
-    case "$bytes" in ''|*[!0-9]*) bytes=${#record} ;; esac
+    bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]' 2>/dev/null)"
+    # If the byte count cannot be had, rotate rather than guess. Falling back
+    # to `${#record}` would reinstate the character count this just replaced --
+    # the exact wrong unit, and fail-OPEN: the bound would quietly stop holding
+    # whenever `wc` is missing or answers oddly. Rotating costs one early
+    # generation; the diagnostic itself is still written whole below.
+    case "$bytes" in ''|*[!0-9]*) bytes="$WATCH_LOG_MAX_BYTES" ;; esac
     if [ "$(( size + bytes + 1 ))" -gt "$WATCH_LOG_MAX_BYTES" ]; then
       mv -f "$LOGFILE" "$LOGFILE.1" 2>/dev/null || true
     fi
