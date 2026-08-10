@@ -28,12 +28,30 @@ shell_quote() {
   printf '%q' "$1"
 }
 
-# True iff exactly one agmsg install (a `.agmsg`-marked directory) exists
-# anywhere under ~/.agents/skills. Derives the candidate set directly from
-# this machine's actual state -- not from whether #599's fail-closed
-# multi-install handling (PR #659) happens to be merged on whatever branch
-# calls this, which it may not be (review finding: measure the base, don't
-# assume another PR landed).
+# Lists this machine's agmsg install candidates, one per line: every
+# directory under ~/.agents/skills carrying a `.agmsg` marker file. Derives
+# the set directly from this machine's actual state -- not from whether
+# #599's fail-closed multi-install handling (PR #659) happens to be merged
+# on whatever branch calls this, which it may not be (review finding:
+# measure the base, don't assume another PR landed).
+#
+# Kept separate from agmsg_only_one_install below so #659's own bare-
+# `--update` candidate enumeration -- not written yet, #659 is still open
+# against `main` and unmerged -- has something to consume instead of
+# re-scanning ~/.agents/skills a second time, once the two share a base.
+# Until #659 lands, this duplicates (rather than shares) that logic; this
+# is the known, accepted overlap flagged in review.
+agmsg_install_candidates() {
+  local skills_dir d
+  skills_dir="$(dirname "$AGENTS_BIN")/skills"
+  [ -d "$skills_dir" ] || return 0
+  for d in "$skills_dir"/*/; do
+    [ -f "${d}.agmsg" ] || continue
+    printf '%s\n' "${d%/}"
+  done
+}
+
+# True iff agmsg_install_candidates lists exactly one directory.
 #
 # What this buys: a legacy shim (agmsg's, but predating ownership tracking,
 # #553) has no recorded owner to compare against -- but if this is
@@ -42,14 +60,8 @@ shell_quote() {
 # more installs present, this returns false and the caller falls back to
 # fail-closed, same as an unrecorded owner always has since #553.
 agmsg_only_one_install() {
-  local skills_dir count=0 d
-  skills_dir="$(dirname "$AGENTS_BIN")/skills"
-  [ -d "$skills_dir" ] || return 1
-  for d in "$skills_dir"/*/; do
-    [ -f "${d}.agmsg" ] || continue
-    count=$((count + 1))
-    [ "$count" -gt 1 ] && return 1
-  done
+  local count
+  count="$(agmsg_install_candidates | wc -l | tr -d ' ')"
   [ "$count" -eq 1 ]
 }
 
