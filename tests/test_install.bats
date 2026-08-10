@@ -93,6 +93,14 @@ teardown() {
   # already has (line ~90 in the template). The Claude Code command file is
   # only installed when ~/.claude exists (install.sh), separate from the
   # shared codex-typed $SK/SKILL.md.
+  #
+  # The substring shape checked here changed under #687 (review round 3):
+  # the old prose "Only if the project's delivery mode is monitor or both"
+  # became a per-mode bullet list (mode: monitor/both starts Monitor; every
+  # other mode -- turn, off (no hooks), off (unrecognized) -- leaves it
+  # stopped, some of them now with a required user-facing message). The
+  # #280 regression this guards -- Monitor invoked unconditionally -- is
+  # still what's being checked; only the literal wording moved.
   mkdir -p "$FAKE_HOME/.claude"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
   local cmd_file="$FAKE_HOME/.claude/commands/agmsg.md"
@@ -100,9 +108,9 @@ teardown() {
   local actas_block drop_block
   actas_block="$(sed -n '/If argument starts with "actas"/,/If argument starts with "drop"/p' "$cmd_file")"
   drop_block="$(sed -n '/If argument starts with "drop"/,/If argument starts with "spawn"/p' "$cmd_file")"
-  [[ "$actas_block" == *"delivery mode is"*"monitor"*"both"* ]]
+  [[ "$actas_block" == *"mode: monitor"*"mode: both"* ]]
   [[ "$actas_block" == *"delivery.sh status"* ]]
-  [[ "$drop_block" == *"delivery mode is"*"monitor"*"both"* ]]
+  [[ "$drop_block" == *"mode: monitor"*"mode: both"* ]]
   [[ "$drop_block" == *"delivery.sh status"* ]]
 }
 

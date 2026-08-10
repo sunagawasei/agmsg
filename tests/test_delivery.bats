@@ -282,16 +282,19 @@ eperm_pid() {
   [[ "$output" =~ "mode: turn" ]]
 }
 
-@test "delivery status: derives 'off' from a settings file that deliberately holds no agmsg hooks (#687)" {
-  # Genuinely off, not merely "no settings file was ever written": `set off`
-  # runs the same strip-and-rewrite apply_default every other mode does, so
+@test "delivery status: a settings file with zero agmsg hooks reads as 'no hooks installed', not asserted-deliberate (#687 review round 3)" {
   # $TEST_PROJECT's settings file exists and is real, just empty of agmsg
-  # entries. This is the case #687 distinguishes FROM -- an intentional
-  # configuration, and its wording must stay exactly "mode: off", not gain
-  # the "(unrecognized: ...)" suffix the next test checks for.
+  # entries -- but `set off`'s apply_default only STRIPS agmsg's own hook
+  # entries, it writes no marker recording that `set off` ran. So this exact
+  # byte state is reachable two ways: someone ran `set off`, or this project
+  # simply never had agmsg configured. delivery.sh cannot tell those apart,
+  # so the wording must not claim "deliberate" -- it states only what's
+  # observable (hooks absent), distinct from the "(unrecognized: ...)" family
+  # the next two tests check for, which means delivery.sh couldn't even read
+  # a settings file at all.
   bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT" >/dev/null
   run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
-  [[ "$output" == "mode: off"$'\n'* ]] || { echo "expected the first line to be exactly 'mode: off', got: $output" >&2; return 1; }
+  [[ "$output" == "mode: off (no agmsg delivery hooks installed for this project)"$'\n'* ]] || { echo "expected the first line to be exactly 'mode: off (no agmsg delivery hooks installed for this project)', got: $output" >&2; return 1; }
   [[ "$output" != *"unrecognized"* ]]
 }
 
