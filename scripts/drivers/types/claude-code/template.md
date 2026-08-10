@@ -212,11 +212,13 @@ If argument starts with "actas" followed by an agent name (e.g. "actas alice"):
    a. Run TaskList. Find any task whose description begins with "agmsg inbox stream".
    b. **If a matching task is found**: TaskStop it.
    c. **If no matching task is found** (typical when /__SKILL_NAME__ actas runs as the first command of a fresh session — SessionStart hasn't fired the Monitor directive yet, or you're invoking actas before the agent acted on it): skip TaskStop entirely. There is no Monitor to stop. Do NOT attempt TaskStop with a guessed or empty task_id — it will fail with "Invalid tool parameters" and confuse the flow.
-   d. **Only if the project's delivery mode is `monitor` or `both`** (check via `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh status claude-code "$(pwd)"`), invoke a fresh Monitor, regardless of whether step b or c applied:
-      - command: `~/.agents/skills/__SKILL_NAME__/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code <name>`
-      - description: `agmsg inbox stream (acting as <name>)`
-      - persistent: true
-      Otherwise (mode `turn` or `off`), leave it stopped — `actas` must not start automatic delivery a project wasn't configured for.
+   d. Run `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh status claude-code "$(pwd)"` and read its **first line**.
+      - **`mode: monitor` or `mode: both`**: invoke a fresh Monitor, regardless of whether step b or c applied:
+        - command: `~/.agents/skills/__SKILL_NAME__/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code <name>`
+        - description: `agmsg inbox stream (acting as <name>)`
+        - persistent: true
+      - **`mode: turn` or exactly `mode: off`**: leave it stopped, silently — `actas` must not start automatic delivery a project wasn't configured for, and this is the expected, deliberate case.
+      - **`mode: off (unrecognized: ...)`**: leave it stopped too (same rule — do not guess a mode), but this is NOT the deliberate case above and must NOT be treated the same way. `delivery.sh` could not find a settings file for this project at the path it resolved, most often because the working directory does not match how the project was actually registered. **Tell the user explicitly** — e.g. "agmsg could not find a delivery configuration for this project at `<path from the message>` — delivery is stopped, but this may mean the project isn't registered here rather than that it was deliberately turned off. Check the path, or run `/__SKILL_NAME__ mode <choice>` to configure it explicitly." Do not report `actas` as complete without saying this — a silent stop here is indistinguishable from the deliberate case and is what let this go unnoticed before (#687).
    The 4th argument to `watch.sh` restricts the subscription to messages addressed to `<name>` only — other roles' inbound messages stop reaching this session until another `actas` or session end.
 6. Set the session's active FROM to `<name>` — use `<name>` in every `send.sh` call for the rest of this session.
 7. Tell the user: "Now acting as `<name>`. Sends use `<name>` as from; receive restricted to `<name>` only."
@@ -229,11 +231,13 @@ If argument starts with "drop" followed by an agent name (e.g. "drop alice"):
    a. Run TaskList. Find any task whose description begins with "agmsg inbox stream".
    b. **If a matching task is found**: TaskStop it.
    c. **If no matching task is found**: skip TaskStop. Do NOT attempt TaskStop with a guessed or empty task_id.
-   d. **Only if the project's delivery mode is `monitor` or `both`** (check via `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh status claude-code "$(pwd)"`), invoke a fresh Monitor with the default subscription (no `actas` name filter — receives every (team, agent) pair currently registered for this project that isn't held by another session):
-      - command: `~/.agents/skills/__SKILL_NAME__/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code`
-      - description: `agmsg inbox stream`
-      - persistent: true
-      Otherwise (mode `turn` or `off`), leave it stopped.
+   d. Run `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh status claude-code "$(pwd)"` and read its **first line**.
+      - **`mode: monitor` or `mode: both`**: invoke a fresh Monitor with the default subscription (no `actas` name filter — receives every (team, agent) pair currently registered for this project that isn't held by another session):
+        - command: `~/.agents/skills/__SKILL_NAME__/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code`
+        - description: `agmsg inbox stream`
+        - persistent: true
+      - **`mode: turn` or exactly `mode: off`**: leave it stopped, silently — the deliberate case.
+      - **`mode: off (unrecognized: ...)`**: leave it stopped, but say so — same reasoning as the `actas` step this mirrors (#687). Do not report the drop as complete without mentioning it.
 4. Tell the user: "Dropped role `<name>` from this project."
 
 If argument starts with "spawn" (e.g. "spawn codex reviewer", "spawn cursor planner", "spawn claude-code alice --window"):

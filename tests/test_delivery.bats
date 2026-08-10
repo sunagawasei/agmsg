@@ -282,9 +282,33 @@ eperm_pid() {
   [[ "$output" =~ "mode: turn" ]]
 }
 
-@test "delivery status: derives 'off' from settings with no agmsg hooks" {
+@test "delivery status: derives 'off' from a settings file that deliberately holds no agmsg hooks (#687)" {
+  # Genuinely off, not merely "no settings file was ever written": `set off`
+  # runs the same strip-and-rewrite apply_default every other mode does, so
+  # $TEST_PROJECT's settings file exists and is real, just empty of agmsg
+  # entries. This is the case #687 distinguishes FROM -- an intentional
+  # configuration, and its wording must stay exactly "mode: off", not gain
+  # the "(unrecognized: ...)" suffix the next test checks for.
+  bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT" >/dev/null
   run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
-  [[ "$output" =~ "mode: off" ]]
+  [[ "$output" == "mode: off"$'\n'* ]] || { echo "expected the first line to be exactly 'mode: off', got: $output" >&2; return 1; }
+  [[ "$output" != *"unrecognized"* ]]
+}
+
+@test "delivery status: an unrecognized project is distinguishable from a deliberately off one (#687)" {
+  # No `set` call at all: $TEST_PROJECT is a bare mktemp -d, so no settings
+  # file exists at the resolved path -- the actual #684 failure mode, where
+  # a settings file could not be found (most often because the caller's
+  # $(pwd) did not match how the project was actually registered) and that
+  # was reported as indistinguishable from a real, deliberate "off". Both
+  # used to print the bare word "off"; the FIRST line has to differ now, not
+  # just a later one, because a reader (or actas) that only looks at the
+  # first line must still be able to tell.
+  run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
+  [[ "$output" == "mode: off ("*")"$'\n'* || "$output" == "mode: off ("*")" ]] \
+    || { echo "expected the first line to read 'mode: off (...)', got: $output" >&2; return 1; }
+  [[ "$output" == *"unrecognized"* ]] &&
+    [[ "$output" == *"$TEST_PROJECT"* ]]
 }
 
 # --- rejects unknown mode ---

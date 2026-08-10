@@ -230,6 +230,28 @@ agmsg_delivery_status_default() {
   if [ "$has_ss" = "1" ] && [ "$has_st" = "1" ]; then mode="both"
   elif [ "$has_ss" = "1" ]; then mode="monitor"
   elif [ "$has_st" = "1" ]; then mode="turn"
+  elif [ ! -f "$hf" ]; then
+    # A settings file that does not exist and a settings file that exists
+    # with zero agmsg entries both fall through to here with has_ss=has_st=0,
+    # but they are not the same answer: one is a real, deliberate
+    # configuration; the other means delivery.sh could not find this project
+    # at all -- most often because the caller passed the wrong path (#687).
+    # Both used to print the bare word "off", so a reader (or `actas`, whose
+    # own rule is "off means don't start delivery") could not tell an
+    # intentional choice from "I don't know". This is what deceived a seat
+    # during #684 recovery: `mode: off` and `mode: monitor` were both true,
+    # for the same project, because one reader's path resolved and the
+    # other's did not. Distinguishing here, in the FIRST line rather than a
+    # secondary one, is what #687 asks for -- a reader (or a caller only
+    # capturing the first line) sees the difference without reading further.
+    # No consumer matches "mode: off" exactly (checked): the only exact-match
+    # consumers key on "monitor"/"both"/"turn", so widening this string is
+    # safe.
+    if [ -n "$hf" ]; then
+      mode="off (unrecognized: no settings file found at $hf -- this project may not be registered)"
+    else
+      mode="off (unrecognized: could not resolve a settings file for this project/type)"
+    fi
   fi
   echo "mode: $mode"
 
