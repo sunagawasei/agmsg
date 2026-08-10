@@ -385,3 +385,67 @@ EOF
   [ "$status" -eq 0 ]
   [ ! -e "$sentinel" ]
 }
+
+# --- agmsg_install_candidates / agmsg_only_one_install (#553 review): these
+# were split from one function into two (list, then count) so a future #659
+# could call the listing half instead of re-scanning ~/.agents/skills itself.
+# The split changes what "counting" means -- it now depends on the listing
+# producing exactly one line per candidate, including when a candidate name
+# contains a space -- so it needs its own direct coverage, not just reliance
+# on the pre-existing install.sh-level tests continuing to pass.
+_run_candidate_probe() {
+  local probe_home="$1"
+  run bash -c "
+    HOME='$probe_home'
+    source '$TYPES/codex/codex-shim-install.sh' >/dev/null 2>&1
+    agmsg_install_candidates
+    echo '[end]'
+    if agmsg_only_one_install; then echo only_one=true; else echo only_one=false; fi
+  "
+}
+
+@test "agmsg_install_candidates/agmsg_only_one_install: no installs at all" {
+  export HOME="$TEST_PROJECT/home"
+  mkdir -p "$HOME/.agents/skills"
+
+  _run_candidate_probe "$HOME"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"only_one=false"* ]]
+  # nothing was listed before [end] -- an empty candidate set. awk (not a sed
+  # "1,/re/" range) because that range never closes on line 1 itself, which
+  # is exactly the zero-candidates case here ([end] IS line 1) -- it would
+  # silently keep reading past it instead.
+  [[ "$(echo "$output" | awk '/\[end\]/{exit}{print}')" == "" ]]
+}
+
+@test "agmsg_install_candidates/agmsg_only_one_install: exactly one install, name containing a space" {
+  export HOME="$TEST_PROJECT/home"
+  local dir="$HOME/.agents/skills/agmsg dev"
+  mkdir -p "$dir"
+  touch "$dir/.agmsg"
+
+  _run_candidate_probe "$HOME"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"only_one=true"* ]]
+  # the whole name (including the embedded space) survives as one line, not
+  # two -- agmsg_only_one_install counts lines, so a name that got word-split
+  # would silently miscount even a single real install as more than one.
+  [[ "$output" == *"$dir"* ]]
+  local candidate_lines; candidate_lines="$(echo "$output" | awk '/\[end\]/{exit}{print}' | grep -c .)"
+  [ "$candidate_lines" -eq 1 ]
+}
+
+@test "agmsg_install_candidates/agmsg_only_one_install: two installs present" {
+  export HOME="$TEST_PROJECT/home"
+  mkdir -p "$HOME/.agents/skills/one" "$HOME/.agents/skills/two"
+  touch "$HOME/.agents/skills/one/.agmsg" "$HOME/.agents/skills/two/.agmsg"
+  # an unmarked sibling directory must not be counted as a candidate
+  mkdir -p "$HOME/.agents/skills/not-agmsg"
+
+  _run_candidate_probe "$HOME"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"only_one=false"* ]]
+  local candidate_lines; candidate_lines="$(echo "$output" | awk '/\[end\]/{exit}{print}' | grep -c .)"
+  [ "$candidate_lines" -eq 2 ]
+  [[ "$output" != *"/not-agmsg"* ]]
+}
