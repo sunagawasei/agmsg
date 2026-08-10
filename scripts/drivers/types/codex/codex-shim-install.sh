@@ -24,28 +24,37 @@ is_agmsg_shim() {
   [ -f "$TARGET" ] && grep -q "Optional Codex entrypoint shim for agmsg monitor mode" "$TARGET" 2>/dev/null
 }
 
-# Prints the skill script dir baked into the currently-installed shim (empty
-# if there is none, or it is not an agmsg shim). This is the install that
+shell_quote() {
+  printf '%q' "$1"
+}
+
+# Prints the shell-QUOTED (%q) skill script dir baked into the currently-
+# installed shim -- empty if there is none, the shim is not an agmsg shim, or
+# it predates ownership tracking (#553; see below). This is the install that
 # "owns" the shim: the one whose codex-shim.sh it execs into and whose
 # storage/drivers every Codex launch through it will resolve.
 #
-# Reads a DEDICATED comment line (`# agmsg-shim-owner: <dir>`, written by
-# `install` below) via plain string extraction -- never eval, and never the
-# executable `export AGMSG_CODEX_SHIM_SCRIPT_DIR=...` line the shim itself
-# needs at runtime. is_agmsg_shim matching only proves the marker STRING is
-# present; it says nothing about the rest of the file's contents, which on a
-# local, single-user path like this one could have been hand-edited after the
-# fact. Evaling anything sourced from it -- as an earlier version of this
-# function did -- turns a read-only `status` call into an arbitrary-code-
-# execution path for whoever can write $TARGET (security review finding).
-# Plain text extraction has no such path regardless of what the line contains.
+# Reads a DEDICATED comment line (`# agmsg-shim-owner: <%q-quoted dir>`,
+# written by `install` below) via plain string extraction -- never eval, and
+# never the executable `export AGMSG_CODEX_SHIM_SCRIPT_DIR=...` line the shim
+# itself needs at runtime. is_agmsg_shim matching only proves the marker
+# STRING is present; it says nothing about the rest of the file's contents,
+# which on a local, single-user path like this one could have been hand-
+# edited after the fact. Evaling anything sourced from it -- as an earlier
+# version of this function did -- turns a read-only `status` call into an
+# arbitrary-code-execution path for whoever can write $TARGET (security
+# review finding). Plain text extraction has no such path regardless of what
+# the line contains.
+#
+# Quoted, not raw, on this side too (every caller compares/prints this value
+# against another %q-quoted value, never an unquoted path) -- a path
+# containing a literal newline would otherwise let its OWN content forge a
+# second, fake comment line (security review, non-blocking but cheap to
+# close). Neither side ever needs the literal path back, only equality and
+# display, both of which a consistently-quoted value still gives correctly.
 shim_owner_script_dir() {
   is_agmsg_shim || return 0
   sed -n 's/^# agmsg-shim-owner: //p' "$TARGET" 2>/dev/null | head -1
-}
-
-shell_quote() {
-  printf '%q' "$1"
 }
 
 cmd="${1:-function}"
@@ -71,18 +80,30 @@ EOF
     # The shim path is one file shared by every install on the machine (#553):
     # whichever install's `install` ran last wins, and every Codex launch
     # through the shim then dispatches into ITS drivers/storage — silently,
-    # since nothing here previously recorded whose the existing one was. Refuse
-    # to hand it to a different skill dir without an explicit ask, naming which
-    # install currently owns it so the caller can decide (re-run with
-    # AGMSG_CODEX_SHIM_FORCE=1 to reclaim it, or leave it alone).
+    # since nothing here previously recorded whose the existing one was.
+    #
+    # A shim that IS ours (is_agmsg_shim, checked above) but carries no
+    # `# agmsg-shim-owner:` line at all is not evidence of "unowned" — it is
+    # every shim this tool ever wrote before this check existed. Treating
+    # "no owner recorded" as "safe to take" would silently repeat #553's own
+    # bug for exactly the migration moment it matters most: the first time a
+    # second-named install runs an installer that HAS this fix, against a
+    # production shim that does not (review finding). Both a foreign-owned
+    # and an owner-unknown shim fail closed here; only a shim already
+    # recording THIS install's own SCRIPT_DIR skips the guard.
+    self_owner="$(shell_quote "$SCRIPT_DIR")"
     owner="$(shim_owner_script_dir)"
-    if [ -n "$owner" ] && [ "$owner" != "$SCRIPT_DIR" ] && [ "${AGMSG_CODEX_SHIM_FORCE:-}" != "1" ]; then
-      echo "codex-shim-install: $TARGET is owned by a different install:" >&2
-      echo "  $owner" >&2
+    if [ -e "$TARGET" ] && [ "$owner" != "$self_owner" ] && [ "${AGMSG_CODEX_SHIM_FORCE:-}" != "1" ]; then
+      if [ -n "$owner" ]; then
+        echo "codex-shim-install: $TARGET is owned by a different install:" >&2
+        echo "  $owner" >&2
+      else
+        echo "codex-shim-install: $TARGET is an agmsg shim from before ownership tracking (#553)," >&2
+        echo "codex-shim-install: so which install actually owns it cannot be named." >&2
+      fi
       echo "codex-shim-install: refusing to repoint it at $SCRIPT_DIR" >&2
       echo "codex-shim-install: to claim it for THIS install instead, re-run with AGMSG_CODEX_SHIM_FORCE=1 --" >&2
-      echo "codex-shim-install: every Codex launch that goes through the shim will then dispatch into" >&2
-      echo "codex-shim-install: $SCRIPT_DIR instead of $owner" >&2
+      echo "codex-shim-install: every Codex launch that goes through the shim will then dispatch into $SCRIPT_DIR" >&2
       exit 1
     fi
     {
@@ -92,10 +113,11 @@ EOF
       echo "# Optional Codex entrypoint shim for agmsg monitor mode."
       echo "# Generated by agmsg. Dispatches to the installed skill script."
       # Comment, never executed: the ownership marker shim_owner_script_dir
-      # reads with plain text extraction, not eval. Kept separate from the
-      # export line below, which is real, executable, runtime-required state
-      # for codex-shim.sh, quoted for shell re-use rather than safe display.
-      echo "# agmsg-shim-owner: $SCRIPT_DIR"
+      # reads with plain text extraction, not eval. %q-quoted (not the raw
+      # path) so a path containing a literal newline can't forge a second,
+      # fake comment line of its own -- every reader compares/prints this
+      # quoted, never unquotes it back to a real path.
+      echo "# agmsg-shim-owner: $self_owner"
       echo ""
       echo "export AGMSG_CODEX_SHIM_WRAPPER=1"
       echo "export AGMSG_CODEX_SHIM_SCRIPT_DIR=$(shell_quote "$SCRIPT_DIR")"
@@ -133,12 +155,12 @@ EOF
       # can still break under `pipefail` once there is a second line at all —
       # see install.sh's own callers for why, and capture before grep there.
       owner="$(shim_owner_script_dir)"
-      if [ -n "$owner" ]; then
-        if [ "$owner" = "$SCRIPT_DIR" ]; then
-          echo "owner: this install ($owner)"
-        else
-          echo "owner: a different install ($owner)"
-        fi
+      if [ "$owner" = "$(shell_quote "$SCRIPT_DIR")" ]; then
+        echo "owner: this install ($SCRIPT_DIR)"
+      elif [ -n "$owner" ]; then
+        echo "owner: a different install ($owner)"
+      else
+        echo "owner: unknown (predates ownership tracking, #553)"
       fi
     else
       echo "not installed: $TARGET"

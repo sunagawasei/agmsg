@@ -366,14 +366,22 @@ EOF
 
   run bash "$TYPES/codex/codex-shim-install.sh" status
   [ "$status" -eq 0 ]
+  [[ "$output" == *"owner: unknown"* ]]
   [ ! -e "$sentinel" ]
 
   # No `# agmsg-shim-owner:` line at all (this crafted file predates it, same
-  # as any real shim written before this PR) reads as owner="" -- unowned, not
-  # foreign -- so install proceeds and overwrites it, same as it always could.
-  # The only property under test here is that doing so never executes
-  # anything the tampered content contained.
+  # as any real shim written before this PR) reads as owner unknown, which
+  # fails closed the same as a foreign owner would (#553 review: "unowned" and
+  # "owner not recorded" are not the same claim, and treating them the same
+  # would silently repeat #553's own bug against every pre-existing shim on
+  # first contact with a second, differently-named install). The property
+  # under test either way: nothing the tampered content contains ever runs.
   run bash "$TYPES/codex/codex-shim-install.sh" install
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"before ownership tracking"* ]]
+  [ ! -e "$sentinel" ]
+
+  AGMSG_CODEX_SHIM_FORCE=1 run bash "$TYPES/codex/codex-shim-install.sh" install
   [ "$status" -eq 0 ]
   [ ! -e "$sentinel" ]
 }

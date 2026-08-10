@@ -708,6 +708,36 @@ PY
   grep -q "/skills/agmsg-dfr/" "$shim"
 }
 
+@test "install: bare --update (no --cmd) does NOT force-steal a Codex shim owned by a different install (#553)" {
+  # Unlike --update --cmd <name>, a bare --update resolves its target by
+  # scanning for an existing install rather than the caller naming one --- and
+  # on this base (#599's fail-closed fix, PR #659, is not yet merged here),
+  # that resolution does not even fail closed when more than one install is
+  # present. Forcing the shim reclaim unconditionally for bare --update would
+  # let whichever install a glob happens to land on steal the shim from
+  # another one the caller never named at all (review finding). This pins
+  # that a shim already owned by a DIFFERENT install survives a bare --update
+  # of the install that does NOT own it.
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
+  local shim="$FAKE_HOME/.agents/bin/codex"
+  local before; before="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
+  [[ "$before" == *"/skills/agmsg/"* ]]
+
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --agent-type codex >/dev/null
+  grep -q "/skills/agmsg/" "$shim"  # still the first install's, per the earlier tests
+
+  # Bare --update, no --cmd: this base's ambiguous-candidate handling means
+  # which of the two real installs it lands on isn't the point of this test
+  # (that's #599 / #659's concern) -- what matters here is that whichever one
+  # it is, it must not walk away with a shim it was never explicitly told to
+  # claim.
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -eq 0 ]
+  local after; after="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
+  [ "$before" = "$after" ]
+}
+
 # --- grok-build skill (~/.grok/skills/<name>/SKILL.md) ---
 
 @test "install: drops a Grok Build SKILL.md when ~/.grok exists" {
