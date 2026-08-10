@@ -373,7 +373,21 @@ trap 'exit 0' INT TERM HUP
 #
 # `run/` is deliberately outside the watched tree: pidfiles and readiness
 # sentinels are written by watchers themselves and would trip it immediately.
-INSTALL_STAMP="$RUN_DIR/.watch-start.$SESSION_ID"
+#
+# Keyed on the PID as well as the session id, because two watchers can hold the
+# same session id at once: Monitor re-invoked for one session leaves the old
+# watcher running until the successor kills it (#66), and both run cleanup. A
+# stamp named for the session alone is one file they share, so the loser's EXIT
+# trap deletes the winner's. `_install_changed` returns false when its stamp is
+# missing, so the successor would go on running with the guard silently off --
+# the same shape as the bug this guard exists for, and failing in the same
+# reassuring direction. $PIDFILE and $READY_FILES carry ownership checks for
+# exactly this; a per-process name gets it without a check to keep in sync.
+# Found in review.
+#
+# A SIGKILLed watcher leaves its stamp behind, which is the same exposure the
+# pidfile already has, and the file is empty.
+INSTALL_STAMP="$RUN_DIR/.watch-start.$SESSION_ID.$$"
 : > "$INSTALL_STAMP" 2>/dev/null || true
 
 # True when anything under scripts/ was written after this watcher started.

@@ -111,3 +111,41 @@ _wait_for() {
   run grep -c 'installation was updated' "$out"
   [ "$output" = "0" ]
 }
+
+@test "watch: a superseded watcher's cleanup does not disarm its successor (#684)" {
+  # Monitor re-invoked for the same session id leaves the old watcher running
+  # until the successor kills it (#66), and both run cleanup. When the stamp was
+  # named for the session alone it was one file shared between them, so the
+  # loser's EXIT trap deleted the winner's -- and `_install_changed` treats a
+  # missing stamp as "nothing changed", so the successor kept running with the
+  # guard silently off. Found in review, and invisible to the two tests above
+  # because each of them only ever has one watcher.
+  local out1="$BATS_TEST_TMPDIR/first.txt" out2="$BATS_TEST_TMPDIR/second.txt"
+  : > "$out1"; : > "$out2"
+
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" shared-sid "$PROJ" claude-code >"$out1" 2>/dev/null 3>&- 4>&- &
+  local first=$!
+  _wait_for "[ -s '$TEST_SKILL_DIR/run/watch.shared-sid.pid' ]" || true
+
+  # Same session id: this one takes the slot and stops the first (#66).
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" shared-sid "$PROJ" claude-code >"$out2" 2>/dev/null 3>&- 4>&- &
+  local second=$!
+  _wait_for "! kill -0 $first 2>/dev/null" || true
+  kill "$first" 2>/dev/null || true
+  wait "$first" 2>/dev/null || true
+
+  # The successor must still be armed.
+  bash "$SCRIPTS/send.sh" team bob alice "successor-control" >/dev/null
+  _wait_for "grep -q 'successor-control' '$out2'" || true
+
+  touch "$SCRIPTS/config.sh"
+  _wait_for "! kill -0 $second 2>/dev/null" || true
+
+  local was_alive=0
+  kill -0 "$second" 2>/dev/null && was_alive=1
+  kill "$second" 2>/dev/null || true
+  wait "$second" 2>/dev/null || true
+
+  [ "$was_alive" -eq 0 ]
+  grep -q 'installation was updated' "$out2"
+}
