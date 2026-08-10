@@ -271,9 +271,9 @@ _second_codex_dir() {
   local second_dir; second_dir="$(_second_codex_dir)"
   run bash "$second_dir/codex-shim-install.sh" install
   [ "$status" -ne 0 ]
-  [[ "$output" == *"owned by a different install"* ]]
-  [[ "$output" == *"$TYPES/codex"* ]]  # names the actual owner, not just "someone else"
-  [[ "$output" == *"AGMSG_CODEX_SHIM_FORCE=1"* ]]
+  printf '%s' "$output" | grep -qF "owned by a different install"
+  printf '%s' "$output" | grep -qF "$TYPES/codex"  # names the actual owner, not just "someone else"
+  printf '%s' "$output" | grep -qF "AGMSG_CODEX_SHIM_FORCE=1"
 
   [ "$(cat "$shim")" = "$before" ]  # byte-for-byte unchanged
 }
@@ -296,7 +296,7 @@ _second_codex_dir() {
 
   run bash "$TYPES/codex/codex-shim-install.sh" status
   [ "$status" -eq 0 ]
-  [[ "$output" == *"owner: this install ($TYPES/codex)"* ]]
+  printf '%s' "$output" | grep -qF "owner: this install ($TYPES/codex)"
 
   local second_dir; second_dir="$(_second_codex_dir)"
   run bash "$second_dir/codex-shim-install.sh" status
@@ -317,8 +317,8 @@ _second_codex_dir() {
 
   run bash "$TYPES/codex/codex-shim-install.sh" install
   [ "$status" -ne 0 ]
-  [[ "$output" == *"refusing to overwrite existing"* ]]
-  [[ "$output" != *"owned by a different install"* ]]
+  printf '%s' "$output" | grep -qF "refusing to overwrite existing"
+  refute grep -qF "owned by a different install" <(printf '%s' "$output")
   [ "$(cat "$HOME/.agents/bin/codex")" = "$before" ]
 }
 
@@ -366,7 +366,7 @@ EOF
 
   run bash "$TYPES/codex/codex-shim-install.sh" status
   [ "$status" -eq 0 ]
-  [[ "$output" == *"owner: unknown"* ]]
+  printf '%s' "$output" | grep -qF "owner: unknown"
   [ ! -e "$sentinel" ]
 
   # No `# agmsg-shim-owner:` line at all (this crafted file predates it, same
@@ -378,7 +378,7 @@ EOF
   # under test either way: nothing the tampered content contains ever runs.
   run bash "$TYPES/codex/codex-shim-install.sh" install
   [ "$status" -ne 0 ]
-  [[ "$output" == *"before ownership tracking"* ]]
+  printf '%s' "$output" | grep -qF "before ownership tracking"
   [ ! -e "$sentinel" ]
 
   AGMSG_CODEX_SHIM_FORCE=1 run bash "$TYPES/codex/codex-shim-install.sh" install
@@ -389,63 +389,102 @@ EOF
 # --- agmsg_install_candidates / agmsg_only_one_install (#553 review): these
 # were split from one function into two (list, then count) so a future #659
 # could call the listing half instead of re-scanning ~/.agents/skills itself.
-# The split changes what "counting" means -- it now depends on the listing
-# producing exactly one line per candidate, including when a candidate name
-# contains a space -- so it needs its own direct coverage, not just reliance
-# on the pre-existing install.sh-level tests continuing to pass.
+# agmsg_only_one_install answers "zero OTHER installs besides me (SCRIPT_DIR)"
+# rather than "exactly one candidate total" (second review round): install.sh
+# checks/refreshes the shim BEFORE it touches this install's own .agmsg
+# marker, so during a fresh install self's own marker genuinely isn't on disk
+# yet -- a plain total-candidate count would then undercount and let a
+# genuinely second install claim a legacy shim it was never told to take.
+# These probes set $0 the same way a real invocation does (bash <path>/
+# codex-shim-install.sh ...), via bash -c's argv0 trick, so "self" resolves
+# to a real, chosen path rather than whatever sourcing this from a bats
+# helper would otherwise produce.
 _run_candidate_probe() {
-  local probe_home="$1"
+  local probe_home="$1" self_dir="$2"
   run bash -c "
     HOME='$probe_home'
     source '$TYPES/codex/codex-shim-install.sh' >/dev/null 2>&1
     agmsg_install_candidates
     echo '[end]'
     if agmsg_only_one_install; then echo only_one=true; else echo only_one=false; fi
-  "
+  " "$self_dir/codex-shim-install.sh"
 }
 
-@test "agmsg_install_candidates/agmsg_only_one_install: no installs at all" {
-  export HOME="$TEST_PROJECT/home"
-  mkdir -p "$HOME/.agents/skills"
-
-  _run_candidate_probe "$HOME"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"only_one=false"* ]]
-  # nothing was listed before [end] -- an empty candidate set. awk (not a sed
-  # "1,/re/" range) because that range never closes on line 1 itself, which
-  # is exactly the zero-candidates case here ([end] IS line 1) -- it would
-  # silently keep reading past it instead.
-  [[ "$(echo "$output" | awk '/\[end\]/{exit}{print}')" == "" ]]
+_candidate_lines() {
+  echo "$output" | awk '/\[end\]/{exit}{print}'
 }
 
-@test "agmsg_install_candidates/agmsg_only_one_install: exactly one install, name containing a space" {
+@test "agmsg_only_one_install: fresh install, self's own marker not written yet, no one else present" {
+  # The exact ordering gap review found: self is a real install about to
+  # register itself, but hasn't yet -- agmsg_install_candidates must not be
+  # the only thing that decides this; self must count even while invisible
+  # on disk.
   export HOME="$TEST_PROJECT/home"
-  local dir="$HOME/.agents/skills/agmsg dev"
-  mkdir -p "$dir"
-  touch "$dir/.agmsg"
+  local self_dir="$HOME/.agents/skills/agmsg/scripts/drivers/types/codex"
+  # The skill directory tree (and this codex driver subdir within it) is
+  # laid down by install.sh well before the shim step -- only the .agmsg
+  # marker in the skill root is deferred. Create the tree, but not the
+  # marker, to match that ordering exactly.
+  mkdir -p "$self_dir"
 
-  _run_candidate_probe "$HOME"
+  _run_candidate_probe "$HOME" "$self_dir"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"only_one=true"* ]]
-  # the whole name (including the embedded space) survives as one line, not
-  # two -- agmsg_only_one_install counts lines, so a name that got word-split
-  # would silently miscount even a single real install as more than one.
-  [[ "$output" == *"$dir"* ]]
-  local candidate_lines; candidate_lines="$(echo "$output" | awk '/\[end\]/{exit}{print}' | grep -c .)"
+  printf '%s' "$output" | grep -qF "only_one=true"
+  # nothing was listed before [end] -- an empty candidate set (self isn't on
+  # disk yet either). awk (not a sed "1,/re/" range) because that range
+  # never closes on line 1 itself, which is exactly this case ([end] IS
+  # line 1) -- it would silently keep reading past it instead.
+  [ -z "$(_candidate_lines)" ]
+}
+
+@test "agmsg_only_one_install: fresh install, self's marker not written yet, but ONE other install already exists" {
+  # Same ordering gap as above, but this time there really is someone else
+  # -- pins that the allowance is specifically about self being invisible,
+  # not about being lenient whenever the total looks low.
+  export HOME="$TEST_PROJECT/home"
+  mkdir -p "$HOME/.agents/skills/agmsg"
+  touch "$HOME/.agents/skills/agmsg/.agmsg"
+  local self_dir="$HOME/.agents/skills/agmsg-dfr/scripts/drivers/types/codex"
+  mkdir -p "$self_dir"
+
+  _run_candidate_probe "$HOME" "$self_dir"
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -qF "only_one=false"
+  local candidate_lines; candidate_lines="$(_candidate_lines | grep -c .)"
   [ "$candidate_lines" -eq 1 ]
 }
 
-@test "agmsg_install_candidates/agmsg_only_one_install: two installs present" {
+@test "agmsg_only_one_install: self already registered, name containing a space, no one else present" {
+  export HOME="$TEST_PROJECT/home"
+  local self_dir="$HOME/.agents/skills/agmsg dev/scripts/drivers/types/codex"
+  mkdir -p "$self_dir"
+  touch "$HOME/.agents/skills/agmsg dev/.agmsg"
+
+  _run_candidate_probe "$HOME" "$self_dir"
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -qF "only_one=true"
+  # the whole name (including the embedded space) survives as one line, not
+  # two, and is recognized as self (not an "other") -- agmsg_only_one_install
+  # counts lines that don't match self's own skill root, so a name that got
+  # word-split, or failed to compare equal to itself, would silently miscount.
+  printf '%s' "$output" | grep -qF "$HOME/.agents/skills/agmsg dev"
+  local candidate_lines; candidate_lines="$(_candidate_lines | grep -c .)"
+  [ "$candidate_lines" -eq 1 ]
+}
+
+@test "agmsg_only_one_install: self plus one other, unmarked sibling not counted" {
   export HOME="$TEST_PROJECT/home"
   mkdir -p "$HOME/.agents/skills/one" "$HOME/.agents/skills/two"
   touch "$HOME/.agents/skills/one/.agmsg" "$HOME/.agents/skills/two/.agmsg"
   # an unmarked sibling directory must not be counted as a candidate
   mkdir -p "$HOME/.agents/skills/not-agmsg"
+  local self_dir="$HOME/.agents/skills/one/scripts/drivers/types/codex"
+  mkdir -p "$self_dir"
 
-  _run_candidate_probe "$HOME"
+  _run_candidate_probe "$HOME" "$self_dir"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"only_one=false"* ]]
-  local candidate_lines; candidate_lines="$(echo "$output" | awk '/\[end\]/{exit}{print}' | grep -c .)"
+  printf '%s' "$output" | grep -qF "only_one=false"
+  local candidate_lines; candidate_lines="$(_candidate_lines | grep -c .)"
   [ "$candidate_lines" -eq 2 ]
-  [[ "$output" != *"/not-agmsg"* ]]
+  refute grep -qF "/not-agmsg" <(printf '%s' "$output")
 }

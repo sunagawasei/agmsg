@@ -51,7 +51,8 @@ agmsg_install_candidates() {
   done
 }
 
-# True iff agmsg_install_candidates lists exactly one directory.
+# True iff no agmsg install OTHER THAN this one (SCRIPT_DIR) is among
+# agmsg_install_candidates.
 #
 # What this buys: a legacy shim (agmsg's, but predating ownership tracking,
 # #553) has no recorded owner to compare against -- but if this is
@@ -59,10 +60,51 @@ agmsg_install_candidates() {
 # written it, so claiming it needs no --cmd/--force to be safe. With two or
 # more installs present, this returns false and the caller falls back to
 # fail-closed, same as an unrecorded owner always has since #553.
+#
+# Counts "other than me" rather than a plain candidate-count check for
+# exactly one, and treats myself as a candidate whether or not my own
+# .agmsg marker is on disk yet (review finding): install.sh's fresh --cmd
+# path checks/refreshes the shim BEFORE it touches this install's own
+# marker, so during a fresh install this install's marker genuinely does
+# not exist yet. A plain candidate count would then see only the FIRST
+# install's marker, conclude "only one install exists", and let a second,
+# distinctly different install silently claim a legacy shim without --force
+# -- the very bug this file exists to prevent.
+#
+# agmsg_install_candidates lists skill-root directories (one level under
+# ~/.agents/skills), but SCRIPT_DIR is the nested .../scripts/drivers/types/
+# codex directory beneath one -- comparing SCRIPT_DIR itself against those
+# entries would never match, so strip the fixed suffix install.sh always
+# lays this script out under to recover my own skill root first.
+#
+# The implicit "I count as a candidate" exception is granted ONLY when that
+# recovered self_root actually sits directly under ~/.agents/skills -- i.e.
+# SCRIPT_DIR really has the shape install.sh lays this script out under.
+# Without that check, running this script directly against some unrelated
+# location (as several of this file's own tests do, standing in for "an
+# install" without a real ~/.agents/skills tree at all) would trivially
+# satisfy "zero others" the moment ~/.agents/skills is empty or absent --
+# self can't be trusted as a real, soon-to-register install just because it
+# also doesn't show up as an "other". In that fallback case this reverts to
+# the plain, pre-self-aware question: is there exactly one REAL marked
+# candidate on disk, full stop.
+#
+# awk (not `grep -v | wc -l`) because it always exits 0, so a count of zero
+# others never trips this script's `set -o pipefail` the way a no-match
+# grep would.
 agmsg_only_one_install() {
-  local count
-  count="$(agmsg_install_candidates | wc -l | tr -d ' ')"
-  [ "$count" -eq 1 ]
+  local skills_dir self_root
+  skills_dir="$(dirname "$AGENTS_BIN")/skills"
+  self_root="${SCRIPT_DIR%/scripts/drivers/types/codex}"
+  if [ "$SCRIPT_DIR" != "$self_root" ] && [ "$(dirname "$self_root")" = "$skills_dir" ]; then
+    local other_count
+    other_count="$(agmsg_install_candidates | awk -v self="$self_root" '$0 != self {c++} END {print c + 0}')"
+    [ "$other_count" -eq 0 ]
+  else
+    local count
+    count="$(agmsg_install_candidates | wc -l | tr -d ' ')"
+    [ "$count" -eq 1 ]
+  fi
 }
 
 # Prints the shell-QUOTED (%q) skill script dir baked into the currently-
