@@ -311,6 +311,23 @@ eperm_pid() {
     [[ "$output" == *"$TEST_PROJECT"* ]]
 }
 
+@test "delivery status: a settings file that exists but is not valid JSON is also unrecognized, not deliberate off (review)" {
+  # A third way has_ss/has_st both land on 0: not "missing" and not "genuinely
+  # empty of agmsg entries" but unreadable/malformed, which the has_ss/has_st
+  # queries collapse to the same 0 a real off produces (`2>/dev/null ||
+  # echo 0`) -- checking only file EXISTENCE, as the first #687 fix did,
+  # missed this: a corrupt settings file still read as a deliberate,
+  # confirmed off. Reproducing what a hand-edited or partially-written
+  # settings.local.json looks like.
+  mkdir -p "$TEST_PROJECT/.claude"
+  printf '{not valid json' > "$TEST_PROJECT/.claude/settings.local.json"
+  run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
+  [[ "$output" == "mode: off ("*")"$'\n'* || "$output" == "mode: off ("*")" ]] \
+    || { echo "expected the first line to read 'mode: off (...)', got: $output" >&2; return 1; }
+  [[ "$output" == *"unrecognized"* ]] &&
+    [[ "$output" == *"could not be read as valid JSON"* ]]
+}
+
 # --- rejects unknown mode ---
 
 @test "delivery set: rejects unknown mode" {
