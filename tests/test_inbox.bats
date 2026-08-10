@@ -122,8 +122,27 @@ SHIM
   # still have been emitted, or it is lost forever (never re-offered).
   [[ "$output" == *"early"* ]]
   [[ "$output" != *"in-zteam"* ]]
-  # The failure is not swallowed: the loop's status is re-raised on exit.
-  [ "$status" -eq 5 ]
+  # And emitting is not enough on its own: the documented hook contract is
+  # that stdout is read as control JSON only on exit 0. (Measured separately,
+  # not by this test: Claude Code 2.1.226 via one-shot `claude -p` with a
+  # synthetic probe hook processed the JSON on exit 0, 1, 2, and 3 alike --
+  # https://github.com/fujibee/agmsg/issues/658. This assertion holds
+  # regardless of which behavior a given runtime actually implements, which
+  # is the point: it pins the script's OWN exit code, not a claim about what
+  # any runtime does with it.) The previous version of this test asserted
+  # status 5 here, which reads as "the failure is not swallowed" but leaves
+  # the delivering path dependent on a non-zero exit for something it cannot
+  # both carry a real payload and safely claim failure with -- see the
+  # `check-inbox.sh` comment at this same branch for why exit 0 is correct
+  # either way. Asserting the emission while asserting a non-zero status made
+  # the defect look like the fix.
+  [ "$status" -eq 0 ]
+  # The failure is not swallowed either — it moved into the payload, which is
+  # the channel that survives. Named team and consequence, so a partial poll
+  # cannot be read as a complete one.
+  [[ "$output" == *"stopped early"* ]]
+  [[ "$output" == *"zteam"* ]]
+  [[ "$output" == *"stay unread"* ]]
   # testteam delivered-and-read; zteam untouched, so its message re-surfaces.
   [ "$(unread_count alice)" -eq 0 ]
   [ "$(sqlite3 "$DBPATH" "SELECT COUNT(*) FROM messages WHERE team='zteam' AND to_agent='alice' AND read_at IS NULL;" | tr -d '\r')" -eq 1 ]

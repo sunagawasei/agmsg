@@ -175,6 +175,7 @@ OUTPUT=""
 # already accumulated still reaches an emit point, teams after the failing one
 # stay untouched (unread), and the failure status is re-raised on exit.
 CLAIM_RC=0
+CLAIM_FAILED_TEAM=""
 IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
 for team in "${TEAM_LIST[@]}"; do
   storage_store_exists "$team" || continue
@@ -182,80 +183,21 @@ for team in "${TEAM_LIST[@]}"; do
   # ONE guarded boundary for everything that reads or formats — and it must NOT
   # be invoked from a condition context.
   #
-  # `RESULT=$(...) || _rc=$?` looks equivalent and is not. Putting the
-  # substitution on the left of `||` makes the whole thing a tested command, and
-  # errexit is then suppressed for what runs inside it — including the `set -e`
-  # the subshell sets for itself. Measured: storage_init returned 13,
-  # storage_list_unread carried on regardless, the assignment landed empty and
-  # SUCCEEDED, and the `[ -n "" ] || exit 98` two lines later became the
-  # subshell's status. A backend failure arrived at the caller as "this team has
-  # no unread messages", and the poll reported a clean turn.
-  #
-  # A single non-conditional assignment with errexit lifted around it does not
-  # have that property: the subshell's own `set -e` aborts at the first failure
-  # and its status is what `$?` holds. The lift is two lines wide and restored
-  # immediately.
-  #
-  # This is also why the failing operations are not listed with `|| return`
-  # inside: an enumeration is short by one the next time an operation is added,
-  # which is the defect this file exists to fix.
-  #
-  # The first attempt listed the substitutions and guarded each -- and missed
-  # one (`_arr`), which is the whole failure mode this file is about: an
-  # enumeration is short by one and the one it is short by is the defect. A
-  # subshell with its own errexit does not need the list. Anything in here that
-  # fails ends the subshell, and its status is read from `$?` below instead of
-  # ending the script.
-  #
-  # 97 and 98 are the two ordinary reasons to skip a team, carried as statuses
-  # because a subshell cannot `continue` its caller's loop.
-  set +e
-  RESULT=$(
-    set -euo pipefail
-    # Honor actas exclusivity locks. If (team, AGENT) is held by another live
-    # session, that session owns that role's inbox — don't deliver here.
-    # Mirrors watch.sh's per-pair filtering (#62).
-    #
-    # AGENT comes from whoami.sh: the first registered agent for
-    # (project, type), NOT the session's in-memory actas role — the Codex
-    # caveat documented in README.
-    state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}")
-    # The leading `(` is load-bearing, not style. bash 3.2 -- which is /bin/bash
-    # on macOS, and what the macOS CI jobs run -- scans `$( ... )` for its
-    # closing paren without understanding `case`, so an unbalanced pattern paren
-    # ends the substitution early and the `;;` that follows is a syntax error.
-    # The whole file failed to parse; every check-inbox test on macOS died with
-    # "syntax error near unexpected token `;;'". Balancing the paren fixes it and
-    # is identical under bash 5.
-    case "$state" in (other:*) exit 97 ;; esac
-
-    # Unread via the storage facade (§2.1 storage_list_unread = events ∪ legacy),
-    # JSONL parsed in one pass with sqlite's JSON funcs (no jq; cf. lib/hooks-json.sh).
-    # id is kept so the mark step below targets exactly the rows shown.
-    UNREAD_JSONL=$(storage_list_unread "$team" "$AGENT")
-    [ -n "$UNREAD_JSONL" ] || exit 98
-    _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
-    agmsg_sqlite ':memory:' "
-      SELECT json_extract(value,'\$.from') || char(31) ||
-             replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
-             json_extract(value,'\$.at') || char(31) ||
-             json_extract(value,'\$.id')
-      FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
-    "
-  )
-  _rc=$?
-  set -e
-  case "$_rc" in
-    0)     ;;
-    97|98) continue ;;
-    *)     LOOP_RC=$_rc; LOOP_FAILED_TEAM="$team"; break ;;
+  # Note: AGENT comes from whoami.sh, which returns the first registered
+  # agent for (project, type). It is NOT the session's in-memory actas
+  # role. That asymmetry is the Codex caveat documented in README — if a
+  # Codex session actas'd into <name>, check-inbox is still polling
+  # whatever whoami chose first, not <name>.
+  state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}") || { CLAIM_RC=$?; CLAIM_FAILED_TEAM="$team"; break; }
+  case "$state" in
+    other:*) continue ;;
   esac
 
   RESULT=$(agmsg_sqlite "$DB" "
     SELECT id || char(31) || from_agent || char(31) || replace(replace(body, char(10), '\n'), char(9), '\t') || char(31) || created_at
     FROM messages WHERE team='$team_sql' AND to_agent='$AGENT_SQL' AND read_at IS NULL
     ORDER BY created_at ASC;
-  ") || { CLAIM_RC=$?; break; }
+  ") || { CLAIM_RC=$?; CLAIM_FAILED_TEAM="$team"; break; }
   if [ -n "$RESULT" ]; then
     COUNT=$(echo "$RESULT" | wc -l | tr -d ' ')
     OUTPUT+="$COUNT new message(s) in $team:"$'\n'
@@ -287,22 +229,52 @@ for team in "${TEAM_LIST[@]}"; do
   fi
 done
 
-# No new messages. Both emit points re-raise a loop failure captured above:
-# exiting 0 here would convert "a team's query failed" into "nothing to
-# deliver", which is the silent half of #637.
+# The two emit points are NOT the same case, and treating them alike is what
+# lost messages.
+#
+# Nothing was accumulated: there is no delivery to protect, so the exit status
+# is free to carry the failure — and it must, because "no new messages" would
+# claim something this run never established. That is the half of #637 the
+# original comment here was right about, and it is unchanged.
+#
+# The status line is emitted only when the poll actually completed. Printing
+# "no new messages" and then exiting non-zero states something untrue on a
+# channel that is about to be discarded anyway.
 if [ -z "$OUTPUT" ]; then
-  # Both exits need the guard, not just the one that carries messages. A loop
-  # that stopped on a failure before accumulating anything has not established
-  # that there is nothing to deliver -- it established that it could not look.
-  # Saying "no new messages" and exiting 0 there is the same lie in a quieter
-  # voice, and the hook runtime treats it as a clean turn.
-  [ "$LOOP_RC" -eq 0 ] || exit "$LOOP_RC"
+  [ "$CLAIM_RC" -eq 0 ] || exit "$CLAIM_RC"
   emit_status_json "agmsg: no new messages"
-  exit "$CLAIM_RC"
+  exit 0
 fi
 
-# New messages found
+# New messages found.
+#
+# This is the delivering path, and the rows above were marked read INSIDE the
+# loop before we got here. The documented hook contract is that stdout is read
+# as control JSON only on exit 0. Measured (Claude Code 2.1.226, one-shot
+# `claude -p`, a synthetic probe hook -- not this script, not an interactive
+# session): the stdout control JSON was processed on exit 0, 1, 2, and 3 alike.
+# So this codebase currently depends on an area where the documented contract
+# and the observed implementation disagree -- see
+# https://github.com/fujibee/agmsg/issues/658 for the measurement.
+#
+# This fix is correct either way, which is why it doesn't bet on which
+# behavior is real: if a runtime DOES discard stdout on non-zero exit (as
+# documented), leaving the old `exit "$CLAIM_RC"` here would throw away the
+# payload that already cost these rows their unread state -- consumed and
+# never shown, worse than the failure this status was meant to protect
+# against. If a runtime does NOT discard it (as measured here), the old
+# non-zero exit was not needed to preserve the delivery or report the
+# partial failure, because the payload already carries both.
+# Exiting 0 unconditionally on this path is safe under both, so delivery and
+# the report are separated: the messages go out with exit 0, and the partial
+# failure is stated inside the payload the operator actually reads. Nothing
+# upstream mistakes a partial poll for a complete one, because the text says
+# which team stopped it and that the rest are still unread.
 if [ -n "$OUTPUT" ]; then
+  if [ "$CLAIM_RC" -ne 0 ]; then
+    OUTPUT+="agmsg: this poll stopped early — team '$CLAIM_FAILED_TEAM' could not be read (status $CLAIM_RC)."$'\n'
+    OUTPUT+="agmsg: teams after it were not checked; their messages stay unread and will be offered again."$'\n'
+  fi
   # Escape for JSON: backslash, double-quote, newlines, tabs (macOS/Linux compatible)
   ESCAPED=$(printf '%s' "$OUTPUT" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | awk '{if(NR>1) printf "\\n"; printf "%s",$0}')
   cat <<ENDJSON
@@ -311,5 +283,5 @@ if [ -n "$OUTPUT" ]; then
   "reason": "$ESCAPED"
 }
 ENDJSON
-  exit "$CLAIM_RC"
+  exit 0
 fi
