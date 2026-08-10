@@ -426,11 +426,13 @@ CODEX_SHIM="$SKILL_DIR/scripts/drivers/types/codex/codex-shim-install.sh"
 CODEX_SHIM_STATUS=""
 [ -x "$CODEX_SHIM" ] && CODEX_SHIM_STATUS="$(AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" status 2>/dev/null || true)"
 if printf '%s' "$CODEX_SHIM_STATUS" | grep -q '^installed:'; then
-  if AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" install >/dev/null 2>&1; then
+  # Stdout suppressed (mirrors the --update block's success case above);
+  # stderr is NOT, since codex-shim-install.sh's own refusal already names the
+  # current owner and the exact consequence of forcing -- repeating a
+  # shorter, separate version of that here would risk saying something
+  # different from what actually happens.
+  if AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" install >/dev/null; then
     echo "  + refreshed Codex monitor shim (~/.agents/bin/codex)"
-  else
-    echo "  ! Codex monitor shim (~/.agents/bin/codex) is owned by a different install; left untouched."
-    echo "    Run 'AGMSG_CODEX_SHIM_FORCE=1 $CODEX_SHIM install' to claim it for this install instead."
   fi
 fi
 install_windows_helpers

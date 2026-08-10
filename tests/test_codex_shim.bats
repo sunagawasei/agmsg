@@ -341,3 +341,39 @@ _second_codex_dir() {
   run bash -c "set -o pipefail; out=\"\$(bash '$TYPES/codex/codex-shim-install.sh' status)\"; printf '%s' \"\$out\" | grep -q '^installed:'"
   [ "$status" -eq 0 ]  # the capture-first form install.sh actually uses does not
 }
+
+@test "codex shim status/install: a tampered shim cannot execute code via ownership parsing (#553 security regression guard)" {
+  # is_agmsg_shim's authenticity check is a grep for one marker string -- it
+  # says nothing about the rest of a LOCAL, single-user, world-writable-by-
+  # that-user path having been hand-edited afterward. An earlier version of
+  # shim_owner_script_dir read the ownership line via `eval`, which turned
+  # that gap into arbitrary code execution reachable from a read-only `status`
+  # call. Plants a shim carrying the real marker (so is_agmsg_shim matches)
+  # plus a line shaped exactly like the one that used to get eval'd, except
+  # its "value" is a command substitution that -- if ever executed -- writes a
+  # sentinel file. Both status and a plain (non-force) install must leave
+  # that sentinel absent.
+  export HOME="$TEST_PROJECT/home"
+  mkdir -p "$HOME/.agents/bin"
+  local sentinel="$TEST_PROJECT/pwned"
+  cat > "$HOME/.agents/bin/codex" <<EOF
+#!/usr/bin/env bash
+# Optional Codex entrypoint shim for agmsg monitor mode.
+export AGMSG_CODEX_SHIM_SCRIPT_DIR=\$(touch $sentinel)
+exec true
+EOF
+  chmod +x "$HOME/.agents/bin/codex"
+
+  run bash "$TYPES/codex/codex-shim-install.sh" status
+  [ "$status" -eq 0 ]
+  [ ! -e "$sentinel" ]
+
+  # No `# agmsg-shim-owner:` line at all (this crafted file predates it, same
+  # as any real shim written before this PR) reads as owner="" -- unowned, not
+  # foreign -- so install proceeds and overwrites it, same as it always could.
+  # The only property under test here is that doing so never executes
+  # anything the tampered content contained.
+  run bash "$TYPES/codex/codex-shim-install.sh" install
+  [ "$status" -eq 0 ]
+  [ ! -e "$sentinel" ]
+}
