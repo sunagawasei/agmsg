@@ -28,6 +28,31 @@ shell_quote() {
   printf '%q' "$1"
 }
 
+# True iff exactly one agmsg install (a `.agmsg`-marked directory) exists
+# anywhere under ~/.agents/skills. Derives the candidate set directly from
+# this machine's actual state -- not from whether #599's fail-closed
+# multi-install handling (PR #659) happens to be merged on whatever branch
+# calls this, which it may not be (review finding: measure the base, don't
+# assume another PR landed).
+#
+# What this buys: a legacy shim (agmsg's, but predating ownership tracking,
+# #553) has no recorded owner to compare against -- but if this is
+# PROVABLY the only agmsg install on the machine, nothing else could have
+# written it, so claiming it needs no --cmd/--force to be safe. With two or
+# more installs present, this returns false and the caller falls back to
+# fail-closed, same as an unrecorded owner always has since #553.
+agmsg_only_one_install() {
+  local skills_dir count=0 d
+  skills_dir="$(dirname "$AGENTS_BIN")/skills"
+  [ -d "$skills_dir" ] || return 1
+  for d in "$skills_dir"/*/; do
+    [ -f "${d}.agmsg" ] || continue
+    count=$((count + 1))
+    [ "$count" -gt 1 ] && return 1
+  done
+  [ "$count" -eq 1 ]
+}
+
 # Prints the shell-QUOTED (%q) skill script dir baked into the currently-
 # installed shim -- empty if there is none, the shim is not an agmsg shim, or
 # it predates ownership tracking (#553; see below). This is the install that
@@ -93,7 +118,18 @@ EOF
     # recording THIS install's own SCRIPT_DIR skips the guard.
     self_owner="$(shell_quote "$SCRIPT_DIR")"
     owner="$(shim_owner_script_dir)"
-    if [ -e "$TARGET" ] && [ "$owner" != "$self_owner" ] && [ "${AGMSG_CODEX_SHIM_FORCE:-}" != "1" ]; then
+    # An owner-unknown (legacy) shim is claimable WITHOUT --force when this is
+    # provably the only agmsg install on the machine: nothing else could have
+    # written it, so there is no one to take it from. This is what keeps the
+    # ordinary, single-install upgrade path working -- most real machines,
+    # migrating from a shim written before ownership tracking existed --
+    # without reopening the multi-install theft this whole guard exists to
+    # close (review finding: the two fixes above, each correct alone, combined
+    # to block the routine case they were never meant to touch).
+    legacy_but_sole_install=false
+    [ -z "$owner" ] && agmsg_only_one_install && legacy_but_sole_install=true
+    if [ -e "$TARGET" ] && [ "$owner" != "$self_owner" ] && [ "${AGMSG_CODEX_SHIM_FORCE:-}" != "1" ] \
+        && [ "$legacy_but_sole_install" != true ]; then
       if [ -n "$owner" ]; then
         echo "codex-shim-install: $TARGET is owned by a different install:" >&2
         echo "  $owner" >&2
