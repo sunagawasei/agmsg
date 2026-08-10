@@ -351,138 +351,38 @@ cleanup() {
       [ "$_owner" = "$SESSION_ID" ] && rm -f "$_rf" 2>/dev/null || true
     done <<< "$READY_FILES"
   fi
+  [ -n "${INSTALL_STAMP:-}" ] && rm -f "$INSTALL_STAMP" 2>/dev/null || true
 }
 # Install these traps as early as re-entry permits because owner publication
 # can precede the target becoming signal-ready.
 trap cleanup EXIT
 trap 'exit 0' INT TERM HUP
 
-# Resolve poll interval. Env var wins over config, default 5s.
-INTERVAL="${AGMSG_WATCH_INTERVAL:-}"
-if [ -z "$INTERVAL" ]; then
-  INTERVAL="$("$SCRIPT_DIR/config.sh" get delivery.monitor.poll_interval 5 2>/dev/null || echo 5)"
-fi
-case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
+# A resident process keeps executing the code it was started with. An update
+# rewrites the scripts in place (same inode -- confirmed with lsof, #684), so
+# after one this watcher is running code from before it while everything it
+# talks to has moved on. Measured on the reported pair: a 1.1.13 watcher, after
+# `npx agmsg@1.2.0-rc.1 install` landed under it, stayed ALIVE and stopped
+# delivering -- the message was never printed and never marked read, and
+# nothing was written to stderr. Liveness is exactly what made it invisible.
+#
+# The guard is a timestamp rather than a version comparison, so it does not
+# only catch the table that moved this time. ANY file under scripts/ being
+# newer than this watcher's start means the code it is running is no longer the
+# code on disk, whatever changed -- which is the class, not the instance.
+#
+# `run/` is deliberately outside the watched tree: pidfiles and readiness
+# sentinels are written by watchers themselves and would trip it immediately.
+INSTALL_STAMP="$RUN_DIR/.watch-start.$SESSION_ID"
+: > "$INSTALL_STAMP" 2>/dev/null || true
 
-# The watchdog is intentionally configured separately from the inbox poll:
-# it is a periodic health check for this watcher team's own worker. A malformed
-# or non-positive value falls back to a safe default so a bad config cannot
-# turn the normal poll loop into a busy loop.
-WATCHDOG_INTERVAL="$("$SCRIPT_DIR/config.sh" get watchdog.interval_s 60 2>/dev/null || echo 60)"
-case "$WATCHDOG_INTERVAL" in ''|*[!0-9]*) WATCHDOG_INTERVAL=60 ;; esac
-[ "$WATCHDOG_INTERVAL" -gt 0 ] || WATCHDOG_INTERVAL=60
-WATCHDOG_LAST_RUN=0
-WATCHDOG_DATE_ERROR_LAUNCHED=0
-WATCHDOG_TOMBSTONE="$RUN_DIR/watchdog.${TEAM_PIN}.tombstone"
-WATCHDOG_STAMP_MAX=256
-
-# A tombstone suppresses recovery only while it is a readable, single-line
-# owner stamp written recently by SessionEnd. Any ambiguity or filesystem
-# error fails open so a stale marker cannot disable recovery indefinitely.
-watchdog_tombstone_fresh() {
-  local now="$1" stamp extra mtime age mtime_status read_status extra_status valid=1
-  # Check the object before opening it. In particular, a FIFO must never be
-  # opened by the polling hook: no writer is expected and the read would block.
-  [ -f "$WATCHDOG_TOMBSTONE" ] || return 1
-  [ ! -L "$WATCHDOG_TOMBSTONE" ] || return 1
-  [ -O "$WATCHDOG_TOMBSTONE" ] || return 1
-  [ -r "$WATCHDOG_TOMBSTONE" ] || return 1
-
-  # INSTANCE_ID values are short path-safe strings. Read at most one extra byte
-  # beyond the documented maximum; never use wc/cat on an attacker-sized file.
-  # Bash read discards NUL bytes, so inspect the same bounded prefix separately
-  # before reading it into a shell variable.
-  dd if="$WATCHDOG_TOMBSTONE" bs=1 count=$((WATCHDOG_STAMP_MAX + 1)) 2>/dev/null \
-    | od -An -tx1 2>/dev/null \
-    | grep -Eq '(^|[[:space:]])00([[:space:]]|$)'
-  local -a probe_status=( "${PIPESTATUS[@]}" )
-  [ "${probe_status[0]:-1}" -eq 0 ] || return 1
-  [ "${probe_status[1]:-1}" -eq 0 ] || return 1
-  [ "${probe_status[2]:-1}" -eq 1 ] || return 1
-  exec 9<"$WATCHDOG_TOMBSTONE" 2>/dev/null || return 1
-  IFS= read -r -n $((WATCHDOG_STAMP_MAX + 1)) stamp <&9
-  read_status=$?
-  if [ "${#stamp}" -eq 0 ] || [ "${#stamp}" -gt "$WATCHDOG_STAMP_MAX" ]; then
-    valid=0
-  fi
-  # read -n consumes the newline delimiter. Any byte left after the first line
-  # therefore proves multiline or oversized content and fails closed.
-  if [ "$valid" -eq 1 ]; then
-    IFS= read -r -n 1 extra <&9
-    extra_status=$?
-    [ "$extra_status" -eq 1 ] || valid=0
-  fi
-  exec 9<&-
-  [ "$valid" -eq 1 ] || return 1
-  case "$read_status" in
-    0) ;;
-    1) [ -n "$stamp" ] || return 1 ;;
-    *) return 1 ;;
-  esac
-  case "$stamp" in *[![:graph:]]*) return 1 ;; esac
-  mtime_status=0
-  mtime="$(compat_file_mtime "$WATCHDOG_TOMBSTONE" 2>/dev/null)" || mtime_status=$?
-  [ "$mtime_status" -eq 0 ] || return 1
-  case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$now" -ge "$mtime" ] || return 1
-  age=$((now - mtime))
-  [ "$age" -le 600 ] || return 1
-  return 0
+# True when anything under scripts/ was written after this watcher started.
+# `-print -quit` stops at the first hit, so the common case is one stat-walk
+# that exits early rather than a full tree scan every cycle.
+_install_changed() {
+  [ -f "$INSTALL_STAMP" ] || return 1
+  [ -n "$(find "$SCRIPT_DIR" -newer "$INSTALL_STAMP" -print -quit 2>/dev/null)" ]
 }
-
-WATCHDOG_OWNER_START=""
-if agmsg_instance_is_composite "$SESSION_ID"; then
-  WATCHDOG_OWNER_START="$(agmsg_pid_start_token \
-    "${SESSION_ID##*.}" 2>/dev/null || true)"
-fi
-
-# Bash has no portable monotonic-clock builtin, so the watchdog cadence uses
-# wall-clock seconds. If the clock moves backward, resetting this process-local
-# baseline prevents a negative delta from wedging future watchdog runs.
-maybe_run_watchdog() {
-  [ -n "$TEAM_PIN" ] || return 0
-
-  local now date_status
-  date_status=0
-  now="$(date +%s 2>/dev/null)" || date_status=$?
-  if [ "$date_status" -ne 0 ]; then
-    if [ "$WATCHDOG_DATE_ERROR_LAUNCHED" -eq 0 ]; then
-      AGMSG_WATCHDOG_OWNER_INSTANCE="$SESSION_ID" \
-        AGMSG_WATCHDOG_OWNER_START="$WATCHDOG_OWNER_START" \
-        "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
-      WATCHDOG_DATE_ERROR_LAUNCHED=1
-    fi
-    return 0
-  fi
-  case "$now" in
-    ''|*[!0-9]*)
-      if [ "$WATCHDOG_DATE_ERROR_LAUNCHED" -eq 0 ]; then
-        AGMSG_WATCHDOG_OWNER_INSTANCE="$SESSION_ID" \
-          AGMSG_WATCHDOG_OWNER_START="$WATCHDOG_OWNER_START" \
-          "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
-        WATCHDOG_DATE_ERROR_LAUNCHED=1
-      fi
-      return 0
-      ;;
-  esac
-  WATCHDOG_DATE_ERROR_LAUNCHED=0
-
-  if [ "$now" -lt "$WATCHDOG_LAST_RUN" ]; then
-    WATCHDOG_LAST_RUN="$now"
-    return 0
-  fi
-  if [ $(( now - WATCHDOG_LAST_RUN )) -lt "$WATCHDOG_INTERVAL" ]; then
-    return 0
-  fi
-
-  WATCHDOG_LAST_RUN="$now"
-  watchdog_tombstone_fresh "$now" && return 0
-  AGMSG_WATCHDOG_OWNER_INSTANCE="$SESSION_ID" \
-    AGMSG_WATCHDOG_OWNER_START="$WATCHDOG_OWNER_START" \
-    "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
-}
-
-mkdir -p "$RUN_DIR" 2>/dev/null || true
 
 # Resolve subscription set.
 PAIRS="$("$SCRIPT_DIR/identities.sh" "$PROJECT_PATH" "$AGENT_TYPE")"
@@ -707,6 +607,15 @@ _held_elsewhere_without() {
 }
 
 while true; do
+  # The installation changed under us (#684). Say it on STDOUT, not stderr:
+  # stdout is the delivery channel the session is reading, and this watcher's
+  # stderr goes to /dev/null in every launcher we ship, which is why the
+  # original failure was silent for hours. Then exit, so "the monitor stopped"
+  # is what the session sees instead of a live process delivering nothing.
+  if _install_changed; then
+    printf 'agmsg watch: the agmsg installation was updated while this watcher was running, so it is still executing the code from before the update. Exiting rather than appearing to work. Restart this session (or run /agmsg actas <name>) to resume delivery.\n'
+    exit 0
+  fi
   # Liveness guard (#67): exit promptly once the originating agent session is
   # gone. A plain pipe gives no portable way to notice a *downstream* consumer
   # that closed silently — printf '' raises no EPIPE, and macOS buffers a final
