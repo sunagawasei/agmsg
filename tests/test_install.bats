@@ -660,6 +660,54 @@ PY
   [ ! -e "$FAKE_HOME/.agents/bin/codex" ]
 }
 
+# #553: a second install under a different --cmd name used to silently
+# rewrite ~/.agents/bin/codex to point at itself, so every Codex launch on the
+# machine (through the shim) started dispatching into the second install's
+# drivers/storage instead of the production one -- with no warning, printed
+# as if it were a routine "refreshed" no-op.
+
+@test "install: a second, differently-named install does NOT clobber the first's Codex shim (#553)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
+  local shim="$FAKE_HOME/.agents/bin/codex"
+  [ -f "$shim" ]
+  # Positive control: pin exactly which install owns it before touching
+  # anything else, byte for byte -- if this does not already say "agmsg",
+  # the rest of the test proves nothing.
+  local before; before="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
+  [[ "$before" == *"/skills/agmsg/"* ]]
+
+  local sk2="$FAKE_HOME/.agents/skills/agmsg-dfr"
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --agent-type codex
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"owned by a different install"* ]]
+
+  # The shim's bytes must be completely unchanged, not just "still valid" --
+  # comparing the whole recorded line rather than only the owning dir catches
+  # a partial/malformed rewrite too.
+  local after; after="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
+  [ "$before" = "$after" ]
+  [ -d "$sk2" ]  # the second install itself still succeeded
+}
+
+@test "install: --update --cmd can reclaim a Codex shim owned by a different install (#553)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
+  local shim="$FAKE_HOME/.agents/bin/codex"
+
+  local sk2="$FAKE_HOME/.agents/skills/agmsg-dfr"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --agent-type codex >/dev/null
+  grep -q "/skills/agmsg/" "$shim"  # still the first install's, per the test above
+
+  # --update --cmd names a specific, already-registered install explicitly --
+  # that explicit targeting is the documented recovery path, so it is allowed
+  # to reclaim the shim rather than being blocked like the fresh install above.
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"refreshed Codex monitor shim"* ]]
+  grep -q "/skills/agmsg-dfr/" "$shim"
+}
+
 # --- grok-build skill (~/.grok/skills/<name>/SKILL.md) ---
 
 @test "install: drops a Grok Build SKILL.md when ~/.grok exists" {

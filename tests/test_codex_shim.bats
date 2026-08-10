@@ -248,3 +248,96 @@ teardown() {
   [[ "$output" =~ "cannot find delivery.sh" ]]
   grep -q "real-codex" "$CALL_LOG"
 }
+
+# --- shim ownership (#553): install.sh's own driver is tested separately in
+# test_install.bats; these exercise codex-shim-install.sh's own refuse/force
+# logic directly, against two independent copies of the codex driver dir
+# standing in for two different installs.
+
+_second_codex_dir() {
+  local dir="$TEST_PROJECT/second-install/codex"
+  mkdir -p "$dir"
+  cp -R "$TYPES/codex/." "$dir/"
+  printf '%s' "$dir"
+}
+
+@test "codex shim install: refuses to repoint a shim owned by a different install" {
+  export HOME="$TEST_PROJECT/home"
+  mkdir -p "$HOME"
+  bash "$TYPES/codex/codex-shim-install.sh" install >/dev/null
+  local shim="$HOME/.agents/bin/codex"
+  local before; before="$(cat "$shim")"
+
+  local second_dir; second_dir="$(_second_codex_dir)"
+  run bash "$second_dir/codex-shim-install.sh" install
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"owned by a different install"* ]]
+  [[ "$output" == *"$TYPES/codex"* ]]  # names the actual owner, not just "someone else"
+  [[ "$output" == *"AGMSG_CODEX_SHIM_FORCE=1"* ]]
+
+  [ "$(cat "$shim")" = "$before" ]  # byte-for-byte unchanged
+}
+
+@test "codex shim install: AGMSG_CODEX_SHIM_FORCE=1 reclaims a shim owned by a different install" {
+  export HOME="$TEST_PROJECT/home"
+  mkdir -p "$HOME"
+  bash "$TYPES/codex/codex-shim-install.sh" install >/dev/null
+
+  local second_dir; second_dir="$(_second_codex_dir)"
+  run bash -c "AGMSG_CODEX_SHIM_FORCE=1 bash '$second_dir/codex-shim-install.sh' install"
+  [ "$status" -eq 0 ]
+  grep -q "AGMSG_CODEX_SHIM_SCRIPT_DIR=$second_dir" "$HOME/.agents/bin/codex"
+}
+
+@test "codex shim status: names which install currently owns the shim" {
+  export HOME="$TEST_PROJECT/home"
+  mkdir -p "$HOME"
+  bash "$TYPES/codex/codex-shim-install.sh" install >/dev/null
+
+  run bash "$TYPES/codex/codex-shim-install.sh" status
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"owner: this install ($TYPES/codex)"* ]]
+
+  local second_dir; second_dir="$(_second_codex_dir)"
+  run bash "$second_dir/codex-shim-install.sh" status
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"owner: a different install ($TYPES/codex)"* ]]
+}
+
+@test "codex shim install: a plain, non-agmsg codex binary is still refused regardless of ownership wording (#553 regression guard)" {
+  # The pre-existing is_agmsg_shim guard, unrelated to ownership -- a real
+  # user codex binary at the target path must never be touched or described
+  # as "owned by a different install" (that phrasing is reserved for a shim
+  # this tool itself generated).
+  export HOME="$TEST_PROJECT/home"
+  mkdir -p "$HOME/.agents/bin"
+  printf '#!/usr/bin/env bash\necho real\n' > "$HOME/.agents/bin/codex"
+  chmod +x "$HOME/.agents/bin/codex"
+  local before; before="$(cat "$HOME/.agents/bin/codex")"
+
+  run bash "$TYPES/codex/codex-shim-install.sh" install
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"refusing to overwrite existing"* ]]
+  [[ "$output" != *"owned by a different install"* ]]
+  [ "$(cat "$HOME/.agents/bin/codex")" = "$before" ]
+}
+
+@test "codex shim status: a multi-line status output does not spuriously fail a piped grep -q check (#553 regression guard)" {
+  # Measured, not theoretical: adding the second "owner:" line to status's
+  # output broke install.sh's own \`status ... | grep -q '^installed:'\` check
+  # under this script's \`pipefail\` -- grep exits the instant it matches the
+  # first line, and status's still-pending write of the second line then hits
+  # SIGPIPE, which pipefail reports as the pipeline failing even though grep
+  # DID match. Pins the exact shape install.sh now avoids by capturing status
+  # into a variable first; this test guards the underlying hazard directly so
+  # a future caller that pipes status straight into grep -q reintroduces it.
+  export HOME="$TEST_PROJECT/home"
+  mkdir -p "$HOME"
+  bash "$TYPES/codex/codex-shim-install.sh" install >/dev/null
+
+  run bash -c "set -o pipefail; bash '$TYPES/codex/codex-shim-install.sh' status | grep -q '^installed:'"
+  [ "$status" -ne 0 ]  # documents the hazard: this form is expected to fail today
+
+  run bash -c "set -o pipefail; out=\"\$(bash '$TYPES/codex/codex-shim-install.sh' status)\"; printf '%s' \"\$out\" | grep -q '^installed:'"
+  [ "$status" -eq 0 ]  # the capture-first form install.sh actually uses does not
+}

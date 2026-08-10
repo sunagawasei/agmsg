@@ -24,6 +24,24 @@ is_agmsg_shim() {
   [ -f "$TARGET" ] && grep -q "Optional Codex entrypoint shim for agmsg monitor mode" "$TARGET" 2>/dev/null
 }
 
+# Prints the skill script dir baked into the currently-installed shim (empty
+# if there is none, or it is not an agmsg shim). This is the install that
+# "owns" the shim: the one whose codex-shim.sh it execs into and whose
+# storage/drivers every Codex launch through it will resolve.
+#
+# Extracts and evals only the single `export ...=` line (never sources the
+# whole file — the file's last line execs into codex-shim.sh, and sourcing it
+# would actually launch that, not just read a variable back out). shell_quote
+# writes the value with bash's own %q, which eval reverses correctly; is_agmsg_shim
+# having already matched means this is a file agmsg generated, not arbitrary input.
+shim_owner_script_dir() {
+  is_agmsg_shim || return 0
+  local line
+  line="$(grep '^export AGMSG_CODEX_SHIM_SCRIPT_DIR=' "$TARGET" 2>/dev/null | head -1)"
+  [ -n "$line" ] || return 0
+  ( eval "$line" 2>/dev/null; printf '%s' "${AGMSG_CODEX_SHIM_SCRIPT_DIR:-}" )
+}
+
 shell_quote() {
   printf '%q' "$1"
 }
@@ -46,6 +64,21 @@ EOF
     if [ -e "$TARGET" ] && ! is_agmsg_shim; then
       echo "codex-shim-install: refusing to overwrite existing $TARGET" >&2
       echo "codex-shim-install: move it aside or remove it first" >&2
+      exit 1
+    fi
+    # The shim path is one file shared by every install on the machine (#553):
+    # whichever install's `install` ran last wins, and every Codex launch
+    # through the shim then dispatches into ITS drivers/storage — silently,
+    # since nothing here previously recorded whose the existing one was. Refuse
+    # to hand it to a different skill dir without an explicit ask, naming which
+    # install currently owns it so the caller can decide (re-run with
+    # AGMSG_CODEX_SHIM_FORCE=1 to reclaim it, or leave it alone).
+    owner="$(shim_owner_script_dir)"
+    if [ -n "$owner" ] && [ "$owner" != "$SCRIPT_DIR" ] && [ "${AGMSG_CODEX_SHIM_FORCE:-}" != "1" ]; then
+      echo "codex-shim-install: $TARGET is owned by a different install:" >&2
+      echo "  $owner" >&2
+      echo "codex-shim-install: refusing to repoint it at $SCRIPT_DIR" >&2
+      echo "codex-shim-install: re-run with AGMSG_CODEX_SHIM_FORCE=1 to claim it for this install instead" >&2
       exit 1
     fi
     {
@@ -85,6 +118,19 @@ EOF
   status)
     if is_agmsg_shim; then
       echo "installed: $TARGET"
+      # A second, separate line, not appended to the first. The "installed:"
+      # prefix a caller matches on is unchanged either way, but a caller
+      # piping this straight into `grep -q` (rather than capturing it first)
+      # can still break under `pipefail` once there is a second line at all —
+      # see install.sh's own callers for why, and capture before grep there.
+      owner="$(shim_owner_script_dir)"
+      if [ -n "$owner" ]; then
+        if [ "$owner" = "$SCRIPT_DIR" ]; then
+          echo "owner: this install ($owner)"
+        else
+          echo "owner: a different install ($owner)"
+        fi
+      fi
     else
       echo "not installed: $TARGET"
     fi

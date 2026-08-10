@@ -325,9 +325,29 @@ if [ "$UPDATE_ONLY" = true ]; then
   # types/ -> scripts/drivers/types/ move. Re-running install regenerates it with
   # the new path; install is idempotent and overwrites only an agmsg shim (a
   # user's own codex binary fails is_agmsg_shim and is left untouched).
+  #
+  # Forced: --update names (explicitly via --cmd, or by resolving the single
+  # existing install) exactly the skill dir the caller means to update, which
+  # is the documented recovery path for #553 (a different install's --cmd
+  # having clobbered the shim). That explicit targeting is what makes
+  # reclaiming the shim here safe — a FRESH install below gets no such signal
+  # and does not force.
+  # Capture status into a variable rather than piping it straight into
+  # `grep -q` (measured, not theoretical): status now prints a second "owner:"
+  # line (#553), and `grep -q` exits the instant it matches the first line,
+  # closing its end of the pipe. status's own `echo` of the second line then
+  # hits a reader that is already gone -- SIGPIPE, a nonzero exit for that
+  # stage -- and under this script's `pipefail`, that alone flips the whole
+  # `if` to false even though grep DID match. A one-line status (as this had
+  # before #553) never triggers it: there is no second write for the closed
+  # pipe to reject. Capturing first reads status to completion regardless of
+  # how many lines it prints, so growing its output again later can't reopen
+  # this.
   CODEX_SHIM="$SKILL_DIR/scripts/drivers/types/codex/codex-shim-install.sh"
-  if [ -x "$CODEX_SHIM" ] && AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" status 2>/dev/null | grep -q '^installed:'; then
-    AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" install >/dev/null 2>&1 \
+  CODEX_SHIM_STATUS=""
+  [ -x "$CODEX_SHIM" ] && CODEX_SHIM_STATUS="$(AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" status 2>/dev/null || true)"
+  if printf '%s' "$CODEX_SHIM_STATUS" | grep -q '^installed:'; then
+    AGMSG_CODEX_SHIM_INSTALL_QUIET=1 AGMSG_CODEX_SHIM_FORCE=1 "$CODEX_SHIM" install >/dev/null 2>&1 \
       && echo "  + refreshed Codex monitor shim (~/.agents/bin/codex)"
   fi
   install_windows_helpers
@@ -396,11 +416,22 @@ chmod +x "$SKILL_DIR/scripts/"*.sh
 # Per-type folded runtime scripts (codex-*.sh, cursor-bridge.sh, watch-once.sh …).
 chmod +x "$SKILL_DIR/scripts/drivers/types/"*/*.sh 2>/dev/null || true
 # Re-point an existing Codex monitor shim at the new path on a reinstall over an
-# older layout (no-op when no agmsg shim is present). See the --update block above.
+# older layout (no-op when no agmsg shim is present). See the --update block
+# above. NOT forced (#553): unlike --update, a fresh install here gives no
+# signal that the caller means to take over an EXISTING install's shim, so a
+# --cmd for a second/different name must not silently repoint it away from
+# whichever install already owns it. codex-shim-install.sh itself refuses that
+# and says whose it is; surface that here instead of swallowing it.
 CODEX_SHIM="$SKILL_DIR/scripts/drivers/types/codex/codex-shim-install.sh"
-if [ -x "$CODEX_SHIM" ] && AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" status 2>/dev/null | grep -q '^installed:'; then
-  AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" install >/dev/null 2>&1 \
-    && echo "  + refreshed Codex monitor shim (~/.agents/bin/codex)"
+CODEX_SHIM_STATUS=""
+[ -x "$CODEX_SHIM" ] && CODEX_SHIM_STATUS="$(AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" status 2>/dev/null || true)"
+if printf '%s' "$CODEX_SHIM_STATUS" | grep -q '^installed:'; then
+  if AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" install >/dev/null 2>&1; then
+    echo "  + refreshed Codex monitor shim (~/.agents/bin/codex)"
+  else
+    echo "  ! Codex monitor shim (~/.agents/bin/codex) is owned by a different install; left untouched."
+    echo "    Run 'AGMSG_CODEX_SHIM_FORCE=1 $CODEX_SHIM install' to claim it for this install instead."
+  fi
 fi
 install_windows_helpers
 
