@@ -59,26 +59,49 @@ which:
 
 ### Manual steps (if you'd rather not use the script)
 
+The base is a variable here for the same reason it is one in the script: an rc
+is cut from `integration/remote`, and a copy-paste that says `main` puts the
+release commit on the wrong branch.
+
 ```bash
-# On an up-to-date release base (main, or integration/remote for an rc),
-# on a release branch:
-git switch -c release/v1.0.4
-echo 1.0.4 > VERSION
+BASE=main                 # integration/remote for a prerelease
+VER=1.0.4                 # 1.2.0-rc.4 for a prerelease
+
+# On an up-to-date $BASE, on a release branch:
+git switch "$BASE" && git pull --ff-only origin "$BASE"
+git switch -c "release/v$VER"
+echo "$VER" > VERSION
 ./scripts/release/sync-version.sh
-git-cliff --tag v1.0.4 -o CHANGELOG.md
-git add VERSION package.json .claude-plugin/plugin.json CHANGELOG.md
-git commit -m "release: 1.0.4"
-git push -u origin release/v1.0.4
-gh pr create --fill && gh pr merge --squash --auto --delete-branch
-# After it merges:
-git switch main && git pull --ff-only
-git tag v1.0.4 && git push origin v1.0.4
+FILES="VERSION package.json .claude-plugin/plugin.json"
+# A prerelease leaves CHANGELOG.md alone — see "Prereleases skip the changelog"
+# above. For a stable version, and only then:
+case "$VER" in *-*) ;; *)
+  git-cliff --tag "v$VER" -o CHANGELOG.md
+  FILES="$FILES CHANGELOG.md" ;;
+esac
+git add $FILES
+git commit -m "release: $VER"
+git push -u origin "release/v$VER"
+gh pr create --base "$BASE" --fill
 ```
+
+**Stop there.** Do not add `--auto`: the merge is a gate, not a formality, and
+the script does not enable auto-merge for the same reason. Merge it yourself
+once the required checks are green, then:
+
+```bash
+gh pr merge "release/v$VER" --squash --delete-branch
+git switch "$BASE" && git pull --ff-only origin "$BASE"
+git tag "v$VER" && git push origin "v$VER"
+```
+
+The tag push fires `release.yml`, which waits for the `production` approval
+before it publishes.
 
 ## Manual fallback (CI unavailable)
 
 ```bash
-# (after the release commit is on main via PR)
+# (after the release commit is on its base branch via PR)
 npm publish --access public --provenance
 git-cliff --latest --strip header -o RELEASE_NOTES.md
 gh release create "v$(cat VERSION)" --title "v$(cat VERSION)" --notes-file RELEASE_NOTES.md
@@ -100,8 +123,12 @@ The pipeline layers four defenses against silent drift and malicious publish:
   and linked back to this workflow run. A tarball without provenance — or with
   provenance pointing elsewhere — is distinguishable on npmjs.com.
 - **`verify-versions.yml`.** Runs `sync-version.sh --check` on every push and
-  PR to `main`. A hand-edit of `package.json` or `plugin.json` without a
-  `VERSION` bump fails CI before merge.
+  PR to `main` **and `integration/remote`**. A hand-edit of `package.json` or
+  `plugin.json` without a `VERSION` bump fails CI before merge. It was
+  `main`-only until #679, which meant it never ran on any of the three
+  prereleases cut from `integration/remote` — `release.yml` runs the same check
+  at tag time, so nothing shipped out of sync, but the failure would have
+  surfaced at publish rather than at review.
 
 ## Repository secrets required by the workflow
 
