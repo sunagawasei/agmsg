@@ -116,19 +116,35 @@ cannot work and must not be attempted:
 - Even if it could authenticate, it would go around the `production` approval,
   which is the one human gate between a pushed tag and a published package.
 
-So a failed run is re-run, never worked around:
+So a failed run is re-run, never worked around. **Find out which side of the
+publish it failed on first** — a red run does not mean nothing shipped. The
+publish step sits in the middle of the job: the release notes and the GitHub
+Release are created *after* it, so a failure in either leaves an npm version
+that is already public and **immutable**.
 
 ```bash
-gh run list --workflow release.yml --limit 5
-gh run rerun <run-id> --failed      # re-runs the failed jobs; approval still applies
+npm view agmsg@1.0.4 version     # prints the version if it published, else errors
 ```
 
-If the tag itself was wrong, delete it and cut again — the version is not
-published until the run succeeds, so the tag is the only thing to undo:
+**Not on npm** — the run failed before publishing (the tag/`VERSION` guard, the
+derived-files check, or the approval). Nothing is public. Re-run it, or if the
+tag itself was wrong, delete the tag and cut again:
 
 ```bash
+gh run rerun <run-id> --failed         # approval still applies
 git push origin :refs/tags/v1.0.4 && git tag -d v1.0.4
 ```
+
+**Already on npm** — the version is permanent; npm does not allow a re-publish
+of the same version, and deleting the tag would only detach the release from
+its source. Do not delete it. Finish the rest:
+
+```bash
+gh run rerun <run-id> --failed
+```
+
+That is safe to repeat: the publish step checks `npm view` first and skips when
+the version is already there, so a re-run picks up at the release notes.
 
 If GitHub Actions is unavailable, the release waits. A release that cannot go
 through the pipeline is a release that has not been reviewed, signed, or
