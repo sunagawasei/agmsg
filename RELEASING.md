@@ -20,8 +20,23 @@ scripts/release/cut-release.sh 1.0.4   # semver, no leading "v"
 
 It bumps `VERSION`, syncs the derived files, regenerates `CHANGELOG.md` from
 Conventional Commits (via [git-cliff](https://git-cliff.org)), opens a
-`release: <version>` PR, auto-merges it once the required checks pass, then tags
-the merged commit and pushes the tag.
+`release: <version>` PR — **and stops there**.
+
+It does **not** enable auto-merge, does not tag, and does not publish. Merging
+the PR and pushing the tag are the two outward, irreversible steps, and each
+stays behind a person. The script prints the remaining commands when it exits.
+(This paragraph used to say it auto-merged and tagged. It never did.)
+
+**Which branch:** whichever one you are on. The PR targets that same branch, so
+a prerelease cut from `integration/remote` opens against `integration/remote`.
+Releases from a side branch are a real case — 1.2.0-rc.1 through rc.3 were all
+cut that way — and the script used to refuse them outright (#679).
+
+**Prereleases skip the changelog.** A version with a prerelease suffix
+(`1.2.0-rc.4`) leaves `CHANGELOG.md` untouched; the GitHub Release notes come
+from `release.yml`'s own `git-cliff --latest`. Writing the section on an
+integration branch would later merge into `main` a section for a version `main`
+never had.
 
 **Why a PR and not a direct push:** `main` is a protected branch with required
 status checks, so the release commit must land through a PR — a direct push is
@@ -45,7 +60,8 @@ which:
 ### Manual steps (if you'd rather not use the script)
 
 ```bash
-# On an up-to-date main, on a release branch:
+# On an up-to-date release base (main, or integration/remote for an rc),
+# on a release branch:
 git switch -c release/v1.0.4
 echo 1.0.4 > VERSION
 ./scripts/release/sync-version.sh
