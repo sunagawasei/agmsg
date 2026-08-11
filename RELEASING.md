@@ -19,8 +19,8 @@ scripts/release/cut-release.sh 1.0.4   # semver, no leading "v"
 ```
 
 It bumps `VERSION`, syncs the derived files, regenerates `CHANGELOG.md` from
-Conventional Commits (via [git-cliff](https://git-cliff.org)), opens a
-`release: <version>` PR — **and stops there**.
+Conventional Commits (via [git-cliff](https://git-cliff.org)) **for a stable
+version only**, opens a `release: <version>` PR — **and stops there**.
 
 It does **not** enable auto-merge, does not tag, and does not publish. Merging
 the PR and pushing the tag are the two outward, irreversible steps, and each
@@ -53,7 +53,11 @@ which:
 1. Verifies the tag matches `VERSION` and that derived files are in sync
    (`sync-version.sh --check`).
 2. Waits for a reviewer to approve the `production` environment.
-3. Runs `npm publish --access public --provenance`.
+3. Runs `npm publish --access public --provenance --tag <dist-tag>`, where the
+   dist-tag is `next` for a version carrying a prerelease suffix and `latest`
+   otherwise. npm reads nothing from the version string on its own — without
+   the flag, `1.2.0-rc.4` would land on `latest` exactly like `1.2.0` and every
+   `npx agmsg` would get it.
 4. Generates the release notes for the tag with git-cliff and creates a
    GitHub Release from them.
 
@@ -98,14 +102,38 @@ git tag "v$VER" && git push origin "v$VER"
 The tag push fires `release.yml`, which waits for the `production` approval
 before it publishes.
 
-## Manual fallback (CI unavailable)
+## If the release run fails
+
+**There is no local publish path, and this section used to print one.** It said
+to run `npm publish --access public --provenance` from a workstation. That
+cannot work and must not be attempted:
+
+- npm accepts a publish for this package **only** from a GitHub Actions run
+  that proves via OIDC it came from this repo, this workflow, and the
+  `production` environment. There is no `NPM_TOKEN` anywhere, and the package
+  is set to require 2FA and disallow tokens — see "Supply-chain guards" below,
+  which the old command contradicted on the same page.
+- Even if it could authenticate, it would go around the `production` approval,
+  which is the one human gate between a pushed tag and a published package.
+
+So a failed run is re-run, never worked around:
 
 ```bash
-# (after the release commit is on its base branch via PR)
-npm publish --access public --provenance
-git-cliff --latest --strip header -o RELEASE_NOTES.md
-gh release create "v$(cat VERSION)" --title "v$(cat VERSION)" --notes-file RELEASE_NOTES.md
+gh run list --workflow release.yml --limit 5
+gh run rerun <run-id> --failed      # re-runs the failed jobs; approval still applies
 ```
+
+If the tag itself was wrong, delete it and cut again — the version is not
+published until the run succeeds, so the tag is the only thing to undo:
+
+```bash
+git push origin :refs/tags/v1.0.4 && git tag -d v1.0.4
+```
+
+If GitHub Actions is unavailable, the release waits. A release that cannot go
+through the pipeline is a release that has not been reviewed, signed, or
+attested, and shipping it by hand would remove every guarantee the pipeline
+exists to make.
 
 ## Supply-chain guards
 

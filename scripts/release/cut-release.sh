@@ -4,8 +4,9 @@ set -euo pipefail
 # cut-release.sh <version> — prepare a release PR.
 #
 #   1. bump VERSION + sync derived files (package.json, plugin.json)
-#   2. regenerate CHANGELOG.md from Conventional Commits (git-cliff)
-#   3. open a "release: <version>" PR — and STOP.
+#   2. regenerate CHANGELOG.md from Conventional Commits (git-cliff) — for a
+#      STABLE version only; a prerelease leaves the file alone (see below)
+#   3. open a "release: <version>" PR against the branch you are on — and STOP.
 #
 # Merging the PR and pushing the tag are deliberately left to a human: review the
 # version bump + changelog, merge, then push the tag. This script NEVER enables
