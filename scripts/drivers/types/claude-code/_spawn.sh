@@ -12,7 +12,9 @@ CLAUDE_CODE_BIN="${AGMSG_CLAUDE_CMD:-claude}"
 # hook firing under `-p` even when `--settings hooks:{}` tried to suppress hooks.
 # That hook result establishes the cwd=scratch contract. Older CLIs are untested
 # against these contracts, so spawn refuses them fail-closed.
-CLAUDE_CODE_MIN_VERSION=2.1.220
+# Only 2.1.226 has been verified to scrub the OAuth token from Bash child
+# environments; 2.1.220 is unverified, so the accepted range starts at 2.1.226.
+CLAUDE_CODE_MIN_VERSION=2.1.226
 CLAUDE_CODE_INHERIT_ADD_DIRS_KEY="spawn.claude_inherit_add_dirs"
 
 # shellcheck source=../../lib/reviewer-add-dirs.sh
@@ -166,7 +168,7 @@ agmsg_claude_check_version() {
   fi
   if (( 10#$major < 2 \
         || (10#$major == 2 && 10#$minor < 1) \
-        || (10#$major == 2 && 10#$minor == 1 && 10#$patch < 220) )); then
+        || (10#$major == 2 && 10#$minor == 1 && 10#$patch < 226) )); then
     die "Claude Code $major.$minor.$patch is below the live-verified minimum $CLAUDE_CODE_MIN_VERSION; refusing headless spawn"
   fi
 }
@@ -267,7 +269,17 @@ agmsg_claude_generate_settings() {
   local -a allow_write=()
   local -a allow_read=()
   local -a deny_read=()
-  local path physical tmp="${settings_file}.tmp.$$" tmp_sql valid
+  local -a worker_home_candidates=("$worker_home")
+  local path physical rule tmp="${settings_file}.tmp.$$" tmp_sql valid
+
+  # Resolve the physical alias only after the directory exists. Otherwise a
+  # first spawn through a symlinked SKILL_DIR would retain only the logical deny.
+  mkdir -p "$worker_home" || return 1
+  physical="$(agmsg_claude_physical_path "$worker_home")"
+  if [ -n "$physical" ] && [ "$physical" != "$worker_home" ]; then
+    agmsg_claude_path_in_list "$physical" "${worker_home_candidates[@]}" \
+      || worker_home_candidates+=("$physical")
+  fi
 
   case "$layout" in
     implementer)
@@ -300,6 +312,21 @@ agmsg_claude_generate_settings() {
       ;;
     *) return 1 ;;
   esac
+
+  # The worker home can contain authentication state. Protect every layout at
+  # both the built-in tool layer and the Bash filesystem sandbox layer.
+  for path in "${worker_home_candidates[@]}"; do
+    rule="$(agmsg_claude_tool_rule Read "$path")"
+    agmsg_claude_path_in_list "$rule" "${deny_rules[@]}" \
+      || deny_rules+=("$rule")
+    rule="$(agmsg_claude_tool_rule Edit "$path")"
+    agmsg_claude_path_in_list "$rule" "${deny_rules[@]}" \
+      || deny_rules+=("$rule")
+    agmsg_claude_path_in_list "$path" "${deny_read[@]}" \
+      || deny_read+=("$path")
+    agmsg_claude_path_in_list "$path" "${deny_write[@]}" \
+      || deny_write+=("$path")
+  done
 
   # Seatbelt evaluates resolved filesystem paths, so retain each logical root
   # first and add its physical alias under the same permission.

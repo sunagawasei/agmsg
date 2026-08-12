@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# Effective denial depends on Claude Code applying this policy and is verified separately with a real spawn.
 
 load test_helper
 
@@ -31,7 +32,7 @@ set -u
 } >> "$FAKE_CAPTURE/claude-invocations"
 
 if [ "${1:-}" = "--version" ]; then
-  printf '%s\n' "${FAKE_VERSION:-2.1.220 (Claude Code)}"
+  printf '%s\n' "${FAKE_VERSION:-2.1.226 (Claude Code)}"
   exit "${FAKE_VERSION_RC:-0}"
 fi
 
@@ -266,7 +267,7 @@ STUB
   export AGMSG_CLAUDE_BRIDGE_CMD="$FAKE_BRIDGE"
   export FAKE_CAPTURE="$CAPTURE"
   export FAKE_RUN="$TEST_SKILL_DIR/run"
-  export FAKE_VERSION="2.1.220 (Claude Code)"
+  export FAKE_VERSION="2.1.226 (Claude Code)"
   export FAKE_VERSION_RC=0
   export FAKE_PROBE_MODE=complete
   export FAKE_BRIDGE_MODE=live
@@ -442,6 +443,63 @@ assert_json_path_alias() {
   fi
 }
 
+permission_rule_for_path() {
+  local tool="$1" path="$2"
+  while [ -n "$path" ] && [ "${path%/}" != "$path" ]; do
+    path="${path%/}"
+  done
+  printf '%s(/%s/**)' "$tool" "$path"
+}
+
+assert_worker_home_denials() {
+  local file="$1" worker_home="$2" physical path rule
+  local -a paths=("$worker_home")
+  physical="$(physical_path "$worker_home")"
+  [ "$physical" = "$worker_home" ] || paths+=("$physical")
+
+  for path in "${paths[@]}"; do
+    rule="$(permission_rule_for_path Read "$path")"
+    [ "$(json_array_count "$file" '$.permissions.deny' "$rule")" -eq 1 ]
+    rule="$(permission_rule_for_path Edit "$path")"
+    [ "$(json_array_count "$file" '$.permissions.deny' "$rule")" -eq 1 ]
+    [ "$(json_array_count "$file" '$.sandbox.filesystem.denyRead' "$path")" -eq 1 ]
+    [ "$(json_array_count "$file" '$.sandbox.filesystem.denyWrite' "$path")" -eq 1 ]
+  done
+}
+
+worker_home_policy_operation() {
+  local settings="$1" operation="$2" root="$3" marker="$4" destination="$5"
+  local policy_path rule
+  case "$operation" in
+    built-in-read)
+      policy_path='$.permissions.deny'
+      rule="$(permission_rule_for_path Read "$root")" ;;
+    built-in-write|built-in-edit)
+      policy_path='$.permissions.deny'
+      rule="$(permission_rule_for_path Edit "$root")" ;;
+    bash-cat|grep)
+      policy_path='$.sandbox.filesystem.denyRead'
+      rule="$root" ;;
+    overwrite|rename|hard-link)
+      policy_path='$.sandbox.filesystem.denyWrite'
+      rule="$root" ;;
+    *) return 64 ;;
+  esac
+  [ "$(json_array_count "$settings" "$policy_path" "$rule")" -eq 1 ] \
+    && return 77
+
+  # Model the operation only when its required deny is missing. This makes each
+  # mapping fail closed without pretending to execute Claude Code's sandbox.
+  case "$operation" in
+    built-in-read|bash-cat) command cat -- "$marker" ;;
+    grep) command grep -F 'agmsg-worker-home-policy-marker-' "$marker" ;;
+    built-in-write|built-in-edit|overwrite)
+      printf '%s\n' 'worker home policy failed open' > "$marker" ;;
+    rename) command mv -- "$marker" "$destination" ;;
+    hard-link) command ln -- "$marker" "$destination" ;;
+  esac
+}
+
 policy_shape() {
   awk '
     $0 == "ARG=--model" || $0 == "ARG=--effort" ||
@@ -455,6 +513,8 @@ policy_shape() {
 
 @test "claude-code sandbox path aliases preserve narrow role scopes and order" {
   local physical_skill="$TEST_SKILL_DIR"
+  local physical_skill_resolved
+  physical_skill_resolved="$(physical_path "$physical_skill")"
   local logical_skill="$BATS_TEST_TMPDIR/skill-logical"
   local physical_project="$TEST_SKILL_DIR/alias-project-physical"
   local logical_project="$BATS_TEST_TMPDIR/project-logical"
@@ -462,11 +522,14 @@ policy_shape() {
   local logical_tmp="$BATS_TEST_TMPDIR/process-tmp-logical"
   local physical_inherited="$TEST_SKILL_DIR/inherited-physical"
   local logical_inherited="$BATS_TEST_TMPDIR/inherited-logical"
+  local logical_worker_home="$logical_skill/db/claude-worker-home"
+  local physical_worker_home="$physical_skill_resolved/db/claude-worker-home"
   mkdir -p "$physical_project/.claude" "$physical_tmp" "$physical_inherited"
   ln -s "$physical_skill" "$logical_skill"
   ln -s "$physical_project" "$logical_project"
   ln -s "$physical_tmp" "$logical_tmp"
   ln -s "$physical_inherited" "$logical_inherited"
+  [ "$physical_worker_home" != "$logical_worker_home" ]
   printf '{"permissions":{"additionalDirectories":["%s"]}}\n' \
     "$logical_inherited" > "$physical_project/.claude/settings.local.json"
 
@@ -475,12 +538,17 @@ policy_shape() {
   export TMPDIR="$logical_tmp"
   bash "$SCRIPTS/config.sh" set spawn.claude_inherit_add_dirs true
 
+  [ ! -e "$logical_worker_home" ]
   run spawn_claude alias-consultant
   [ "$status" -eq 0 ]
   wait_bridge_capture alias-consultant
+  [ -d "$logical_worker_home" ]
+  rmdir "$physical_worker_home"
+  [ ! -e "$logical_worker_home" ]
   run spawn_claude alias-implementer --implementer
   [ "$status" -eq 0 ]
   wait_bridge_capture alias-implementer
+  [ -d "$logical_worker_home" ]
   run spawn_claude alias-reviewer --reviewer
   [ "$status" -eq 0 ]
   wait_bridge_capture alias-reviewer
@@ -512,8 +580,12 @@ policy_shape() {
   for settings in "$consultant" "$implementer" "$reviewer"; do
     [ "$(sqlite_mem "SELECT json_valid(readfile('$(rf "$settings")'));")" = 1 ]
     assert_permission_rule_shapes "$settings"
+    assert_worker_home_denials "$settings" "$logical_worker_home"
+    assert_json_array_unique "$settings" '$.permissions.deny'
     assert_json_array_unique "$settings" '$.sandbox.filesystem.allowWrite'
+    assert_json_array_unique "$settings" '$.sandbox.filesystem.denyWrite'
     assert_json_array_unique "$settings" '$.sandbox.filesystem.allowRead'
+    assert_json_array_unique "$settings" '$.sandbox.filesystem.denyRead'
     for raw in "$logical_skill/db" "$logical_skill/teams" "$logical_skill/run" \
       "/tmp"; do
       assert_json_path_alias "$settings" '$.sandbox.filesystem.allowWrite' "$raw"
@@ -528,8 +600,38 @@ policy_shape() {
       ! json_array_has "$settings" "$path" "$physical_tmp"
     done
     ! json_array_has "$settings" '$.sandbox.filesystem.allowWrite' \
-      "$logical_skill/db/claude-worker-home"
+      "$logical_worker_home"
     ! json_array_has "$settings" '$.sandbox.filesystem.allowRead' "$HOME"
+  done
+
+  # Built-in Read and Write/Edit map to permissions.deny; Bash cat and Grep map
+  # to denyRead; overwrite, rename, and hard-link map to denyWrite.
+  local marker_name=".agmsg-worker-home-policy-marker-$BATS_TEST_NUMBER"
+  local marker_content="agmsg-worker-home-policy-marker-$BATS_TEST_NUMBER-$$"
+  local operation root marker destination operation_index=0
+  local -a worker_home_roots=("$logical_worker_home")
+  local -a worker_home_operations=(
+    built-in-read bash-cat built-in-write built-in-edit
+    overwrite rename hard-link grep
+  )
+  [ "$physical_worker_home" = "$logical_worker_home" ] \
+    || worker_home_roots+=("$physical_worker_home")
+  printf '%s\n' "$marker_content" > "$logical_worker_home/$marker_name"
+  for settings in "$consultant" "$implementer" "$reviewer"; do
+    for root in "${worker_home_roots[@]}"; do
+      marker="$root/$marker_name"
+      for operation in "${worker_home_operations[@]}"; do
+        operation_index=$((operation_index + 1))
+        destination="$logical_skill/run/.worker-home-policy-$operation_index"
+        [ ! -e "$destination" ] && [ ! -L "$destination" ]
+        run worker_home_policy_operation \
+          "$settings" "$operation" "$root" "$marker" "$destination"
+        [ "$status" -eq 77 ]
+        [ -f "$marker" ] && [ ! -L "$marker" ]
+        [ "$(command cat -- "$marker")" = "$marker_content" ]
+        [ ! -e "$destination" ] && [ ! -L "$destination" ]
+      done
+    done
   done
 
   [ "$(physical_path /nix)" = /nix ]
@@ -919,13 +1021,13 @@ policy_shape() {
 }
 
 @test "minimum version is numeric and malformed or wrong suffix fails before artifacts" {
-  export FAKE_VERSION="2.1.99 (Claude Code)"
+  export FAKE_VERSION="2.1.225 (Claude Code)"
   run spawn_claude below
   [ "$status" -ne 0 ]
-  [[ "$output" == *"below the live-verified minimum 2.1.220"* ]]
+  [[ "$output" == *"below the live-verified minimum 2.1.226"* ]]
   [ ! -e "$TEST_SKILL_DIR/run/claude-code-bridge.team.below.log" ]
 
-  export FAKE_VERSION="2.1.220 (Claude Code)"
+  export FAKE_VERSION="2.1.226 (Claude Code)"
   run spawn_claude equal
   [ "$status" -eq 0 ]
 
@@ -933,13 +1035,13 @@ policy_shape() {
   run spawn_claude above
   [ "$status" -eq 0 ]
 
-  export FAKE_VERSION="2.1.220"
+  export FAKE_VERSION="2.1.226"
   run spawn_claude malformed
   [ "$status" -ne 0 ]
   [[ "$output" == *"unparseable Claude Code version"* ]]
   [ ! -e "$TEST_SKILL_DIR/run/claude-code-bridge.team.malformed.log" ]
 
-  export FAKE_VERSION="2.1.220 (Claude)"
+  export FAKE_VERSION="2.1.226 (Claude)"
   run spawn_claude wrong-suffix
   [ "$status" -ne 0 ]
   [[ "$output" == *"unparseable Claude Code version"* ]]
