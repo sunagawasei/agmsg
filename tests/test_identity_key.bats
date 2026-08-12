@@ -21,14 +21,16 @@
   [[ "$long" != "$short"* ]]
 }
 
-@test "identity-key: all four producer and matcher call sites use the shared generator" {
+@test "identity-key: every producer and matcher call site uses the shared generator" {
   local scripts="$BATS_TEST_DIRNAME/../scripts" file
-  local files=(
-    "$scripts/ensure-codex.sh"
-    "$scripts/despawn.sh"
-    "$scripts/drivers/types/codex/_spawn.sh"
-    "$scripts/drivers/types/cursor/_spawn.sh"
-  )
+  local -a files=()
+  # Derived from the tree, not hardcoded: call sites move (ensure-codex.sh became
+  # a wrapper over ensure-headless.sh) and new ones must not skip the generator.
+  while IFS= read -r file; do
+    files+=("$file")
+  done < <(grep -rl 'agmsg_identity_key ' "$scripts" \
+    | grep -v '/lib/identity-key\.sh$' | sort)
+  [ "${#files[@]}" -ge 4 ]
 
   for file in "${files[@]}"; do
     grep -Eq '^[[:space:]]*(source|\.) "\$SCRIPT_DIR/lib/identity-key\.sh"' \
