@@ -44,6 +44,11 @@ setup_test_env() {
   # `env CLAUDE_CODE_SESSION_ID=...` / `env -u CLAUDE_CODE_SESSION_ID`; clear the
   # ambient value here so neither relies on what shell launched bats.
   unset CLAUDE_CODE_SESSION_ID
+  # Claude Code v2.1.214+ also exports its own process id to hook/Bash
+  # subprocesses. Tests that exercise this resolver input set it explicitly;
+  # clearing the ambient value keeps unrelated ancestry and bare-id cases
+  # independent of the CLI process that launched bats.
+  unset CLAUDE_PID
 
   # Keep ordinary tests fast without changing production defaults. Intervals
   # are seconds (0.05s = 20 polls/s, inside the validated 0.01..60 range);
@@ -141,6 +146,55 @@ _test_fixture_register_pid() {
 # checks exact.
 test_fixture_register_owned_pid() {
   _test_fixture_register_pid "$1" owned
+}
+
+# Start a process under a short-lived supervisor that waits for and reaps it.
+# Production headless bridges are detached from spawn.sh and adopted by init;
+# this fixture gives signal-based teardown tests the same post-exit ESRCH
+# behavior instead of leaving a Bats-owned zombie until the foreground command
+# returns. TEST_REAPED_PID identifies the target; the registered supervisor
+# owns cleanup if an assertion aborts before the target is stopped.
+test_fixture_start_reaped_process() {
+  local pidfile supervisor
+  _AGMSG_TEST_FIXTURE_SEQUENCE=$((_AGMSG_TEST_FIXTURE_SEQUENCE + 1))
+  pidfile="$_AGMSG_TEST_FIXTURE_ROOT/reaped.$$.${_AGMSG_TEST_FIXTURE_SEQUENCE}.pid"
+  rm -f "$pidfile"
+  bash -c '
+    pidfile="$1"
+    marker="$2"
+    shift 2
+    child=""
+    finish() {
+      status="$1"
+      trap "" TERM INT
+      if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then
+        kill -TERM "$child" 2>/dev/null || true
+        attempt=0
+        while kill -0 "$child" 2>/dev/null && [ "$attempt" -lt 20 ]; do
+          /bin/sleep 0.05
+          attempt=$((attempt + 1))
+        done
+        kill -0 "$child" 2>/dev/null \
+          && kill -KILL "$child" 2>/dev/null || true
+      fi
+      [ -z "$child" ] || wait "$child" 2>/dev/null || true
+      exit "$status"
+    }
+    trap "finish 143" TERM
+    trap "finish 130" INT
+    "$@" &
+    child=$!
+    printf "%s\n" "$child" > "$pidfile"
+    wait "$child"
+    exit $?
+  ' _ "$pidfile" "$AGMSG_TEST_FIXTURE_SIGNATURE" "$@" &
+  supervisor=$!
+  _test_fixture_register_pid "$supervisor" || return
+  wait_for_file "$pidfile" || return
+  IFS= read -r TEST_REAPED_PID < "$pidfile" || return
+  case "$TEST_REAPED_PID" in ''|*[!0-9]*) return 2 ;; esac
+  [ "$TEST_REAPED_PID" -gt 0 ] 2>/dev/null || return 2
+  TEST_REAPED_SUPERVISOR_PID="$supervisor"
 }
 
 _test_fixture_pid_signature_state() {

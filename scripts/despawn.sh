@@ -65,20 +65,18 @@ case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout must be a whole number of seconds
 SPAWN_REC="$(agmsg_spawn_path "$TEAM" "$NAME")"
 
 # A plain/non-watchdog despawn is an intentional stop and therefore invalidates
-# a pending watchdog recovery reservation before any force/graceful branch can
-# return. A watchdog-scoped call carries its owner token and never invalidates
-# an intent here; after compare-and-act, watchdog removes only the reservation
-# that still matches its exact owner/record stamp. Only a plain caller performs
-# invalidation. This mechanism does not alter reset/kill/record cleanup.
+# a pending watchdog recovery reservation once teardown is confirmed or safely
+# skipped. An unverified force attempt preserves it along with every other
+# target artifact. A watchdog-scoped call carries its owner token and never
+# invalidates an intent here; after compare-and-act, watchdog removes only the
+# reservation that still matches its exact owner/record stamp.
 WATCHDOG_TOKEN="${AGMSG_WATCHDOG_INTENT_TOKEN:-}"
+WATCHDOG_INTENT=""
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/validate.sh"
 if agmsg_validate_team_name "$TEAM" >/dev/null 2>&1 \
     && agmsg_validate_agent_name "$NAME" >/dev/null 2>&1; then
   WATCHDOG_INTENT="$SKILL_DIR/run/watchdog.$TEAM.$NAME.intent"
-  if [ -z "$WATCHDOG_TOKEN" ]; then
-    rm -f -- "$WATCHDOG_INTENT" 2>/dev/null || true
-  fi
 fi
 
 # Headless codex workers (recorded as pid:<n>) have no watcher to answer a
@@ -101,9 +99,10 @@ fi
 #     spawners. A recycled pid (now an unrelated process) fails the match and is
 #     left alone. The old code skipped the guard entirely when meta was missing
 #     and killed the pid blindly — a PID-reuse footgun.
-# Neither verifiable (pid already gone) → nothing to do. SIGTERM first (the bridge
-# stops its work loop and any child it owns, e.g. codex's stdio app-server),
-# SIGKILL fallback.
+# Return 0 when absence is confirmed, 2 for a confirmed identity mismatch, and
+# 4 when identity or post-signal absence cannot be verified. SIGTERM comes
+# first (the bridge stops its work loop and any child it owns, e.g. codex's
+# stdio app-server), with SIGKILL as fallback.
 kill_headless_pid() {
   local pid="$1" team="$2" name="$3" type="${4:-codex}" meta meta_pid n=0 args identity_key
   local kill_poll_interval kill_poll_max
@@ -113,21 +112,37 @@ kill_headless_pid() {
     "${AGMSG_KILL_POLL_INTERVAL-}" 1 0.01 60 decimal)"
   kill_poll_max="$(agmsg_wait_knob_resolve \
     "${AGMSG_KILL_POLL_MAX-}" 5 1 10000 integer)"
+  case "$pid" in
+    ''|*[!0-9]*)
+      echo "despawn: invalid headless pid '$pid' for $team/$name — identity unverified" >&2
+      return 4 ;;
+  esac
+  if ! [ "$pid" -gt 0 ] 2>/dev/null; then
+    echo "despawn: invalid headless pid '$pid' for $team/$name — identity unverified" >&2
+    return 4
+  fi
   meta="$SKILL_DIR/run/$type-bridge.$team.$name.meta"
   [ -f "$meta" ] && meta_pid="$(sed -n 's/^pid=//p' "$meta" 2>/dev/null)"
-  kill -0 "$pid" 2>/dev/null || return 0
+  _agmsg_pid_alive "$pid" || return 0
   if [ -n "${meta_pid:-}" ]; then
     if [ "$meta_pid" != "$pid" ]; then
       echo "despawn: recorded pid $pid != bridge meta pid $meta_pid for $team/$name — skipping kill (stale record?)" >&2
-      return 0
+      return 2
     fi
   else
     identity_key="$(agmsg_identity_key "$team" "$name")"
-    args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+    if ! args="$(ps -ww -o args= -p "$pid" 2>/dev/null)" || [ -z "$args" ]; then
+      echo "despawn: could not inspect argv for live pid $pid for $team/$name — identity unverified" >&2
+      return 4
+    fi
     # ps returns a command-line rendering, so split it into argv-like tokens and
     # require both markers as complete tokens. Bridge launchers use one of the
     # known script extensions; a prefix/suffix near-match is not our bridge.
     read -r -a argv <<<"$args" || true
+    if [ "${#argv[@]}" -eq 0 ]; then
+      echo "despawn: could not inspect argv for live pid $pid for $team/$name — identity unverified" >&2
+      return 4
+    fi
     for arg in "${argv[@]}"; do
       if [ "$expect_identity" = 1 ]; then
         [ "$arg" = "$identity_key" ] && identity_token=1
@@ -140,20 +155,33 @@ kill_headless_pid() {
           bridge_token=1 ;;
       esac
     done
-    if [ "$bridge_token" != 1 ] || [ "$identity_token" != 1 ]; then
+    if [ "$bridge_token" != 1 ]; then
       echo "despawn: pid $pid is not a $type-bridge for $team/$name and no meta confirms it — skipping kill (pid reuse?)" >&2
-      return 0
+      return 2
+    fi
+    # A visible bridge with no matching identity may be truncated or redacted.
+    if [ "$identity_token" != 1 ]; then
+      echo "despawn: could not verify the $type-bridge identity for live pid $pid for $team/$name — identity unverified" >&2
+      return 4
     fi
   fi
   kill "$pid" 2>/dev/null || true
-  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt "$kill_poll_max" ]; do
+  while _agmsg_pid_alive "$pid" && [ "$n" -lt "$kill_poll_max" ]; do
     sleep "$kill_poll_interval"
     n=$((n + 1))
   done
-  if kill -0 "$pid" 2>/dev/null; then
+  if _agmsg_pid_alive "$pid"; then
     kill -9 "$pid" 2>/dev/null || true
     echo "despawn: bridge pid $pid did not exit on SIGTERM — sent SIGKILL" >&2
+    n=0
+    while _agmsg_pid_alive "$pid" && [ "$n" -lt "$kill_poll_max" ]; do
+      sleep "$kill_poll_interval"
+      n=$((n + 1))
+    done
   fi
+  _agmsg_pid_alive "$pid" || return 0
+  echo "despawn: bridge pid $pid is still alive after signals — teardown unverified" >&2
+  return 4
 }
 
 # Retire the bridge's persistent per-identity state: failstate streak counters
@@ -173,11 +201,17 @@ gc_bridge_state() {
 # the LINE passed in, never a re-read of the file, so a caller that snapshotted
 # the record (despawn --expect-record) tears down exactly what it verified.
 kill_recorded_placement() {
-  local id _proj _type
+  local id _proj _type result=0
   IFS=$'\t' read -r id _proj _type <<<"${1-}"
-  [ -n "$id" ] || return 1
+  [ -n "$id" ] || return 4
   case "$id" in
-    pid:*) kill_headless_pid "${id#pid:}" "$TEAM" "$NAME" "${_type:-codex}" ;;
+    pid:*)
+      if kill_headless_pid "${id#pid:}" "$TEAM" "$NAME" "${_type:-codex}"; then
+        result=0
+      else
+        result=$?
+      fi
+      ;;
     herdr:*)
       command -v herdr >/dev/null 2>&1 && herdr pane close "${id#herdr:}" 2>/dev/null || true
       ;;
@@ -189,15 +223,19 @@ kill_recorded_placement() {
         esac
       fi ;;
   esac
-  printf '%s\t%s\t%s' "$id" "$_proj" "$_type"   # echo back for the caller
+  printf '%s\t%s\t%s\n' "$id" "$_proj" "$_type"
+  return "$result"
 }
 
 if [ "$FORCE" = "1" ]; then
   # Serialize against a concurrent spawn-record write (spawn.sh launch_headless),
   # so the compare and the rm below can't straddle a fresh lazy-respawn. Fail-open
-  # on acquire timeout — the --expect-record compare is the backstop. Released on
-  # every exit path, including the early skip.
-  agmsg_placement_lock_acquire "$TEAM" "$NAME" 10 || true
+  # on acquire timeout — the --expect-record compare is the backstop. Release on
+  # every exit path only when this process acquired the lock.
+  placement_lock_held=0
+  if agmsg_placement_lock_acquire "$TEAM" "$NAME" 10; then
+    placement_lock_held=1
+  fi
 
   # Resolve the record line to act on. With --expect-record, the live record must
   # still equal the snapshot or we do nothing (a respawn replaced it); and we act
@@ -207,21 +245,43 @@ if [ "$FORCE" = "1" ]; then
   if [ "$EXPECT_SET" = "1" ]; then
     cur="$(cat "$SPAWN_REC" 2>/dev/null || true)"
     if [ "$cur" != "$EXPECT_RECORD" ]; then
-      agmsg_placement_lock_release "$TEAM" "$NAME"
+      if [ "$placement_lock_held" -eq 1 ]; then
+        agmsg_placement_lock_release "$TEAM" "$NAME"
+      fi
+      [ -n "$WATCHDOG_INTENT" ] && [ -z "$WATCHDOG_TOKEN" ] \
+        && rm -f -- "$WATCHDOG_INTENT" 2>/dev/null || true
       echo "status=skipped name=$NAME team=$TEAM reason=record-changed"
       exit 0
     fi
     rec="$EXPECT_RECORD"
   else
     if [ ! -f "$SPAWN_REC" ]; then
-      agmsg_placement_lock_release "$TEAM" "$NAME"
+      if [ "$placement_lock_held" -eq 1 ]; then
+        agmsg_placement_lock_release "$TEAM" "$NAME"
+      fi
+      [ -n "$WATCHDOG_INTENT" ] && [ -z "$WATCHDOG_TOKEN" ] \
+        && rm -f -- "$WATCHDOG_INTENT" 2>/dev/null || true
       die "no placement record for '$TEAM/$NAME' — nothing to force (was it launched via 'spawn'? graceful despawn does not need this)"
     fi
     rec="$(cat "$SPAWN_REC" 2>/dev/null || true)"
   fi
 
   IFS=$'\t' read -r _id _proj _type <<<"$rec"
-  kill_recorded_placement "$rec"
+  placement_result=0
+  if kill_recorded_placement "$rec"; then
+    placement_result=0
+  else
+    placement_result=$?
+  fi
+  if [ "$placement_result" -eq 4 ]; then
+    if [ "$placement_lock_held" -eq 1 ]; then
+      agmsg_placement_lock_release "$TEAM" "$NAME"
+    fi
+    echo "status=unverified name=$NAME team=$TEAM reason=process-state"
+    exit 4
+  fi
+  [ -n "$WATCHDOG_INTENT" ] && [ -z "$WATCHDOG_TOKEN" ] \
+    && rm -f -- "$WATCHDOG_INTENT" 2>/dev/null || true
   # Drop the member's registration, and release its (now-stale) lock.
   if [ -n "${_proj:-}" ] && [ -n "${_type:-}" ]; then
     # Internal teardown must not remove an equivalent registration in another team.
@@ -238,12 +298,16 @@ if [ "$FORCE" = "1" ]; then
   # its own cleanup runs, so remove run/<type>-bridge.<team>.<name>.role here too.
   rm -f "$SPAWN_REC" "$SKILL_DIR/run/${_type:-codex}-bridge.$TEAM.$NAME.role" 2>/dev/null || true
   gc_bridge_state
-  agmsg_placement_lock_release "$TEAM" "$NAME"
+  if [ "$placement_lock_held" -eq 1 ]; then
+    agmsg_placement_lock_release "$TEAM" "$NAME"
+  fi
   echo "status=forced name=$NAME team=$TEAM"
   exit 0
 fi
 
 # --- Graceful ---
+[ -n "$WATCHDOG_INTENT" ] && [ -z "$WATCHDOG_TOKEN" ] \
+  && rm -f -- "$WATCHDOG_INTENT" 2>/dev/null || true
 state="$(actas_lock_state "$TEAM" "$NAME" "" 2>/dev/null || echo free)"
 case "$state" in
   free)

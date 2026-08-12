@@ -67,10 +67,10 @@ start_stub_bridge() {
   # bats installs a TERM handler in the test shell. Reset it before forking so
   # the bridge stub can install and exercise its own cleanup handler.
   trap - TERM
-  STUB_READY="$ready" STUB_CHILD_PID="$child" STUB_EVENTS="$events" STUB_MODE="$mode" \
-    bash "$BRIDGE_STUB" --identity-key "$(agmsg_identity_key "$STEAM" "$name")" &
-  pid=$!
-  TEST_PIDS="$TEST_PIDS $pid"
+  test_fixture_start_reaped_process env \
+    STUB_READY="$ready" STUB_CHILD_PID="$child" STUB_EVENTS="$events" STUB_MODE="$mode" \
+    bash "$BRIDGE_STUB" --identity-key "$(agmsg_identity_key "$STEAM" "$name")"
+  pid="$TEST_REAPED_PID"
   wait_for_file "$ready"
   record="$(printf 'pid:%s\t%s\tcodex' "$pid" "$PROJ")"
   printf '%s\n' "$record" > "$(agmsg_spawn_path "$STEAM" "$name")"
@@ -185,6 +185,30 @@ write_snapshot() {
   [ "$(sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
     "SELECT COUNT(*) FROM messages WHERE team='$STEAM' AND to_agent='claude' AND body LIKE '[drain-timeout]%';" \
     | tr -d '\r')" -eq 1 ]
+}
+
+@test "timeout with unverified teardown sends a persistent non-forced notice" {
+  local snapshot="$RUN/unverified.snapshot" pid body
+  start_stub_bridge unverified 1 ignore-usr2
+  pid="$STUB_PID"
+  write_snapshot "$snapshot" unverified "$STUB_RECORD"
+  cat > "$SCRIPTS/despawn.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 4
+STUB
+  chmod +x "$SCRIPTS/despawn.sh"
+  export AGMSG_DRAIN_DEADLINE_S=1
+
+  run run_worker "$snapshot"
+  [ "$status" -eq 0 ]
+  body="$(sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
+    "SELECT body FROM messages WHERE team='$STEAM' AND to_agent='claude' AND body LIKE '[drain-timeout]%' ORDER BY id DESC LIMIT 1;" \
+    | tr -d '\r')"
+  [[ "$body" == *"could not verify teardown"* ]]
+  [[ "$body" == *"placement record was preserved"* ]]
+  [[ "$body" != *" forced "* ]]
+  kill -0 "$pid" 2>/dev/null
+  [ -e "$(agmsg_spawn_path "$STEAM" unverified)" ]
 }
 
 @test "replacing a live fence makes the old owner abort without force" {

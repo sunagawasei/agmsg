@@ -618,12 +618,23 @@ while IFS= read -r NAME; do
       despawn_rc=$?
     fi
     if [ "$despawn_rc" -eq 124 ]; then
+      printf 'watchdog: despawn incomplete %s/%s (status=%s)\n' \
+        "$TEAM" "$NAME" "$despawn_rc"
       ABORT_PASS=1
       break
     fi
-    if [ "$despawn_rc" -ne 0 ] \
-        || printf '%s\n' "$LAST_PROCESS_OUTPUT" \
-          | grep -q 'status=skipped .*reason=record-changed'; then
+    if [ "$despawn_rc" -ne 0 ]; then
+      printf 'watchdog: despawn incomplete %s/%s (status=%s)\n' \
+        "$TEAM" "$NAME" "$despawn_rc"
+      if [ "$despawn_rc" -eq 4 ]; then
+        ATTEMPT_TEXT="${ATTEMPT_TEXT}${NOW}"$'\n'
+        atomic_write "$BASE.attempts" "$ATTEMPT_TEXT" || continue
+        atomic_write "$BASE.last" "$NOW"$'\n' || continue
+      fi
+      continue
+    fi
+    if printf '%s\n' "$LAST_PROCESS_OUTPUT" \
+        | grep -q 'status=skipped .*reason=record-changed'; then
       intent_remove_owned "$INTENT" "$OWNER" "$RECORD" "$NOW"
       continue
     fi

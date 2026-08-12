@@ -258,7 +258,8 @@ STUB
   # Fake a spawned headless codex: a live process, its placement record, and the
   # bridge meta the real worker writes — so despawn's pid-reuse guard confirms the
   # recorded pid against meta and proceeds to kill it.
-  sleep 300 & local fake=$!
+  test_fixture_start_reaped_process sleep 300
+  local fake="$TEST_REAPED_PID"
   mkdir -p "$TEST_SKILL_DIR/run"
   printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-end" > "$TEST_SKILL_DIR/run/spawn.s-sessEND__codex"
   printf 'pid=%s\n' "$fake" > "$TEST_SKILL_DIR/run/codex-bridge.s-sessEND.codex.meta"
@@ -279,12 +280,13 @@ STUB
   # the check is deterministic even in a sandbox that denies process listings.
   local key
   key="$(agmsg_identity_key s-sessAPS codex)"
-  sleep 300 & local fake=$!
+  test_fixture_start_reaped_process sleep 300
+  local fake="$TEST_REAPED_PID"
   local stub_bin="$TEST_SKILL_DIR/ps-stub"
   mkdir -p "$stub_bin"
   cat > "$stub_bin/ps" <<'STUB'
 #!/usr/bin/env bash
-if [ "$*" = "-o args= -p $FAKE_BRIDGE_PID" ]; then
+if [ "$*" = "-ww -o args= -p $FAKE_BRIDGE_PID" ]; then
   printf 'node /x/codex-bridge.js --identity-key %s --pair s-sessAPS\tcodex --inline-inbox\n' "$FAKE_IDENTITY_KEY"
   exit 0
 fi
@@ -332,11 +334,13 @@ STUB
 
 @test "session-end: keeps the codex worker if a parallel-resume sibling is alive" {
   enable_st
-  sleep 300 & local fake=$!
+  test_fixture_start_reaped_process sleep 300
+  local fake="$TEST_REAPED_PID"
   mkdir -p "$TEST_SKILL_DIR/run"
   printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-sib" > "$TEST_SKILL_DIR/run/spawn.s-sessSIB__codex"
   # A live sibling instance of the SAME bare session (different pid).
-  sleep 300 & local sib=$!
+  test_fixture_start_reaped_process sleep 300
+  local sib="$TEST_REAPED_PID"
   printf 'sessSIB.%s\n' "$sib" > "$TEST_SKILL_DIR/run/cc-instance.$sib"
   printf '{"session_id":"sessSIB"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
   # Retained negative window: sibling preservation has no completion artifact
@@ -360,8 +364,10 @@ STUB
   # Fake a headless codex bridge for a DEAD session (no live cc-instance for it).
   local key
   key="$(agmsg_identity_key s-DEADCA codex)"
-  ( exec -a "node /x/codex-bridge.js --identity-key $key --pair s-DEADCA	codex --inline-inbox" sleep 300 ) &
-  local fake=$!
+  test_fixture_start_reaped_process bash -c \
+    'exec -a "$1" sleep 300' _ \
+    "node /x/codex-bridge.js --identity-key $key --pair s-DEADCA	codex --inline-inbox"
+  local fake="$TEST_REAPED_PID"
   mkdir -p "$TEST_SKILL_DIR/run"
   printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-gc" > "$TEST_SKILL_DIR/run/spawn.s-DEADCA__codex"
   printf 'pid=%s\nidentities=s-DEADCA/codex\ntype=codex\n' "$fake" > "$TEST_SKILL_DIR/run/codex-bridge.s-DEADCA.codex.meta"

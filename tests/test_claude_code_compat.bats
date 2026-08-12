@@ -24,11 +24,16 @@ setup() {
 kill() {
   case "${1:-}" in
     -0)
-      grep -Fxq "${2:-}" "$FAKE_LIVE_STATE" 2>/dev/null
-      return $?
+      if grep -Fxq "${2:-}" "$FAKE_LIVE_STATE" 2>/dev/null; then
+        return 0
+      fi
+      printf 'bash: kill: (%s) - No such process\n' "${2:-}" >&2
+      return 1
       ;;
     -9)
       printf 'KILL\t%s\n' "${2:-}" >> "$FAKE_SIGNAL_LOG"
+      grep -Fvx "${2:-}" "$FAKE_LIVE_STATE" > "$FAKE_LIVE_STATE.tmp" 2>/dev/null || true
+      mv "$FAKE_LIVE_STATE.tmp" "$FAKE_LIVE_STATE"
       return 0
       ;;
     *)
@@ -56,9 +61,8 @@ teardown() {
 }
 
 start_sleep_process() {
-  sleep 300 &
-  LAST_PID=$!
-  TEST_PIDS="$TEST_PIDS $LAST_PID"
+  test_fixture_start_reaped_process sleep 300
+  LAST_PID="$TEST_REAPED_PID"
 }
 
 start_identity_process() {
@@ -197,7 +201,7 @@ assert_claude_artifacts_absent() {
   mkdir -p "$ps_stub"
   cat > "$ps_stub/ps" <<'EOF'
 #!/usr/bin/env bash
-if [ "$*" = "-o args= -p $FAKE_PS_PID" ]; then
+if [ "$*" = "-ww -o args= -p $FAKE_PS_PID" ]; then
   printf '%s\n' "$FAKE_PS_ARGS"
   exit 0
 fi
@@ -218,6 +222,10 @@ EOF
   write_record "$TEAM" "$missing" "$pid_missing"
   write_record "$TEAM" "$codex" "$pid_codex" "$PROJ" codex
   write_record "$TEAM" "$cursor" "$pid_cursor" "$PROJ" cursor
+  bash "$SCRIPTS/join.sh" "$TEAM" "$wrong" claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" "$TEAM" "$wrong_bridge" claude-code "$PROJ" >/dev/null
+  printf 'role-state\n' > "$RUN/claude-code-bridge.$TEAM.$wrong.role"
+  printf 'role-state\n' > "$RUN/claude-code-bridge.$TEAM.$wrong_bridge.role"
 
   run env PATH="$ps_stub:$PATH" FAKE_PS_PID="$pid_correct" FAKE_PS_ARGS="$cmd_correct" \
     BASH_ENV="$FAKE_KILL_ENV" \
@@ -229,10 +237,14 @@ EOF
   run env PATH="$ps_stub:$PATH" FAKE_PS_PID="$pid_wrong" FAKE_PS_ARGS="$cmd_wrong" \
     BASH_ENV="$FAKE_KILL_ENV" \
     bash "$SCRIPTS/despawn.sh" "$TEAM" leader "$wrong" --force
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"skipping kill"* ]]
+  [ "$status" -eq 4 ]
+  printf '%s\n' "$output" | grep -q '^status=unverified '
   assert_fake_alive "$pid_wrong"
   assert_fake_not_signaled "$pid_wrong"
+  [ -e "$(agmsg_spawn_path "$TEAM" "$wrong")" ]
+  [ -e "$RUN/claude-code-bridge.$TEAM.$wrong.role" ]
+  bash "$SCRIPTS/identities.sh" "$PROJ" claude-code \
+    | grep -Fxq "$TEAM"$'\t'"$wrong"
 
   run env PATH="$ps_stub:$PATH" FAKE_PS_PID="$pid_wrong_bridge" FAKE_PS_ARGS="$cmd_wrong_bridge" \
     BASH_ENV="$FAKE_KILL_ENV" \
@@ -241,22 +253,28 @@ EOF
   [[ "$output" == *"skipping kill"* ]]
   assert_fake_alive "$pid_wrong_bridge"
   assert_fake_not_signaled "$pid_wrong_bridge"
+  [ ! -e "$(agmsg_spawn_path "$TEAM" "$wrong_bridge")" ]
+  [ ! -e "$RUN/claude-code-bridge.$TEAM.$wrong_bridge.role" ]
+  ! bash "$SCRIPTS/identities.sh" "$PROJ" claude-code \
+    | grep -Fxq "$TEAM"$'\t'"$wrong_bridge"
 
   run env PATH="$ps_stub:$PATH" FAKE_PS_PID="$pid_key_suffix" FAKE_PS_ARGS="$cmd_key_suffix" \
     BASH_ENV="$FAKE_KILL_ENV" \
     bash "$SCRIPTS/despawn.sh" "$TEAM" leader "$key_suffix" --force
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"skipping kill"* ]]
+  [ "$status" -eq 4 ]
+  printf '%s\n' "$output" | grep -q '^status=unverified '
   assert_fake_alive "$pid_key_suffix"
   assert_fake_not_signaled "$pid_key_suffix"
+  [ -e "$(agmsg_spawn_path "$TEAM" "$key_suffix")" ]
 
   run env PATH="$ps_stub:$PATH" FAKE_PS_PID="$pid_missing" FAKE_PS_ARGS="$cmd_missing" \
     BASH_ENV="$FAKE_KILL_ENV" \
     bash "$SCRIPTS/despawn.sh" "$TEAM" leader "$missing" --force
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"skipping kill"* ]]
+  [ "$status" -eq 4 ]
+  printf '%s\n' "$output" | grep -q '^status=unverified '
   assert_fake_alive "$pid_missing"
   assert_fake_not_signaled "$pid_missing"
+  [ -e "$(agmsg_spawn_path "$TEAM" "$missing")" ]
 
   run env PATH="$ps_stub:$PATH" FAKE_PS_PID="$pid_codex" FAKE_PS_ARGS="$cmd_codex" \
     BASH_ENV="$FAKE_KILL_ENV" \
@@ -271,6 +289,27 @@ EOF
   [ "$status" -eq 0 ]
   assert_fake_dead "$pid_cursor"
   assert_fake_signaled "$pid_cursor"
+}
+
+@test "despawn absence-confirmed initial ESRCH performs artifact cleanup" {
+  local name='already-absent' dead_pid=2147483647
+  bash "$SCRIPTS/join.sh" "$TEAM" "$name" claude-code "$PROJ" >/dev/null
+  write_record "$TEAM" "$name" "$dead_pid"
+  printf 'owner-instance\n' > "$RUN/actas.${TEAM}__${name}.session"
+  printf 'role-state\n' > "$RUN/claude-code-bridge.$TEAM.$name.role"
+  printf 'fail-state\n' > "$RUN/claude-code-bridge.$TEAM.$name.failstate"
+  printf 'outbound-state\n' > "$RUN/claude-code-bridge.$TEAM.$name.outbound.1"
+
+  run bash "$SCRIPTS/despawn.sh" "$TEAM" leader "$name" --force
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"status=forced"* ]]
+  [ ! -e "$(agmsg_spawn_path "$TEAM" "$name")" ]
+  [ ! -e "$RUN/actas.${TEAM}__${name}.session" ]
+  [ ! -e "$RUN/claude-code-bridge.$TEAM.$name.role" ]
+  [ ! -e "$RUN/claude-code-bridge.$TEAM.$name.failstate" ]
+  [ ! -e "$RUN/claude-code-bridge.$TEAM.$name.outbound.1" ]
+  ! bash "$SCRIPTS/identities.sh" "$PROJ" claude-code \
+    | grep -Fxq "$TEAM"$'\t'"$name"
 }
 
 @test "despawn expect-record mismatch is per-worker no-op and matching snapshot tears down" {
@@ -297,6 +336,81 @@ EOF
   run kill -0 "$pid"
   [ "$status" -ne 0 ]
   [ ! -e "$(agmsg_spawn_path "$TEAM" "$name")" ]
+}
+
+@test "despawn unverified argv inspection preserves every target artifact" {
+  local name='argv-unverified' pid=49001 rec ps_stub lock intent before_identities
+  ps_stub="$TEST_SKILL_DIR/ps-denied"
+  mkdir -p "$ps_stub"
+  cat > "$ps_stub/ps" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+  chmod +x "$ps_stub/ps"
+
+  bash "$SCRIPTS/join.sh" "$TEAM" "$name" claude-code "$PROJ" >/dev/null
+  printf '%s\n' "$pid" >> "$FAKE_LIVE_STATE"
+  write_record "$TEAM" "$name" "$pid"
+  rec="$(cat "$(agmsg_spawn_path "$TEAM" "$name")")"
+  lock="$RUN/actas.${TEAM}__${name}.session"
+  intent="$RUN/watchdog.$TEAM.$name.intent"
+  printf 'owner-instance\n' > "$lock"
+  printf 'role-state\n' > "$RUN/claude-code-bridge.$TEAM.$name.role"
+  printf 'fail-state\n' > "$RUN/claude-code-bridge.$TEAM.$name.failstate"
+  printf 'outbound-state\n' > "$RUN/claude-code-bridge.$TEAM.$name.outbound.1"
+  printf 'owner=plain\ncreated=1\n%s\n' "$rec" > "$intent"
+  before_identities="$(bash "$SCRIPTS/identities.sh" "$PROJ" claude-code)"
+
+  run env PATH="$ps_stub:$PATH" BASH_ENV="$FAKE_KILL_ENV" \
+    bash "$SCRIPTS/despawn.sh" "$TEAM" leader "$name" --force
+  [ "$status" -eq 4 ]
+  printf '%s\n' "$output" | grep -q '^status=unverified '
+  [ "$(cat "$(agmsg_spawn_path "$TEAM" "$name")")" = "$rec" ]
+  [ "$(cat "$lock")" = owner-instance ]
+  [ "$(cat "$RUN/claude-code-bridge.$TEAM.$name.role")" = role-state ]
+  [ "$(cat "$RUN/claude-code-bridge.$TEAM.$name.failstate")" = fail-state ]
+  [ "$(cat "$RUN/claude-code-bridge.$TEAM.$name.outbound.1")" = outbound-state ]
+  [ -f "$intent" ]
+  [ "$(bash "$SCRIPTS/identities.sh" "$PROJ" claude-code)" = "$before_identities" ]
+  assert_fake_alive "$pid"
+  assert_fake_not_signaled "$pid"
+}
+
+@test "despawn EPERM liveness after signals preserves every target artifact" {
+  local name='signal-unverified' pid=49002 rec stubborn_env
+  stubborn_env="$TEST_SKILL_DIR/stubborn-kill-env.sh"
+  cat > "$stubborn_env" <<'EOF'
+kill() {
+  case "${1:-}" in
+    -0)
+      echo "bash: kill: (${2:-}) - Operation not permitted" >&2
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+EOF
+  bash "$SCRIPTS/join.sh" "$TEAM" "$name" claude-code "$PROJ" >/dev/null
+  write_record "$TEAM" "$name" "$pid"
+  write_meta "$TEAM" "$name" "$pid"
+  rec="$(cat "$(agmsg_spawn_path "$TEAM" "$name")")"
+  printf 'owner-instance\n' > "$RUN/actas.${TEAM}__${name}.session"
+  printf 'role-state\n' > "$RUN/claude-code-bridge.$TEAM.$name.role"
+  printf 'fail-state\n' > "$RUN/claude-code-bridge.$TEAM.$name.failstate"
+  printf 'outbound-state\n' > "$RUN/claude-code-bridge.$TEAM.$name.outbound.1"
+
+  run env BASH_ENV="$stubborn_env" AGMSG_KILL_POLL_INTERVAL=0.01 \
+    AGMSG_KILL_POLL_MAX=1 bash "$SCRIPTS/despawn.sh" \
+      "$TEAM" leader "$name" --force
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"still alive after signals"* ]]
+  [ "$(cat "$(agmsg_spawn_path "$TEAM" "$name")")" = "$rec" ]
+  [ "$(cat "$RUN/actas.${TEAM}__${name}.session")" = owner-instance ]
+  [ "$(cat "$RUN/claude-code-bridge.$TEAM.$name.role")" = role-state ]
+  [ "$(cat "$RUN/claude-code-bridge.$TEAM.$name.failstate")" = fail-state ]
+  [ "$(cat "$RUN/claude-code-bridge.$TEAM.$name.outbound.1")" = outbound-state ]
+  bash "$SCRIPTS/identities.sh" "$PROJ" claude-code \
+    | grep -Fxq "$TEAM"$'\t'"$name"
 }
 
 @test "session-end worker reaps matching claude-code headless rows and preserves mismatch and interactive rows" {

@@ -163,8 +163,8 @@ _read_at_for_body() {
 @test "despawn: headless codex (pid: placement) is force-torn-down on a graceful call" {
   bash "$SCRIPTS/join.sh" team rev codex "$PROJ" >/dev/null
   # Stand-in for the bridge worker.
-  sleep 300 &
-  local dummy=$!
+  test_fixture_start_reaped_process sleep 300
+  local dummy="$TEST_REAPED_PID"
   printf 'pid:%s\t%s\t%s\n' "$dummy" "$PROJ" codex > "$RUN/spawn.team__rev"
   printf 'pid=%s\nteam=team\nname=rev\ntype=codex\n' "$dummy" > "$RUN/codex-bridge.team.rev.meta"
 
@@ -210,7 +210,7 @@ _read_at_for_body() {
   mkdir -p "$stub_bin"
   cat > "$stub_bin/ps" <<'STUB'
 #!/usr/bin/env bash
-if [ "$*" = "-o args= -p $SURVIVOR_PID" ]; then
+if [ "$*" = "-ww -o args= -p $SURVIVOR_PID" ]; then
   printf 'node /x/codex-bridge.js --identity-key %s --pair tt\\taaabbb\n' \
     "$LONG_IDENTITY_KEY"
   exit 0
@@ -222,8 +222,9 @@ STUB
   run env PATH="$stub_bin:$PATH" SURVIVOR_PID="$survivor" \
     LONG_IDENTITY_KEY="$long_key" \
     bash "$SCRIPTS/despawn.sh" tt leader aaa --force
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"skipping kill"* ]]
+  [ "$status" -eq 4 ]
+  printf '%s\n' "$output" | grep -q '^status=unverified '
+  [ -e "$RUN/spawn.tt__aaa" ]
   kill -0 "$survivor" 2>/dev/null
   kill "$survivor" 2>/dev/null || true
   wait "$survivor" 2>/dev/null || true

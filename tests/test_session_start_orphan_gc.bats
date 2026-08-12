@@ -35,8 +35,10 @@ run_session_start() {
   cursor_rec="$(agmsg_spawn_path "$team" "$cursor_name")"
   interactive_rec="$(agmsg_spawn_path "$team" 'interactive__worker')"
 
-  sleep 300 & local codex_pid=$!
-  sleep 300 & local cursor_pid=$!
+  test_fixture_start_reaped_process sleep 300
+  local codex_pid="$TEST_REAPED_PID"
+  test_fixture_start_reaped_process sleep 300
+  local cursor_pid="$TEST_REAPED_PID"
   printf 'pid:%s\t%s\tcodex\n' "$codex_pid" "$PROJ" > "$codex_rec"
   printf 'pid=%s\n' "$codex_pid" > "$TEST_SKILL_DIR/run/codex-bridge.$team.$codex_name.meta"
   printf 'pid:%s\t%s\tcursor\n' "$cursor_pid" "$PROJ" > "$cursor_rec"
@@ -68,7 +70,8 @@ run_session_start() {
   local rec marker real_cat stub_bin
   mkdir -p "$TEST_SKILL_DIR/run" "$TEST_SKILL_DIR/teams/$team"
   rec="$(agmsg_spawn_path "$team" "$name")"
-  sleep 300 & local worker_pid=$!
+  test_fixture_start_reaped_process sleep 300
+  local worker_pid="$TEST_REAPED_PID"
   printf 'pid:%s\t%s\tcodex\n' "$worker_pid" "$PROJ" > "$rec"
   printf 'pid=%s\n' "$worker_pid" > "$TEST_SKILL_DIR/run/codex-bridge.$team.$name.meta"
 
@@ -101,7 +104,8 @@ EOF
 
   local rec="$TEST_SKILL_DIR/run/spawn.s-foo__bar__w"
   mkdir -p "$TEST_SKILL_DIR/run"
-  sleep 300 & local worker_pid=$!
+  test_fixture_start_reaped_process sleep 300
+  local worker_pid="$TEST_REAPED_PID"
   printf 'pid:%s\t%s\tcodex\n' "$worker_pid" "$PROJ" > "$rec"
 
   run run_session_start
@@ -119,7 +123,8 @@ EOF
   local canonical="$TEST_SKILL_DIR/run/spawn.s-DEAD__A"
   local log="$TEST_SKILL_DIR/run/despawn-calls.log"
   mkdir -p "$TEST_SKILL_DIR/run"
-  sleep 300 & local worker_pid=$!
+  test_fixture_start_reaped_process sleep 300
+  local worker_pid="$TEST_REAPED_PID"
   printf 'pid:%s\t%s\tcodex\n' "$worker_pid" "$PROJ" > "$malformed"
   printf 'pid:%s\t%s\tcodex\n' "$worker_pid" "$PROJ" > "$canonical"
 
@@ -153,9 +158,12 @@ EOF
   stale_rec="$(agmsg_spawn_path "$stale_team" "$stale_name")"
   live_rec="$(agmsg_spawn_path "$live_team" "$live_name")"
 
-  sleep 300 & local stale_pid=$!
-  sleep 300 & local live_pid=$!
-  sleep 300 & local owner_pid=$!
+  test_fixture_start_reaped_process sleep 300
+  local stale_pid="$TEST_REAPED_PID"
+  test_fixture_start_reaped_process sleep 300
+  local live_pid="$TEST_REAPED_PID"
+  test_fixture_start_reaped_process sleep 300
+  local owner_pid="$TEST_REAPED_PID"
   printf 'pid:%s\t%s\tcodex\n' "$stale_pid" "$PROJ" > "$stale_rec"
   printf 'pid=%s\n' "$stale_pid" > "$TEST_SKILL_DIR/run/codex-bridge.$stale_team.$stale_name.meta"
   printf 'pid:%s\t%s\tcodex\n' "$live_pid" "$PROJ" > "$live_rec"
@@ -189,4 +197,29 @@ EOF
   [ "$status" -eq 0 ]
   [ ! -d "$TEST_SKILL_DIR/teams/s-OLD-TTL" ]
   [ -d "$TEST_SKILL_DIR/teams/s-RECENT-TTL" ]
+}
+
+@test "session-start orphan GC reports unverified despawn and preserves its record through TTL GC" {
+  enable_session_team
+
+  local team='s-DEAD-FEED' name='worker' rec
+  mkdir -p "$TEST_SKILL_DIR/run" "$TEST_SKILL_DIR/teams/$team"
+  printf '{"name":"%s","agents":{}}\n' "$team" \
+    > "$TEST_SKILL_DIR/teams/$team/config.json"
+  rec="$(agmsg_spawn_path "$team" "$name")"
+  printf 'pid:12345\t%s\tcodex\n' "$PROJ" > "$rec"
+  touch -t 202501010000 \
+    "$TEST_SKILL_DIR/teams/$team/config.json" "$TEST_SKILL_DIR/teams/$team"
+
+  cat > "$SCRIPTS/despawn.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 4
+EOF
+  chmod +x "$SCRIPTS/despawn.sh"
+
+  run run_session_start
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"orphan GC incomplete for $team/$name"* ]]
+  [ -f "$rec" ]
+  [ -d "$TEST_SKILL_DIR/teams/$team" ]
 }

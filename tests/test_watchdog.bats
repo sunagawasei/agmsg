@@ -125,6 +125,9 @@ case "${WATCHDOG_MODE:-ok}" in
   fail-despawn)
     exit 17
     ;;
+  unverified-despawn)
+    exit 4
+    ;;
   fail-first-despawn)
     [ "$name" = aaa ] && exit 17
     ;;
@@ -590,13 +593,62 @@ STUB
 
   run_watchdog
   [ "$status" -eq 0 ]
-  [ "$output" = "watchdog: respawned zzz (reason=dead)" ]
+  [ "$output" = $'watchdog: despawn incomplete s-A11CE-001/aaa (status=17)\nwatchdog: respawned zzz (reason=dead)' ]
   grep -q '^despawn:aaa$' "$WATCHDOG_CALLS"
   grep -q '^despawn:zzz$' "$WATCHDOG_CALLS"
   ! grep -q '^spawn:aaa$' "$WATCHDOG_CALLS"
   grep -q '^spawn:zzz$' "$WATCHDOG_CALLS"
-  [ ! -e "$RUN/watchdog.$TEAM.aaa.intent" ]
+  [ -f "$RUN/watchdog.$TEAM.aaa.intent" ]
   [ -f "$(agmsg_spawn_path "$TEAM" aaa)" ]
+}
+
+@test "unverified teardown is rate-limited and capped without record loss or respawn" {
+  join_worker worker codex
+  write_record worker 999999
+  install_recovery_stubs
+  export WATCHDOG_MODE=unverified-despawn
+  local record="$(agmsg_spawn_path "$TEAM" worker)"
+  local intent="$RUN/watchdog.$TEAM.worker.intent"
+  local attempts="$RUN/watchdog.$TEAM.worker.attempts"
+  local last="$RUN/watchdog.$TEAM.worker.last"
+
+  run_watchdog
+  [ "$status" -eq 0 ]
+  [ "$output" = "watchdog: despawn incomplete $TEAM/worker (status=4)" ]
+  [ "$(cat "$attempts")" = 1000 ]
+  [ "$(cat "$last")" = 1000 ]
+  [ -f "$record" ]
+  [ -f "$intent" ]
+  ! grep -q '^spawn:' "$WATCHDOG_CALLS"
+
+  : > "$WATCHDOG_CALLS"
+  run_watchdog
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  assert_no_calls
+
+  set_now 1060
+  run_watchdog
+  [ "$status" -eq 0 ]
+  [ "$output" = "watchdog: despawn incomplete $TEAM/worker (status=4)" ]
+  [ "$(cat "$attempts")" = $'1000\n1060' ]
+  [ "$(cat "$last")" = 1060 ]
+
+  : > "$WATCHDOG_CALLS"
+  set_now 1120
+  run_watchdog
+  [ "$status" -eq 0 ]
+  [ "$output" = "watchdog: despawn incomplete $TEAM/worker (status=4)" ]
+  [ "$(cat "$attempts")" = $'1000\n1060\n1120' ]
+
+  : > "$WATCHDOG_CALLS"
+  set_now 1180
+  run_watchdog
+  [ "$status" -eq 0 ]
+  [ "$output" = "watchdog: crashloop capped worker (attempts>=3/hour)" ]
+  assert_no_calls
+  [ -f "$record" ]
+  [ -f "$intent" ]
 }
 
 @test "only registered names in the requested team are inspected" {
@@ -672,7 +724,7 @@ STUB
 
   run_watchdog
   [ "$status" -eq 0 ]
-  [ -z "$output" ]
+  [ "$output" = "watchdog: despawn incomplete $TEAM/aaa (status=124)" ]
   [ -f "$RUN/watchdog.$TEAM.aaa.intent" ]
   ! grep -q '^spawn:' "$WATCHDOG_CALLS"
   ! grep -q '^despawn:zzz$' "$WATCHDOG_CALLS"

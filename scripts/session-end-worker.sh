@@ -258,7 +258,7 @@ inspect_snapshot_target() {
 # lifecycle critical section. despawn performs the final meta/argv PID check
 # immediately before kill(2), and its placement lock preserves expect-record.
 cleanup_target_locked() {
-  local name="$1" record="$2" current
+  local name="$1" record="$2" current despawn_rc
   agmsg_team_lifecycle_lock_acquire "$STEAM" "$LIFECYCLE_LOCK_TIMEOUT" || return 2
   if ! fence_owned_and_live || session_sibling_alive; then
     DRAIN_ABORTED=1
@@ -270,9 +270,17 @@ cleanup_target_locked() {
     agmsg_team_lifecycle_lock_release "$STEAM"
     return 1
   fi
-  "$SCRIPT_DIR/despawn.sh" "$STEAM" claude "$name" --force \
-    --expect-record "$record" >/dev/null 2>&1 || true
+  if "$SCRIPT_DIR/despawn.sh" "$STEAM" claude "$name" --force \
+      --expect-record "$record" >/dev/null 2>&1; then
+    despawn_rc=0
+  else
+    despawn_rc=$?
+  fi
   agmsg_team_lifecycle_lock_release "$STEAM"
+  if [ "$despawn_rc" -ne 0 ]; then
+    echo "session-end-worker: teardown incomplete for $STEAM/$name (despawn status $despawn_rc); preserving its placement record" >&2
+    return 4
+  fi
   return 0
 }
 
@@ -328,8 +336,12 @@ maintain_leases_if_due() {
 }
 
 notify_drain_timeout() {
-  local name="$1" pid="$2" body
-  body="[drain-timeout] session-end-worker forced $name (pid $pid) after ${DRAIN_DEADLINE_S}s. Read-but-unanswered rows remain queryable in messages.db; inspect with: SELECT id,from_agent,to_agent,created_at,read_at FROM messages WHERE team='$STEAM' AND to_agent='$name' AND read_at IS NOT NULL ORDER BY id DESC LIMIT 20;"
+  local name="$1" pid="$2" outcome="${3:-forced}" body
+  if [ "$outcome" = "unverified" ]; then
+    body="[drain-timeout] session-end-worker could not verify teardown of $name (pid $pid) after ${DRAIN_DEADLINE_S}s; the worker may still be alive and its placement record was preserved. Read-but-unanswered rows remain queryable in messages.db; inspect with: SELECT id,from_agent,to_agent,created_at,read_at FROM messages WHERE team='$STEAM' AND to_agent='$name' AND read_at IS NOT NULL ORDER BY id DESC LIMIT 20;"
+  else
+    body="[drain-timeout] session-end-worker forced $name (pid $pid) after ${DRAIN_DEADLINE_S}s. Read-but-unanswered rows remain queryable in messages.db; inspect with: SELECT id,from_agent,to_agent,created_at,read_at FROM messages WHERE team='$STEAM' AND to_agent='$name' AND read_at IS NOT NULL ORDER BY id DESC LIMIT 20;"
+  fi
   "$SCRIPT_DIR/send.sh" "$STEAM" session-end-worker claude "$body" --force \
     >/dev/null 2>&1 || true
 }
@@ -481,13 +493,21 @@ if [ "$DRAIN_ABORTED" -eq 0 ]; then
   i=0
   while [ "$i" -lt "$CAPABLE_COUNT" ]; do
     timed_out=0
+    cleanup_rc=0
     _agmsg_pid_alive "${CAPABLE_PIDS[$i]}" && timed_out=1
-    cleanup_target_locked "${CAPABLE_NAMES[$i]}" "${CAPABLE_RECORDS[$i]}" || true
+    cleanup_target_locked "${CAPABLE_NAMES[$i]}" "${CAPABLE_RECORDS[$i]}" \
+      || cleanup_rc=$?
     if [ "$DRAIN_ABORTED" -eq 1 ]; then
       break
     fi
-    [ "$timed_out" -eq 0 ] \
-      || notify_drain_timeout "${CAPABLE_NAMES[$i]}" "${CAPABLE_PIDS[$i]}"
+    if [ "$timed_out" -eq 1 ]; then
+      if [ "$cleanup_rc" -eq 0 ]; then
+        notify_drain_timeout "${CAPABLE_NAMES[$i]}" "${CAPABLE_PIDS[$i]}"
+      elif [ "$cleanup_rc" -eq 4 ]; then
+        notify_drain_timeout \
+          "${CAPABLE_NAMES[$i]}" "${CAPABLE_PIDS[$i]}" unverified
+      fi
+    fi
     maintain_leases_if_due || true
     [ "$DRAIN_ABORTED" -eq 0 ] || break
     i=$((i + 1))

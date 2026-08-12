@@ -244,6 +244,56 @@ teardown() { teardown_test_env; }
   [ "${lines[${#lines[@]} - 1]}" = "$walk_pid" ]
 }
 
+# --- CLAUDE_PID hook subprocess contract ---
+
+@test "claude pid: resolves a live CLAUDE_PID before a blocked ps walk" {
+  unset AGMSG_AGENT_PID
+  compat_get_ppid() { return 1; }
+  ps() { return 1; }
+  CLAUDE_PID="$$" run agmsg_agent_pid claude-code
+  [ "$status" -eq 0 ]
+  [ "$output" = "$$" ]
+}
+
+@test "claude pid: explicit empty AGMSG_AGENT_PID still forces bare fallback" {
+  AGMSG_AGENT_PID="" CLAUDE_PID="$$" run agmsg_agent_pid claude-code
+  [ "$status" -ne 0 ]
+  [ -z "$output" ]
+}
+
+@test "claude pid: non-numeric AGMSG_AGENT_PID still forces bare fallback" {
+  AGMSG_AGENT_PID=invalid CLAUDE_PID="$$" run agmsg_agent_pid claude-code
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"ignoring non-numeric AGMSG_AGENT_PID"* ]]
+  [[ "$output" != *"$$"* ]]
+}
+
+@test "claude pid: dead AGMSG_AGENT_PID falls through to a live CLAUDE_PID" {
+  AGMSG_AGENT_PID=2147483647 CLAUDE_PID="$$" run agmsg_agent_pid claude-code
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ignoring dead AGMSG_AGENT_PID=2147483647"* ]]
+  [ "${lines[${#lines[@]} - 1]}" = "$$" ]
+}
+
+@test "claude pid: invalid CLAUDE_PID values fall through to the ancestry walk" {
+  local raw
+  unset AGMSG_AGENT_PID
+  compat_get_ppid() { return 1; }
+  for raw in 0 -1 invalid " 1" "1 " $'1\n2'; do
+    CLAUDE_PID="$raw" run agmsg_agent_pid claude-code
+    [ "$status" -ne 0 ]
+    [ -z "$output" ]
+  done
+}
+
+@test "claude pid: non-claude types ignore a live CLAUDE_PID" {
+  unset AGMSG_AGENT_PID
+  compat_get_ppid() { return 1; }
+  CLAUDE_PID="$$" run agmsg_agent_pid codex
+  [ "$status" -ne 0 ]
+  [ -z "$output" ]
+}
+
 # --- actas distinctness: the #93 payoff ---
 
 # Two instance ids that share a session_id prefix but differ in pid must be

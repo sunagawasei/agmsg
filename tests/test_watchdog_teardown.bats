@@ -117,6 +117,25 @@ EOF
   [ ! -e "$RUN/watch.$instance.pid" ]
 }
 
+@test "session-end-worker reports unverified despawn and preserves its record" {
+  local sid='D0E0-BEEF-001' instance='D0E0-BEEF-001.7001'
+  local snapshot="$RUN/unverified.snapshot" rec="$RUN/spawn.s-D0E0-BEEF-001__worker"
+  printf 'worker\tpid:2147483647\t%s\tcodex\n' "$PROJ" > "$snapshot"
+  printf 'pid:2147483647\t%s\tcodex\n' "$PROJ" > "$rec"
+
+  cat > "$SCRIPTS/despawn.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 4
+EOF
+  chmod +x "$SCRIPTS/despawn.sh"
+
+  run bash "$SCRIPTS/session-end-worker.sh" claude-code "$PROJ" \
+    "$sid" "$instance" "$snapshot"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"teardown incomplete for s-$sid/worker"* ]]
+  [ -f "$rec" ]
+}
+
 @test "session-start clears only its own tombstone and missing cleanup is a no-op" {
   local sid='D0E0-START-001' own="s-D0E0-START-001" other='s-D0E0-OTHER'
   printf '%s\n' "$sid" > "$RUN/watchdog.$own.tombstone"

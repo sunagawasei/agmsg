@@ -11,10 +11,29 @@ setup() {
   export STUB_BIN="$TEST_SKILL_DIR/wait-stub-bin"
   export WAIT_SLEEP_LOG="$TEST_SKILL_DIR/wait-sleep.log"
   export WAIT_DATE_COUNT="$TEST_SKILL_DIR/wait-date.count"
+  export REAP_KILL_ENV="$TEST_SKILL_DIR/reap-kill-env.sh"
   mkdir -p "$PROJ" "$RUN" "$STUB_BIN"
   unset AGMSG_KILL_POLL_INTERVAL AGMSG_KILL_POLL_MAX AGMSG_DESPAWN_WAIT_POLL_INTERVAL
   unset TEST_SUBJECT_PID
   source "$SCRIPTS/lib/actas-lock.sh"
+  cat > "$REAP_KILL_ENV" <<'REAP_KILL_STUB'
+kill() {
+  local reap_pid reap_attempt
+  case "${1:-}" in
+    -9|-KILL)
+      builtin kill "$@" || return
+      reap_pid="${2:-}"
+      reap_attempt=0
+      while builtin kill -0 "$reap_pid" 2>/dev/null \
+          && [ "$reap_attempt" -lt 100 ]; do
+        /bin/sleep 0.01
+        reap_attempt=$((reap_attempt + 1))
+      done
+      ;;
+    *) builtin kill "$@" ;;
+  esac
+}
+REAP_KILL_STUB
 }
 
 teardown() {
@@ -51,6 +70,8 @@ printf '%s\n' "$count" > "$WAIT_DATE_COUNT"
 case "${WAIT_DATE_MODE:-timeout}" in
   timeout|early)
     [ "$count" -eq 1 ] && printf '100\n' || printf '101\n' ;;
+  placement-timeout)
+    [ "$count" -eq 1 ] && printf '100\n' || printf '110\n' ;;
   backward)
     case "$count" in
       1) printf '100\n' ;;
@@ -70,8 +91,9 @@ DATE_STUB
 }
 
 start_ignoring_subject() {
-  bash -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
-  TEST_SUBJECT_PID=$!
+  test_fixture_start_reaped_process \
+    bash -c 'trap "" TERM; while :; do /bin/sleep 1; done'
+  TEST_SUBJECT_PID="$TEST_REAPED_PID"
 }
 
 register_headless_fixture() {
@@ -115,7 +137,8 @@ register_graceful_fixture() {
   install_sleep_stub
   start_ignoring_subject
   register_headless_fixture kill-team interval-two
-  run env PATH="$STUB_BIN:$PATH" AGMSG_KILL_POLL_INTERVAL=0.01 AGMSG_KILL_POLL_MAX=2 \
+  run env PATH="$STUB_BIN:$PATH" BASH_ENV="$REAP_KILL_ENV" \
+    AGMSG_KILL_POLL_INTERVAL=0.01 AGMSG_KILL_POLL_MAX=2 \
     bash "$SCRIPTS/despawn.sh" kill-team leader interval-two --force
   [ "$status" -eq 0 ]
   [ "$(wc -l < "$WAIT_SLEEP_LOG" | tr -d ' ')" -eq 2 ]
@@ -126,13 +149,57 @@ register_graceful_fixture() {
   : > "$WAIT_SLEEP_LOG"
   start_ignoring_subject
   register_headless_fixture kill-team interval-five
-  run env PATH="$STUB_BIN:$PATH" AGMSG_KILL_POLL_INTERVAL=0.01 AGMSG_KILL_POLL_MAX=1.2 \
+  run env PATH="$STUB_BIN:$PATH" BASH_ENV="$REAP_KILL_ENV" \
+    AGMSG_KILL_POLL_INTERVAL=0.01 AGMSG_KILL_POLL_MAX=1.2 \
     bash "$SCRIPTS/despawn.sh" kill-team leader interval-five --force
   [ "$status" -eq 0 ]
   [ "$(wc -l < "$WAIT_SLEEP_LOG" | tr -d ' ')" -eq 5 ]
   [ "$(sort -u "$WAIT_SLEEP_LOG")" = 0.01 ]
   ! kill -0 "$TEST_SUBJECT_PID" 2>/dev/null
   TEST_SUBJECT_PID=""
+}
+
+@test "force kill polls for convergence after both TERM and KILL" {
+  local stubborn_env="$TEST_SKILL_DIR/stubborn-kill-env.sh"
+  install_sleep_stub
+  start_ignoring_subject
+  register_headless_fixture kill-team still-alive
+  cat > "$stubborn_env" <<'STUB'
+kill() {
+  case "${1:-}" in
+    -0) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+STUB
+
+  run env PATH="$STUB_BIN:$PATH" BASH_ENV="$stubborn_env" \
+    AGMSG_KILL_POLL_INTERVAL=0.01 AGMSG_KILL_POLL_MAX=2 \
+    bash "$SCRIPTS/despawn.sh" kill-team leader still-alive --force
+  [ "$status" -eq 4 ]
+  printf '%s\n' "$output" | grep -q '^status=unverified '
+  [ "$(wc -l < "$WAIT_SLEEP_LOG" | tr -d ' ')" -eq 4 ]
+  [ "$(sort -u "$WAIT_SLEEP_LOG")" = 0.01 ]
+  [ -e "$RUN/spawn.kill-team__still-alive" ]
+}
+
+@test "despawn never releases a placement lock it failed to acquire" {
+  local lock stale
+  install_sleep_stub
+  install_date_stub
+  export WAIT_DATE_MODE=placement-timeout
+  lock="$(_agmsg_placement_lock_path lock-team contended)"
+  mkdir "$lock"
+  printf 'pid:999999\t%s\tcodex\n' "$PROJ" \
+    > "$RUN/spawn.lock-team__contended"
+  stale="$(printf 'pid:888888\t%s\tcodex' "$PROJ")"
+
+  run env PATH="$STUB_BIN:$PATH" AGMSG_PLACEMENT_LOCK_POLL_INTERVAL=0.01 \
+    bash "$SCRIPTS/despawn.sh" lock-team leader contended --force \
+      --expect-record "$stale"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"reason=record-changed"* ]]
+  [ -d "$lock" ]
 }
 
 @test "graceful wait keeps timeout in seconds while using fractional polling" {
@@ -189,6 +256,7 @@ register_graceful_fixture() {
   started="$(date +%s)"
   run env -u AGMSG_KILL_POLL_INTERVAL -u AGMSG_KILL_POLL_MAX \
     -u AGMSG_DESPAWN_WAIT_POLL_INTERVAL \
+    BASH_ENV="$REAP_KILL_ENV" \
     bash "$SCRIPTS/despawn.sh" slow-team leader default-five --force
   ended="$(date +%s)"
   elapsed=$((ended - started))

@@ -319,6 +319,18 @@ agmsg_agent_pid() {
         ;;
     esac
   fi
+  if [ "$type" = "claude-code" ]; then
+    case "${CLAUDE_PID-}" in
+      ''|*[!0-9]*) ;;
+      *)
+        if [ "$CLAUDE_PID" -gt 0 ] 2>/dev/null \
+            && _agmsg_resolve_pid_alive "$CLAUDE_PID"; then
+          printf '%s' "$CLAUDE_PID"
+          return 0
+        fi
+        ;;
+    esac
+  fi
   local pid="$$" hops=0
   while [ "${pid:-0}" -gt 1 ] && [ "$hops" -lt 20 ]; do
     pid=$(compat_get_ppid "$pid" 2>/dev/null || true)

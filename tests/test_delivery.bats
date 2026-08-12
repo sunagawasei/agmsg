@@ -240,6 +240,29 @@ settings_file() {
   [ "$3" = "$sp" ]
 }
 
+@test "session-start: warns once when owner pid resolution degrades to a bare sid" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" \
+    team alice claude-code "$TEST_PROJECT" >/dev/null
+  run env AGMSG_AGENT_PID= CLAUDE_PID="$$" AGMSG_RESOLVE_PROJECT=0 \
+    bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" \
+      <<< '{"session_id":"sid-bare-warning"}'
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | grep -c 'owner PID unresolved')" -eq 1 ]
+  [[ "$output" == *"without a cc-instance record"* ]]
+  [[ "$output" == *"orphan GC may see this session as dead"* ]]
+}
+
+@test "session-start: a live CLAUDE_PID creates cc-instance without a warning" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" \
+    team alice claude-code "$TEST_PROJECT" >/dev/null
+  run env -u AGMSG_AGENT_PID CLAUDE_PID="$$" AGMSG_RESOLVE_PROJECT=0 \
+    bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" \
+      <<< '{"session_id":"sid-claude-pid"}'
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"owner PID unresolved"* ]]
+  [ "$(cat "$TEST_SKILL_DIR/run/cc-instance.$$")" = "sid-claude-pid.$$" ]
+}
+
 # --- session-start.sh role-aware resume directive (#339) ---
 
 # Write a role-session record into the isolated skill dir's run/.

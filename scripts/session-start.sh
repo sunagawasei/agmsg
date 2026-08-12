@@ -152,6 +152,9 @@ mkdir -p "$RUN_DIR" 2>/dev/null || true
 # Empty when no agent ancestor is found (detached / sandboxed) — in that case
 # the instance id degrades to the bare session_id and the dedup step is skipped.
 CC_PID=$(agmsg_agent_pid "$TYPE" 2>/dev/null || true)
+if [ -z "$CC_PID" ]; then
+  echo "agmsg: owner PID unresolved; using a bare session_id without a cc-instance record, so other sessions' orphan GC may see this session as dead" >&2
+fi
 
 # Per-process instance id (see instance-id.sh): "<session_id>.<cc_pid>", or the
 # bare session_id when cc_pid is unresolved. This — not the bare session_id — is
@@ -296,6 +299,7 @@ fi
 # a resuming session's own workers (same uuid → seen alive via upgrade-compat)
 # are never reaped. Best-effort; never blocks the directive below.
 if agmsg_session_team_enabled; then
+  _orphan_gc_unverified_teams=""
   # Spawn records use the same reversible encoding as actas locks:
   #   spawn.<encoded-team>__<encoded-agent>
   # Session-team names use the UUID-safe `s-<hex-and-dash>` contract, so the
@@ -303,7 +307,7 @@ if agmsg_session_team_enabled; then
   # contain `__` and are decoded after stripping the team segment.
   _orphan_gc_record() {
     local _gc_rec="$1" _gc_key _gc_enc_team _gc_enc_name
-    local _gc_team _gc_sid _gc_name _gc_snapshot _gc_id _gc_project _gc_type
+    local _gc_team _gc_sid _gc_name _gc_snapshot _gc_id _gc_project _gc_type _gc_rc
     _gc_key="${_gc_rec##*/spawn.}"
     _gc_enc_team="${_gc_key%%__*}"
     _gc_enc_name="${_gc_key#*__}"
@@ -325,8 +329,17 @@ if agmsg_session_team_enabled; then
     IFS=$'\t' read -r _gc_id _gc_project _gc_type <<<"$_gc_snapshot" || return 0
     case "${_gc_id:-}" in
       pid:*)
-        "$SCRIPT_DIR/despawn.sh" "$_gc_team" claude "$_gc_name" --force \
-          --expect-record "$_gc_snapshot" >/dev/null 2>&1 || true
+        if "$SCRIPT_DIR/despawn.sh" "$_gc_team" claude "$_gc_name" --force \
+            --expect-record "$_gc_snapshot" >/dev/null 2>&1; then
+          :
+        else
+          _gc_rc=$?
+          case "$_orphan_gc_unverified_teams" in
+            *"|$_gc_team|"*) ;;
+            *) _orphan_gc_unverified_teams="$_orphan_gc_unverified_teams|$_gc_team|" ;;
+          esac
+          echo "agmsg: orphan GC incomplete for $_gc_team/$_gc_name (despawn status $_gc_rc); preserving its placement record" >&2
+        fi
         ;;
       *) ;; # interactive placements (%*, @*, herdr:*) are preserved
     esac
@@ -353,6 +366,7 @@ if agmsg_session_team_enabled; then
     [ -d "$_d" ] || continue
     _tn="$(basename "$_d")"                                       # s-<uuid>
     agmsg_instance_alive "${_tn#s-}" 2>/dev/null && continue      # owner alive → keep
+    case "${_orphan_gc_unverified_teams:-}" in *"|$_tn|"*) continue ;; esac
     # `find -mtime` exits 0 whether or not the dir matches, so gate on its
     # OUTPUT (non-empty == older than the TTL), not its exit code.
     [ -n "$(find "$_d" -maxdepth 0 -mtime +"$_ttl" 2>/dev/null)" ] || continue  # too recent → keep
