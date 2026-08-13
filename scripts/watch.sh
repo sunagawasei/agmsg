@@ -328,12 +328,14 @@ fi
 
 # Metadata BEFORE the pidfile, deliberately.
 #
-# A reader treats "live pid, no filter file" as a pre-change watcher, i.e.
-# unfiltered. Written the other way round, every filtered watcher spends its
-# startup window looking exactly like that, and a scan landing in the window
-# warns about a watcher that is not sharing anything. The pidfile is what makes
-# this process visible at all, so nothing may be visible before what describes
-# it (raised in review).
+# A reader that finds a live pid with no filter file cannot tell what that
+# watcher is doing OR which project it serves, so it SKIPS it. Written the other
+# way round, every filtered watcher spends its startup window in exactly that
+# state, and a scan landing in the window reaches the opposite conclusion from
+# the one this metadata exists to support -- it would count nothing where there
+# is something to count, or, before the project was recorded, warn about a
+# watcher sharing nothing. The pidfile is what makes this process visible at
+# all, so nothing may be visible before what describes it (raised in review).
 #
 # The project is part of the record because RUN_DIR is per INSTALL, not per
 # project: two projects using the same install both write here, and their

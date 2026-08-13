@@ -630,10 +630,11 @@ run_named_watcher_for() {
 }
 
 @test "watch: a filtered watcher is never mistaken for unfiltered while starting (#683)" {
-  # The reader treats "live pid, no filter file" as a pre-change watcher. If the
-  # pidfile were published first, every filtered watcher would look exactly like
-  # that for the length of its startup window, and a scan landing inside it
-  # would warn about a watcher that shares nothing.
+  # A reader that finds a live pid with no filter file SKIPS it: it cannot tell
+  # the role or the project. If the pidfile were published first, every filtered
+  # watcher would sit in exactly that state for the length of its startup
+  # window, and a scan landing inside it would reach the wrong conclusion about
+  # a watcher whose metadata was already on its way.
   #
   # Asserted on the ARTEFACTS rather than by racing: whenever a pidfile exists,
   # its filter file exists too, and names this watcher's role. That is the
