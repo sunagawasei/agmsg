@@ -382,10 +382,17 @@ if [ -z "$ACTIVE_NAME" ]; then
     [ "$_pf" = "$PIDFILE" ] && continue
     _other_pid="$(cat "$_pf" 2>/dev/null || true)"
     case "$_other_pid" in ''|*[!0-9]*) continue ;; esac
-    # Liveness by the same means the rest of this file uses. A pidfile left by a
-    # crashed watcher names nobody, and counting it would make the warning fire
-    # on an installation that has no second watcher at all.
-    kill -0 "$_other_pid" 2>/dev/null || continue
+    # `_agmsg_pid_alive_local`, not a bare `kill -0`. The bare form reads EPERM
+    # as "dead", so a watcher this process cannot signal -- another user, a
+    # sandbox -- would be counted as gone and its inbox-sharing left unsaid. The
+    # repo enforces this (`no shipped script decides liveness with a bare
+    # kill -0`), and it caught this line: the first version used the bare form
+    # while the comment above it claimed to use what the rest of the file uses.
+    #
+    # A pidfile left by a crashed watcher names nobody, which is why liveness is
+    # checked at all: counting one would fire the warning on an installation
+    # that has no second watcher.
+    _agmsg_pid_alive_local "$_other_pid" || continue
     _other_filter="${_pf%.pid}.filter"
     # An absent filter file is a watcher from BEFORE this change. It cannot be
     # asked which project it serves, so it is not counted: warning on it would
