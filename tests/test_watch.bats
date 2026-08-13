@@ -640,10 +640,10 @@ run_named_watcher_for() {
   # its filter file exists too, and names this watcher's role. That is the
   # property the ordering buys, and it holds at every instant rather than at the
   # one this test happened to look.
-  # Read WHILE IT RUNS. The filter file is removed on exit under the same owner
-  # check as the pidfile, so inspecting after the watcher stops measures the
-  # cleanup, not the ordering — measured, that is how the first version of this
-  # failed.
+  # Read WHILE IT RUNS. The filter file is removed on exit by its own recorded
+  # owner (not by the pidfile's), so inspecting after the watcher stops measures
+  # the cleanup rather than the ordering — measured, that is how the first
+  # version of this failed.
   local run_dir="$TEST_SKILL_DIR/run" named_id="named-order.$$"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$named_id" "$PROJ" claude-code alice \
     >"$BATS_TEST_TMPDIR/named.out" 2>/dev/null 3>&- &
