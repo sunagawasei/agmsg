@@ -419,11 +419,15 @@ cleanup() {
   # would erase the successor's record. See #66.
   local pidfile_pid=""
   [ -f "$PIDFILE" ] && IFS= read -r pidfile_pid < "$PIDFILE" || true
-  # The filter file goes with the pidfile, under the same ownership test. Left
-  # behind, it would keep asserting on behalf of a dead process -- and this one
-  # asserts "I am filtered", which is the direction that SUPPRESSES the warning
-  # for everybody else. A stale pidfile makes the next watcher count a ghost; a
-  # stale filter file makes it count nobody.
+  # Both files are removed by their owner, but they do not share an owner test:
+  # the pidfile's owner is whoever it names, and the filter file's is whoever it
+  # records. See below for why the pidfile cannot answer for both.
+  #
+  # Neither may be left behind. A stale pidfile makes the next watcher count a
+  # ghost. A stale filter file is worse in the direction that matters: it keeps
+  # asserting a role on behalf of a dead process, and if that role is a name,
+  # every other watcher reads it as "filtered, not sharing" -- so the warning is
+  # SUPPRESSED by a process that no longer exists.
   [ "$pidfile_pid" = "$$" ] && rm -f "$PIDFILE"
   # The filter file is judged on ITS OWN recorded owner, not on the pidfile.
   # During a replacement the pidfile still names the predecessor while the
