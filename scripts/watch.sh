@@ -326,6 +326,23 @@ if [ -f "$PIDFILE" ]; then
   fi
 fi
 
+# Metadata BEFORE the pidfile, deliberately.
+#
+# A reader treats "live pid, no filter file" as a pre-change watcher, i.e.
+# unfiltered. Written the other way round, every filtered watcher spends its
+# startup window looking exactly like that, and a scan landing in the window
+# warns about a watcher that is not sharing anything. The pidfile is what makes
+# this process visible at all, so nothing may be visible before what describes
+# it (raised in review).
+#
+# The project is part of the record because RUN_DIR is per INSTALL, not per
+# project: two projects using the same install both write here, and their
+# watchers do not share a subscription -- the pairs come from the project's own
+# registrations. Counting across projects would warn about a hazard that does
+# not exist (also raised in review).
+FILTERFILE="$RUN_DIR/watch.$SESSION_ID.filter"
+printf '%s\n%s\n' "${ACTIVE_NAME:-unfiltered}" "$PROJECT_PATH" > "$FILTERFILE" 2>/dev/null || true
+
 echo $$ > "$PIDFILE"
 
 # --- Say when this watcher is sharing an inbox with another (#683). ---
@@ -344,10 +361,6 @@ echo $$ > "$PIDFILE"
 # NOT a lease. This process still subscribes to exactly what it would have
 # subscribed to; it only stops being quiet about the fact that someone else is
 # doing the same. Exclusion is a separate decision.
-FILTERFILE="$RUN_DIR/watch.$SESSION_ID.filter"
-printf '%s
-' "${ACTIVE_NAME:-unfiltered}" > "$FILTERFILE" 2>/dev/null || true
-
 # Only when the hazard is real. A warning printed on every start is a warning
 # nobody reads, and an unfiltered watcher running alone is not in danger.
 if [ -z "$ACTIVE_NAME" ]; then
@@ -362,11 +375,20 @@ if [ -z "$ACTIVE_NAME" ]; then
     # on an installation that has no second watcher at all.
     kill -0 "$_other_pid" 2>/dev/null || continue
     _other_filter="${_pf%.pid}.filter"
-    # An absent filter file means a watcher from before this change: unfiltered
-    # is the only thing it could have been, since filtered ones write the name.
-    if [ ! -f "$_other_filter" ] || [ "$(cat "$_other_filter" 2>/dev/null || true)" = "unfiltered" ]; then
-      _sharing=$((_sharing + 1))
-    fi
+    # An absent filter file is a watcher from BEFORE this change. It cannot be
+    # asked which project it serves, so it is not counted: warning on it would
+    # fire for every unrelated project sharing this install, and this warning is
+    # only worth having if it is true. A pre-change watcher in the SAME project
+    # is a real hazard that goes unreported here -- named in the PR rather than
+    # papered over, and it disappears as installs update.
+    [ -f "$_other_filter" ] || continue
+    _other_name="$(sed -n '1p' "$_other_filter" 2>/dev/null || true)"
+    _other_project="$(sed -n '2p' "$_other_filter" 2>/dev/null || true)"
+    # Same project only. RUN_DIR is per install; the subscription is per
+    # project, so a watcher in another project shares no pairs with this one.
+    [ "$_other_project" = "$PROJECT_PATH" ] || continue
+    [ "$_other_name" = "unfiltered" ] || continue
+    _sharing=$((_sharing + 1))
   done
   if [ "$_sharing" -gt 0 ]; then
     watch_log "another watcher ($_sharing) is receiving for the same unclaimed roles in this project."

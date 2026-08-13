@@ -612,7 +612,51 @@ run_named_watcher_for() {
   run_named_watcher_for "$third_id" "$BATS_TEST_TMPDIR/third.out" 2 alice
   refute grep -qF -- "another watcher" "$run_dir/watch.$third_id.log"
 
+  # A DIFFERENT PROJECT does not warn, even with this project's unfiltered
+  # watcher still live. `RUN_DIR` is per install, so the scan sees that pidfile
+  # — but the subscription is per project and they share no pairs. Without the
+  # project in the metadata this case warns, which is a false alarm on every
+  # installation serving two projects (raised in review).
+  local other_proj="/tmp/agmsg-watch-proj-other" other_id="other-proj-sid.$$"
+  bash "$SCRIPTS/join.sh" otherteam carol claude-code "$other_proj" >/dev/null
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$other_id" "$other_proj" claude-code \
+    >"$BATS_TEST_TMPDIR/other.out" 2>/dev/null 3>&- &
+  local other_pid=$!
+  sleep 2
+  _stop_watcher "$other_pid"
+  refute grep -qF -- "another watcher" "$run_dir/watch.$other_id.log"
+
   _stop_watcher "$first_pid"
+}
+
+@test "watch: a filtered watcher is never mistaken for unfiltered while starting (#683)" {
+  # The reader treats "live pid, no filter file" as a pre-change watcher. If the
+  # pidfile were published first, every filtered watcher would look exactly like
+  # that for the length of its startup window, and a scan landing inside it
+  # would warn about a watcher that shares nothing.
+  #
+  # Asserted on the ARTEFACTS rather than by racing: whenever a pidfile exists,
+  # its filter file exists too, and names this watcher's role. That is the
+  # property the ordering buys, and it holds at every instant rather than at the
+  # one this test happened to look.
+  # Read WHILE IT RUNS. The filter file is removed on exit under the same owner
+  # check as the pidfile, so inspecting after the watcher stops measures the
+  # cleanup, not the ordering — measured, that is how the first version of this
+  # failed.
+  local run_dir="$TEST_SKILL_DIR/run" named_id="named-order.$$"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$named_id" "$PROJ" claude-code alice \
+    >"$BATS_TEST_TMPDIR/named.out" 2>/dev/null 3>&- &
+  local named_pid=$!
+  wait_for_file "$run_dir/watch.$named_id.pid"
+
+  # Whenever the pidfile exists, the filter file exists too and names the role.
+  # That is what publishing the metadata first buys, and it holds at every
+  # instant rather than at the one this test happened to look at.
+  [ -f "$run_dir/watch.$named_id.filter" ]
+  [ "$(sed -n '1p' "$run_dir/watch.$named_id.filter")" = "alice" ]
+  [ "$(sed -n '2p' "$run_dir/watch.$named_id.filter")" = "$PROJ" ]
+
+  _stop_watcher "$named_pid"
 }
 
 @test "watch: surfaces an unopenable DB once instead of spinning silently (#197)" {
