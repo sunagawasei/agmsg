@@ -552,6 +552,69 @@ _pidfile_matches() {
 # DB-open healthcheck (#197): a store that exists but cannot be opened (the
 # native sqlite3.exe / Git Bash /c/ path mismatch, or bad perms) must surface a
 # loud error rather than spin silently delivering nothing.
+# Run watch.sh for <secs> with an active name (actas mode), then stop it.
+run_named_watcher_for() {
+  local sid="$1" out="$2" secs="$3" name="$4" pid
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code "$name" >"$out" 2>/dev/null 3>&- &
+  pid=$!
+  sleep "$secs"
+  _stop_watcher "$pid"
+}
+
+@test "watch: a second unfiltered watcher says it is sharing, and a lone one does not (#683)" {
+  # Two watchers with no active name subscribe to the same unclaimed pairs. The
+  # read cursor is one per (team, agent), so whoever polls first takes the row
+  # and the other never sees it — and `inbox.sh` then truthfully says "no new
+  # messages", because it was read. Nothing observable is left behind, so this
+  # is said at the only moment it can be: startup.
+  #
+  # Asserted from the LOG. In the configuration this runs in, fd2 is /dev/null
+  # (#691) — the helpers above redirect it too — so a warning written only to
+  # stderr would be invisible here and in production.
+  #
+  # Composite ids: a bare token is normalized on the way in (watch.sh:92), so
+  # naming the pidfile from a bare id waits for a file never written. Measured.
+  local run_dir="$TEST_SKILL_DIR/run"
+  local solo_id="solo-sid.$$" first_id="first-sid.$$" second_id="second-sid.$$" third_id="third-sid.$$"
+
+  # NEGATIVE FIRST, on the ordinary case: one watcher, alone. An implementation
+  # that always warns passes the positive half below and is wrong every start.
+  # Given seconds rather than a file to wait for, because the assertion is an
+  # ABSENCE — there is no arrival to synchronise on, and waiting longer only
+  # makes the negative stronger.
+  run_watcher_for "$solo_id" "$BATS_TEST_TMPDIR/solo.out" 2
+  refute grep -qF -- "another watcher" "$run_dir/watch.$solo_id.log"
+
+  # Now a live one, and a second started while it runs.
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$first_id" "$PROJ" claude-code \
+    >"$BATS_TEST_TMPDIR/first.out" 2>/dev/null 3>&- &
+  local first_pid=$!
+  wait_for_file "$run_dir/watch.$first_id.pid"
+
+  # Waits for the LAST of the three lines, not for the pidfile: the pidfile is
+  # written before the warning, so a test that waits on it kills the watcher
+  # mid-sentence and sees a partial message. Measured — that is how this failed.
+  local second_log="$run_dir/watch.$second_id.log"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$second_id" "$PROJ" claude-code \
+    >"$BATS_TEST_TMPDIR/second.out" 2>/dev/null 3>&- &
+  local second_pid=$!
+  wait_for_file_contains "$second_log" "/agmsg actas"
+  _stop_watcher "$second_pid"
+
+  grep -q -F -- "another watcher" "$second_log"
+  # The remedy, not only the cause. A warning that names neither what is lost
+  # nor what to type leaves the reader stopped.
+  grep -q -F -- "polls first" "$second_log"
+  grep -q -F -- "/agmsg actas" "$second_log"
+
+  # And a filtered watcher stays quiet even with the same unfiltered one alive:
+  # it is not sharing anything.
+  run_named_watcher_for "$third_id" "$BATS_TEST_TMPDIR/third.out" 2 alice
+  refute grep -qF -- "another watcher" "$run_dir/watch.$third_id.log"
+
+  _stop_watcher "$first_pid"
+}
+
 @test "watch: surfaces an unopenable DB once instead of spinning silently (#197)" {
   [ "$(id -u)" -eq 0 ] && skip "chmod 000 is ineffective as root"
   local DB="$TEST_SKILL_DIR/db/messages.db"

@@ -326,9 +326,54 @@ if [ -f "$PIDFILE" ]; then
   fi
 fi
 
-# The acquire-then-exec bootstrap above is the single-owner claim.  Do not add
-# a PID-based takeover here: signal authorization belongs exclusively to
-# agmsg_process_signal_owned, and a duplicate never reaches this body.
+echo $$ > "$PIDFILE"
+
+# --- Say when this watcher is sharing an inbox with another (#683). ---
+#
+# A watcher started WITHOUT an active name subscribes to every (team, agent)
+# registered for this project that nobody else has claimed. The read cursor is
+# one per pair, so when two such watchers exist, whoever polls first takes the
+# row and the other sees nothing -- the comment at the subscription site says
+# exactly this. The message is not duplicated and it is not lost loudly: it is
+# delivered to one of them, and the other's `inbox.sh` truthfully answers "no
+# new messages" because the row was read.
+#
+# Nothing observable is left behind, which is why this has to be said at the one
+# moment something can be said: startup.
+#
+# NOT a lease. This process still subscribes to exactly what it would have
+# subscribed to; it only stops being quiet about the fact that someone else is
+# doing the same. Exclusion is a separate decision.
+FILTERFILE="$RUN_DIR/watch.$SESSION_ID.filter"
+printf '%s
+' "${ACTIVE_NAME:-unfiltered}" > "$FILTERFILE" 2>/dev/null || true
+
+# Only when the hazard is real. A warning printed on every start is a warning
+# nobody reads, and an unfiltered watcher running alone is not in danger.
+if [ -z "$ACTIVE_NAME" ]; then
+  _sharing=0
+  for _pf in "$RUN_DIR"/watch.*.pid; do
+    [ -f "$_pf" ] || continue
+    [ "$_pf" = "$PIDFILE" ] && continue
+    _other_pid="$(cat "$_pf" 2>/dev/null || true)"
+    case "$_other_pid" in ''|*[!0-9]*) continue ;; esac
+    # Liveness by the same means the rest of this file uses. A pidfile left by a
+    # crashed watcher names nobody, and counting it would make the warning fire
+    # on an installation that has no second watcher at all.
+    kill -0 "$_other_pid" 2>/dev/null || continue
+    _other_filter="${_pf%.pid}.filter"
+    # An absent filter file means a watcher from before this change: unfiltered
+    # is the only thing it could have been, since filtered ones write the name.
+    if [ ! -f "$_other_filter" ] || [ "$(cat "$_other_filter" 2>/dev/null || true)" = "unfiltered" ]; then
+      _sharing=$((_sharing + 1))
+    fi
+  done
+  if [ "$_sharing" -gt 0 ]; then
+    watch_log "another watcher ($_sharing) is receiving for the same unclaimed roles in this project."
+    watch_log "messages addressed to those roles will reach whichever of us polls first, and the others will not see them."
+    watch_log "to receive only your own: /agmsg actas <name>"
+  fi
+fi
 # Readiness sentinels this watcher created (see #108). Populated once the
 # subscription is resolved; removed on exit so the file is present iff a live
 # watcher is currently receiving for that role.
@@ -338,7 +383,17 @@ cleanup() {
   # watcher (Monitor re-invoked for the same session_id) overwrites $PIDFILE
   # with its own pid before killing us; without this guard our EXIT trap
   # would erase the successor's record. See #66.
-  agmsg_process_cleanup_self watch "$PIDFILE" "@hash:$WATCH_OWNER_SCOPE_HASH"
+  local pidfile_pid=""
+  [ -f "$PIDFILE" ] && IFS= read -r pidfile_pid < "$PIDFILE" || true
+  # The filter file goes with the pidfile, under the same ownership test. Left
+  # behind, it would keep asserting on behalf of a dead process -- and this one
+  # asserts "I am filtered", which is the direction that SUPPRESSES the warning
+  # for everybody else. A stale pidfile makes the next watcher count a ghost; a
+  # stale filter file makes it count nobody.
+  if [ "$pidfile_pid" = "$$" ]; then
+    rm -f "$PIDFILE"
+    rm -f "$RUN_DIR/watch.$SESSION_ID.filter" 2>/dev/null || true
+  fi
   if [ -n "$READY_FILES" ]; then
     while IFS= read -r _rf; do
       [ -z "$_rf" ] && continue
