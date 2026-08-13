@@ -341,7 +341,17 @@ fi
 # registrations. Counting across projects would warn about a hazard that does
 # not exist (also raised in review).
 FILTERFILE="$RUN_DIR/watch.$SESSION_ID.filter"
-printf '%s\n%s\n' "${ACTIVE_NAME:-unfiltered}" "$PROJECT_PATH" > "$FILTERFILE" 2>/dev/null || true
+# Three lines: role, project, and OWNER PID.
+#
+# The owner is what makes this survive a successor. The replacement path signals
+# the previous watcher and does not wait for it, so the order is: successor
+# writes this file, predecessor's EXIT runs, reads the pidfile (still its own
+# pid), and removes both -- taking the successor's fresh metadata with it. The
+# successor is then live with a pidfile and no filter, which a reader classifies
+# as pre-change and skips, so a real second unfiltered watcher in this project
+# goes unreported. The pidfile transfers ownership by being overwritten; this
+# file has to carry its own (raised in review).
+printf '%s\n%s\n%s\n' "${ACTIVE_NAME:-unfiltered}" "$PROJECT_PATH" "$$" > "$FILTERFILE" 2>/dev/null || true
 
 echo $$ > "$PIDFILE"
 
@@ -412,9 +422,14 @@ cleanup() {
   # asserts "I am filtered", which is the direction that SUPPRESSES the warning
   # for everybody else. A stale pidfile makes the next watcher count a ghost; a
   # stale filter file makes it count nobody.
-  if [ "$pidfile_pid" = "$$" ]; then
-    rm -f "$PIDFILE"
-    rm -f "$RUN_DIR/watch.$SESSION_ID.filter" 2>/dev/null || true
+  [ "$pidfile_pid" = "$$" ] && rm -f "$PIDFILE"
+  # The filter file is judged on ITS OWN recorded owner, not on the pidfile.
+  # During a replacement the pidfile still names the predecessor while the
+  # successor's metadata is already on disk, so deciding by the pidfile lets the
+  # predecessor delete a file it did not write.
+  _ff="$RUN_DIR/watch.$SESSION_ID.filter"
+  if [ -f "$_ff" ] && [ "$(sed -n '3p' "$_ff" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$_ff" 2>/dev/null || true
   fi
   if [ -n "$READY_FILES" ]; then
     while IFS= read -r _rf; do

@@ -659,6 +659,45 @@ run_named_watcher_for() {
   _stop_watcher "$named_pid"
 }
 
+@test "watch: a watcher does not delete filter metadata it did not write (#683)" {
+  # The replacement path signals the previous watcher for this session id and
+  # does not wait for it, so a successor writes its filter file while the
+  # pidfile still names the predecessor. Deciding the filter's fate by the
+  # PIDFILE lets the predecessor delete metadata the successor just wrote — and
+  # the successor is then live with a pidfile and no filter, which a reader
+  # classifies as pre-change and skips. A second unfiltered watcher in the same
+  # project then goes unreported, which is the whole point of the warning.
+  #
+  # Driven deterministically rather than by racing two watchers: the race window
+  # is real but does not reproduce on demand, and a control that only sometimes
+  # enters the window is a control that only sometimes tests anything. Measured
+  # — the racing version passed with the ownership check removed.
+  #
+  # What is driven is the real `cleanup` in the real process: the file on disk
+  # is made to belong to somebody else, and the watcher is then stopped.
+  local run_dir="$TEST_SKILL_DIR/run" sid="owner.$$"
+  local pf="$run_dir/watch.$sid.pid" ff="$run_dir/watch.$sid.filter"
+
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code \
+    >"$BATS_TEST_TMPDIR/owner.out" 2>/dev/null 3>&- &
+  local w=$!
+  wait_for_file "$pf"
+  [ -f "$ff" ]
+  # Its own pid while it runs — the ordinary case, and the premise of the swap
+  # below. Without this the test could pass on a watcher that never wrote one.
+  [ "$(sed -n '3p' "$ff")" = "$(cat "$pf")" ]
+
+  # Now the file belongs to a successor: same role and project, different owner.
+  printf '%s\n%s\n%s\n' alice "$PROJ" 999999 > "$ff"
+
+  _stop_watcher "$w"
+
+  # The watcher owned the PIDFILE and removed it. It did not own the filter.
+  refute test -f "$pf"
+  [ -f "$ff" ]
+  [ "$(sed -n '3p' "$ff")" = "999999" ]
+}
+
 @test "watch: surfaces an unopenable DB once instead of spinning silently (#197)" {
   [ "$(id -u)" -eq 0 ] && skip "chmod 000 is ineffective as root"
   local DB="$TEST_SKILL_DIR/db/messages.db"
