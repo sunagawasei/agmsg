@@ -377,43 +377,66 @@ EOF
 # temp file in the same directory, then rename(2) it over <dest>. The rename is
 # atomic, so a concurrent unlocked reader sees either the old or the new file,
 # never a truncated one.
+# Best effort, and said out loud rather than assumed: `rm` is NOT on the PATH
+# that `join` is required to work under, so on that path a failed write leaves
+# its temp behind. The temp is 0600 and holds no more than the destination
+# would have, so what is lost is tidiness, not privacy -- and this is the one
+# place in here allowed to shrug, because it runs only after a failure that has
+# already been reported.
+_agmsg_discard_temp() {
+  if command -v rm >/dev/null 2>&1; then
+    rm -f "$1"
+  fi
+}
+
 agmsg_write_atomic() {
   local dest="$1" content="$2" tmp
-  # The temp is CREATED, never adopted.
+  # The temp is CREATED, never adopted, using only shell builtins.
   #
   # `> "$dest.tmp.$$"` onto a file a killed run left behind only truncates it:
   # the redirect does not touch the mode, and `umask` applies to creation, so
-  # the content would exist at whatever that leftover was set to before any
-  # `chmod` could run. For a binding that is a disclosure, not a tidiness
-  # problem -- `remote_binding.endpoint` is the credential on a hosted
-  # deployment (#804, review).
+  # the content would exist at whatever that leftover was set to. For a binding
+  # that is a disclosure -- `remote_binding.endpoint` is the credential on a
+  # hosted deployment (#804).
   #
-  # `mktemp` is the primitive that cannot do that: it creates exclusively, and
-  # it creates at 0600. A leftover `.tmp.<pid>` is now simply another file this
-  # function does not open.
+  # `mktemp` would solve it and CANNOT BE USED HERE. `join` is required to work
+  # on a PATH that carries only bash, dirname, sqlite3, sed, date, mkdir, rmdir,
+  # cat, mv, head, od, tr, sort, basename and paste -- there is a test for it,
+  # and it caught the first attempt at this fix. `chmod` is not on that list
+  # either; the version before this one called it and only survived because its
+  # failure was ignored.
   #
-  # 0600 is deliberate and applies to every caller of this helper -- team
-  # configs, roster journals, the codex port file, migrations. It is a policy
-  # for this product's own state, matching `key.sh` (chmod 600 in three places)
-  # and the handoff bundle (`umask 077`), not a change made for bindings alone.
-  tmp="$(mktemp "$dest.tmp.XXXXXX")" || {
-    printf 'agmsg: could not create a temporary file beside %s\n' "$dest" >&2
-    return 1
-  }
+  # So: `umask` and `noclobber`, both builtins. `set -C` makes `>` REFUSE an
+  # existing file rather than truncate it, so a leftover is never opened, and
+  # the name carries $RANDOM so a leftover does not block the write forever.
+  #
+  # 0600 applies to every caller of this helper -- team configs, roster
+  # journals, the codex port file, migrations. That is deliberate: it is how
+  # this product already treats its own state (`key.sh`, the handoff bundle).
+  local attempts=0
+  while :; do
+    tmp="$dest.tmp.$$.$RANDOM"
+    if ( umask 077; set -C; : > "$tmp" ) 2>/dev/null; then
+      break
+    fi
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 32 ]; then
+      printf 'agmsg: could not create a private temporary file beside %s\n' "$dest" >&2
+      return 1
+    fi
+  done
+
   # The `mv` is what makes a reader see the whole new file or the whole old one.
   # It does NOT make the CONTENT whole: a `printf` that writes half the payload
   # and then fails -- a full disk, a quota, an I/O error -- would otherwise be
-  # published, indivisibly, as the truncated destination (review).
-  #
-  # So the move is gated on the write finishing, and a failed write leaves the
-  # old destination exactly where it was.
+  # published, indivisibly, as the truncated destination.
   if ! printf '%s\n' "$content" > "$tmp"; then
-    rm -f "$tmp"
+    _agmsg_discard_temp "$tmp"
     printf 'agmsg: could not write the new contents for %s\n' "$dest" >&2
     return 1
   fi
   if ! mv "$tmp" "$dest"; then
-    rm -f "$tmp"
+    _agmsg_discard_temp "$tmp"
     printf 'agmsg: could not move the new contents into place at %s\n' "$dest" >&2
     return 1
   fi
