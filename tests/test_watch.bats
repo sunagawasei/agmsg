@@ -575,14 +575,32 @@ run_named_watcher_for() {
 # THIS TEST'S OWN COPY of the script (`$SCRIPTS` is a per-test tree), one
 # holding the predecessor between its read and its remove, one delaying the
 # successor's write into that window. Nothing outside the test tree is touched.
+# The two processes RENDEZVOUS on files; they do not sleep and hope. Each wait
+# is bounded, and the bound is a failure bound rather than a timing assumption:
+# reaching it means the other side never arrived, which is itself the answer.
+#
+#   predecessor, after its read:   announce read_done, then wait for write_done
+#   successor,  before its write:  wait for read_done, write, announce write_done
+#
+# Under the OLD order the successor signals first, so the predecessor enters
+# cleanup, reads its own pid, and blocks — the successor's write then lands
+# strictly between that read and the remove. A -> B -> C, by construction.
+#
+# Under the FIXED order the successor is not waited for by anybody: it waits
+# for a read_done that cannot come (the predecessor has not been signalled
+# yet), hits its bound, writes, and only then signals. The predecessor's
+# cleanup reads a pidfile that already names the successor. The bound is spent,
+# not raced.
 _pin_handover_interleaving() {
   local sh="$SCRIPTS/watch.sh" applied
-  perl -0pi -e 's/(\[ -f "\$PIDFILE" \] && IFS= read -r pidfile_pid < "\$PIDFILE" \|\| true)/$1\n  sleep 3  # PINNED: hold between the read and the remove/' "$sh"
-  perl -0pi -e 's/^echo \$\$ > "\$PIDFILE"$/sleep 1  # PINNED: write inside that window\necho \$\$ > "\$PIDFILE"/m' "$sh"
+  export AGMSG_TEST_PIN_DIR="$TEST_SKILL_DIR/run/pin"
+  mkdir -p "$AGMSG_TEST_PIN_DIR"
+  perl -0pi -e 's/(\[ -f "\$PIDFILE" \] && IFS= read -r pidfile_pid < "\$PIDFILE" \|\| true)/$1\n  if [ "\${AGMSG_TEST_PIN_ROLE:-}" = predecessor ] && [ -n "\${AGMSG_TEST_PIN_DIR:-}" ]; then  # PINNED\n    : > "\$AGMSG_TEST_PIN_DIR\/read_done"\n    _pin_i=0\n    while [ ! -f "\$AGMSG_TEST_PIN_DIR\/write_done" ] && [ "\$_pin_i" -lt 100 ]; do sleep 0.1; _pin_i=\$((_pin_i+1)); done\n  fi/' "$sh"
+  perl -0pi -e 's/^echo \$\$ > "\$PIDFILE"$/if [ "\${AGMSG_TEST_PIN_ROLE:-}" = successor ] && [ -n "\${AGMSG_TEST_PIN_DIR:-}" ]; then  # PINNED\n  _pin_i=0\n  while [ ! -f "\$AGMSG_TEST_PIN_DIR\/read_done" ] && [ "\$_pin_i" -lt 20 ]; do sleep 0.1; _pin_i=\$((_pin_i+1)); done\nfi\necho \$\$ > "\$PIDFILE"\nif [ "\${AGMSG_TEST_PIN_ROLE:-}" = successor ] && [ -n "\${AGMSG_TEST_PIN_DIR:-}" ]; then : > "\$AGMSG_TEST_PIN_DIR\/write_done"; fi  # PINNED/m' "$sh"
   # A control on the injection itself: an edit that silently matched nothing
   # would leave this test asserting the ordinary case and calling it the race.
-  applied="$(grep -c 'PINNED:' "$sh")"
-  [ "$applied" -eq 2 ]
+  applied="$(grep -c 'PINNED' "$sh")"
+  [ "$applied" -eq 3 ]
 }
 
 @test "watch: a predecessor stopped mid-cleanup cannot delete the successor's pidfile (#595)" {
@@ -593,15 +611,32 @@ _pin_handover_interleaving() {
   local iid="solo.$sesspid"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
 
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
+  AGMSG_TEST_PIN_ROLE=predecessor AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w1=$!
   _wait_pidfile "$pf" "$w1"
 
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
+  AGMSG_TEST_PIN_ROLE=successor AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w2=$!
-  # Past the successor's delayed write AND past the predecessor's delayed
-  # remove, so what is read here is the state both have finished acting on.
-  sleep 6
+
+  # Wait for the rendezvous to complete rather than for a duration: the
+  # successor announces its write, and only then can the predecessor's remove
+  # run at all. Bounded, and the bound failing is a real failure.
+  local i
+  for i in $(seq 1 150); do
+    [ -f "$AGMSG_TEST_PIN_DIR/write_done" ] && break
+    sleep 0.1
+  done
+  [ -f "$AGMSG_TEST_PIN_DIR/write_done" ]
+  # The predecessor's remove is the last thing it does before exiting, so its
+  # exit is the point after which nothing more can touch the pidfile. Waiting
+  # for the process rather than for a number is what makes this deterministic.
+  for i in $(seq 1 150); do
+    kill -0 "$w1" 2>/dev/null || break
+    sleep 0.1
+  done
+  run kill -0 "$w1"; [ "$status" -ne 0 ]
 
   # The successor is alive: this is about its record, not about it dying.
   run kill -0 "$w2"; [ "$status" -eq 0 ]
