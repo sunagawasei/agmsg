@@ -551,12 +551,50 @@ eperm_pid() {
   [ "$3" = "$sp" ]
 }
 
-@test "session-start: warns once when owner pid resolution degrades to a bare sid" {
-  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" \
-    team alice claude-code "$TEST_PROJECT" >/dev/null
-  run env AGMSG_AGENT_PID= CLAUDE_PID="$$" AGMSG_RESOLVE_PROJECT=0 \
-    bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" \
-      <<< '{"session_id":"sid-bare-warning"}'
+@test "session-start: a connected team with no engine is started, and said when that fails (#761, #774)" {
+  # A reboot kills every sync engine and nothing restarts one. `connected` keeps
+  # printing and `send` keeps succeeding locally, so the only symptom is silence
+  # — which reads as "nobody wrote anything". This hook is the first thing of
+  # ours that runs afterwards.
+  #
+  # A RULING WAS REVERSED HERE, and this test is where it is recorded.
+  #
+  # #761/#765 decided: do NOT start anything, make the absence VISIBLE. That
+  # decision is what this test was written to hold. #774 reverses it — an agent
+  # arriving at a connected team now STARTS the engine — on the grounds that
+  # visibility asks a person for something the machine can do.
+  #
+  # What #765 built is not discarded: its warning, its wording and its runnable
+  # remedy are exactly what remains when the start FAILS, which is the case
+  # below. So the assertions about what the operator is told are unchanged, and
+  # only the reason they are reachable is new. This is a reversal of a decision,
+  # not a test edited to fit new output (raised in review). It fails here because there is no engine to start in this fixture,
+  # which is exactly the case the warning is for, so the assertions about what
+  # the operator is told are unchanged. What is new is the reason they are
+  # reachable.
+  #
+  # THE FAILURE IS FORCED, not inherited from the fixture.
+  #
+  # The first version relied on there being no engine to start, which is true
+  # when this file runs alone and NOT when it runs with its neighbours: the
+  # case passed under `--filter` and failed in the full file, because what the
+  # start does depends on what other tests left behind. That is the same
+  # cross-test coupling this PR fixes in its own suite, arriving from the other
+  # direction — so the condition is stated here instead of assumed.
+  #
+  # An unusable interpreter makes `sync start` fail immediately and for a named
+  # reason, which is what the warning below is about. The budget is raised as
+  # well: under the 5s default a slow refusal is reported as "still in flight",
+  # which is a different fact and is tested separately in
+  # tests/test_sync_autostart.bats.
+  export AGMSG_NODE="$TEST_SKILL_DIR/no-such-node-for-this-test"
+  export AGMSG_SYNC_AUTOSTART_TIMEOUT_S=60
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+
+  # NEGATIVE FIRST, on the state every ordinary machine is in: no connected
+  # team at all. A line printed unconditionally would pass the positive half
+  # below and be wrong every single session.
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
   [ "$status" -eq 0 ]
   [ "$(printf '%s\n' "$output" | grep -c 'owner PID unresolved')" -eq 1 ]
   [[ "$output" == *"without a cc-instance record"* ]]
