@@ -64,11 +64,26 @@ file_mode() {
   source "$SCRIPTS/lib/registry-lock.sh"
   agmsg_write_atomic "$probe" '{"endpoint":"https://host/t/THE-SECRET/"}'
 
-  # 1. the leftover still holds its own bytes: nothing was written through it
+  # 1. the leftover is still THERE. This is the assertion that discriminates:
+  # the old implementation opened this exact path and then `mv`'d it into place,
+  # so under that code the decoy does not survive at all -- it becomes the
+  # destination. Its disappearance is the observable, and it has to be asserted
+  # before its contents, because `cat` on a missing file is a different failure
+  # with a different message.
+  [ -f "$decoy" ]
+  # 2. and it still holds its own bytes
   [ "$(cat "$decoy")" = "SENTINEL-NOT-TOUCHED" ]
-  # 2. and the secret is not in it, at any mode
-  ! grep -q 'THE-SECRET' "$decoy"
-  # 3. the real write happened, privately
+  # 3. and the secret is not in it, at any mode. This one cannot be the reason
+  # the test reddens -- adoption removes the file rather than leaving it with
+  # the secret inside -- so it is a guard against a future implementation that
+  # writes through the leftover WITHOUT consuming it, not the discriminator.
+  #
+  # `refute`, not `! grep`: a command under `!` is exempt from errexit, so the
+  # negated form returns non-zero and the test carries on regardless -- it could
+  # not fail. The repository has a checker for exactly this, and it was right to
+  # stop this file. #715 is the same mechanism, found the same way.
+  refute grep -q 'THE-SECRET' "$decoy"
+  # 4. the real write happened, privately
   grep -q 'THE-SECRET' "$probe"
   [ "$(file_mode "$probe")" = "600" ]
   rm -f "$decoy"
