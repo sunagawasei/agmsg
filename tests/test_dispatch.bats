@@ -47,6 +47,46 @@ reply_after_request() {
   [[ "$output" =~ "No new messages." ]]
 }
 
+# Every other test here passes `--type codex`, so none of them exercises the
+# default — which is where #783 actually bit. dispatch.sh must resolve a type
+# for the commands that require one, but whoami.sh is the caller that can work
+# it out itself, and handing it the `codex` default replaced detection with a
+# guess: a Claude Code user on Windows who never set AGMSG_AGENT_TYPE asked "am
+# I joined AS CODEX?", got the truthful `not_joined=true`, and read it as "I am
+# not joined". Reverting either half of the dispatch change turns this red.
+@test "dispatch: with no type chosen, identity comes from detection, not the codex default (#783)" {
+  local proj="$BATS_TEST_TMPDIR/project-claude"
+  mkdir -p "$proj"
+  bash "$SCRIPTS/join.sh" demo carol claude-code "$proj"
+
+  # Control first. If detection does not land on claude-code here, the
+  # assertion below would pass or fail for a reason that has nothing to do
+  # with dispatch, and this line says so instead of staying quiet.
+  run env CLAUDE_CODE_SESSION_ID=test-session bash "$SCRIPTS/whoami.sh" "$proj"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "type=claude-code" ]]
+
+  run env CLAUDE_CODE_SESSION_ID=test-session bash "$SCRIPTS/windows/dispatch.sh" --project "$proj" -- inbox
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "No new messages." ]]
+}
+
+# The other direction: a type the caller DID choose must still be honoured, so
+# the fix above cannot be "ignore the type argument".
+@test "dispatch: an explicitly chosen type is still what identity is resolved as (#783)" {
+  local proj="$BATS_TEST_TMPDIR/project-both"
+  mkdir -p "$proj"
+  bash "$SCRIPTS/join.sh" demo dave claude-code "$proj"
+
+  # Asked as codex, dave is not there — dispatch must stop rather than quietly
+  # resolve him. (The output is `suggest=true`, not `not_joined=true`: setup()
+  # registers codex agents in other projects, so the scan has something to
+  # suggest. What matters is that dave is not the answer.)
+  run env CLAUDE_CODE_SESSION_ID=test-session bash "$SCRIPTS/windows/dispatch.sh" --type codex --project "$proj" -- inbox
+  [ "$status" -eq 2 ]
+  [[ ! "$output" =~ "agent=dave" ]]
+}
+
 @test "dispatch: multiple identity stops without choosing" {
   bash "$SCRIPTS/join.sh" many first codex "$PROJECT_MULTI"
   bash "$SCRIPTS/join.sh" many second codex "$PROJECT_MULTI"

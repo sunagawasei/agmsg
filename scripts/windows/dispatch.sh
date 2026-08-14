@@ -12,6 +12,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 AGENT_TYPE="${AGMSG_AGENT_TYPE:-codex}"
+# Whether the type above was CHOSEN or merely defaulted (#783). The commands
+# below all require a type, so the `codex` fallback has to stay — but whoami.sh
+# is the one caller that can work it out for itself, and handing it this default
+# replaces its detection with a guess. A Claude Code user on Windows who never
+# set AGMSG_AGENT_TYPE was asking "am I joined AS CODEX?", getting the truthful
+# `not_joined=true`, and reading it as "I am not joined."
+AGENT_TYPE_EXPLICIT="${AGMSG_AGENT_TYPE:+1}"
 PROJECT="$PWD"
 TEAM="${AGMSG_TEAM:-}"
 AGENT="${AGMSG_AGENT:-}"
@@ -38,7 +45,7 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --type)    AGENT_TYPE="${2:?--type needs a value}"; shift 2 ;;
+    --type)    AGENT_TYPE="${2:?--type needs a value}"; AGENT_TYPE_EXPLICIT=1; shift 2 ;;
     --project) PROJECT="${2:?--project needs a path}"; shift 2 ;;
     --team)    TEAM="${2:?--team needs a value}"; shift 2 ;;
     --agent)   AGENT="${2:?--agent needs a value}"; shift 2 ;;
@@ -129,7 +136,13 @@ resolve_identity() {
   local whoami_output
   local whoami_code
   set +e
-  whoami_output="$(run_script whoami.sh "$PROJECT" "$AGENT_TYPE" 2>&1)"
+  # Pass the type only when the caller chose it; otherwise let whoami.sh detect.
+  # See AGENT_TYPE_EXPLICIT above (#783).
+  if [ -n "$AGENT_TYPE_EXPLICIT" ]; then
+    whoami_output="$(run_script whoami.sh "$PROJECT" "$AGENT_TYPE" 2>&1)"
+  else
+    whoami_output="$(run_script whoami.sh "$PROJECT" 2>&1)"
+  fi
   whoami_code=$?
   set -e
   if [ "$whoami_code" -ne 0 ]; then

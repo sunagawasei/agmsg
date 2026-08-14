@@ -86,6 +86,28 @@ EOF
 PROJECT_PATH="${1:?Usage: whoami.sh <project_path> [type]}"
 AGENT_TYPE="${2:-$(detect_cli_type)}"
 
+# Reject an unknown type the caller ASKED for, the same check join.sh makes
+# (#783). Without it a wrong or misspelled $2 reads all the way through to
+# `not_joined=true` — a true answer to a different question ("are you
+# registered under this exact, wrong type?"), which looks like ordinary output
+# rather than an error, so nobody doubts it and they go and join again.
+#
+# GUARDED ON $2 BEING PRESENT, following doctor.sh's --type check, and that is
+# not tidiness. detect_cli_type's own value is NOT guaranteed to be a member of
+# the registry: two of its three exits echo a name read out of
+# agmsg_known_types, but the third is the literal `claude-code` fallback above,
+# which no registry lookup stands behind. Validating the RESOLVED value ties
+# the no-argument path to that literal still being discoverable — so a broken
+# install, or a trust decision that drops the built-in base, would stop
+# everyone rather than only the person who mistyped a type. Measured: with
+# `claude-code` renamed out of scripts/drivers/types/, validating the resolved
+# value turns a plain `whoami.sh <project>` into exit 1, while the same tree
+# without the check still answers.
+if [ -n "${2:-}" ] && ! agmsg_is_known_type "$AGENT_TYPE"; then
+  echo "Unknown agent type: '$AGENT_TYPE' (supported: $(agmsg_known_types | sort -u | paste -sd, - | sed 's/,/, /g'))" >&2
+  exit 1
+fi
+
 # SCRIPT_DIR is already resolved above (before sourcing the type registry).
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEAMS_DIR="$SCRIPT_DIR/../teams"

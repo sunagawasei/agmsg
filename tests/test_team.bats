@@ -336,6 +336,49 @@ EOF
   [[ "$output" =~ "type=claude-code" ]]
 }
 
+@test "whoami: rejects an explicit unknown type instead of answering not_joined (#783)" {
+  bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/proj
+  clear_autodetect_env
+  mock_no_agent_ps
+  run bash "$SCRIPTS/whoami.sh" /tmp/proj not-a-real-type
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "Unknown agent type: 'not-a-real-type'" ]]
+  # The whole point: the old behaviour was a truthful answer to a question the
+  # caller did not mean to ask, and it is that answer which must not appear.
+  [[ ! "$output" =~ "not_joined=true" ]]
+}
+
+@test "whoami: the unknown-type error lists the registry, like join.sh's does (#783)" {
+  clear_autodetect_env
+  mock_no_agent_ps
+  run bash "$SCRIPTS/whoami.sh" /tmp/proj bogus-type
+  [ "$status" -eq 1 ]
+  # Derived from the registry rather than compared against a written-out list,
+  # so adding a type cannot leave this assertion behind.
+  local expected
+  expected="$(cd "$SCRIPTS" && bash -c 'source lib/type-registry.sh; agmsg_known_types | sort -u | paste -sd, - | sed "s/,/, /g"')"
+  [[ "$output" =~ "supported: $expected" ]]
+}
+
+# THE CHECK IS GUARDED ON $2, AND THIS IS THE TEST THAT SAYS SO. Validating the
+# RESOLVED type instead would pass every other test in this file and fail only
+# here: detect_cli_type's last exit is a hardcoded `claude-code` that no
+# registry lookup stands behind, so tying the no-argument path to it makes a
+# registry that cannot offer that name stop everyone, not just a caller who
+# mistyped. Removing the `[ -n "${2:-}" ]` guard turns this red.
+@test "whoami: no type argument still answers when the fallback name is not in the registry (#783)" {
+  bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/proj
+  clear_autodetect_env
+  mock_no_agent_ps
+  # Move it aside rather than delete it: what is under test is the registry no
+  # longer offering the name detect_cli_type falls back to.
+  mv "$TYPES/claude-code" "$TYPES/.claude-code-hidden"
+  run bash "$SCRIPTS/whoami.sh" /tmp/proj
+  mv "$TYPES/.claude-code-hidden" "$TYPES/claude-code"
+  [ "$status" -eq 0 ]
+  [[ ! "$output" =~ "Unknown agent type" ]]
+}
+
 # --- reset.sh ---
 
 @test "reset: removes only current project registration" {
