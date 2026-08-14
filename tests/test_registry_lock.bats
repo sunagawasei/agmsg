@@ -313,3 +313,24 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   # And the refusal names the real reason rather than accusing another process.
   grep -q "cannot prove the lock is its own" <<<"$output"
 }
+
+@test "lock: a failed release is clean under set -u (#778)" {
+  # The dead `saved` restore was an unbound-variable error waiting for a caller
+  # with `set -u`, and every test here ran without it — so the suite could not
+  # have caught it. The reviewer found it by reading. This drives the same path
+  # with `set -u` on, which is the shape a real caller has.
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    set -u
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR" || exit 1
+    printf "x\n" > "$TEAM_DIR/.config.lock/stray"
+    agmsg_lock_release
+  '
+  # The release reports the stuck lock and does not abort the caller.
+  [ "$status" -eq 0 ]
+  grep -q "could not release the registry lock" <<<"$output"
+  refute grep -qi "unbound variable" <<<"$output"
+  # And the holder survives with everything an operator needs.
+  grep -qE "^pid [0-9]+$" "$TEAM_DIR/.config.lock.holder"
+  grep -q "^command " "$TEAM_DIR/.config.lock.holder"
+}
