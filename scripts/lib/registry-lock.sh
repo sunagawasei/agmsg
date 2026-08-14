@@ -140,7 +140,19 @@ agmsg_lock_acquire() {
   local nonce=""
   nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
   [ -n "$nonce" ] || nonce="${RANDOM:-}${RANDOM:-}${RANDOM:-}"
-  _agmsg_lock_set_token "$lock" "${HOSTNAME:-h}.$$.$(date +%s).$nonce"
+  # FAIL SAFE MEANS NO TOKEN, not a weak one. With neither /dev/urandom nor
+  # $RANDOM, what is left is host.pid.second — which collides across hosts, and
+  # a collision makes this process delete someone else's successor. That is the
+  # hazard the token exists to close, so the degraded path must not produce a
+  # token at all.
+  #
+  # No token recorded means release finds no match and refuses to remove
+  # anything: the lock leaks, and leaking is the failure this file chose over
+  # taking a live lock away. The claim "it degrades toward not deleting" was
+  # written before this branch existed; it is true now (raised in review).
+  if [ -n "$nonce" ]; then
+    _agmsg_lock_set_token "$lock" "${HOSTNAME:-h}.$$.$(date +%s).$nonce"
+  fi
   {
     printf 'token %s\n' "$(_agmsg_lock_get_token "$lock")"
     printf 'pid %s\n' "$$"
@@ -239,7 +251,15 @@ _agmsg_lock_drop() {
     # Someone else's lock, or one whose holder file could not be written. Either
     # way this process has no standing to remove it, and saying so is the whole
     # report — there is nothing here for the operator to fix.
-    echo "agmsg: not releasing $l — it is held by another process now" >&2
+    if [ -z "$mine" ]; then
+      # This process never recorded a token for this path: either the holder
+      # could not be written, or there was no entropy to make one with. Saying
+      # "another process holds it" would be a claim about someone else that
+      # nothing here supports.
+      echo "agmsg: not releasing $l — this process cannot prove the lock is its own" >&2
+    else
+      echo "agmsg: not releasing $l — it is held by another process now" >&2
+    fi
     return 0
   fi
   # The holder is READ before it is removed, and restored byte for byte if the
@@ -282,11 +302,15 @@ _agmsg_lock_drop() {
     fi
     return 0
   fi
-  # Still here, so this process still owns it. Put back what was there, not a
-  # summary of it.
-  if [ -d "$l" ] && [ -n "$saved" ]; then
-    printf '%s\n' "$saved" > "$l.holder" 2>/dev/null || true
-  fi
+  # NOTHING TO RESTORE. The holder is a sibling, so the rmdir above never
+  # touched it — it is still on disk, with the pid, command and host intact,
+  # which is what the operator reading the message below needs.
+  #
+  # An earlier version of this file wrote the holder INSIDE the lock, had to
+  # remove it before rmdir, and restored it on failure. That restore survived
+  # the move to a sibling as dead code referencing an unset `saved`: harmless
+  # where `set -u` is off, an unbound-variable error where it is on, and in
+  # neither case doing anything. Raised in review.
   # Still here. Say which lock, say why, and say what it costs — the next
   # acquire on this team will wait for a holder that is not coming back.
   echo "agmsg: could not release the registry lock at $l" >&2
@@ -319,6 +343,11 @@ agmsg_lock_release_one() {
   while IFS= read -r l; do
     [ -n "$l" ] || continue
     if [ "$l" = "$lock" ]; then
+      # `|| true` here does NOT swallow the failure: `_agmsg_lock_drop` has
+      # already reported it on stderr. What it does is keep the loop going, so
+      # one stuck lock does not strand the others this process holds — the
+      # opposite of the `rmdir … || true` this file replaced, where the failure
+      # had nowhere else to appear.
       _agmsg_lock_drop "$l" || true
     else
       kept="${kept:+$kept
@@ -334,6 +363,8 @@ agmsg_lock_release() {
   [ -n "${AGMSG_HELD_LOCKS:-}" ] || return 0
   local l
   while IFS= read -r l; do
+    # Reported inside the helper; `|| true` only keeps the loop alive so one
+    # stuck lock cannot strand the rest. See the note in release_one.
     [ -n "$l" ] && { _agmsg_lock_drop "$l" || true; }
   done <<EOF
 $AGMSG_HELD_LOCKS

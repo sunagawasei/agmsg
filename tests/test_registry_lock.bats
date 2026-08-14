@@ -290,3 +290,26 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   [ "$status" -eq 0 ]
   [ "$(sort -u <<<"$output" | grep -c .)" -eq 2 ]
 }
+
+@test "lock: with no entropy source, no token is recorded and nothing is removed (#778)" {
+  # Fail-safe means NO token, not a weak one. With neither /dev/urandom nor
+  # $RANDOM, what is left is host.pid.second — which collides across hosts, and
+  # a collision makes this process delete someone else's successor. So the
+  # degraded path records nothing, release finds no match, and the lock leaks
+  # rather than being taken from whoever holds it (raised in review).
+  local lib="$BATS_TEST_TMPDIR/nolib.sh"
+  sed -e 's|^  nonce="\$(LC_ALL=C od.*|  nonce=""|' \
+      -e 's|^  \[ -n "\$nonce" \] \|\| nonce=.*|  :|' "$LOCKLIB" > "$lib"
+  bash -n "$lib"
+
+  run env LIB="$lib" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LIB"
+    agmsg_lock_acquire "$TEAM_DIR" || exit 1
+    [ -z "$(sed -n "s/^token //p" "$TEAM_DIR/.config.lock.holder" 2>/dev/null)" ] || exit 2
+    agmsg_lock_release
+    [ -d "$TEAM_DIR/.config.lock" ] || exit 3
+  '
+  [ "$status" -eq 0 ]
+  # And the refusal names the real reason rather than accusing another process.
+  grep -q "cannot prove the lock is its own" <<<"$output"
+}
