@@ -319,10 +319,11 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   # with `set -u`, and every test here ran without it — so the suite could not
   # have caught it. The reviewer found it by reading. This drives the same path
   # with `set -u` on, which is the shape a real caller has.
-  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" SNAP="$BATS_TEST_TMPDIR/holder.before" bash -c '
     set -u
     . "$LOCKLIB"
     agmsg_lock_acquire "$TEAM_DIR" || exit 1
+    cp "$TEAM_DIR/.config.lock.holder" "$SNAP"
     printf "x\n" > "$TEAM_DIR/.config.lock/stray"
     agmsg_lock_release
   '
@@ -330,7 +331,11 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   [ "$status" -eq 0 ]
   grep -q "could not release the registry lock" <<<"$output"
   refute grep -qi "unbound variable" <<<"$output"
-  # And the holder survives with everything an operator needs.
-  grep -qE "^pid [0-9]+$" "$TEAM_DIR/.config.lock.holder"
-  grep -q "^command " "$TEAM_DIR/.config.lock.holder"
+  # And the holder is BYTE FOR BYTE what acquire wrote. Checking that `pid` and
+  # `command` are present would pass a change that drops `token` or `host`,
+  # rewrites a value, reorders the lines, or appends to the file — and the claim
+  # being made is that a failed release does not touch it at all (raised in
+  # review). The comparison is against a copy taken while the lock was held.
+  run diff "$BATS_TEST_TMPDIR/holder.before" "$TEAM_DIR/.config.lock.holder"
+  [ "$status" -eq 0 ]
 }
