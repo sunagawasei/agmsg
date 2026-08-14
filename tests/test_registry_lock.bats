@@ -234,3 +234,57 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   # And it took nothing else with it.
   [ -d "$BATS_TEST_TMPDIR/with space/DO-NOT-TOUCH" ]
 }
+
+@test "lock: a process holding TWO locks releases both (#778)" {
+  # This library's contract is that a caller can hold several locks at once —
+  # rename-team takes two. A single per-process token is overwritten by the
+  # second acquire, so releasing the first reads a mismatch, calls it someone
+  # else's, and leaks it. Measured before the fix: both leaked (raised in
+  # review).
+  local a="$BATS_TEST_TMPDIR/A" b="$BATS_TEST_TMPDIR/B"
+  mkdir -p "$a" "$b"
+  run env LOCKLIB="$LOCKLIB" A="$a" B="$b" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$A" || exit 1
+    agmsg_lock_acquire "$B" || exit 1
+    agmsg_lock_release
+    [ ! -d "$A/.config.lock" ] || exit 2
+    [ ! -d "$B/.config.lock" ] || exit 3
+  '
+  [ "$status" -eq 0 ]
+  refute grep -q "not releasing" <<<"$output"
+}
+
+@test "lock: a stuck lock keeps saying WHO, not just that it is owned (#778)" {
+  # The moment the diagnosis is needed is the moment the removal fails. An
+  # earlier version restored only the token line, so pid, command and host —
+  # the whole point of writing a holder — disappeared exactly then.
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR" || exit 1
+    printf "x\n" > "$TEAM_DIR/.config.lock/stray"
+    agmsg_lock_release >/dev/null 2>&1
+    cat "$TEAM_DIR/.config.lock/holder"
+  '
+  [ "$status" -eq 0 ]
+  grep -qE "^token " <<<"$output"
+  grep -qE "^pid [0-9]+$" <<<"$output"
+  grep -q "^command " <<<"$output"
+  grep -q "^host " <<<"$output"
+}
+
+@test "lock: two locks taken in the same second by the same pid differ (#778)" {
+  # Ownership is decided by this token, so a collision means deleting someone
+  # else's successor — the hazard the token exists to close. A pid and a second
+  # are not unique across hosts on a shared store.
+  local a="$BATS_TEST_TMPDIR/T1" b="$BATS_TEST_TMPDIR/T2"
+  mkdir -p "$a" "$b"
+  run env LOCKLIB="$LOCKLIB" A="$a" B="$b" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$A" || exit 1
+    agmsg_lock_acquire "$B" || exit 1
+    sed -n "s/^token //p" "$A/.config.lock/holder" "$B/.config.lock/holder"
+  '
+  [ "$status" -eq 0 ]
+  [ "$(sort -u <<<"$output" | grep -c .)" -eq 2 ]
+}

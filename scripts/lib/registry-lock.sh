@@ -123,9 +123,22 @@ agmsg_lock_acquire() {
   # process can then take the same path. Releasing on "it is mine because I once
   # took this path" would delete the SUCCESSOR's lock and break the exclusion
   # this file exists for (raised in review). The token makes "mine" checkable.
-  _agmsg_lock_token="$$.$(date +%s).${RANDOM:-0}"
+  # PER LOCK, not per process. This library's own contract is that a process can
+  # hold several locks at once — rename-team takes two — so a single global
+  # token is overwritten by the second acquire, and releasing the first then
+  # reads a mismatch, calls it someone else's, and leaks it (raised in review).
+  #
+  # Entropy: a pid and a second are not unique across hosts on a shared store,
+  # and $RANDOM is 15 bits where it exists at all. /dev/urandom is the source
+  # when there is one; the fallbacks degrade toward "cannot prove it is mine",
+  # and an unprovable lock is one this process will refuse to delete rather
+  # than one it deletes on a coincidence.
+  local nonce=""
+  nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  [ -n "$nonce" ] || nonce="${RANDOM:-}${RANDOM:-}${RANDOM:-}"
+  _agmsg_lock_set_token "$lock" "$(uname -n 2>/dev/null || echo unknown).$$.$(date +%s).$nonce"
   {
-    printf 'token %s\n' "$_agmsg_lock_token"
+    printf 'token %s\n' "$(_agmsg_lock_get_token "$lock")"
     printf 'pid %s\n' "$$"
     printf 'command %s\n' "${0##*/}"
     printf 'host %s\n' "$(uname -n 2>/dev/null || echo unknown)"
@@ -169,8 +182,42 @@ agmsg_lock_acquire() {
 # The holder file written at acquire time makes the directory non-empty, so the
 # removal is two steps. Both are this process's own file and its own lock; a
 # failure of either is reported rather than swallowed.
+# Per-lock token storage, kept in one newline-separated variable because bash
+# 3.2 has no associative arrays and this library targets it.
+#
+# Format: one "<lock path>\t<token>" per line. The path is matched WHOLE, for
+# the reason AGMSG_HELD_LOCKS already documents: lock paths nest, so a substring
+# test would let one team's entry answer for another's.
+_agmsg_lock_set_token() {
+  local path="$1" token="$2" kept="" line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      "$path	"*) ;;
+      *) kept="${kept:+$kept
+}$line" ;;
+    esac
+  done <<EOF
+${_AGMSG_LOCK_TOKENS:-}
+EOF
+  _AGMSG_LOCK_TOKENS="${kept:+$kept
+}$path	$token"
+}
+
+_agmsg_lock_get_token() {
+  local path="$1" line
+  while IFS= read -r line; do
+    case "$line" in
+      "$path	"*) printf '%s' "${line#*	}"; return 0 ;;
+    esac
+  done <<EOF
+${_AGMSG_LOCK_TOKENS:-}
+EOF
+  return 1
+}
+
 _agmsg_lock_drop() {
-  local l="$1" err="" seen=""
+  local l="$1" err="" seen="" mine="" saved=""
   [ -d "$l" ] || return 0
   # OWNERSHIP FIRST. The directory being at the path this process locked is not
   # evidence that it is the same directory: an operator can remove a stuck lock
@@ -181,26 +228,36 @@ _agmsg_lock_drop() {
   #
   # Compared against the token written at acquire, not the pid: a pid recurs.
   seen="$(sed -n 's/^token //p' "$l/holder" 2>/dev/null | head -1)"
-  if [ "$seen" != "${_agmsg_lock_token:-}" ]; then
+  mine="$(_agmsg_lock_get_token "$l" || printf '')"
+  # An empty recorded token means this process never proved ownership of this
+  # path — refuse rather than guess. Same branch as a genuine mismatch.
+  if [ -z "$mine" ] || [ "$seen" != "$mine" ]; then
     # Someone else's lock, or one whose holder file could not be written. Either
     # way this process has no standing to remove it, and saying so is the whole
     # report — there is nothing here for the operator to fix.
     echo "agmsg: not releasing $l — it is held by another process now" >&2
     return 0
   fi
-  # rmdir FIRST, with the holder still in place. Removing the holder and then
-  # failing to remove the directory leaves a lock nobody can prove is theirs:
-  # the next release reads no token, decides the lock belongs to someone else,
-  # and reports that instead of the stuck lock — two contradictory lines about
-  # the same directory. Measured, on the trap's second call.
+  # The holder is READ before it is removed, and restored byte for byte if the
+  # directory will not go.
   #
-  # A lock with a holder file is never empty, so the first rmdir is expected to
-  # fail; the holder is removed only once the directory is going to go.
+  # Restoring only the token was the first attempt and it defeated the change:
+  # pid, command and host are what "a leaked lock says who left it" MEANS, and
+  # a stuck removal is exactly the moment an operator needs them. The one
+  # failure this file is about would have been the one failure with no
+  # diagnosis (raised in review).
+  #
+  # Removing the holder first is unavoidable — a directory with a file in it
+  # cannot be rmdir'd — so the ordering is: read, remove, try, restore on
+  # failure.
+  saved="$(cat "$l/holder" 2>/dev/null || printf '')"
   rm -f "$l/holder" 2>/dev/null || true
   err="$(rmdir "$l" 2>&1)" && return 0
-  # Put the holder back: this process still owns the lock, and the next release
-  # — or the operator reading the message below — has to be able to tell.
-  [ -d "$l" ] && printf 'token %s\n' "${_agmsg_lock_token:-}" > "$l/holder" 2>/dev/null || true
+  # Still here, so this process still owns it. Put back what was there, not a
+  # summary of it.
+  if [ -d "$l" ] && [ -n "$saved" ]; then
+    printf '%s\n' "$saved" > "$l/holder" 2>/dev/null || true
+  fi
   # Still here. Say which lock, say why, and say what it costs — the next
   # acquire on this team will wait for a holder that is not coming back.
   echo "agmsg: could not release the registry lock at $l" >&2
