@@ -82,6 +82,45 @@ Options:
 Set AGMSG_CODEX_APP_SERVER_CMD to override the app-server command for tests.`);
 }
 
+// EVERY DIAGNOSTIC LINE NAMES THE PROCESS THAT WROTE IT, AND REACHES THE FILE
+// IN ONE WRITE.
+//
+// The launcher appends this process's stderr to a per-identity log
+// (`codex-bridge-launcher.sh`: `>>"$log" 2>&1`), and that file has more than
+// one writer by construction: the bridge that is running, plus every launch
+// attempt that finds it already there, says so, and exits. Two such lines were
+// reported spliced mid-word, and other logs were reported losing their line
+// beginnings (#784).
+//
+// This does not claim to prevent that, and it is deliberately not written as
+// if it did. What it does:
+//
+//   ONE WRITE PER LINE. The newline is part of the same `write` as the text,
+//   so a line is never split into two writes by this side. Whether two
+//   processes' writes can still interleave is a property of the platform's
+//   append, not of this code — and the report is from Windows/Git Bash, where
+//   that is exactly the open question.
+//
+//   THE WRITER IS NAMED. A spliced line now carries two pids, and a line that
+//   lost its beginning no longer starts with `[<pid>] `. Corruption that
+//   cannot be prevented from here can at least stop being invisible: the log
+//   is the only evidence for the other reports on that platform, and one that
+//   is quietly wrong is worse than one that is obviously wrong.
+//
+// stdout is deliberately NOT prefixed. `usage()`, the thread-id list and
+// `--resolve-only` are read by people and asserted by tests; a prefix there
+// would change an interface, not a diagnostic.
+const LOG_PREFIX = `[${process.pid}] `;
+
+function logLine(...args) {
+  process.stderr.write(LOG_PREFIX + require("util").format(...args) + "\n");
+}
+
+// Rebound rather than applied at the forty-odd call sites: a helper that has
+// to be remembered is one a later line will forget, and the point of this
+// change is that EVERY diagnostic carries the pid.
+console.error = logLine;
+
 function die(message) {
   console.error(`codex-bridge: ${message}`);
   process.exit(1);

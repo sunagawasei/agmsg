@@ -69,6 +69,34 @@ EOF
   [[ "$output" =~ "Codex app-server bridge" ]]
 }
 
+# --- the log names who wrote each line (#784) ---------------------------
+#     The launcher appends this process's stderr to a per-identity log that has
+#     more than one writer by construction, and lines were reported spliced
+#     mid-word. These two pin the half that can be pinned from here: every
+#     diagnostic says which process wrote it, and stdout is left alone.
+
+@test "codex-bridge: every diagnostic line carries the pid that wrote it" {
+  # stderr only, so a prefix leaking into stdout cannot be mistaken for this
+  # passing. `2>&1 >/dev/null` in that order keeps stderr and drops stdout —
+  # `run --separate-stderr` would do the same but needs a minimum-version
+  # declaration this suite does not otherwise carry.
+  run bash -c 'node "$1" 2>&1 >/dev/null' _ "$TYPES/codex/codex-bridge.js"
+  [ "$status" -eq 1 ]
+  # `[<digits>] ` and then the message, on the same line — the prefix is what
+  # makes a spliced line show two pids instead of reading as one line.
+  [[ "$output" =~ ^\[[0-9]+\]\ codex-bridge:\ --project\ is\ required$ ]]
+}
+
+@test "codex-bridge: stdout is NOT prefixed — it is an interface, not a diagnostic" {
+  # `--resolve-only`, the thread-id list and `usage()` are read by people and
+  # asserted by other tests here. Prefixing them would change a contract, so
+  # this fails if the prefix ever spreads to stdout.
+  run node "$TYPES/codex/codex-bridge.js" --help
+  [ "$status" -eq 0 ]
+  [[ "${lines[0]}" =~ ^Usage: ]]
+  [[ ! "$output" =~ \[[0-9]+\]\  ]]
+}
+
 @test "codex-bridge: toPosixPath maps Windows drive paths to POSIX paths" {
   run node -e 'const { toPosixPath } = require(process.argv[1]); const expected = "/c/Users/me/OneDrive/codex-work"; if (toPosixPath(String.raw`C:\Users\me\OneDrive\codex-work`) !== expected) process.exit(1); if (toPosixPath("C:/Users/me/OneDrive/codex-work") !== expected) process.exit(1);' "$TYPES/codex/codex-bridge.js"
   [ "$status" -eq 0 ]
