@@ -89,6 +89,25 @@ reply_after_request() {
   [[ ! "$output" =~ "agent=dave" ]]
 }
 
+# "Explicit" is TWO entrances, and a control that drives one of them measures
+# half of the property. `--type` is covered above; this is the environment
+# side. Without it, flattening AGENT_TYPE_EXPLICIT's env-derived value to empty
+# leaves every declared control green, so the claim "both are honoured" would
+# rest on reading the source rather than on anything the tree enforces.
+@test "dispatch: AGMSG_AGENT_TYPE is honoured over detection, exactly as --type is (#801)" {
+  local proj="$BATS_TEST_TMPDIR/project-envtype"
+  mkdir -p "$proj"
+  bash "$SCRIPTS/join.sh" demo gina claude-code "$proj"
+
+  # Detection would answer claude-code here — CLAUDE_CODE_SESSION_ID is set and
+  # gina is registered under it. The env var says codex, and the env var wins,
+  # so gina must not be the identity that comes back.
+  run env CLAUDE_CODE_SESSION_ID=test-session AGMSG_AGENT_TYPE=codex \
+    bash "$SCRIPTS/windows/dispatch.sh" --project "$proj" -- inbox
+  [ "$status" -eq 2 ]
+  refute grep -qF "agent=gina" <<<"$output"
+}
+
 # WHAT THIS BINDS IS THE BREAKAGE, NOT THE REPAIR. Detecting the type inside
 # whoami.sh fixed the message a user reads; it did not fix what dispatch then
 # WRITES. `actas` resolves the identity from the claude-code registration and
