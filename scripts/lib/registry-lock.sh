@@ -380,6 +380,27 @@ EOF
 agmsg_write_atomic() {
   local dest="$1" content="$2" tmp
   tmp="$dest.tmp.$$"
-  printf '%s\n' "$content" > "$tmp"
+  # The mode is set as the bytes are created, not afterwards: a file that exists
+  # readable-by-others for even one syscall has already been readable.
+  #
+  # It is set AT ALL because leaving it to the caller's umask made the product
+  # refuse its own output (#804). Every reader of a team binding rejects
+  # `mode & 0o022`, and `umask 002` -- an ordinary setting on a group-shared
+  # machine -- produces 0664. `pull` wrote the file and the `unlock` after it
+  # would not accept it.
+  #
+  # 0600 rather than 0644, because `remote_binding.endpoint` holds whatever
+  # address the caller connected to, and on a hosted deployment that address IS
+  # the credential (the secret is a path segment). The rest of this product
+  # already treats its own state that way: key.sh chmods to 600 in three places
+  # and the handoff bundle is written under `umask 077`. The binding was the one
+  # authority file left out.
+  #
+  # A `chmod` follows the write because `>` on a PRE-EXISTING temp keeps that
+  # file's old mode, and a stale `.tmp.<pid>` from a killed run is reachable.
+  # It is not silenced: this is a file this function just created, so a refusal
+  # here is a real fault and not a condition to swallow (#802).
+  ( umask 077; printf '%s\n' "$content" > "$tmp" )
+  chmod 600 "$tmp"
   mv "$tmp" "$dest"
 }
