@@ -160,12 +160,15 @@ if [ ! -f "$DB" ]; then exit 0; fi
 # So a failure stops the loop instead of ending the script, and what was
 # already accumulated is delivered.
 #
-# The failure is reported IN THE PAYLOAD, not by the exit status. The runtimes
-# read stdout as control JSON only on exit 0, so a non-zero exit throws the
-# delivery away -- which is what the first attempt at this fix did, on exactly
-# the path that was broken. When there are messages to hand over the status is
-# 0 and the text says the poll was partial; only when there is nothing to
-# deliver does the status carry the failure.
+# The failure is reported IN THE PAYLOAD, not by the exit status. The documented
+# contract is that stdout is read as control JSON only on exit 0 -- and the
+# measurement disagrees with it (see the emit points below, and #658). Either
+# way this is the safe shape: if a runtime does discard on non-zero, exiting
+# non-zero here throws away a payload whose rows are already marked read, which
+# is what the first attempt at this fix did on exactly the path that was broken.
+# When there are messages to hand over the status is 0 and the text says the
+# poll was partial; only when there is nothing to deliver does the status carry
+# the failure.
 OUTPUT=""
 # Messages are marked read per team INSIDE this loop, but emitted only AFTER
 # it. Under errexit, a failure while processing a later team (either command

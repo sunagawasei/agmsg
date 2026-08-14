@@ -92,12 +92,42 @@ _break_only_this_teams_store() {
 
 # --- check-inbox.sh ------------------------------------------------------
 
-@test "check-inbox: a later team's query failure does not lose earlier teams' messages (#637)" {
-  # alice is in two teams; glob order enumerates testteam before zteam.
-  bash "$SCRIPTS/join.sh" zteam alice claude-code /tmp/project-a
-  bash "$SCRIPTS/join.sh" zteam bob claude-code /tmp/project-a
-  bash "$SCRIPTS/send.sh" testteam bob alice "early"
-  bash "$SCRIPTS/send.sh" zteam bob alice "in-zteam"
+# What the hook runtimes actually do with a Stop-hook run, applied to a real
+# invocation of check-inbox.sh.
+#
+# The contract is theirs, not ours: as DOCUMENTED, stdout is read as control
+# JSON only when the process exits 0, and a non-zero exit is logged as a hook
+# failure with the output discarded. Measured on Claude Code 2.1.226 it was
+# processed on exit 0, 1, 2 and 3 alike (#658), so the two disagree — and this
+# helper models the documented rule deliberately, because a helper that assumed
+# the laxer observed behaviour would stop catching the defect on any runtime
+# that follows the document. Asserting on the shell's stdout alone cannot see
+# either: the first attempt at this fix emitted the messages and then exited
+# non-zero, so it was inert on the only path that was broken while its tests
+# passed.
+#
+# The parse is part of the contract too. Returning raw stdout would stay green
+# for malformed JSON, for a payload under some other key, or for text outside
+# `reason` — none of which an operator would ever see. So this parses, requires
+# `decision` to be `block`, and returns ONLY `reason`: exactly the bytes the
+# runtime puts in front of a person.
+#
+# Prints that text, or nothing at all.
+delivered_to_operator() {
+  local out status
+  out="$(bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a </dev/null 2>/dev/null)" && status=0 || status=$?
+  [ "$status" -eq 0 ] || return 0                 # the runtime's rule
+  [ -n "$out" ] || return 0
+  # Valid JSON, decision=block, and then the reason — each a separate gate so a
+  # payload that fails any one of them delivers nothing.
+  local esc parsed
+  esc="$(printf '%s' "$out" | sed "s/'/''/g")"
+  parsed="$(sqlite_mem "SELECT CASE
+      WHEN json_valid('$esc') = 0 THEN ''
+      WHEN json_extract('$esc', '\$.decision') IS NOT 'block' THEN ''
+      ELSE COALESCE(json_extract('$esc', '\$.reason'), '') END;")"
+  printf '%s' "$parsed"
+}
 
   # PATH shim: fail (SQLITE_BUSY-style rc=5) exactly the unread SELECT for the
   # second team; everything else passes through to the real sqlite3. testteam's
