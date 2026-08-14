@@ -96,3 +96,55 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   '
   [ "$status" -eq 0 ]
 }
+
+@test "lock: a held lock names its holder (#778)" {
+  # A lock directory with nothing in it says something holds it and nothing
+  # about what. When one leaks, that is the difference between "remove this,
+  # the process is gone" and guessing — and guessing wrong removes a live lock.
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR" || exit 1
+    cat "$TEAM_DIR/.config.lock/holder"
+  '
+  [ "$status" -eq 0 ]
+  grep -qE "^pid [0-9]+$" <<<"$output"
+  grep -q "^command " <<<"$output"
+}
+
+@test "lock: a lock that cannot be released says so, and the way out works (#778)" {
+  # The defect: `rmdir … || true` treated "already gone" and "will not go" as
+  # the same event. The second is a permanent leak — every later command for
+  # this team waits for a holder that is never coming back — and it was silent.
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR" || exit 1
+    printf "x\n" > "$TEAM_DIR/.config.lock/stray"
+    agmsg_lock_release
+  '
+  grep -q "could not release the registry lock" <<<"$output"
+  grep -q "commands for this team will wait" <<<"$output"
+
+  # The route it prints has to work on the case that produced it. `rmdir` does
+  # not: it is what just failed. Lifted out of the message and run, so the two
+  # cannot drift apart.
+  local remedy
+  remedy="$(grep -oE 'rm -r .*' <<<"$output" | tail -1)"
+  [ -n "$remedy" ]
+  run bash -c "$remedy"
+  [ "$status" -eq 0 ]
+  [ ! -d "$TEAM_DIR/.config.lock" ]
+}
+
+@test "lock: releasing a lock that is already gone stays quiet (#778)" {
+  # The other half of the same distinction. A lock that is already released is
+  # not an event, and reporting it would train the operator to ignore the line
+  # that matters.
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR" || exit 1
+    rm -f "$TEAM_DIR/.config.lock/holder"; rmdir "$TEAM_DIR/.config.lock"
+    agmsg_lock_release
+  '
+  [ "$status" -eq 0 ]
+  refute grep -q "could not release" <<<"$output"
+}

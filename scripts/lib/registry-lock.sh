@@ -82,6 +82,23 @@ agmsg_lock_acquire() {
     fi
     sleep 0.01
   done
+  # WHO HOLDS IT, written the moment it is held (#778).
+  #
+  # A lock directory with nothing in it can say that something is holding it and
+  # nothing about what. When one leaks, the operator's only options are to guess
+  # or to remove it blind — and removing a live lock is worse than the leak. The
+  # pid and the command are what turn "a lock is here" into "this process, and
+  # it is gone".
+  #
+  # Best-effort on purpose: the lock is HELD as of the mkdir above, and a failure
+  # to annotate it must not undo that. An unannotated lock is exactly the lock
+  # this file had before, which is worse than one that names its holder and no
+  # worse than nothing.
+  {
+    printf 'pid %s\n' "$$"
+    printf 'command %s\n' "${0##*/}"
+    printf 'host %s\n' "$(uname -n 2>/dev/null || echo unknown)"
+  } > "$lock/holder" 2>/dev/null || true
   AGMSG_HELD_LOCKS="${AGMSG_HELD_LOCKS:+$AGMSG_HELD_LOCKS
 }$lock"
   # Idempotent: re-arming the same handlers each acquire is harmless. They release
@@ -99,11 +116,72 @@ agmsg_lock_acquire() {
 # agmsg_lock_release
 # Release every lock this process holds (no-op if none). rmdir only removes the
 # (empty) lock dirs, never a team dir or its config.
+# agmsg_lock_release_one <team_dir>
+# Release ONE lock and leave every other held lock alone.
+#
+# `agmsg_lock_release` drops everything this process holds, which is right for a
+# command that is finishing and wrong for anything that acquires a lock inside a
+# larger operation: the caller may hold locks for other teams, and this library's
+# own contract is that it can. A caller that acquired one lock and released all
+# of them has taken locks away from code that is still using them.
+#
+# The line is matched WHOLE, not as a substring: lock paths nest (a team named
+# `a` and a team named `ab` under the same root), so a substring test would let
+# one team's release take another's.
+# Release one lock directory, and say so when it cannot be released (#778).
+#
+# `rmdir … || true` treated two different events as one. A lock that is already
+# gone is a released lock — nothing to report. A lock that will not go is the
+# leak this file's own contract promises not to leave, and the operator learned
+# about it only when the next command blocked, with nothing naming the cause.
+#
+# The holder file written at acquire time makes the directory non-empty, so the
+# removal is two steps. Both are this process's own file and its own lock; a
+# failure of either is reported rather than swallowed.
+_agmsg_lock_drop() {
+  local l="$1" err=""
+  [ -d "$l" ] || return 0
+  rm -f "$l/holder" 2>/dev/null || true
+  err="$(rmdir "$l" 2>&1)" && return 0
+  # Still here. Say which lock, say why, and say what it costs — the next
+  # acquire on this team will wait for a holder that is not coming back.
+  echo "agmsg: could not release the registry lock at $l" >&2
+  echo "agmsg: rmdir: $err" >&2
+  echo "agmsg: until this directory is removed, commands for this team will wait" >&2
+  echo "agmsg: for a lock nothing holds." >&2
+  # The remedy has to work for the case that produced it. `rmdir` is what just
+  # failed — printing it back is a route that ends where the operator already
+  # is. Measured: the only reason release gets here with the directory present
+  # is that something is inside it, and that is precisely what rmdir refuses.
+  echo "agmsg: look at what is in it, then remove the directory:" >&2
+  echo "agmsg:   ls -la $l" >&2
+  echo "agmsg:   rm -r $l" >&2
+  echo "agmsg: nothing but this lock lives in there — it holds no team data." >&2
+  return 1
+}
+
+agmsg_lock_release_one() {
+  local lock="$1/.config.lock" kept="" l
+  [ -n "${AGMSG_HELD_LOCKS:-}" ] || return 0
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    if [ "$l" = "$lock" ]; then
+      _agmsg_lock_drop "$l" || true
+    else
+      kept="${kept:+$kept
+}$l"
+    fi
+  done <<EOF
+$AGMSG_HELD_LOCKS
+EOF
+  AGMSG_HELD_LOCKS="$kept"
+}
+
 agmsg_lock_release() {
   [ -n "${AGMSG_HELD_LOCKS:-}" ] || return 0
   local l
   while IFS= read -r l; do
-    [ -n "$l" ] && { rmdir "$l" 2>/dev/null || true; }
+    [ -n "$l" ] && { _agmsg_lock_drop "$l" || true; }
   done <<EOF
 $AGMSG_HELD_LOCKS
 EOF
