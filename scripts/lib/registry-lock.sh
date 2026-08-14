@@ -140,13 +140,13 @@ agmsg_lock_acquire() {
   local nonce=""
   nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
   [ -n "$nonce" ] || nonce="${RANDOM:-}${RANDOM:-}${RANDOM:-}"
-  _agmsg_lock_set_token "$lock" "$(uname -n 2>/dev/null || echo unknown).$$.$(date +%s).$nonce"
+  _agmsg_lock_set_token "$lock" "${HOSTNAME:-h}.$$.$(date +%s).$nonce"
   {
     printf 'token %s\n' "$(_agmsg_lock_get_token "$lock")"
     printf 'pid %s\n' "$$"
     printf 'command %s\n' "${0##*/}"
-    printf 'host %s\n' "$(uname -n 2>/dev/null || echo unknown)"
-  } > "$lock/holder" 2>/dev/null || true
+    printf 'host %s\n' "${HOSTNAME:-$(uname -n 2>/dev/null || echo unknown)}"
+  } > "$lock.holder" 2>/dev/null || true
   AGMSG_HELD_LOCKS="${AGMSG_HELD_LOCKS:+$AGMSG_HELD_LOCKS
 }$lock"
   # Idempotent: re-arming the same handlers each acquire is harmless. They release
@@ -221,7 +221,7 @@ EOF
 }
 
 _agmsg_lock_drop() {
-  local l="$1" err="" seen="" mine="" saved=""
+  local l="$1" err="" seen="" mine=""
   [ -d "$l" ] || return 0
   # OWNERSHIP FIRST. The directory being at the path this process locked is not
   # evidence that it is the same directory: an operator can remove a stuck lock
@@ -231,7 +231,7 @@ _agmsg_lock_drop() {
   # is about (raised in review).
   #
   # Compared against the token written at acquire, not the pid: a pid recurs.
-  seen="$(sed -n 's/^token //p' "$l/holder" 2>/dev/null | head -1)"
+  seen="$(sed -n 's/^token //p' "$l.holder" 2>/dev/null | head -1)"
   mine="$(_agmsg_lock_get_token "$l" || printf '')"
   # An empty recorded token means this process never proved ownership of this
   # path — refuse rather than guess. Same branch as a genuine mismatch.
@@ -254,13 +254,35 @@ _agmsg_lock_drop() {
   # Removing the holder first is unavoidable — a directory with a file in it
   # cannot be rmdir'd — so the ordering is: read, remove, try, restore on
   # failure.
-  saved="$(cat "$l/holder" 2>/dev/null || printf '')"
-  rm -f "$l/holder" 2>/dev/null || true
-  err="$(rmdir "$l" 2>&1)" && return 0
+  # The holder lives BESIDE the lock, not inside it. A lock directory has to be
+  # empty to be removed, and `rm` is not available on every path that takes this
+  # lock — `test_local_team_ids.bats` runs the core join with an allow-listed
+  # PATH that has no `rm`. A holder written inside the directory made the lock
+  # unremovable there, so the one path promising to work without python3 leaked
+  # a lock on every call. Measured by CI; the local run has a full PATH and
+  # never saw it.
+  #
+  # Outside, `rmdir` succeeds and the holder is a stale file next to nothing —
+  # tidied when it can be, harmless when it cannot.
+  if err="$(rmdir "$l" 2>&1)"; then
+    # The holder is a sibling, so removing the directory does not remove it.
+    # Left behind it is a stale file in the team directory, and `rename-team`
+    # ends with `rmdir "$OLD_DIR"` — which then fails, and the rename leaves the
+    # old directory standing. Measured: that is what broke the quoted-team-name
+    # test, on a path with no lock message anywhere in it.
+    #
+    # Best-effort: `rm` is not on every allow-listed PATH that takes this lock,
+    # and a leftover holder beside no lock is inert. The lock itself is gone,
+    # which is the part that had to succeed.
+    if command -v rm >/dev/null 2>&1; then
+      rm -f "$l.holder" 2>/dev/null || true
+    fi
+    return 0
+  fi
   # Still here, so this process still owns it. Put back what was there, not a
   # summary of it.
   if [ -d "$l" ] && [ -n "$saved" ]; then
-    printf '%s\n' "$saved" > "$l/holder" 2>/dev/null || true
+    printf '%s\n' "$saved" > "$l.holder" 2>/dev/null || true
   fi
   # Still here. Say which lock, say why, and say what it costs — the next
   # acquire on this team will wait for a holder that is not coming back.

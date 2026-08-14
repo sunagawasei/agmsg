@@ -104,7 +104,7 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
     . "$LOCKLIB"
     agmsg_lock_acquire "$TEAM_DIR" || exit 1
-    cat "$TEAM_DIR/.config.lock/holder"
+    cat "$TEAM_DIR/.config.lock.holder"
   '
   [ "$status" -eq 0 ]
   grep -qE "^pid [0-9]+$" <<<"$output"
@@ -142,7 +142,7 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
     . "$LOCKLIB"
     agmsg_lock_acquire "$TEAM_DIR" || exit 1
-    rm -f "$TEAM_DIR/.config.lock/holder"; rmdir "$TEAM_DIR/.config.lock"
+    rm -f "$TEAM_DIR/.config.lock.holder"; rmdir "$TEAM_DIR/.config.lock"
     agmsg_lock_release
   '
   [ "$status" -eq 0 ]
@@ -203,12 +203,12 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
     . "$LOCKLIB"
     agmsg_lock_acquire "$TEAM_DIR" || exit 1
-    rm -f "$TEAM_DIR/.config.lock/holder"; rmdir "$TEAM_DIR/.config.lock"
+    rm -f "$TEAM_DIR/.config.lock.holder"; rmdir "$TEAM_DIR/.config.lock"
     mkdir "$TEAM_DIR/.config.lock"
-    printf "token successor-owns-this\n" > "$TEAM_DIR/.config.lock/holder"
+    printf "token successor-owns-this\n" > "$TEAM_DIR/.config.lock.holder"
     agmsg_lock_release
     [ -d "$TEAM_DIR/.config.lock" ] || exit 2
-    grep -q "successor-owns-this" "$TEAM_DIR/.config.lock/holder" || exit 3
+    grep -q "successor-owns-this" "$TEAM_DIR/.config.lock.holder" || exit 3
   '
   [ "$status" -eq 0 ]
 }
@@ -266,7 +266,7 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
     agmsg_lock_acquire "$TEAM_DIR" || exit 1
     printf "x\n" > "$TEAM_DIR/.config.lock/stray"
     agmsg_lock_release >/dev/null 2>&1
-    cat "$TEAM_DIR/.config.lock/holder"
+    cat "$TEAM_DIR/.config.lock.holder"
   '
   [ "$status" -eq 0 ]
   grep -qE "^token " <<<"$output"
@@ -285,7 +285,7 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
     . "$LOCKLIB"
     agmsg_lock_acquire "$A" || exit 1
     agmsg_lock_acquire "$B" || exit 1
-    sed -n "s/^token //p" "$A/.config.lock/holder" "$B/.config.lock/holder"
+    sed -n "s/^token //p" "$A/.config.lock.holder" "$B/.config.lock.holder"
   '
   [ "$status" -eq 0 ]
   [ "$(sort -u <<<"$output" | grep -c .)" -eq 2 ]
