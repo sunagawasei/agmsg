@@ -187,9 +187,11 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
     agmsg_lock_acquire "$TEAM_DIR"
   '
   [ "$status" -ne 0 ]
-  grep -q "gave up acquiring registry lock" <<<"$output"
+  # Same phrase for both bounds — callers match on it. The clause is what
+  # separates them, and an operator deciding whether to retry needs the clause.
+  grep -q "timed out acquiring registry lock" <<<"$output"
   grep -qE "after 5 attempts" <<<"$output"
-  refute grep -q "timed out" <<<"$output"
+  refute grep -qE "after [0-9]+s$" <<<"$output"
 }
 
 @test "lock: release leaves a SUCCESSOR's lock alone (#778)" {

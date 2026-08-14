@@ -91,10 +91,14 @@ agmsg_lock_acquire() {
     # and "10 seconds" are different facts about a wait, and an operator
     # deciding whether to retry needs the one that actually stopped it.
     if [ "$elapsed" -ge "$budget" ] || [ "$i" -ge "$max" ]; then
+      # ONE PHRASE, then which bound. Callers match on "timed out acquiring
+      # registry lock" — `test_remote.bats` does, with a short attempt budget —
+      # and inventing a second sentence for the attempt ceiling broke them
+      # while telling the operator nothing they could not be told in a clause.
       if [ "$elapsed" -ge "$budget" ]; then
         echo "agmsg: timed out acquiring registry lock for $team_dir after ${elapsed}s" >&2
       else
-        echo "agmsg: gave up acquiring registry lock for $team_dir after $i attempts (${elapsed}s)" >&2
+        echo "agmsg: timed out acquiring registry lock for $team_dir after $i attempts (${elapsed}s)" >&2
       fi
       # The reason travels with the timeout too. If the wait was hopeless for
       # a cause this function did not anticipate, the errno is the only thing
