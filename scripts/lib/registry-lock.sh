@@ -116,7 +116,16 @@ agmsg_lock_acquire() {
   # to annotate it must not undo that. An unannotated lock is exactly the lock
   # this file had before, which is worse than one that names its holder and no
   # worse than nothing.
+  #
+  # The token is what release checks. A pid is not enough: the directory can be
+  # removed by an operator while this process still believes it holds the lock —
+  # the remedy printed further down tells them to do exactly that — and a second
+  # process can then take the same path. Releasing on "it is mine because I once
+  # took this path" would delete the SUCCESSOR's lock and break the exclusion
+  # this file exists for (raised in review). The token makes "mine" checkable.
+  _agmsg_lock_token="$$.$(date +%s).${RANDOM:-0}"
   {
+    printf 'token %s\n' "$_agmsg_lock_token"
     printf 'pid %s\n' "$$"
     printf 'command %s\n' "${0##*/}"
     printf 'host %s\n' "$(uname -n 2>/dev/null || echo unknown)"
@@ -161,10 +170,37 @@ agmsg_lock_acquire() {
 # removal is two steps. Both are this process's own file and its own lock; a
 # failure of either is reported rather than swallowed.
 _agmsg_lock_drop() {
-  local l="$1" err=""
+  local l="$1" err="" seen=""
   [ -d "$l" ] || return 0
+  # OWNERSHIP FIRST. The directory being at the path this process locked is not
+  # evidence that it is the same directory: an operator can remove a stuck lock
+  # — the message below tells them to — and another process can take the path
+  # before this one releases. Deleting then would take the exclusion away from
+  # a process that is using it, which is worse than the leak this whole change
+  # is about (raised in review).
+  #
+  # Compared against the token written at acquire, not the pid: a pid recurs.
+  seen="$(sed -n 's/^token //p' "$l/holder" 2>/dev/null | head -1)"
+  if [ "$seen" != "${_agmsg_lock_token:-}" ]; then
+    # Someone else's lock, or one whose holder file could not be written. Either
+    # way this process has no standing to remove it, and saying so is the whole
+    # report — there is nothing here for the operator to fix.
+    echo "agmsg: not releasing $l — it is held by another process now" >&2
+    return 0
+  fi
+  # rmdir FIRST, with the holder still in place. Removing the holder and then
+  # failing to remove the directory leaves a lock nobody can prove is theirs:
+  # the next release reads no token, decides the lock belongs to someone else,
+  # and reports that instead of the stuck lock — two contradictory lines about
+  # the same directory. Measured, on the trap's second call.
+  #
+  # A lock with a holder file is never empty, so the first rmdir is expected to
+  # fail; the holder is removed only once the directory is going to go.
   rm -f "$l/holder" 2>/dev/null || true
   err="$(rmdir "$l" 2>&1)" && return 0
+  # Put the holder back: this process still owns the lock, and the next release
+  # — or the operator reading the message below — has to be able to tell.
+  [ -d "$l" ] && printf 'token %s\n' "${_agmsg_lock_token:-}" > "$l/holder" 2>/dev/null || true
   # Still here. Say which lock, say why, and say what it costs — the next
   # acquire on this team will wait for a holder that is not coming back.
   echo "agmsg: could not release the registry lock at $l" >&2
@@ -175,9 +211,18 @@ _agmsg_lock_drop() {
   # failed — printing it back is a route that ends where the operator already
   # is. Measured: the only reason release gets here with the directory present
   # is that something is inside it, and that is precisely what rmdir refuses.
+  # QUOTED, because a printed command is meant to be pasted into a shell. The
+  # store root and the team name can both contain a space — team names are
+  # validated against empty / `.` / `..` / `/` / `\` / a leading `-` / control
+  # characters, and nothing else — so an unquoted path becomes several
+  # arguments, and `rm -r` then removes something the operator did not read
+  # about (raised in review). Same scheme as lib/shquote.sh, inline rather than
+  # sourced so this library keeps its single-file contract.
+  local q
+  q="$(printf "'%s'" "$(printf '%s' "$l" | sed "s/'/'\\''/g")")"
   echo "agmsg: look at what is in it, then remove the directory:" >&2
-  echo "agmsg:   ls -la $l" >&2
-  echo "agmsg:   rm -r $l" >&2
+  echo "agmsg:   ls -la $q" >&2
+  echo "agmsg:   rm -r $q" >&2
   echo "agmsg: nothing but this lock lives in there — it holds no team data." >&2
   return 1
 }

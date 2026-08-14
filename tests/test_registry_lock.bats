@@ -191,3 +191,46 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   grep -qE "after 5 attempts" <<<"$output"
   refute grep -q "timed out" <<<"$output"
 }
+
+@test "lock: release leaves a SUCCESSOR's lock alone (#778)" {
+  # The hazard this change created. The remedy printed for a stuck lock tells
+  # an operator to remove the directory; another process can then take the same
+  # path. Releasing on "I once locked this path" would delete the successor's
+  # lock and take mutual exclusion away from a process that is using it —
+  # worse than the leak (raised in review).
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR" || exit 1
+    rm -f "$TEAM_DIR/.config.lock/holder"; rmdir "$TEAM_DIR/.config.lock"
+    mkdir "$TEAM_DIR/.config.lock"
+    printf "token successor-owns-this\n" > "$TEAM_DIR/.config.lock/holder"
+    agmsg_lock_release
+    [ -d "$TEAM_DIR/.config.lock" ] || exit 2
+    grep -q "successor-owns-this" "$TEAM_DIR/.config.lock/holder" || exit 3
+  '
+  [ "$status" -eq 0 ]
+}
+
+@test "lock: the printed remedy is safe on a path with a space (#778)" {
+  # A store root or a team name may contain a space — team names are validated
+  # against empty / . / .. / / / \ / a leading - / control characters, and
+  # nothing else. An unquoted path in a pasted command becomes several
+  # arguments, and `rm -r` then removes something the operator never read about.
+  local spaced="$BATS_TEST_TMPDIR/with space/team"
+  mkdir -p "$spaced" "$BATS_TEST_TMPDIR/with space/DO-NOT-TOUCH"
+  run env LOCKLIB="$LOCKLIB" SPACED="$spaced" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$SPACED" || exit 1
+    printf "x\n" > "$SPACED/.config.lock/stray"
+    agmsg_lock_release
+  '
+  local remedy
+  remedy="$(grep -oE "rm -r .*" <<<"$output" | tail -1)"
+  [ -n "$remedy" ]
+  # Run it the way it is meant to be run: through a shell, as one pasted line.
+  run bash -c "$remedy"
+  [ "$status" -eq 0 ]
+  [ ! -d "$spaced/.config.lock" ]
+  # And it took nothing else with it.
+  [ -d "$BATS_TEST_TMPDIR/with space/DO-NOT-TOUCH" ]
+}
