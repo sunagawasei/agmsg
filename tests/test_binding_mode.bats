@@ -88,3 +88,36 @@ file_mode() {
   # No temp survives beside it.
   [ -z "$(find "$TEST_SKILL_DIR" -maxdepth 1 -name 'probe.json.tmp.*' -print -quit)" ]
 }
+
+@test "a write that fails part-way leaves the old file exactly as it was (#804)" {
+  # `mv` makes a reader see the whole new file or the whole old one. It does not
+  # make the CONTENT whole: a printf that writes half the payload and then fails
+  # would be published, indivisibly, as a truncated destination (review).
+  #
+  # The failure is forced with `ulimit -f`, and SIGXFSZ is ignored so the write
+  # RETURNS the error instead of killing the shell -- which is what makes the
+  # helper's own handling observable rather than the kernel's.
+  local dest original
+  dest="$TEST_SKILL_DIR/partial.json"
+  original='{"keep":"this exact byte string"}'
+  printf '%s\n' "$original" > "$dest"
+  chmod 600 "$dest"
+  local before
+  before="$(cat "$dest")"
+
+  local status=0
+  (
+    trap '' XFSZ
+    ulimit -f 1          # 512-byte blocks: a 200 KB payload cannot land
+    # shellcheck disable=SC1091
+    source "$SCRIPTS/lib/registry-lock.sh"
+    agmsg_write_atomic "$dest" "$(head -c 200000 /dev/zero | tr '\0' 'x')"
+  ) 2>/dev/null || status=$?
+
+  # 1. it did not claim success
+  [ "$status" -ne 0 ]
+  # 2. the old destination is byte-for-byte what it was
+  [ "$(cat "$dest")" = "$before" ]
+  # 3. and nothing private was left lying beside it
+  [ -z "$(find "$TEST_SKILL_DIR" -maxdepth 1 -name 'partial.json.tmp.*' -print -quit)" ]
+}

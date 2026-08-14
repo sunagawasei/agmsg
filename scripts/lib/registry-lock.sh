@@ -400,6 +400,21 @@ agmsg_write_atomic() {
     printf 'agmsg: could not create a temporary file beside %s\n' "$dest" >&2
     return 1
   }
-  printf '%s\n' "$content" > "$tmp"
-  mv "$tmp" "$dest"
+  # The `mv` is what makes a reader see the whole new file or the whole old one.
+  # It does NOT make the CONTENT whole: a `printf` that writes half the payload
+  # and then fails -- a full disk, a quota, an I/O error -- would otherwise be
+  # published, indivisibly, as the truncated destination (review).
+  #
+  # So the move is gated on the write finishing, and a failed write leaves the
+  # old destination exactly where it was.
+  if ! printf '%s\n' "$content" > "$tmp"; then
+    rm -f "$tmp"
+    printf 'agmsg: could not write the new contents for %s\n' "$dest" >&2
+    return 1
+  fi
+  if ! mv "$tmp" "$dest"; then
+    rm -f "$tmp"
+    printf 'agmsg: could not move the new contents into place at %s\n' "$dest" >&2
+    return 1
+  fi
 }
