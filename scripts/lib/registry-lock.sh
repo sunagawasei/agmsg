@@ -259,8 +259,11 @@ _agmsg_lock_drop() {
   # lock — `test_local_team_ids.bats` runs the core join with an allow-listed
   # PATH that has no `rm`. A holder written inside the directory made the lock
   # unremovable there, so the one path promising to work without python3 leaked
-  # a lock on every call. Measured by CI; the local run has a full PATH and
-  # never saw it.
+  # a lock on every call. CI reported it first, but it is reproducible here:
+  # build a directory of symlinks to the tools that test allow-lists, point
+  # PATH at it, and the pre-fix library leaks while this one releases. Nothing
+  # about it needs CI — the local suite simply runs with a full PATH by
+  # default, which is a habit rather than a limit.
   #
   # Outside, `rmdir` succeeds and the holder is a stale file next to nothing —
   # tidied when it can be, harmless when it cannot.
