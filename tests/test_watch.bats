@@ -561,6 +561,38 @@ run_named_watcher_for() {
   _stop_watcher "$pid"
 }
 
+@test "watch: the slot is claimed before the previous holder is signalled (#595)" {
+  # The property is an ORDER between two statements, and the failure it
+  # prevents is a race, so this is asserted where the order lives rather than
+  # by trying to lose the race on purpose. A timing test here would pass on
+  # every machine that happens to win it -- which is how the defect survived:
+  # `bats tests/test_watch.bats` is green on a developer machine and the
+  # failure only ever appeared on a CI runner.
+  #
+  # What the order buys: the predecessor's EXIT guard removes the pidfile only
+  # if it still records the predecessor's pid, and that read-check-remove is
+  # three steps. Signalling first lets the successor's write land between the
+  # read and the remove, and the successor's record is deleted by a process on
+  # its way out. Writing first makes the guard's own read see the successor.
+  local watch_sh="$SCRIPTS/watch.sh" claim displace
+  claim="$(grep -n '^echo \$\$ > "\$PIDFILE"$' "$watch_sh" | head -1 | cut -d: -f1)"
+  displace="$(grep -n 'kill "\$PREV_PID_TO_DISPLACE"' "$watch_sh" | head -1 | cut -d: -f1)"
+
+  # Both anchors must exist, or this test passes by finding nothing -- the
+  # failure mode of every grep-based check.
+  [ -n "$claim" ]
+  [ -n "$displace" ]
+  [ "$displace" -gt "$claim" ]
+
+  # And the takeover block must not signal anyone on its own. The first
+  # version of this line anchored the pattern to the start of a line, and a
+  # mutation that put the old `kill "$prev_pid"` back INSIDE the case arm --
+  # where it lived before, after the pattern and a `)` -- left this test
+  # green. Unanchored, because what matters is that the previous holder is
+  # never signalled through that variable at all, wherever it is written.
+  refute grep -n 'kill "\$prev_pid"' "$watch_sh"
+}
+
 @test "watch: a second unfiltered watcher says it is sharing, and a lone one does not (#683)" {
   # Two watchers with no active name subscribe to the same unclaimed pairs. The
   # read cursor is one per (team, agent), so whoever polls first takes the row

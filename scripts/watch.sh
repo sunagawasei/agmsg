@@ -303,25 +303,39 @@ mkdir -p "$RUN_DIR" 2>/dev/null || true
 
 # Sequential re-invocation of Monitor for this same session_id leaves the
 # previous watch.sh running but loses track of it (pidfile gets clobbered).
-# Stop the prior holder before claiming the slot. ps args check defends
-# against pid recycling — only touch processes whose cmdline still matches
-# our watch.sh. See #66.
+# The prior holder has to go. ps args check defends against pid recycling —
+# only touch processes whose cmdline still matches our watch.sh. See #66.
 #
-# When ps is unavailable (e.g. Claude Code sandbox), fall back to _agmsg_pid_alive
-# which confirms the pid is alive but cannot validate the cmdline. It is EPERM-aware
-# so a live-but-unsignalable sibling watcher isn't misread as dead and left running.
+# When ps is unavailable (e.g. Claude Code sandbox), fall back to kill -0
+# which confirms the pid is alive but cannot validate the cmdline.
+#
+# WHO to displace is decided here; the signal is sent AFTER this process has
+# written its own pid (#595). Sending it first is what made the predecessor's
+# own EXIT guard unsound: that guard removes the pidfile only if it still
+# records the predecessor's pid, and read-check-remove is three steps, so a
+# successor writing between the read and the remove has its record deleted by
+# a process on its way out. The successor never writes again, so the slot
+# stays empty while a live watcher owns it.
+#
+# Claiming first removes the interleaving rather than narrowing it: once the
+# file names the successor before the predecessor is ever signalled, the read
+# that the predecessor's cleanup performs cannot see the predecessor's own
+# pid, so the guard's condition is false and it deletes nothing.
+#
+# The comment on that guard already described this order as the one in force.
+# It was not; the code signalled first.
+PREV_PID_TO_DISPLACE=""
 if [ -f "$PIDFILE" ]; then
   prev_pid=$(cat "$PIDFILE" 2>/dev/null || true)
   if [ -n "$prev_pid" ] && [ "$prev_pid" != "$$" ] && _agmsg_pid_alive_local "$prev_pid"; then
     prev_cmd=$(compat_get_cmdline "$prev_pid" 2>/dev/null || true)
     if [ -n "$prev_cmd" ]; then
       case "$prev_cmd" in
-        *"$SKILL_DIR/scripts/watch.sh"*) kill "$prev_pid" 2>/dev/null || true ;;
+        *"$SKILL_DIR/scripts/watch.sh"*) PREV_PID_TO_DISPLACE="$prev_pid" ;;
       esac
     else
-      # ps unavailable (sandboxed) — skip cmdline validation, rely on the
-      # _agmsg_pid_alive check above
-      kill "$prev_pid" 2>/dev/null || true
+      # ps unavailable (sandboxed) — skip cmdline validation, rely on kill -0
+      PREV_PID_TO_DISPLACE="$prev_pid"
     fi
   fi
 fi
@@ -356,6 +370,13 @@ FILTERFILE="$RUN_DIR/watch.$SESSION_ID.filter"
 printf '%s\n%s\n%s\n' "${ACTIVE_NAME:-unfiltered}" "$PROJECT_PATH" "$$" > "$FILTERFILE" 2>/dev/null || true
 
 echo $$ > "$PIDFILE"
+
+# The slot is ours on disk; now the previous holder can be told to go (#595).
+# Nothing waits for it to finish: it is displaced, not depended on, and its
+# EXIT will find a pidfile that names this process and leave it alone.
+if [ -n "$PREV_PID_TO_DISPLACE" ]; then
+  kill "$PREV_PID_TO_DISPLACE" 2>/dev/null || true
+fi
 
 # --- Say when this watcher is sharing an inbox with another (#683). ---
 #
@@ -422,8 +443,17 @@ READY_FILES=""
 cleanup() {
   # EXIT only removes the pidfile if it still records our pid. A successor
   # watcher (Monitor re-invoked for the same session_id) overwrites $PIDFILE
-  # with its own pid before killing us; without this guard our EXIT trap
-  # would erase the successor's record. See #66.
+  # with its own pid before signalling us, so this read sees the successor's
+  # pid and leaves its record alone. See #66, and #595 for what happened when
+  # the signal came first: read, then the successor's write, then this remove
+  # — a guard that is three steps cannot decide anything about a file another
+  # process may write between them. The order is what makes it sound, not the
+  # comparison.
+  #
+  # This is still not atomic, and it is not relied on to be: a predecessor
+  # that entered cleanup for its OWN reasons before any successor existed can
+  # still race a newcomer's write. That window is not the relaunch path and
+  # is not what #595 observed.
   local pidfile_pid=""
   [ -f "$PIDFILE" ] && IFS= read -r pidfile_pid < "$PIDFILE" || true
   # Both files are removed by their owner, but they do not share an owner test:
