@@ -561,20 +561,6 @@ run_named_watcher_for() {
   _stop_watcher "$pid"
 }
 
-# Pin the handover's interleaving instead of racing for it (#595).
-#
-# The defect only appears when three things happen in one order: the departing
-# predecessor reads the pidfile, the successor writes its own pid, and only
-# then does the predecessor remove what it read. On a developer machine that
-# order essentially never occurs — the predecessor is asleep in its poll when
-# the signal arrives, so its read lands after the successor's write, the guard
-# sees a pid that is not its own, and nothing is deleted. That is why the suite
-# is green here and was red on CI runners for weeks.
-#
-# So the order is imposed rather than waited for: two stalls are injected into
-# THIS TEST'S OWN COPY of the script (`$SCRIPTS` is a per-test tree), one
-# holding the predecessor between its read and its remove, one delaying the
-# successor's write into that window. Nothing outside the test tree is touched.
 # Record the ORDER THAT ACTUALLY HAPPENED; do not try to impose one (#595).
 #
 # Two earlier versions of this control were wrong in the same way twice. The
