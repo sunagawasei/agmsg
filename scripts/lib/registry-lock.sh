@@ -379,28 +379,27 @@ EOF
 # never a truncated one.
 agmsg_write_atomic() {
   local dest="$1" content="$2" tmp
-  tmp="$dest.tmp.$$"
-  # The mode is set as the bytes are created, not afterwards: a file that exists
-  # readable-by-others for even one syscall has already been readable.
+  # The temp is CREATED, never adopted.
   #
-  # It is set AT ALL because leaving it to the caller's umask made the product
-  # refuse its own output (#804). Every reader of a team binding rejects
-  # `mode & 0o022`, and `umask 002` -- an ordinary setting on a group-shared
-  # machine -- produces 0664. `pull` wrote the file and the `unlock` after it
-  # would not accept it.
+  # `> "$dest.tmp.$$"` onto a file a killed run left behind only truncates it:
+  # the redirect does not touch the mode, and `umask` applies to creation, so
+  # the content would exist at whatever that leftover was set to before any
+  # `chmod` could run. For a binding that is a disclosure, not a tidiness
+  # problem -- `remote_binding.endpoint` is the credential on a hosted
+  # deployment (#804, review).
   #
-  # 0600 rather than 0644, because `remote_binding.endpoint` holds whatever
-  # address the caller connected to, and on a hosted deployment that address IS
-  # the credential (the secret is a path segment). The rest of this product
-  # already treats its own state that way: key.sh chmods to 600 in three places
-  # and the handoff bundle is written under `umask 077`. The binding was the one
-  # authority file left out.
+  # `mktemp` is the primitive that cannot do that: it creates exclusively, and
+  # it creates at 0600. A leftover `.tmp.<pid>` is now simply another file this
+  # function does not open.
   #
-  # A `chmod` follows the write because `>` on a PRE-EXISTING temp keeps that
-  # file's old mode, and a stale `.tmp.<pid>` from a killed run is reachable.
-  # It is not silenced: this is a file this function just created, so a refusal
-  # here is a real fault and not a condition to swallow (#802).
-  ( umask 077; printf '%s\n' "$content" > "$tmp" )
-  chmod 600 "$tmp"
+  # 0600 is deliberate and applies to every caller of this helper -- team
+  # configs, roster journals, the codex port file, migrations. It is a policy
+  # for this product's own state, matching `key.sh` (chmod 600 in three places)
+  # and the handoff bundle (`umask 077`), not a change made for bindings alone.
+  tmp="$(mktemp "$dest.tmp.XXXXXX")" || {
+    printf 'agmsg: could not create a temporary file beside %s\n' "$dest" >&2
+    return 1
+  }
+  printf '%s\n' "$content" > "$tmp"
   mv "$tmp" "$dest"
 }

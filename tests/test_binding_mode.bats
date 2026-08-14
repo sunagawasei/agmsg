@@ -44,14 +44,47 @@ file_mode() {
   [ "$mode" = "600" ]
 }
 
-@test "a rewrite of an existing binding does not widen it back (#804)" {
-  # The second write goes through the same helper; a temp file left by a killed
-  # run would otherwise carry its old mode through `>`.
-  ( umask 002; bash "$SCRIPTS/join.sh" rewriteteam alice claude-code /tmp/p-804c >/dev/null )
-  local cfg
-  cfg="$TEST_SKILL_DIR/teams/rewriteteam/config.json"
-  printf 'stale\n' > "$cfg.tmp.$$"
-  chmod 666 "$cfg.tmp.$$"
-  ( umask 002; bash "$SCRIPTS/join.sh" rewriteteam bob claude-code /tmp/p-804d >/dev/null )
-  [ "$(( 8#$(file_mode "$cfg") & 8#0022 ))" -eq 0 ]
+@test "a leftover permissive temp is never opened, so no content passes through it (#804)" {
+  # THE STALE-TEMP CASE, and it has to be driven through the helper directly.
+  #
+  # An earlier version of this test spawned `join.sh` and planted a decoy named
+  # `<dest>.tmp.$$` — but `$$` there was the TEST's pid, and the script writing
+  # the file has its own. The decoy never had the name the old implementation
+  # would have opened, so the control passed against both implementations. It
+  # proved nothing, which is the same defect it exists to catch.
+  #
+  # Calling the helper in this shell makes `$$` the one it would use.
+  local probe decoy
+  probe="$TEST_SKILL_DIR/stale.json"
+  decoy="$probe.tmp.$$"
+  printf 'SENTINEL-NOT-TOUCHED\n' > "$decoy"
+  chmod 666 "$decoy"
+
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/registry-lock.sh"
+  agmsg_write_atomic "$probe" '{"endpoint":"https://host/t/THE-SECRET/"}'
+
+  # 1. the leftover still holds its own bytes: nothing was written through it
+  [ "$(cat "$decoy")" = "SENTINEL-NOT-TOUCHED" ]
+  # 2. and the secret is not in it, at any mode
+  ! grep -q 'THE-SECRET' "$decoy"
+  # 3. the real write happened, privately
+  grep -q 'THE-SECRET' "$probe"
+  [ "$(file_mode "$probe")" = "600" ]
+  rm -f "$decoy"
+}
+
+@test "the temp the helper creates is private before any content is written (#804)" {
+  # Asserted on the primitive rather than on a race: `mktemp` creates at 0600,
+  # so there is no moment at which the file exists more permissively. If the
+  # helper is changed to create-then-narrow, this stops holding.
+  local probe
+  probe="$TEST_SKILL_DIR/probe.json"
+  ( umask 002
+    source "$SCRIPTS/lib/registry-lock.sh"
+    # A content large enough that the write is not one atomic-looking blip.
+    agmsg_write_atomic "$probe" "$(head -c 200000 /dev/zero | tr '\0' 'x')" )
+  [ "$(file_mode "$probe")" = "600" ]
+  # No temp survives beside it.
+  [ -z "$(find "$TEST_SKILL_DIR" -maxdepth 1 -name 'probe.json.tmp.*' -print -quit)" ]
 }
