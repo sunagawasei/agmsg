@@ -342,10 +342,13 @@ EOF
   mock_no_agent_ps
   run bash "$SCRIPTS/whoami.sh" /tmp/proj not-a-real-type
   [ "$status" -eq 1 ]
-  [[ "$output" =~ "Unknown agent type: 'not-a-real-type'" ]]
-  # The whole point: the old behaviour was a truthful answer to a question the
-  # caller did not mean to ask, and it is that answer which must not appear.
-  [[ ! "$output" =~ "not_joined=true" ]]
+  # Plain commands, not `[[ ]]`: a non-last `[[ ]]` cannot fail the test on
+  # bash 3.2 (#670), and the absence check below is the one that carries the
+  # point of this fix.
+  grep -qF "Unknown agent type: 'not-a-real-type'" <<<"$output"
+  # The old behaviour was a truthful answer to a question the caller did not
+  # mean to ask, and it is that answer which must not appear.
+  refute grep -qF "not_joined=true" <<<"$output"
 }
 
 @test "whoami: the unknown-type error lists the registry, like join.sh's does (#783)" {

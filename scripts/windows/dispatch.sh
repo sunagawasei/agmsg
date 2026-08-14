@@ -12,12 +12,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 AGENT_TYPE="${AGMSG_AGENT_TYPE:-codex}"
-# Whether the type above was CHOSEN or merely defaulted (#783). The commands
-# below all require a type, so the `codex` fallback has to stay — but whoami.sh
-# is the one caller that can work it out for itself, and handing it this default
-# replaces its detection with a guess. A Claude Code user on Windows who never
-# set AGMSG_AGENT_TYPE was asking "am I joined AS CODEX?", getting the truthful
-# `not_joined=true`, and reading it as "I am not joined."
+# Whether the type above was CHOSEN or merely defaulted (#783/#801). Resolved
+# into a detected type below, once the flags have been read.
 AGENT_TYPE_EXPLICIT="${AGMSG_AGENT_TYPE:+1}"
 PROJECT="$PWD"
 TEAM="${AGMSG_TEAM:-}"
@@ -55,6 +51,28 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
+
+# THE TYPE IS DETECTED, NOT GUESSED, WHENEVER NOBODY CHOSE ONE (#801).
+#
+# Every command below hands $AGENT_TYPE to a script that acts on it —
+# join.sh and reset.sh WRITE registrations with it, identities.sh and
+# delivery.sh read by it. Leaving the `codex` literal in place made those
+# writes real: a Claude Code user on Windows who never set AGMSG_AGENT_TYPE
+# would run `agmsg actas <name>`, have their identity resolved correctly from
+# the claude-code registration, and then be joined a SECOND time as codex —
+# one person, two identities. That is a broken state, not a misread message,
+# which is why detecting inside whoami.sh alone was not enough.
+#
+# An explicit --type or AGMSG_AGENT_TYPE is never overridden.
+if [ -z "$AGENT_TYPE_EXPLICIT" ]; then
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/../lib/type-registry.sh"
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/../lib/compat.sh"
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/../lib/detect-cli-type.sh"
+  AGENT_TYPE="$(agmsg_detect_cli_type)"
+fi
 
 if [ -n "$ARGV_FILE" ]; then
   if ! command -v base64 >/dev/null 2>&1; then
@@ -136,8 +154,12 @@ resolve_identity() {
   local whoami_output
   local whoami_code
   set +e
-  # Pass the type only when the caller chose it; otherwise let whoami.sh detect.
-  # See AGENT_TYPE_EXPLICIT above (#783).
+  # Still not passed when nobody chose it, even though $AGENT_TYPE now holds
+  # the same detected value: whoami.sh validates the type it is GIVEN, so
+  # passing it would put the fail-closed case back — a registry that cannot
+  # offer detect's literal fallback would stop every Windows caller instead of
+  # only one who mistyped. Letting whoami detect for itself costs a second
+  # process-tree walk and keeps that guard meaningful.
   if [ -n "$AGENT_TYPE_EXPLICIT" ]; then
     whoami_output="$(run_script whoami.sh "$PROJECT" "$AGENT_TYPE" 2>&1)"
   else

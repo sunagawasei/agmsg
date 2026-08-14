@@ -64,7 +64,9 @@ reply_after_request() {
   # with dispatch, and this line says so instead of staying quiet.
   run env CLAUDE_CODE_SESSION_ID=test-session bash "$SCRIPTS/whoami.sh" "$proj"
   [ "$status" -eq 0 ]
-  [[ "$output" =~ "type=claude-code" ]]
+  # A plain command: a non-last `[[ ]]` cannot fail the test on bash 3.2 (#670),
+  # and a control that cannot fail is not a control.
+  grep -qF "type=claude-code" <<<"$output"
 
   run env CLAUDE_CODE_SESSION_ID=test-session bash "$SCRIPTS/windows/dispatch.sh" --project "$proj" -- inbox
   [ "$status" -eq 0 ]
@@ -85,6 +87,33 @@ reply_after_request() {
   run env CLAUDE_CODE_SESSION_ID=test-session bash "$SCRIPTS/windows/dispatch.sh" --type codex --project "$proj" -- inbox
   [ "$status" -eq 2 ]
   [[ ! "$output" =~ "agent=dave" ]]
+}
+
+# WHAT THIS BINDS IS THE BREAKAGE, NOT THE REPAIR. Detecting the type inside
+# whoami.sh fixed the message a user reads; it did not fix what dispatch then
+# WRITES. `actas` resolves the identity from the claude-code registration and
+# immediately calls identities.sh and join.sh — with the type dispatch is
+# holding. Left at the `codex` literal, an already-joined claude-code user gets
+# a SECOND registration under codex: one person, two identities.
+#
+# So the assertion is that the wrong record does not appear. Asserting "the
+# claude-code one is used" would pass while an extra codex row was created
+# beside it.
+@test "dispatch: actas with no type chosen does not register the user again under codex (#801)" {
+  local proj="$BATS_TEST_TMPDIR/project-actas"
+  mkdir -p "$proj"
+  bash "$SCRIPTS/join.sh" demo erin claude-code "$proj"
+
+  # Control: nothing is registered as codex in this project yet, so a codex
+  # row found afterwards can only have been created by the run below.
+  run bash "$SCRIPTS/identities.sh" "$proj" codex
+  [ -z "$output" ]
+
+  run env CLAUDE_CODE_SESSION_ID=test-session bash "$SCRIPTS/windows/dispatch.sh" --project "$proj" -- actas frank
+  [ "$status" -eq 0 ]
+
+  run bash "$SCRIPTS/identities.sh" "$proj" codex
+  [ -z "$output" ]
 }
 
 @test "dispatch: multiple identity stops without choosing" {
