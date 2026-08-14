@@ -561,6 +561,59 @@ run_named_watcher_for() {
   _stop_watcher "$pid"
 }
 
+# Pin the handover's interleaving instead of racing for it (#595).
+#
+# The defect only appears when three things happen in one order: the departing
+# predecessor reads the pidfile, the successor writes its own pid, and only
+# then does the predecessor remove what it read. On a developer machine that
+# order essentially never occurs — the predecessor is asleep in its poll when
+# the signal arrives, so its read lands after the successor's write, the guard
+# sees a pid that is not its own, and nothing is deleted. That is why the suite
+# is green here and was red on CI runners for weeks.
+#
+# So the order is imposed rather than waited for: two stalls are injected into
+# THIS TEST'S OWN COPY of the script (`$SCRIPTS` is a per-test tree), one
+# holding the predecessor between its read and its remove, one delaying the
+# successor's write into that window. Nothing outside the test tree is touched.
+_pin_handover_interleaving() {
+  local sh="$SCRIPTS/watch.sh" applied
+  perl -0pi -e 's/(\[ -f "\$PIDFILE" \] && IFS= read -r pidfile_pid < "\$PIDFILE" \|\| true)/$1\n  sleep 3  # PINNED: hold between the read and the remove/' "$sh"
+  perl -0pi -e 's/^echo \$\$ > "\$PIDFILE"$/sleep 1  # PINNED: write inside that window\necho \$\$ > "\$PIDFILE"/m' "$sh"
+  # A control on the injection itself: an edit that silently matched nothing
+  # would leave this test asserting the ordinary case and calling it the race.
+  applied="$(grep -c 'PINNED:' "$sh")"
+  [ "$applied" -eq 2 ]
+}
+
+@test "watch: a predecessor stopped mid-cleanup cannot delete the successor's pidfile (#595)" {
+  skip_on_windows "watcher process mgmt under Git Bash (#182)"
+  _pin_handover_interleaving
+
+  local sesspid; sleep 600 3>&- & sesspid=$!
+  local iid="solo.$sesspid"
+  local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
+
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
+  local w1=$!
+  _wait_pidfile "$pf" "$w1"
+
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
+  local w2=$!
+  # Past the successor's delayed write AND past the predecessor's delayed
+  # remove, so what is read here is the state both have finished acting on.
+  sleep 6
+
+  # The successor is alive: this is about its record, not about it dying.
+  run kill -0 "$w2"; [ "$status" -eq 0 ]
+  # And the record it wrote is still there. Before this fix the predecessor's
+  # remove landed on it and the file stayed gone for the rest of the run.
+  local seen; seen="$( [ -e "$pf" ] && cat "$pf" 2>/dev/null || printf '<no-file>' )"
+  [ "$seen" = "$w2" ]
+
+  kill "$w1" "$w2" "$sesspid" 2>/dev/null || true
+  wait "$w2" 2>/dev/null || true
+}
+
 @test "watch: the slot is claimed before the previous holder is signalled (#595)" {
   # The property is an ORDER between two statements, and the failure it
   # prevents is a race, so this is asserted where the order lives rather than
