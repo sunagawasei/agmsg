@@ -138,12 +138,25 @@ let atLineStart = true;
 
 // The funnel. Streamed content passes through byte-for-byte; all it does is
 // keep the flag honest.
+//
+// A BUFFER IS WRITTEN AS A BUFFER. The first version of this decoded every
+// chunk with `toString()`, which is wrong at exactly the boundary this code
+// exists for: a multi-byte character split across two `data` events decodes to
+// a replacement character in each half, and the child's diagnostic arrives
+// corrupted — a regression the direct `process.stderr.write(chunk)` it replaced
+// did not have (raised in review). "byte-for-byte" has to be true of the code,
+// not only of the comment.
+//
+// The newline flag comes from the last BYTE for a Buffer and the last CHARACTER
+// for a string. Those agree: `\n` is 0x0a and is never part of a multi-byte
+// UTF-8 sequence.
 function writeErr(text) {
-  if (text === undefined || text === null) return;
-  const chunk = typeof text === "string" ? text : String(text);
-  if (chunk.length === 0) return;
-  process.stderr.write(chunk);
-  atLineStart = chunk.endsWith("\n");
+  if (text === undefined || text === null || text.length === 0) return;
+  // One call, string or Buffer alike: `process.stderr.write` takes both, and
+  // keeping it to one is what lets a test assert that nothing writes to stderr
+  // outside this function.
+  process.stderr.write(text);
+  atLineStart = typeof text === "string" ? text.endsWith("\n") : text[text.length - 1] === 0x0a;
 }
 
 function logLine(...args) {
@@ -420,9 +433,9 @@ class AppServerClient {
 
     this.child.stderr.on("data", (chunk) => {
       // Through the funnel so a chunk that does not end in a newline cannot
-      // leave the next diagnostic continuing the child's half-line. The bytes
-      // are unchanged.
-      writeErr(chunk.toString());
+      // leave the next diagnostic continuing the child's half-line. The Buffer
+      // is passed on undecoded: see `writeErr`.
+      writeErr(chunk);
     });
 
     const lines = readline.createInterface({ input: this.child.stdout });

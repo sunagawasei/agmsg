@@ -116,9 +116,38 @@ EOF
   # A future `process.stderr.write` added elsewhere would silently reopen the
   # hole this test exists to close, so the count is pinned rather than the
   # behaviour of the writers that exist today.
-  run grep -c 'process\.stderr\.write' "$TYPES/codex/codex-bridge.js"
+  # Comment lines are stripped first: this file explains the funnel by naming
+  # `process.stderr.write` in prose, and counting those would make the check
+  # measure the commentary rather than the calls.
+  run bash -c "grep -v '^[[:space:]]*\(//\|\*\)' \"\$1\" | grep -c 'process\.stderr\.write'" _ "$TYPES/codex/codex-bridge.js"
   [ "$status" -eq 0 ]
   [ "$output" = "1" ]
+}
+
+@test "codex-bridge: a multi-byte character split across child stderr chunks survives byte-for-byte" {
+  # THROUGH THE PRODUCTION WIRING, not by calling the funnel directly: what is
+  # being pinned is that the child's stderr reaches the log undecoded, and only
+  # the real `child.stderr` handler can show that.
+  #
+  # The app-server writes a 3-byte character with the split INSIDE it, in two
+  # `data` events. Decoding each chunk on arrival — which an earlier revision of
+  # this change did — turns both halves into replacement characters and destroys
+  # the child's diagnostic. That is data loss the direct Buffer write it
+  # replaced did not have.
+  local fake="$TEST_SKILL_DIR/fake-split-utf8.js"
+  cat >"$fake" <<'EOF'
+const full = Buffer.from("日本語\n", "utf8");
+process.stderr.write(full.subarray(0, 4));       // ends mid-character
+setTimeout(() => {
+  process.stderr.write(full.subarray(4));
+  setTimeout(() => process.exit(0), 20);
+}, 20);
+EOF
+
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake" run bash -c 'node "$1" --project "$2" --team team --name alice --timeout 1 --interval 1 --max-wakes 1 2>&1 >/dev/null' _ "$TYPES/codex/codex-bridge.js" "$PROJ"
+  printf '%s\n' "$output" | grep -q '日本語'
+  # `refute`, not `!`: a bare `! cmd` does not trip errexit on either bash.
+  refute grep -q $'\ufffd' <<<"$output"
 }
 
 @test "codex-bridge: stdout is NOT prefixed — it is an interface, not a diagnostic" {
