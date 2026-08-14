@@ -30,8 +30,20 @@ AGMSG_HELD_LOCKS="${AGMSG_HELD_LOCKS:-}"
 # Acquire <team_dir>'s lock. <team_dir> (teams/<team>) must already exist — the
 # caller creates it for a brand-new/target team before locking, so this never
 # resurrects a team dir that a concurrent leave/reset just removed. Spins with a
-# short sleep up to AGMSG_LOCK_TRIES attempts (default 1000 = ~10s), then fails
-# non-zero so the caller can abort rather than silently skip the team.
+# short sleep until AGMSG_LOCK_SECONDS elapse (default 10), then fails non-zero
+# so the caller can abort rather than silently skip the team.
+#
+# BUDGETED IN TIME, NOT ITERATIONS (#779). The old budget was 1000 attempts and
+# the comment beside it read "= ~10s", which is arithmetic that holds only where
+# an mkdir and a sleep are free. Measured on macOS: 100 attempts take 3 seconds,
+# not 1 — already three times the stated figure, before Windows, where the
+# report that raised this saw minutes. A wait announced in seconds has to be
+# counted in seconds, or the number in the message is not about the wait.
+#
+# AGMSG_LOCK_TRIES still caps the attempt count and still defaults to 1000. It
+# is set by four tests to make them fail fast and by nothing in production, so
+# it stays as a ceiling — whichever bound is reached first ends the wait, and
+# each one names itself when it does.
 # Who owns the directory and what this process is, for a failure that is about
 # neither the team nor the lock. `ls -ld` and `id` rather than stat(1), whose
 # flags differ between BSD and GNU, and both are already required here.
@@ -43,6 +55,8 @@ _agmsg_lock_describe_dir() {
 
 agmsg_lock_acquire() {
   local team_dir="$1" lock i=0 max="${AGMSG_LOCK_TRIES:-1000}" err=""
+  local budget="${AGMSG_LOCK_SECONDS:-10}" started elapsed
+  started="$(date +%s)"
   lock="$team_dir/.config.lock"
   until err="$(mkdir "$lock" 2>&1)"; do
     # WHY mkdir failed decides whether waiting can help, and only one reason
@@ -72,8 +86,16 @@ agmsg_lock_acquire() {
       return 1
     fi
     i=$((i + 1))
-    if [ "$i" -ge "$max" ]; then
-      echo "agmsg: timed out acquiring registry lock for $team_dir" >&2
+    elapsed=$(( $(date +%s) - started ))
+    # Whichever bound arrives first, and the message says which — "1000 tries"
+    # and "10 seconds" are different facts about a wait, and an operator
+    # deciding whether to retry needs the one that actually stopped it.
+    if [ "$elapsed" -ge "$budget" ] || [ "$i" -ge "$max" ]; then
+      if [ "$elapsed" -ge "$budget" ]; then
+        echo "agmsg: timed out acquiring registry lock for $team_dir after ${elapsed}s" >&2
+      else
+        echo "agmsg: gave up acquiring registry lock for $team_dir after $i attempts (${elapsed}s)" >&2
+      fi
       # The reason travels with the timeout too. If the wait was hopeless for
       # a cause this function did not anticipate, the errno is the only thing
       # that will say so.

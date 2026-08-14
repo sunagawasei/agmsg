@@ -148,3 +148,46 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   [ "$status" -eq 0 ]
   refute grep -q "could not release" <<<"$output"
 }
+
+@test "lock: the wait is budgeted in seconds, and stops at the declared one (#779)" {
+  # The old budget was an attempt count with "= ~10s" written beside it. That
+  # arithmetic holds only where an mkdir and a sleep are free: measured here,
+  # 100 attempts take 3 seconds, not 1 — and the report that raised this saw
+  # minutes on Windows. A wait announced in seconds has to be counted in them.
+  mkdir -p "$TEAM_DIR/.config.lock"
+  local start end
+  start="$(date +%s)"
+  # TRIES is set to a number that CANNOT be the thing that stops this: measured
+  # on this machine, ~100 attempts take 3 seconds, so 300 would run about nine
+  # if the wait were counted in iterations. Only the time bound ends it at two.
+  # Deliberately not 1000000 — under a mutation that removes the time bound,
+  # that number does not fail the test, it hangs the suite, and a check that
+  # hangs instead of reddening is a worse check than one that is slow.
+  run env AGMSG_LOCK_SECONDS=2 AGMSG_LOCK_TRIES=300 LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR"
+  '
+  end="$(date +%s)"
+  [ "$status" -ne 0 ]
+  # Not "roughly": the point of the change is that the number in the message is
+  # about the wait. Allow one second of slack for the clock's granularity.
+  [ "$((end - start))" -ge 2 ]
+  [ "$((end - start))" -le 4 ]
+  grep -q "timed out acquiring registry lock" <<<"$output"
+  grep -qE "after [0-9]+s" <<<"$output"
+}
+
+@test "lock: the attempt ceiling still ends the wait, and says which bound it was (#779)" {
+  # Both bounds exist and they are different facts. An operator deciding
+  # whether to retry needs the one that actually stopped it — "1000 tries" and
+  # "10 seconds" send them to different places.
+  mkdir -p "$TEAM_DIR/.config.lock"
+  run env AGMSG_LOCK_TRIES=5 AGMSG_LOCK_SECONDS=60 LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR"
+  '
+  [ "$status" -ne 0 ]
+  grep -q "gave up acquiring registry lock" <<<"$output"
+  grep -qE "after 5 attempts" <<<"$output"
+  refute grep -q "timed out" <<<"$output"
+}
