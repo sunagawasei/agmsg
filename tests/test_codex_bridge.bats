@@ -72,19 +72,53 @@ EOF
 # --- the log names who wrote each line (#784) ---------------------------
 #     The launcher appends this process's stderr to a per-identity log that has
 #     more than one writer by construction, and lines were reported spliced
-#     mid-word. These two pin the half that can be pinned from here: every
-#     diagnostic says which process wrote it, and stdout is left alone.
+#     mid-word. Three things reach that file from the bridge and only one is a
+#     log record: diagnostics (ours, whole lines), the child app-server's own
+#     stderr (arbitrary chunks), and agent message deltas (partial by name).
+#     These pin what can be pinned from a POSIX machine: a diagnostic says who
+#     wrote it, it never continues someone else's half-line, and stdout is left
+#     alone.
+#
+#     `grep -q` rather than `[[ ]]` in the non-last positions: on bash 3.2,
+#     which is what macOS CI runs, a false `[[ ]]` there reports ok.
 
 @test "codex-bridge: every diagnostic line carries the pid that wrote it" {
   # stderr only, so a prefix leaking into stdout cannot be mistaken for this
-  # passing. `2>&1 >/dev/null` in that order keeps stderr and drops stdout —
-  # `run --separate-stderr` would do the same but needs a minimum-version
-  # declaration this suite does not otherwise carry.
+  # passing. `2>&1 >/dev/null` in that order keeps stderr and drops stdout.
   run bash -c 'node "$1" 2>&1 >/dev/null' _ "$TYPES/codex/codex-bridge.js"
   [ "$status" -eq 1 ]
-  # `[<digits>] ` and then the message, on the same line — the prefix is what
-  # makes a spliced line show two pids instead of reading as one line.
-  [[ "$output" =~ ^\[[0-9]+\]\ codex-bridge:\ --project\ is\ required$ ]]
+  # `[<digits>] ` and then the message, on one line — the prefix is what makes
+  # a spliced line show two pids instead of reading as a single line.
+  printf '%s\n' "$output" | grep -qE '^\[[0-9]+\] codex-bridge: --project is required$'
+}
+
+@test "codex-bridge: a diagnostic never continues the half-line streamed output left open" {
+  # THE SHAPE #784 REPORTED, REACHED INSIDE ONE PROCESS. An agent message delta
+  # is partial by name, so it ends mid-word; before the funnel, the diagnostic
+  # that followed it landed on the same physical line and the record was
+  # unreadable without any second writer and without any platform question.
+  run bash -c 'node -e "
+    const { writeErr, logLine } = require(process.argv[1]);
+    writeErr(\"delta-ending-mid\");
+    logLine(\"codex-bridge: the diagnostic after it\");
+  " "$1" 2>&1 >/dev/null' _ "$TYPES/codex/codex-bridge.js"
+  [ "$status" -eq 0 ]
+  # The streamed bytes are unchanged and on their own line...
+  printf '%s\n' "$output" | grep -qx 'delta-ending-mid'
+  # ...and the diagnostic starts a line of its own, prefix first.
+  printf '%s\n' "$output" | grep -qE '^\[[0-9]+\] codex-bridge: the diagnostic after it$'
+  # `refute`, not `!`: a bare `! cmd` does not trip errexit on either bash.
+  refute grep -q 'delta-ending-midcodex-bridge' <<<"$output"
+}
+
+@test "codex-bridge: only one place writes to stderr, so the funnel cannot be bypassed" {
+  # The property above is only true while every write goes through `writeErr`.
+  # A future `process.stderr.write` added elsewhere would silently reopen the
+  # hole this test exists to close, so the count is pinned rather than the
+  # behaviour of the writers that exist today.
+  run grep -c 'process\.stderr\.write' "$TYPES/codex/codex-bridge.js"
+  [ "$status" -eq 0 ]
+  [ "$output" = "1" ]
 }
 
 @test "codex-bridge: stdout is NOT prefixed — it is an interface, not a diagnostic" {
@@ -93,7 +127,7 @@ EOF
   # this fails if the prefix ever spreads to stdout.
   run node "$TYPES/codex/codex-bridge.js" --help
   [ "$status" -eq 0 ]
-  [[ "${lines[0]}" =~ ^Usage: ]]
+  printf '%s\n' "${lines[0]}" | grep -q '^Usage:'
   [[ ! "$output" =~ \[[0-9]+\]\  ]]
 }
 

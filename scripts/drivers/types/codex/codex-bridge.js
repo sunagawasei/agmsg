@@ -110,10 +110,47 @@ Set AGMSG_CODEX_APP_SERVER_CMD to override the app-server command for tests.`);
 // stdout is deliberately NOT prefixed. `usage()`, the thread-id list and
 // `--resolve-only` are read by people and asserted by tests; a prefix there
 // would change an interface, not a diagnostic.
+//
+// THREE THINGS REACH STDERR FROM THIS FILE, and only one of them is a log
+// record. Derived by grepping every write rather than by listing the ones that
+// came to mind — the first version of this change named only the first and was
+// wrong about the other two (raised in review):
+//
+//   1. DIAGNOSTICS — `console.error`, forty-odd sites. Whole lines, ours.
+//      These are the log records: prefixed, one write each.
+//   2. CHILD DIAGNOSTICS — the app-server's own stderr, forwarded in whatever
+//      chunks it arrives in. Not ours to frame: a chunk is not a line, and
+//      buffering it would delay someone's only view of a child that is hanging.
+//   3. STREAMED AGENT OUTPUT — `agent/message/delta`, partial BY NAME. There is
+//      no newline to wait for; that is what makes it a delta.
+//
+// 2 and 3 are passed through unchanged and are NOT log records. What they must
+// not do is make a log record unreadable, and before this they could: a delta
+// that ends mid-word, followed immediately by a diagnostic, produces one
+// physical line containing both — the exact shape reported in #784, reachable
+// INSIDE ONE PROCESS with no concurrent writer and no platform question.
+//
+// So everything goes through one funnel that remembers whether the last byte
+// was a newline, and a diagnostic starts a fresh line when it was not.
 const LOG_PREFIX = `[${process.pid}] `;
 
+let atLineStart = true;
+
+// The funnel. Streamed content passes through byte-for-byte; all it does is
+// keep the flag honest.
+function writeErr(text) {
+  if (text === undefined || text === null) return;
+  const chunk = typeof text === "string" ? text : String(text);
+  if (chunk.length === 0) return;
+  process.stderr.write(chunk);
+  atLineStart = chunk.endsWith("\n");
+}
+
 function logLine(...args) {
-  process.stderr.write(LOG_PREFIX + require("util").format(...args) + "\n");
+  const line = `${LOG_PREFIX}${require("util").format(...args)}\n`;
+  // The leading newline is the whole point: without it this diagnostic would
+  // continue whatever half-line a delta or a child chunk left open.
+  writeErr(atLineStart ? line : `\n${line}`);
 }
 
 // Rebound rather than applied at the forty-odd call sites: a helper that has
@@ -382,7 +419,10 @@ class AppServerClient {
     });
 
     this.child.stderr.on("data", (chunk) => {
-      process.stderr.write(chunk);
+      // Through the funnel so a chunk that does not end in a newline cannot
+      // leave the next diagnostic continuing the child's half-line. The bytes
+      // are unchanged.
+      writeErr(chunk.toString());
     });
 
     const lines = readline.createInterface({ input: this.child.stdout });
@@ -1814,7 +1854,9 @@ class CodexBridge {
 
   onAgentMessageDelta(params) {
     if (params.threadId !== this.threadId) return;
-    process.stderr.write(params.delta);
+    // Same funnel: a delta is partial by name, so the flag it leaves behind is
+    // what stops the next diagnostic from joining it into one line (#784).
+    writeErr(params.delta);
     // Watchdog re-arm on this activity is handled generically by
     // client.onThreadActivity (see run()), covering every notification type,
     // not just this one.
@@ -2255,10 +2297,8 @@ if (require.main === module) {
   main().catch((error) => die(error.message));
 }
 
-module.exports = {
-  CodexBridge,
-  toPosixPath,
-  WatchFailureBackoff,
-  WATCH_FAILURE_DELAYS_MS,
-  WATCH_FAILURE_STOP_MS,
-};
+// `writeErr` and `logLine` are exported for the same reason `toPosixPath` is:
+// the property that matters — a diagnostic never continues someone else's
+// half-line — is a property of these two together, and driving them directly
+// is the only way to state it without standing up an app-server.
+module.exports = { toPosixPath, writeErr, logLine };
