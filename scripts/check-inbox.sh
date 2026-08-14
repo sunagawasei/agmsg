@@ -232,10 +232,20 @@ done
 # The two emit points are NOT the same case, and treating them alike is what
 # lost messages.
 #
-# Nothing was accumulated: there is no delivery to protect, so the exit status
-# is free to carry the failure — and it must, because "no new messages" would
-# claim something this run never established. That is the half of #637 the
-# original comment here was right about, and it is unchanged.
+# The DOCUMENTED contract is that stdout is read as control JSON only on exit 0.
+# MEASURED (Claude Code 2.1.226, one-shot `claude -p`, a synthetic probe hook --
+# not this script, not an interactive session): the stdout control JSON was
+# processed on exit 0, 1, 2 and 3 alike. So this codebase depends on an area
+# where the documented contract and the observed implementation disagree; the
+# measurement is on #658.
+#
+# This fix is correct either way, which is why it does not bet on which is real.
+# If a runtime DOES discard stdout on a non-zero exit, as documented, then
+# emitting the messages and then exiting non-zero throws away the payload that
+# already cost these rows their unread state -- consumed and never shown, worse
+# than the failure the status was meant to report. If it does NOT discard it, as
+# measured, the non-zero exit was never needed to preserve the delivery or to
+# report the partial failure, because the payload already carries both.
 #
 # The status line is emitted only when the poll actually completed. Printing
 # "no new messages" and then exiting non-zero states something untrue on a
