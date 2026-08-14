@@ -575,79 +575,95 @@ run_named_watcher_for() {
 # THIS TEST'S OWN COPY of the script (`$SCRIPTS` is a per-test tree), one
 # holding the predecessor between its read and its remove, one delaying the
 # successor's write into that window. Nothing outside the test tree is touched.
-# The two processes RENDEZVOUS on files; they do not sleep and hope. Each wait
-# is bounded, and the bound is a failure bound rather than a timing assumption:
-# reaching it means the other side never arrived, which is itself the answer.
+# Record the ORDER THAT ACTUALLY HAPPENED; do not try to impose one (#595).
 #
-#   predecessor, after its read:   announce read_done, then wait for write_done
-#   successor,  before its write:  wait for read_done, write, announce write_done
+# Two earlier versions of this control were wrong in the same way twice. The
+# first slept between the steps, so the ordering was decided by machine load.
+# The second had the processes rendezvous on marker files, with a bounded wait
+# — and a bound that PROCEEDS when it expires turns the negative control green
+# on the broken code: if the predecessor is slow to reach its cleanup, the
+# successor's wait times out, it writes anyway, and the predecessor then reads
+# a pidfile that already names the successor and correctly deletes nothing.
+# The control would have reported the defect as fixed (raised in review).
 #
-# Under the OLD order the successor signals first, so the predecessor enters
-# cleanup, reads its own pid, and blocks — the successor's write then lands
-# strictly between that read and the remove. A -> B -> C, by construction.
+# So nothing is imposed and nothing is waited for. Each process APPENDS a word
+# to one file as it passes the point that matters, and the assertion is about
+# the sequence that came out. Under either implementation the events happen in
+# whatever order they happen; the fix's whole content is which order that is,
+# and a recorded order cannot be lost to load.
 #
-# Under the FIXED order the successor is not waited for by anybody: it waits
-# for a read_done that cannot come (the predecessor has not been signalled
-# yet), hits its bound, writes, and only then signals. The predecessor's
-# cleanup reads a pidfile that already names the successor. The bound is spent,
-# not raced.
-_pin_handover_interleaving() {
+#   claim   the successor wrote its own pid to the pidfile
+#   signal  the successor sent the previous holder its signal
+#   read    the departing predecessor read the pidfile in its EXIT guard
+#
+# The fix says `claim` precedes `signal`. Everything else follows from that:
+# a `read` triggered by the signal necessarily lands after the claim, and the
+# guard then sees a pid that is not its own.
+_record_handover_events() {
   local sh="$SCRIPTS/watch.sh" applied
-  export AGMSG_TEST_PIN_DIR="$TEST_SKILL_DIR/run/pin"
-  mkdir -p "$AGMSG_TEST_PIN_DIR"
-  perl -0pi -e 's/(\[ -f "\$PIDFILE" \] && IFS= read -r pidfile_pid < "\$PIDFILE" \|\| true)/$1\n  if [ "\${AGMSG_TEST_PIN_ROLE:-}" = predecessor ] && [ -n "\${AGMSG_TEST_PIN_DIR:-}" ]; then  # PINNED\n    : > "\$AGMSG_TEST_PIN_DIR\/read_done"\n    _pin_i=0\n    while [ ! -f "\$AGMSG_TEST_PIN_DIR\/write_done" ] && [ "\$_pin_i" -lt 100 ]; do sleep 0.1; _pin_i=\$((_pin_i+1)); done\n  fi/' "$sh"
-  perl -0pi -e 's/^echo \$\$ > "\$PIDFILE"$/if [ "\${AGMSG_TEST_PIN_ROLE:-}" = successor ] && [ -n "\${AGMSG_TEST_PIN_DIR:-}" ]; then  # PINNED\n  _pin_i=0\n  while [ ! -f "\$AGMSG_TEST_PIN_DIR\/read_done" ] && [ "\$_pin_i" -lt 20 ]; do sleep 0.1; _pin_i=\$((_pin_i+1)); done\nfi\necho \$\$ > "\$PIDFILE"\nif [ "\${AGMSG_TEST_PIN_ROLE:-}" = successor ] && [ -n "\${AGMSG_TEST_PIN_DIR:-}" ]; then : > "\$AGMSG_TEST_PIN_DIR\/write_done"; fi  # PINNED/m' "$sh"
-  # A control on the injection itself: an edit that silently matched nothing
-  # would leave this test asserting the ordinary case and calling it the race.
-  applied="$(grep -c 'PINNED' "$sh")"
-  [ "$applied" -eq 3 ]
+  export AGMSG_TEST_EVENTS="$TEST_SKILL_DIR/run/handover.events"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  : > "$AGMSG_TEST_EVENTS"
+  perl -0pi -e 's/(\[ -f "\$PIDFILE" \] && IFS= read -r pidfile_pid < "\$PIDFILE" \|\| true)/$1\n  [ -n "\${AGMSG_TEST_EVENTS:-}" ] && printf %s\\ %s\\\\n read \$\$ >> "\$AGMSG_TEST_EVENTS"  # RECORDED/' "$sh"
+  perl -0pi -e 's/^echo \$\$ > "\$PIDFILE"$/echo \$\$ > "\$PIDFILE"\n[ -n "\${AGMSG_TEST_EVENTS:-}" ] && printf %s\\ %s\\\\n claim \$\$ >> "\$AGMSG_TEST_EVENTS"  # RECORDED/m' "$sh"
+  perl -0pi -e 's/(kill "\$PREV_PID_TO_DISPLACE" 2>\/dev\/null \|\| true|kill "\$prev_pid" 2>\/dev\/null \|\| true)/[ -n "\${AGMSG_TEST_EVENTS:-}" ] \&\& printf %s\\ %s\\\\n signal \$\$ >> "\$AGMSG_TEST_EVENTS"  # RECORDED\n      $1/g' "$sh"
+  # A control on the instrumentation: an edit that matched nothing would leave
+  # every assertion below reading an empty file and passing.
+  applied="$(grep -c 'RECORDED' "$sh")"
+  [ "$applied" -ge 3 ]
 }
 
-@test "watch: a predecessor stopped mid-cleanup cannot delete the successor's pidfile (#595)" {
+@test "watch: the successor claims the pidfile before it signals, and keeps its record (#595)" {
   skip_on_windows "watcher process mgmt under Git Bash (#182)"
-  _pin_handover_interleaving
+  _record_handover_events
 
   local sesspid; sleep 600 3>&- & sesspid=$!
   local iid="solo.$sesspid"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
 
-  AGMSG_TEST_PIN_ROLE=predecessor AGMSG_WATCH_INTERVAL=1 \
-    bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w1=$!
   _wait_pidfile "$pf" "$w1"
 
-  AGMSG_TEST_PIN_ROLE=successor AGMSG_WATCH_INTERVAL=1 \
-    bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w2=$!
 
-  # Wait for the rendezvous to complete rather than for a duration: the
-  # successor announces its write, and only then can the predecessor's remove
-  # run at all. Bounded, and the bound failing is a real failure.
+  # Wait for the PREDECESSOR TO BE GONE, which is a condition and not a
+  # duration: its remove is the last thing it does, so once it is gone nothing
+  # else can touch the pidfile.
   local i
-  for i in $(seq 1 150); do
-    [ -f "$AGMSG_TEST_PIN_DIR/write_done" ] && break
-    sleep 0.1
-  done
-  [ -f "$AGMSG_TEST_PIN_DIR/write_done" ]
-  # The predecessor's remove is the last thing it does before exiting, so its
-  # exit is the point after which nothing more can touch the pidfile. Waiting
-  # for the process rather than for a number is what makes this deterministic.
-  for i in $(seq 1 150); do
+  for i in $(seq 1 200); do
     kill -0 "$w1" 2>/dev/null || break
     sleep 0.1
   done
   run kill -0 "$w1"; [ "$status" -ne 0 ]
-
-  # The successor is alive: this is about its record, not about it dying.
   run kill -0 "$w2"; [ "$status" -eq 0 ]
-  # And the record it wrote is still there. Before this fix the predecessor's
-  # remove landed on it and the file stayed gone for the rest of the run.
+
+  # The order that actually occurred. Both events must be present -- an
+  # assertion over a sequence that is missing one of its terms proves nothing.
+  local claim_at signal_at read_at
+  # BY PID, not by event name. Both watchers claim the slot -- the predecessor
+  # when it starts -- so a search for the first `claim` finds the wrong one and
+  # the assertion passes on the broken code. The mutation caught that before
+  # CI did; the events carry the pid that wrote them for exactly this reason.
+  claim_at="$(grep -n "^claim $w2\$"  "$AGMSG_TEST_EVENTS" | head -1 | cut -d: -f1)"
+  signal_at="$(grep -n "^signal $w2\$" "$AGMSG_TEST_EVENTS" | head -1 | cut -d: -f1)"
+  read_at="$(grep -n "^read $w1\$"    "$AGMSG_TEST_EVENTS" | head -1 | cut -d: -f1)"
+  [ -n "$claim_at" ]
+  [ -n "$signal_at" ]
+  [ -n "$read_at" ]
+  # The fix, stated as the thing it is: the slot is claimed first.
+  [ "$claim_at" -lt "$signal_at" ]
+  # And the consequence, which is what the operator actually loses when the
+  # order is wrong: the record the live watcher wrote is still there.
+  [ "$read_at" -gt "$claim_at" ]
   local seen; seen="$( [ -e "$pf" ] && cat "$pf" 2>/dev/null || printf '<no-file>' )"
   [ "$seen" = "$w2" ]
 
-  kill "$w1" "$w2" "$sesspid" 2>/dev/null || true
+  kill "$w2" "$sesspid" 2>/dev/null || true
   wait "$w2" 2>/dev/null || true
 }
+
 
 @test "watch: the slot is claimed before the previous holder is signalled (#595)" {
   # The property is an ORDER between two statements, and the failure it
