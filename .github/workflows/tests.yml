@@ -181,23 +181,7 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         run: |
           bash --version | head -1
-          # Two changes here, and they pull in opposite directions (#824).
-          #
-          # The `|| sqlite3.exe --version || echo "sqlite3 not found on PATH"`
-          # fallback is gone: it turned a missing binary into a success line, so
-          # nothing between a failed install and `Run tests` said anything was
-          # wrong. Absence is now decided by the presence check above, which is
-          # allowed to be red about it.
-          #
-          # But without the fallback this line would fail on a leg that never
-          # installs sqlite3 — `driver input (#817)` carries `sqlite: false`
-          # precisely so a package feed cannot stop a leg that drives a mock
-          # bash driver. Reporting a version it was never meant to have would
-          # re-create, one step lower, the coupling #822 removed. `matrix.sqlite`
-          # is a fixed value from the matrix above, not external input.
-          if [ "${{ matrix.sqlite }}" = "true" ]; then
-            sqlite3 --version
-          fi
+          sqlite3 --version
           bats --version
 
       # Diagnostics for the shards that report every test ok and then sit
@@ -531,11 +515,23 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         run: |
           bash --version | head -1
-          # No `|| echo` fallback (#824): it turned a missing binary into a
-          # success line, so nothing between the failed install and `Run tests`
-          # said anything was wrong. Absence is decided by the step above, which
-          # is allowed to be red about it; this one only reports.
-          sqlite3 --version
+          # Two changes here, pulling in opposite directions (#824).
+          #
+          # The `|| sqlite3.exe --version || echo "sqlite3 not found on PATH"`
+          # fallback is gone: it turned a missing binary into a success line, so
+          # nothing between a failed install and `Run tests` said anything was
+          # wrong. Absence is decided by the presence check above, which is
+          # allowed to be red about it.
+          #
+          # Without the fallback this line would fail on a leg that never
+          # installs sqlite3 — `driver input (#817)` carries `sqlite: false`
+          # precisely so a package feed cannot stop a leg driving a mock bash
+          # driver. Reporting a version it was never meant to have would
+          # re-create, one step lower, the coupling #822 removed.
+          # `matrix.sqlite` is a fixed value from the matrix above.
+          if [ "${{ matrix.sqlite }}" = "true" ]; then
+            sqlite3 --version
+          fi
           bats --version
 
       - name: Run tests
