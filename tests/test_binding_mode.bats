@@ -277,24 +277,28 @@ file_mode() {
     ln -sf "$(command -v "$tool")" "$bindir/$tool"
   done
 
-  # BUILT BEFORE THE PATH IS NARROWED. `head` and `tr` are not in that bin dir --
-  # they do not need to be, the helper never calls them -- so composing the
-  # payload inside the subshell produced an EMPTY string, a write small enough to
-  # land, and a pass with rc=0. The assertion below caught it.
-  local payload
-  payload="$(head -c 200000 /dev/zero | tr '\0' 'x')"
-
-  # RUN IN A CHILD SHELL, and that is not a style choice.
+  # THE PAYLOAD IS BUILT INSIDE THE SCRIPT, BY A BUILTIN, AND NOT PASSED IN.
   #
-  # The first version wrapped the scenario in `( set -e; ... ) || rc=$?`. A
-  # compound command on the left of `||` has errexit DISABLED inside it, so the
-  # `set -e` never applied and the mutation that removes the `|| :` from the
-  # cleanup changed nothing -- the control could not see the thing it exists to
-  # bind. Measured: with that harness, removing the guard reddened no case.
+  # Two ways of getting it in have already failed here, and both are recorded
+  # because each looked correct:
   #
+  #   composed inside the narrowed PATH -> `head` and `tr` are not in that bin
+  #     dir, so it wrote an EMPTY string, the write succeeded, and the case
+  #     passed with rc=0.
+  #   passed as `run bash "$script" "$payload"` -> a 200 KB argv entry is over
+  #     ARG_MAX on Linux. It ran on the machine that wrote it and died on CI
+  #     with `/usr/bin/bash: Argument list too long` -- the same shape as #820,
+  #     which I had filed against `history.sh` an hour earlier.
+  #
+  # Doubling a string is a builtin loop: no argv, no external command, and it
+  # works after PATH has been narrowed to the bin dir below.
+  #
+  # RUN IN A CHILD SHELL, and that is not a style choice. The first version
+  # wrapped the scenario in `( set -e; ... ) || rc=$?`. A compound command on the
+  # left of `||` has errexit DISABLED inside it, so the `set -e` never applied
+  # and the mutation that removes the `|| :` from the cleanup changed nothing.
   # A separate process carries its own errexit, which no condition in this test
-  # can suppress. `run` then records the status without putting the child on the
-  # left of anything.
+  # can suppress.
   local script="$TEST_SKILL_DIR/no-rm-write.sh"
   cat > "$script" <<SCRIPT
 set -e
@@ -302,10 +306,12 @@ trap '' XFSZ
 ulimit -f 1
 PATH="$bindir"
 . "$SCRIPTS/lib/registry-lock.sh"
-agmsg_write_atomic "$dest" "\$1"
+payload=x
+while [ \${#payload} -lt 200000 ]; do payload="\$payload\$payload"; done
+agmsg_write_atomic "$dest" "\$payload"
 SCRIPT
 
-  run bash "$script" "$payload"
+  run bash "$script"
   rc="$status"
   printf '%s' "$output" > "$errfile"
 
