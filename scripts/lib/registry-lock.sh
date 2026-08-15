@@ -416,25 +416,53 @@ agmsg_write_atomic() {
   local attempts=0
   while :; do
     tmp="$dest.tmp.$$.$RANDOM"
-    if ( umask 077; set -C; : > "$tmp" ) 2>/dev/null; then
+    # A NAME ALREADY IN USE IS RETRIED, and this test is a FILTER, not the
+    # guarantee. `set -C` below is what makes the creation exclusive against a
+    # writer that arrives between these two lines. This exists so a leftover is
+    # answered by drawing another name, rather than by the branch underneath,
+    # which reports a write that ran out of room and removes what it wrote.
+    if [ -e "$tmp" ]; then
+      attempts=$((attempts + 1))
+      if [ "$attempts" -ge 32 ]; then
+        printf 'agmsg: could not create a private temporary file beside %s\n' "$dest" >&2
+        return 1
+      fi
+      continue
+    fi
+    # CREATED AND FILLED BY ONE REDIRECTION, so the name is resolved once.
+    #
+    # This used to create the temp empty under `set -C` and then open `$tmp`
+    # AGAIN to write the content. The second open resolves the name a second
+    # time, so whatever the exclusive creation established could be replaced in
+    # between and the payload would follow the replacement -- through a file
+    # this call never created. Review named it as a stop condition and it was
+    # right: an exclusive create whose result is used BY NAME is not exclusive.
+    #
+    # One `>` both creates the file and receives the bytes. `umask 077` still
+    # applies at creation and `set -C` still refuses an existing file rather
+    # than truncating it, so neither property is traded away for the merge.
+    if ( umask 077; set -C; printf '%s\n' "$content" > "$tmp" ) 2>/dev/null; then
       break
     fi
-    attempts=$((attempts + 1))
-    if [ "$attempts" -ge 32 ]; then
-      printf 'agmsg: could not create a private temporary file beside %s\n' "$dest" >&2
-      return 1
-    fi
-  done
-
-  # The `mv` is what makes a reader see the whole new file or the whole old one.
-  # It does NOT make the CONTENT whole: a `printf` that writes half the payload
-  # and then fails -- a full disk, a quota, an I/O error -- would otherwise be
-  # published, indivisibly, as the truncated destination.
-  if ! printf '%s\n' "$content" > "$tmp"; then
+    # The name was free on the line above and nothing is publishable, so the
+    # WRITE is what failed -- a full disk, a quota, an I/O error. Not retried:
+    # 32 attempts at a full disk leave 32 partial files behind, and the
+    # destination is what this function protects, which it has done by not
+    # reaching the `mv`.
+    #
+    # The temp is discarded on the reading that this process made it: the name
+    # carries THIS shell's pid, so another writer producing the same one is not
+    # a case this defends against. That reading is written down because it is
+    # what makes the removal safe rather than obvious.
     _agmsg_discard_temp "$tmp"
     printf 'agmsg: could not write the new contents for %s\n' "$dest" >&2
     return 1
-  fi
+  done
+
+  # The `mv` is what makes a reader see the whole new file or the whole old one.
+  # The loop above is what makes the CONTENT whole: a `printf` that wrote half
+  # the payload and then failed would otherwise be published, indivisibly, as
+  # the truncated destination.
   if ! mv "$tmp" "$dest"; then
     _agmsg_discard_temp "$tmp"
     printf 'agmsg: could not move the new contents into place at %s\n' "$dest" >&2

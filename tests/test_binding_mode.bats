@@ -54,14 +54,34 @@ file_mode() {
   # proved nothing, which is the same defect it exists to catch.
   #
   # Calling the helper in this shell makes `$$` the one it would use.
+  #
+  # AND `$$` ALONE WAS NOT ENOUGH, WHICH THIS TEST USED TO GET WRONG.
+  #
+  # The candidate name is `<dest>.tmp.$$.$RANDOM`. This planted its decoy at
+  # `<dest>.tmp.$$` — a name the helper never draws — so the helper walked past
+  # it and every assertion below passed for the wrong reason. Measured, not
+  # supposed: with the decoy at that name, REMOVING `set -C` from the creation
+  # left all five cases in this file green. The guard had no control at all,
+  # which is the second time this same test proved nothing (see the paragraph
+  # above for the first).
+  #
+  # `RANDOM` is seeded so the helper's FIRST draw is known here, and the decoy
+  # is planted at exactly that name. Assigning to `RANDOM` reseeds bash's
+  # generator, so drawing the name and then reseeding puts the helper back at
+  # the same first value. The call has to be direct rather than under `run`:
+  # `run` forks, and bash reseeds the generator in a subshell.
   local probe decoy
   probe="$TEST_SKILL_DIR/stale.json"
-  decoy="$probe.tmp.$$"
-  printf 'SENTINEL-NOT-TOUCHED\n' > "$decoy"
-  chmod 666 "$decoy"
 
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/registry-lock.sh"
+
+  RANDOM=20804
+  decoy="$probe.tmp.$$.$RANDOM"
+  printf 'SENTINEL-NOT-TOUCHED\n' > "$decoy"
+  chmod 666 "$decoy"
+
+  RANDOM=20804
   agmsg_write_atomic "$probe" '{"endpoint":"https://host/t/THE-SECRET/"}'
 
   # 1. the leftover is still THERE. This is the assertion that discriminates:
@@ -135,4 +155,59 @@ file_mode() {
   [ "$(cat "$dest")" = "$before" ]
   # 3. and nothing private was left lying beside it
   [ -z "$(find "$TEST_SKILL_DIR" -maxdepth 1 -name 'partial.json.tmp.*' -print -quit)" ]
+}
+
+@test "when every candidate name is taken the write gives up and says so (#804)" {
+  # THE GIVE-UP PATH, driven deterministically rather than by luck.
+  #
+  # The loop draws `<dest>.tmp.$$.$RANDOM` and stops after 32 candidates. Seeding
+  # `RANDOM` makes that sequence reproducible, so this plants exactly the 32
+  # names the helper is about to draw and nothing else. No permissions are
+  # changed and no filesystem is filled, which is what makes it run the same way
+  # on every platform in the matrix.
+  #
+  # The alternative was an unwritable directory. That drives the same branch
+  # through a different cause and answers differently where chmod is advisory,
+  # so it would have been a control on the runner rather than on this loop.
+  local probe taken i
+  probe="$TEST_SKILL_DIR/exhaust.json"
+  printf 'ORIGINAL\n' > "$probe"
+
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/registry-lock.sh"
+
+  RANDOM=7104
+  taken=()
+  for ((i = 0; i < 32; i++)); do
+    taken+=("$probe.tmp.$$.$RANDOM")
+  done
+  for name in "${taken[@]}"; do
+    printf 'SOMEONE-ELSES\n' > "$name"
+  done
+
+  # Direct, not under `run`: bash reseeds the generator in a subshell, so a
+  # forked call would draw a different sequence and collide with none of these.
+  # STDERR GOES TO A FILE, not through `$( )`. A command substitution forks, and
+  # a forked bash reseeds `RANDOM` -- the helper would then draw 32 names none of
+  # which are planted here, allocate on the first try and return 0. That is
+  # exactly what it did on the first run of this test: the assertion below caught
+  # it, and the cause was the capture, not the loop.
+  RANDOM=7104
+  local rc=0 errfile="$TEST_SKILL_DIR/exhaust.err"
+  agmsg_write_atomic "$probe" '{"endpoint":"https://host/t/THE-SECRET/"}' 2>"$errfile" || rc=$?
+
+  # 1. it FAILED, rather than returning 0 with nothing written
+  [ "$rc" -ne 0 ]
+  # 2. and said which of the two failures this was
+  grep -q 'could not create a private temporary file' "$errfile"
+  # 3. the destination is untouched — the caller's old file is still the file
+  [ "$(cat "$probe")" = "ORIGINAL" ]
+  # 4. and not one of the 32 was opened, emptied or carried off
+  for name in "${taken[@]}"; do
+    [ -f "$name" ]
+    [ "$(cat "$name")" = "SOMEONE-ELSES" ]
+  done
+  refute grep -rq 'THE-SECRET' "$TEST_SKILL_DIR"
+
+  rm -f "${taken[@]}"
 }
