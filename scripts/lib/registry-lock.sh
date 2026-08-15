@@ -415,7 +415,12 @@ _agmsg_say_residue() {
 
 agmsg_write_atomic() {
   local dest="$1" content="$2" tmp
-  # The temp is CREATED, never adopted, using only shell builtins.
+  # The temp is CREATED, never adopted, using only what the minimal PATH
+  # guarantees: `umask` and `printf` from the shell, and `mkdir`, `mv` and
+  # `rmdir`, which are on that list. It said "only shell builtins" while calling
+  # three external commands -- true of a revision that used `noclobber`, and
+  # contradicted twelve lines further down by the paragraph explaining why
+  # `mkdir` and `rmdir` are safe to depend on.
   #
   # `> "$dest.tmp.$$"` onto a file a killed run left behind only truncates it:
   # the redirect does not touch the mode, and `umask` applies to creation, so
