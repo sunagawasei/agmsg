@@ -389,6 +389,30 @@ _agmsg_discard_temp() {
   fi
 }
 
+# Remove what a failed attempt left, and NEVER let the removal speak for the
+# attempt.
+#
+# Both commands are neutralised with `|| :`. Many of this repository's scripts
+# run under `set -e`, where a `rmdir` that fails on a directory it could not
+# empty aborts the shell BEFORE the caller's diagnostic is printed and before
+# its `return 1` -- turning a named failure into a silent exit. Cleanup is
+# allowed to fail here. It is not allowed to decide (#804, raised in review).
+_agmsg_cleanup_attempt() {
+  _agmsg_discard_temp "$1" || :
+  rmdir "$2" 2>/dev/null || :
+}
+
+# SAID, NOT SWALLOWED (#802). On the PATH `join` is required to work under there
+# is no `rm`, so a failed write cannot be removed and the directory holding it
+# cannot be removed either. What survives is 0700 with a 0600 file inside --
+# privacy intact, tidiness not -- and the operator is told WHERE in the same
+# breath as the failure rather than finding it later.
+_agmsg_say_residue() {
+  if [ -d "$1" ]; then
+    printf 'agmsg: a private copy of the failed attempt is left in %s\n' "$1" >&2
+  fi
+}
+
 agmsg_write_atomic() {
   local dest="$1" content="$2" tmp
   # The temp is CREATED, never adopted, using only shell builtins.
@@ -406,9 +430,13 @@ agmsg_write_atomic() {
   # either; the version before this one called it and only survived because its
   # failure was ignored.
   #
-  # So: `umask` and `noclobber`, both builtins. `set -C` makes `>` REFUSE an
-  # existing file rather than truncate it, so a leftover is never opened, and
-  # the name carries $RANDOM so a leftover does not block the write forever.
+  # So: `umask`, plus `mkdir` and `rmdir`, which that list does carry. An
+  # earlier revision of this fix used `noclobber` (`set -C`) to refuse an
+  # existing file; that is gone, and the paragraph describing it went with it,
+  # because a comment that explains a primitive the code no longer uses is read
+  # as enforcement by whoever arrives next. What replaced it is below: the temp
+  # lives inside a directory this call created, and the name carries $RANDOM so
+  # a leftover does not block the write forever.
   #
   # 0600 applies to every caller of this helper -- team configs, roster
   # journals, the codex port file, migrations. That is deliberate: it is how
@@ -460,9 +488,9 @@ agmsg_write_atomic() {
   # 0700 on the directory and 0600 on the file. The content is written once,
   # into a fresh name inside a directory only this call can enter.
   if ! ( umask 077; printf '%s\n' "$content" > "$tmp" ) 2>/dev/null; then
-    _agmsg_discard_temp "$tmp"
-    rmdir "$tmpdir" 2>/dev/null
+    _agmsg_cleanup_attempt "$tmp" "$tmpdir"
     printf 'agmsg: could not write the new contents for %s\n' "$dest" >&2
+    _agmsg_say_residue "$tmpdir"
     return 1
   fi
 
@@ -471,10 +499,28 @@ agmsg_write_atomic() {
   # the payload and then failed would otherwise be published, indivisibly, as
   # the truncated destination.
   if ! mv "$tmp" "$dest"; then
-    _agmsg_discard_temp "$tmp"
-    rmdir "$tmpdir" 2>/dev/null
+    _agmsg_cleanup_attempt "$tmp" "$tmpdir"
     printf 'agmsg: could not move the new contents into place at %s\n' "$dest" >&2
+    _agmsg_say_residue "$tmpdir"
     return 1
   fi
-  rmdir "$tmpdir" 2>/dev/null
+
+  # PUBLISHED. EVERYTHING BELOW IS TIDYING, AND TIDYING DOES NOT GET A VOTE.
+  #
+  # This function used to end on a bare `rmdir`, so the status of the tidy-up
+  # became the status of the write: a `rmdir` that failed after a `mv` that
+  # succeeded returned non-zero, and the caller treated a committed write as a
+  # failure. That needs no `set -e` to happen -- the last command's status is
+  # the function's -- and under `set -e` it is worse, because the caller aborts
+  # on a write that in fact landed. Review named it (#804).
+  #
+  # So the removal is checked, its failure is SAID rather than swallowed (#802),
+  # and the return is explicit and unconditional. After a successful `mv` the
+  # directory is empty and 0700, so a failure here is close to impossible; if it
+  # happens, what leaks is an empty private directory, and the operator is told
+  # which one rather than left to find it.
+  if ! rmdir "$tmpdir" 2>/dev/null; then
+    printf 'agmsg: wrote %s, but could not remove the temporary directory %s\n' "$dest" "$tmpdir" >&2
+  fi
+  return 0
 }

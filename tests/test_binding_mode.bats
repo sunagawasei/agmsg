@@ -117,9 +117,14 @@ file_mode() {
 }
 
 @test "the temp the helper creates is private before any content is written (#804)" {
-  # Asserted on the primitive rather than on a race: `mktemp` creates at 0600,
-  # so there is no moment at which the file exists more permissively. If the
+  # Asserted on the primitive rather than on a race: `umask 077` applies at
+  # CREATION -- to the directory the call makes and to the file it opens inside
+  # it -- so there is no moment at which either exists more permissively. If the
   # helper is changed to create-then-narrow, this stops holding.
+  #
+  # It used to say `mktemp` creates at 0600. `mktemp` was removed from this
+  # helper long before this line was, and a comment naming a primitive the code
+  # does not use is read as enforcement by whoever arrives next.
   local probe
   probe="$TEST_SKILL_DIR/probe.json"
   ( umask 002
@@ -218,4 +223,97 @@ file_mode() {
   refute grep -rq 'THE-SECRET' "$TEST_SKILL_DIR"
 
   rm -rf "${taken[@]}"
+}
+
+@test "a cleanup that fails after the write landed does not report a failure (#804)" {
+  # THE WRITE IS COMMITTED AT THE `mv`. Everything after it is tidying, and this
+  # function used to end on a bare `rmdir` -- so the tidy-up's status became the
+  # function's, and a caller was told a committed write had failed. No `set -e`
+  # is needed for that; the last command's status is the function's.
+  #
+  # `rmdir` is shadowed by one that always fails, which is the same failure a
+  # non-empty or vanished directory would produce, without needing to arrange
+  # either.
+  local dest bindir errfile rc=0
+  dest="$TEST_SKILL_DIR/committed.json"
+  bindir="$TEST_SKILL_DIR/failing-rmdir"
+  errfile="$TEST_SKILL_DIR/committed.err"
+  mkdir -p "$bindir"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$bindir/rmdir"
+  chmod +x "$bindir/rmdir"
+
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/registry-lock.sh"
+  PATH="$bindir:$PATH" agmsg_write_atomic "$dest" '{"endpoint":"https://host/t/KEPT/"}' 2>"$errfile" || rc=$?
+
+  # 1. the write is reported as what it is: done
+  [ "$rc" -eq 0 ]
+  # 2. and it really is done, at the right mode
+  grep -q 'KEPT' "$dest"
+  [ "$(file_mode "$dest")" = "600" ]
+  # 3. the leak is SAID rather than swallowed, and says which directory
+  grep -q 'could not remove the temporary directory' "$errfile"
+  # 4. and it is not dressed up as a failure of the write
+  refute grep -q 'could not write the new contents' "$errfile"
+}
+
+@test "a failed write with no rm says so, and says what it left (#804)" {
+  # THE MINIMAL PATH IS THE POINT. `join` must work on a PATH without `rm`, so
+  # a write that fails there cannot remove its own attempt, and the directory
+  # holding it cannot be removed either. Two things must survive that: the
+  # caller's diagnostic and its non-zero return, neither of which may be
+  # replaced by the cleanup's own failure under `set -e`.
+  local dest bindir errfile before rc=0
+  dest="$TEST_SKILL_DIR/norm.json"
+  bindir="$TEST_SKILL_DIR/no-rm-bin"
+  errfile="$TEST_SKILL_DIR/norm.err"
+  printf '%s\n' '{"keep":"this exact byte string"}' > "$dest"
+  chmod 600 "$dest"
+  before="$(cat "$dest")"
+
+  mkdir -p "$bindir"
+  # Everything the helper needs, and deliberately NOT `rm`.
+  for tool in mkdir rmdir mv; do
+    ln -sf "$(command -v "$tool")" "$bindir/$tool"
+  done
+
+  # BUILT BEFORE THE PATH IS NARROWED. `head` and `tr` are not in that bin dir --
+  # they do not need to be, the helper never calls them -- so composing the
+  # payload inside the subshell produced an EMPTY string, a write small enough to
+  # land, and a pass with rc=0. The assertion below caught it.
+  local payload
+  payload="$(head -c 200000 /dev/zero | tr '\0' 'x')"
+
+  # RUN IN A CHILD SHELL, and that is not a style choice.
+  #
+  # The first version wrapped the scenario in `( set -e; ... ) || rc=$?`. A
+  # compound command on the left of `||` has errexit DISABLED inside it, so the
+  # `set -e` never applied and the mutation that removes the `|| :` from the
+  # cleanup changed nothing -- the control could not see the thing it exists to
+  # bind. Measured: with that harness, removing the guard reddened no case.
+  #
+  # A separate process carries its own errexit, which no condition in this test
+  # can suppress. `run` then records the status without putting the child on the
+  # left of anything.
+  local script="$TEST_SKILL_DIR/no-rm-write.sh"
+  cat > "$script" <<SCRIPT
+set -e
+trap '' XFSZ
+ulimit -f 1
+PATH="$bindir"
+. "$SCRIPTS/lib/registry-lock.sh"
+agmsg_write_atomic "$dest" "\$1"
+SCRIPT
+
+  run bash "$script" "$payload"
+  rc="$status"
+  printf '%s' "$output" > "$errfile"
+
+  # 1. it failed, and said so as a WRITE failure
+  [ "$rc" -ne 0 ]
+  grep -q 'could not write the new contents' "$errfile"
+  # 2. the residue is named rather than left to be discovered
+  grep -q 'a private copy of the failed attempt is left in' "$errfile"
+  # 3. the destination is byte-for-byte what it was
+  [ "$(cat "$dest")" = "$before" ]
 }
