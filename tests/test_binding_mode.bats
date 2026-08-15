@@ -55,21 +55,25 @@ file_mode() {
   #
   # Calling the helper in this shell makes `$$` the one it would use.
   #
-  # AND `$$` ALONE WAS NOT ENOUGH, WHICH THIS TEST USED TO GET WRONG.
+  # AND `$$` ALONE WAS NOT ENOUGH, WHICH THIS TEST USED TO GET WRONG. TWICE.
   #
-  # The candidate name is `<dest>.tmp.$$.$RANDOM`. This planted its decoy at
-  # `<dest>.tmp.$$` — a name the helper never draws — so the helper walked past
-  # it and every assertion below passed for the wrong reason. Measured, not
-  # supposed: with the decoy at that name, REMOVING `set -C` from the creation
-  # left all five cases in this file green. The guard had no control at all,
-  # which is the second time this same test proved nothing (see the paragraph
-  # above for the first).
+  # The candidate name has changed twice under this case, and both times the
+  # decoy was left on the OLD one, so the helper walked past it and every
+  # assertion below passed for the wrong reason:
   #
-  # `RANDOM` is seeded so the helper's FIRST draw is known here, and the decoy
-  # is planted at exactly that name. Assigning to `RANDOM` reseeds bash's
-  # generator, so drawing the name and then reseeding puts the helper back at
-  # the same first value. The call has to be direct rather than under `run`:
-  # `run` forks, and bash reseeds the generator in a subshell.
+  #   decoy at `<dest>.tmp.$$`          candidate was `<dest>.tmp.$$.$RANDOM`
+  #   decoy at `<dest>.tmp.$$.$RANDOM`  candidate is  `<dest>.tmp.$$.$RANDOM.d`
+  #
+  # Measured, not supposed: at the first of those, removing `set -C` from the
+  # creation altogether left all five cases in this file green.
+  #
+  # The decoy is now a DIRECTORY on the seeded first candidate, holding a file
+  # at the name the helper writes into. That is the stronger statement: it fails
+  # if the helper adopts a directory it did not create, not merely if it
+  # truncates a file.
+  #
+  # `RANDOM` is seeded so the first candidate is known here. The call is direct
+  # rather than under `run`, because bash reseeds the generator in a subshell.
   local probe decoy
   probe="$TEST_SKILL_DIR/stale.json"
 
@@ -77,9 +81,11 @@ file_mode() {
   source "$SCRIPTS/lib/registry-lock.sh"
 
   RANDOM=20804
-  decoy="$probe.tmp.$$.$RANDOM"
-  printf 'SENTINEL-NOT-TOUCHED\n' > "$decoy"
-  chmod 666 "$decoy"
+  decoy="$probe.tmp.$$.$RANDOM.d"
+  mkdir "$decoy"
+  printf 'SENTINEL-NOT-TOUCHED\n' > "$decoy/new"
+  chmod 777 "$decoy"
+  chmod 666 "$decoy/new"
 
   RANDOM=20804
   agmsg_write_atomic "$probe" '{"endpoint":"https://host/t/THE-SECRET/"}'
@@ -90,9 +96,10 @@ file_mode() {
   # destination. Its disappearance is the observable, and it has to be asserted
   # before its contents, because `cat` on a missing file is a different failure
   # with a different message.
-  [ -f "$decoy" ]
+  [ -d "$decoy" ]
+  [ -f "$decoy/new" ]
   # 2. and it still holds its own bytes
-  [ "$(cat "$decoy")" = "SENTINEL-NOT-TOUCHED" ]
+  [ "$(cat "$decoy/new")" = "SENTINEL-NOT-TOUCHED" ]
   # 3. and the secret is not in it, at any mode. This one cannot be the reason
   # the test reddens -- adoption removes the file rather than leaving it with
   # the secret inside -- so it is a guard against a future implementation that
@@ -102,11 +109,11 @@ file_mode() {
   # negated form returns non-zero and the test carries on regardless -- it could
   # not fail. The repository has a checker for exactly this, and it was right to
   # stop this file. #715 is the same mechanism, found the same way.
-  refute grep -q 'THE-SECRET' "$decoy"
+  refute grep -q 'THE-SECRET' "$decoy/new"
   # 4. the real write happened, privately
   grep -q 'THE-SECRET' "$probe"
   [ "$(file_mode "$probe")" = "600" ]
-  rm -f "$decoy"
+  rm -rf "$decoy"
 }
 
 @test "the temp the helper creates is private before any content is written (#804)" {
@@ -179,10 +186,11 @@ file_mode() {
   RANDOM=7104
   taken=()
   for ((i = 0; i < 32; i++)); do
-    taken+=("$probe.tmp.$$.$RANDOM")
+    taken+=("$probe.tmp.$$.$RANDOM.d")
   done
   for name in "${taken[@]}"; do
-    printf 'SOMEONE-ELSES\n' > "$name"
+    mkdir "$name"
+    printf 'SOMEONE-ELSES\n' > "$name/new"
   done
 
   # Direct, not under `run`: bash reseeds the generator in a subshell, so a
@@ -199,15 +207,15 @@ file_mode() {
   # 1. it FAILED, rather than returning 0 with nothing written
   [ "$rc" -ne 0 ]
   # 2. and said which of the two failures this was
-  grep -q 'could not create a private temporary file' "$errfile"
+  grep -q 'could not create a private temporary directory' "$errfile"
   # 3. the destination is untouched — the caller's old file is still the file
   [ "$(cat "$probe")" = "ORIGINAL" ]
   # 4. and not one of the 32 was opened, emptied or carried off
   for name in "${taken[@]}"; do
-    [ -f "$name" ]
-    [ "$(cat "$name")" = "SOMEONE-ELSES" ]
+    [ -d "$name" ]
+    [ "$(cat "$name/new")" = "SOMEONE-ELSES" ]
   done
   refute grep -rq 'THE-SECRET' "$TEST_SKILL_DIR"
 
-  rm -f "${taken[@]}"
+  rm -rf "${taken[@]}"
 }

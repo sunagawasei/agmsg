@@ -413,59 +413,68 @@ agmsg_write_atomic() {
   # 0600 applies to every caller of this helper -- team configs, roster
   # journals, the codex port file, migrations. That is deliberate: it is how
   # this product already treats its own state (`key.sh`, the handoff bundle).
-  local attempts=0
+  # THE TEMP LIVES IN A DIRECTORY THIS CALL MADE, and that is the whole point.
+  #
+  # Two earlier shapes were refused by review, and the second one is why this is
+  # a directory:
+  #
+  #   - creating the temp empty under `set -C` and then opening `$tmp` AGAIN to
+  #     write it. The second open resolves the name a second time, so what the
+  #     exclusive creation established could be replaced in between. An
+  #     exclusive create whose result is reached BY NAME is not exclusive.
+  #
+  #   - merging those into one `>` and testing `[ -e ]` first. That test is a
+  #     filter and not a guarantee -- which the comment said -- and then the
+  #     failure branch removed `$tmp` on the reading that this process must have
+  #     made it. When the loser of a real race takes that branch, the file it
+  #     removes belongs to the WINNER. `$$` does not rescue the reasoning: a
+  #     subshell shares its parent's pid, so two concurrent calls in one process
+  #     tree draw from the same `$$.$RANDOM` space. The removal was the defect,
+  #     not the detection.
+  #
+  # `mkdir` answers both. It is atomic, it fails rather than joining an existing
+  # directory, and its SUCCESS is the proof of ownership that `[ -e ]` could
+  # never be: everything inside belongs to this call, so the payload is written
+  # into a name nothing else can be holding, and removing that name cannot
+  # remove anyone else's. It is the same primitive this file already trusts for
+  # the registry lock, for the same reason.
+  #
+  # `mkdir` and `rmdir` are both on the PATH `join` is required to work under --
+  # checked, because that list is what ruled out `mktemp` and `chmod`.
+  local attempts=0 tmpdir
   while :; do
-    tmp="$dest.tmp.$$.$RANDOM"
-    # A NAME ALREADY IN USE IS RETRIED, and this test is a FILTER, not the
-    # guarantee. `set -C` below is what makes the creation exclusive against a
-    # writer that arrives between these two lines. This exists so a leftover is
-    # answered by drawing another name, rather than by the branch underneath,
-    # which reports a write that ran out of room and removes what it wrote.
-    if [ -e "$tmp" ]; then
-      attempts=$((attempts + 1))
-      if [ "$attempts" -ge 32 ]; then
-        printf 'agmsg: could not create a private temporary file beside %s\n' "$dest" >&2
-        return 1
-      fi
-      continue
-    fi
-    # CREATED AND FILLED BY ONE REDIRECTION, so the name is resolved once.
-    #
-    # This used to create the temp empty under `set -C` and then open `$tmp`
-    # AGAIN to write the content. The second open resolves the name a second
-    # time, so whatever the exclusive creation established could be replaced in
-    # between and the payload would follow the replacement -- through a file
-    # this call never created. Review named it as a stop condition and it was
-    # right: an exclusive create whose result is used BY NAME is not exclusive.
-    #
-    # One `>` both creates the file and receives the bytes. `umask 077` still
-    # applies at creation and `set -C` still refuses an existing file rather
-    # than truncating it, so neither property is traded away for the merge.
-    if ( umask 077; set -C; printf '%s\n' "$content" > "$tmp" ) 2>/dev/null; then
+    tmpdir="$dest.tmp.$$.$RANDOM.d"
+    if ( umask 077; mkdir "$tmpdir" ) 2>/dev/null; then
       break
     fi
-    # The name was free on the line above and nothing is publishable, so the
-    # WRITE is what failed -- a full disk, a quota, an I/O error. Not retried:
-    # 32 attempts at a full disk leave 32 partial files behind, and the
-    # destination is what this function protects, which it has done by not
-    # reaching the `mv`.
-    #
-    # The temp is discarded on the reading that this process made it: the name
-    # carries THIS shell's pid, so another writer producing the same one is not
-    # a case this defends against. That reading is written down because it is
-    # what makes the removal safe rather than obvious.
+    # Taken, by anyone, for any reason: draw another name. Nothing is removed
+    # here, because nothing here was created.
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 32 ]; then
+      printf 'agmsg: could not create a private temporary directory beside %s\n' "$dest" >&2
+      return 1
+    fi
+  done
+  tmp="$tmpdir/new"
+
+  # 0700 on the directory and 0600 on the file. The content is written once,
+  # into a fresh name inside a directory only this call can enter.
+  if ! ( umask 077; printf '%s\n' "$content" > "$tmp" ) 2>/dev/null; then
     _agmsg_discard_temp "$tmp"
+    rmdir "$tmpdir" 2>/dev/null
     printf 'agmsg: could not write the new contents for %s\n' "$dest" >&2
     return 1
-  done
+  fi
 
   # The `mv` is what makes a reader see the whole new file or the whole old one.
-  # The loop above is what makes the CONTENT whole: a `printf` that wrote half
+  # The gate above is what makes the CONTENT whole: a `printf` that wrote half
   # the payload and then failed would otherwise be published, indivisibly, as
   # the truncated destination.
   if ! mv "$tmp" "$dest"; then
     _agmsg_discard_temp "$tmp"
+    rmdir "$tmpdir" 2>/dev/null
     printf 'agmsg: could not move the new contents into place at %s\n' "$dest" >&2
     return 1
   fi
+  rmdir "$tmpdir" 2>/dev/null
 }
