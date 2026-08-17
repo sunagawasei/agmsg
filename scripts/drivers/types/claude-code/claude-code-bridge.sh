@@ -2,6 +2,7 @@
 # A daemon must survive ordinary non-zero helper results. Keep nounset and
 # pipefail, but guard every fallible operation explicitly.
 set -uo pipefail
+CLAUDE_BRIDGE_ORIGINAL_ARGS=("$@")
 
 usage() {
   cat <<'EOF'
@@ -102,6 +103,8 @@ source "$SCRIPTS_DIR/lib/subscription.sh"
 # shellcheck disable=SC1091
 source "$SCRIPTS_DIR/lib/validate.sh"
 # shellcheck disable=SC1091
+source "$SCRIPTS_DIR/lib/process-identity.sh"
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/_delivery.sh"
 
 agmsg_validate_team_name "$TEAM" >/dev/null 2>&1 \
@@ -131,6 +134,19 @@ WATCH_FILE="$BASE.watch"
 LOCK_DIR="$BASE.lock"
 LOCK_OWNER="$LOCK_DIR/owner"
 WORK_DIR="$RUN_DIR/claude-code-$TEAM-$NAME-cwd"
+CLAUDE_OWNER_SCOPE="claude-code-bridge|$TEAM.$NAME"
+
+if agmsg_process_assert_bootstrap claude-code-bridge "$PIDFILE" "$CLAUDE_OWNER_SCOPE"; then
+  :
+else
+  _owner_bootstrap_rc=$?
+  [ "$_owner_bootstrap_rc" -eq 75 ] || exit "$_owner_bootstrap_rc"
+  exec "$SCRIPTS_DIR/internal/process-owner-launch.sh" \
+    --kind claude-code-bridge --pidfile "$PIDFILE" --scope "$CLAUDE_OWNER_SCOPE" \
+    --legacy-needle claude-code-bridge.sh --legacy-needle "$TEAM" \
+    --legacy-needle "$NAME" -- \
+    bash "$SCRIPT_DIR/claude-code-bridge.sh" "${CLAUDE_BRIDGE_ORIGINAL_ARGS[@]}"
+fi
 
 CLAUDE_CONFIG_DIR="$SKILL_DIR/db/claude-worker-home"
 export CLAUDE_CONFIG_DIR
@@ -211,7 +227,6 @@ on_drain_signal() {
 }
 trap on_drain_signal USR2
 
-printf '%s\n' "$$" > "$PIDFILE"
 printf 'pid=%s\nproject=%s\nteam=%s\nname=%s\ntype=claude-code\ndrain_capable=1\n' \
   "$$" "$PROJECT" "$TEAM" "$NAME" > "$METAFILE"
 : >> "$LOGFILE"
@@ -263,10 +278,11 @@ cleanup() {
   meta_owner="$(sed -n 's/^pid=//p' "$METAFILE" 2>/dev/null | head -1)"
   lock_owner="$(cat "$LOCK_OWNER" 2>/dev/null || true)"
   if [ "$pid_owner" = "$$" ] && [ "$meta_owner" = "$$" ]; then
-    rm -f "$PIDFILE" "$METAFILE" "$ROLE_SNAPSHOT" \
+    rm -f "$METAFILE" "$ROLE_SNAPSHOT" \
       "$PROMPT_FILE" "$ROWS_FILE" "$SELECTED_FILE" "$CONSUMED_FILE" \
       "$STDOUT_FILE" "$STDERR_FILE" "$WATCH_FILE" \
       "$SELECTED_FILE.next" "$PROMPT_FILE.next" 2>/dev/null || true
+    agmsg_process_cleanup_self claude-code-bridge "$PIDFILE" "$CLAUDE_OWNER_SCOPE"
   fi
   if [ "$lock_owner" = "$$" ]; then
     rm -f "$LOCK_OWNER" 2>/dev/null || true
@@ -659,7 +675,7 @@ run_turn_group() {
       my $status = $?;
       exit($status & 127 ? 128 + ($status & 127) : ($status >> 8));
     ' "$secs" "$grace" "$@" \
-      < "$PROMPT_FILE" > "$STDOUT_FILE" 2> "$STDERR_FILE" &
+      < "$PROMPT_FILE" > "$STDOUT_FILE" 2> "$STDERR_FILE" 19>&- &
   else
     "$PYTHON_BIN" -c '
 import os
@@ -703,7 +719,7 @@ if os.WIFSIGNALED(status):
     sys.exit(128 + os.WTERMSIG(status))
 sys.exit(os.WEXITSTATUS(status))
 ' "$secs" "$grace" "$@" \
-      < "$PROMPT_FILE" > "$STDOUT_FILE" 2> "$STDERR_FILE" &
+      < "$PROMPT_FILE" > "$STDOUT_FILE" 2> "$STDERR_FILE" 19>&- &
   fi
   CHILD_PID=$!
   wait_tracked_pid "$CHILD_PID" turn
@@ -911,7 +927,7 @@ while [ "$STOPPING" -eq 0 ]; do
   bash "$SCRIPT_DIR/watch-once.sh" "$PROJECT" "$TYPE" \
     --team "$TEAM" --name "$NAME" --pair "${TEAM}"$'\t'"${NAME}" \
     --timeout "$WATCH_TIMEOUT" --interval "$INTERVAL" \
-    > "$WATCH_FILE" 2>&1 &
+    > "$WATCH_FILE" 2>&1 19>&- &
   WATCH_PID=$!
   wait_tracked_pid "$WATCH_PID" watch
   watch_rc="$WAIT_TRACKED_RC"

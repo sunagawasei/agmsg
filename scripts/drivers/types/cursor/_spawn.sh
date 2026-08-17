@@ -34,6 +34,8 @@
 # boundary (the model may simply decline to attempt the write).
 
 CURSOR_BIN="${AGMSG_CURSOR_AGENT_CMD:-cursor-agent}"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/process-identity.sh"
 
 # Shared /add-dir harvest (agmsg_collect_add_dir_roots), used when the optional
 # spawn.cursor_inherit_add_dirs gate is on. Sourced in spawn.sh's global context
@@ -135,8 +137,11 @@ agmsg_spawn_headless() {
   # registration). pidfile first, then a fallback scan (the bridge can remove its
   # pidfile during its own cleanup while still alive).
   local pidfile="$run_dir/cursor-bridge.$TEAM.$NAME.pid"
+  local bridge_scope="cursor-bridge|$TEAM.$NAME"
   local running=""
-  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+  if [ -f "$pidfile" ] \
+      && agmsg_process_dedup_should_suppress cursor-bridge "$pidfile" "$bridge_scope" \
+        cursor-bridge.sh "$_idkey"; then
     running="$(cat "$pidfile" 2>/dev/null)"
   else
     # Fallback: list cursor-bridge candidates, then confirm identity by the opaque
@@ -203,7 +208,10 @@ agmsg_spawn_headless() {
   [ -n "$rolefile" ] && extra_args+=(--role-file "$rolefile")
 
   local log="$run_dir/cursor-bridge.$TEAM.$NAME.log"
-  nohup "${bridge_run[@]}" \
+  nohup "$SCRIPT_DIR/internal/process-owner-launch.sh" \
+    --kind cursor-bridge --pidfile "$pidfile" --scope "$bridge_scope" \
+    --legacy-needle cursor-bridge.sh --legacy-needle "$_idkey" -- \
+    "${bridge_run[@]}" \
     --project "$PROJECT" --team "$TEAM" --name "$NAME" --chat-id "$chat_id" \
     --identity-key "$_idkey" \
     ${extra_args[@]+"${extra_args[@]}"} \

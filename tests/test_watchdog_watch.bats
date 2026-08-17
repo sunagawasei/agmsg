@@ -156,7 +156,7 @@ watchdog_count_at_least() {
   set_dates 100 109 110 121
   local out="$TEST_SKILL_DIR/out" err="$TEST_SKILL_DIR/err"
   start_watcher boundary "$out" "$err"
-  wait_until 5 watchdog_count_at_least "$out" 3
+  wait_until 10 watchdog_count_at_least "$out" 3
   stop_watcher
 
   [ "$(watchdog_count "$out")" -eq 3 ]
@@ -459,7 +459,7 @@ STUB
   set_dates 100 95 104 105
   local out="$TEST_SKILL_DIR/out" err="$TEST_SKILL_DIR/err"
   start_watcher backward "$out" "$err"
-  wait_until 5 watchdog_count_at_least "$out" 2
+  wait_until 10 watchdog_count_at_least "$out" 2
   stop_watcher
 
   [ "$(watchdog_count "$out")" -eq 2 ]

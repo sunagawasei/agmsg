@@ -171,6 +171,8 @@ agmsg_delivery_status() {
 _agmsg_grok_emit_monitor_directive() {
   local type="$1" project="$2"
   local watch="$SKILL_DIR/scripts/watch.sh"
+  local watch_project
+  watch_project="$(agmsg_resolve_project "$project" "$type")"
 
   # Bake GROK_SESSION_ID in when it is set here, so the agent does not invent a
   # value and cleanup can find the pidfile. NOTE: Grok does NOT reliably export
@@ -190,8 +192,9 @@ _agmsg_grok_emit_monitor_directive() {
   if [ -f "$pidfile" ]; then
     local existing
     existing=$(cat "$pidfile" 2>/dev/null || true)
-    # EPERM-aware liveness (_agmsg_pid_alive), mirroring delivery.sh emit dedup.
-    if [ -n "$existing" ] && _agmsg_pid_alive "$existing"; then
+    if agmsg_process_dedup_should_suppress watch "$pidfile" \
+        "watch|$session_id|$watch_project|$type" \
+        "$watch" "$session_id" "$project" "$type"; then
       cat <<EOF
 
 A watch.sh is already streaming into this session (pid $existing). No

@@ -64,6 +64,8 @@ RUN_DIR="$SKILL_DIR/run"
 # rule-file types' _delivery.sh plugs.
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/delivery-rulefile.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/process-identity.sh"
 
 # Single-quote-escape $1 for splicing into a hook command string as its own
 # shell argument: replace each embedded ' with '\'' (close the quote, emit an
@@ -245,24 +247,18 @@ agmsg_delivery_status() { agmsg_delivery_status_default "$@"; }
 
 agmsg_delivery_runtime_status_default() {
   if [ -d "$RUN_DIR" ]; then
-    local alive=0 dead=0
+    local verified=0 fallback=0 unverified=0 dead=0
     for f in "$RUN_DIR"/watch.*.pid; do
       [ -f "$f" ] || continue
-      local pid
-      pid=$(cat "$f" 2>/dev/null || echo "")
-      # _agmsg_pid_alive, not bare kill -0: a watcher from another session runs
-      # under a different sandbox, where kill -0 returns EPERM and would be
-      # miscounted as a stale pidfile. Treat EPERM as alive (see instance-id.sh).
-      # Status only reads liveness (no kill), so fail-open is safe here. The
-      # teardown paths below use the same helper before attempting a signal;
-      # EPERM must not be mistaken for a stale/recycled pid.
-      if [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
-        alive=$((alive + 1))
-      else
-        dead=$((dead + 1))
-      fi
+      agmsg_process_identity_state watch "$f" ""
+      case "$AGMSG_PROCESS_STATE" in
+        owned) verified=$((verified + 1)) ;;
+        legacy-exact-live|legacy-unverified-live|degraded-live) fallback=$((fallback + 1)) ;;
+        held-unverified|unverified-live) unverified=$((unverified + 1)) ;;
+        *) dead=$((dead + 1)) ;;
+      esac
     done
-    echo "watch processes: $alive alive, $dead stale pidfiles"
+    echo "watch processes: $verified verified, $fallback legacy/degraded, $unverified unverified, $dead stale pidfiles"
   fi
 }
 agmsg_delivery_runtime_status() { agmsg_delivery_runtime_status_default "$@"; }
@@ -290,6 +286,8 @@ emit_monitor_directive() {
   local type="$1"
   local project="$2"
   local watch="$SKILL_DIR/scripts/watch.sh"
+  local watch_project
+  watch_project="$(agmsg_resolve_project "$project" "$type")"
 
   # Claude Code exports CLAUDE_CODE_SESSION_ID for every subprocess of the
   # session. Bake it directly into the command so the agent never has to
@@ -316,7 +314,9 @@ emit_monitor_directive() {
     existing=$(cat "$pidfile" 2>/dev/null || true)
     # EPERM-aware liveness (_agmsg_pid_alive): a sandbox-unsignalable watcher is
     # still alive, so we must not re-emit and spawn a duplicate.
-    if [ -n "$existing" ] && _agmsg_pid_alive "$existing"; then
+    if agmsg_process_dedup_should_suppress watch "$pidfile" \
+        "watch|$session_id|$watch_project|$type" \
+        "$watch" "$session_id" "$project" "$type"; then
       cat <<EOF
 
 A watch.sh is already streaming into this session (pid $existing). No
@@ -372,21 +372,41 @@ EOF
 # shim is left alone (it is cross-project). Echoes how many bridges were killed.
 stop_codex_bridge() {
   local project="$1"
-  local pairs team name pidfile bpid killed=0
+  local pairs team name pidfile killed=0
+  local observed_pid observed_generation observed_scope
   pairs=$("$SCRIPT_DIR/identities.sh" "$project" codex 2>/dev/null || true)
   if [ -n "$pairs" ]; then
     while IFS=$'\t' read -r team name _rest; do
       [ -n "$team" ] && [ -n "$name" ] || continue
       pidfile="$RUN_DIR/codex-bridge.$team.$name.pid"
       [ -f "$pidfile" ] || continue
-      bpid=$(cat "$pidfile" 2>/dev/null || true)
-      if [ -n "$bpid" ] && _agmsg_pid_alive "$bpid"; then
-        kill "$bpid" 2>/dev/null && killed=$((killed + 1))
+      agmsg_process_identity_state codex-bridge "$pidfile" \
+        "codex-bridge|$team.$name" codex-bridge "$team" "$name"
+      [ "$AGMSG_PROCESS_STATE" = owned ] || {
+        # Unknown/legacy/degraded ownership is not authority to signal or to
+        # discard the only record from which an operator can inspect it.
+        continue
+      }
+      observed_pid="$AGMSG_PROCESS_PID"
+      observed_generation="$AGMSG_PROCESS_GENERATION"
+      observed_scope="$AGMSG_PROCESS_SCOPE_HASH"
+      if agmsg_process_signal_owned codex-bridge "$pidfile" \
+          "codex-bridge|$team.$name" TERM \
+          --expected-owner "$observed_pid" "$observed_generation" \
+          "$observed_scope" --wait-release 5 \
+          codex-bridge "$team" "$name"; then
+        killed=$((killed + 1))
+      else
+        continue
       fi
       # .appserver records which app-server URL the bridge was bound to (the
       # launcher's stale-binding guard); drop it with the rest so it cannot
       # mislead a later launcher.
-      rm -f "$pidfile" "${pidfile%.pid}.meta" "${pidfile%.pid}.log" "${pidfile%.pid}.appserver"
+      AGMSG_PROCESS_PID="$observed_pid"
+      AGMSG_PROCESS_GENERATION="$observed_generation"
+      agmsg_process_cleanup_observed "$pidfile" --allow-missing-owner \
+        "${pidfile%.pid}.meta" "${pidfile%.pid}.log" \
+        "${pidfile%.pid}.appserver" "${pidfile%.pid}.thread" || true
     done <<EOF
 $pairs
 EOF
@@ -549,6 +569,10 @@ kill_all_watchers() {
   # SAME project — which, because claude-code is the only type with a watcher,
   # is exactly the collateral kill that a non-claude `set turn` used to cause.
   local project="${1:-}" type="${2:-}"
+  local watch_project=""
+  if [ -n "$project" ] && [ -n "$type" ]; then
+    watch_project="$(agmsg_resolve_project "$project" "$type")"
+  fi
   local killed=0
   # The argv substring to scope to: "<project> <type>" when a type is given
   # (exact adjacent fields), else just "<project>", else empty (match all).
@@ -559,29 +583,32 @@ kill_all_watchers() {
   if [ -d "$RUN_DIR" ]; then
     for f in "$RUN_DIR"/watch.*.pid; do
       [ -f "$f" ] || continue
-      local pid cmd
+      local pid cmd instance expected_scope
       pid=$(cat "$f" 2>/dev/null || echo "")
-      if [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
-        # Defensive: only kill if the pid's command line still looks like
-        # our watch.sh. Defends against pid recycling — a stale pidfile
-        # could point at an unrelated process that reused the pid.
-        cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
-        case "$cmd" in
-          *"$SKILL_DIR/scripts/watch.sh"*)
-            # When scoped, skip (and preserve the pidfile of) watchers that don't
-            # match this (project, type) — i.e. other projects, and other types
-            # in the same project.
-            if [ -n "$needle" ]; then
-              case " $cmd " in
-                *"$needle"*) ;;
-                *) continue ;;
-              esac
-            fi
-            kill "$pid" 2>/dev/null && killed=$((killed + 1)) ;;
-          *) ;;  # not our watcher; leave it
-        esac
+      instance=${f##*/watch.}; instance=${instance%.pid}
+      expected_scope=""
+      [ -n "$type" ] && expected_scope="watch|$instance|$watch_project|$type"
+      agmsg_process_identity_state watch "$f" "$expected_scope" \
+        "$SKILL_DIR/scripts/watch.sh" "$instance" "$project" "$type"
+      if [ "$AGMSG_PROCESS_STATE" = owned ]; then
+        # A complete (project,type) scope is authenticated by the sidecar and
+        # lease even when ps is unavailable.  The project-only compatibility
+        # form has no complete scope hash, so retain its cmdline filter.
+        if [ -n "$project" ] && [ -z "$type" ]; then
+          cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
+          case " $cmd " in *"$needle"*) ;; *) continue ;; esac
+        fi
+        [ -n "$expected_scope" ] \
+          || expected_scope="@hash:$AGMSG_PROCESS_SCOPE_HASH"
+        if agmsg_process_signal_owned watch "$f" "$expected_scope" TERM \
+            "$SKILL_DIR/scripts/watch.sh" "$instance" "$project" "$type"; then
+          killed=$((killed + 1))
+        fi
       fi
-      rm -f "$f"
+      case "$AGMSG_PROCESS_STATE" in
+        stale|legacy-dead|legacy-foreign-live|legacy-unverified-live|degraded-dead|unverified-dead)
+          agmsg_process_cleanup_observed "$f" || true ;;
+      esac
     done
   fi
   echo "$killed"

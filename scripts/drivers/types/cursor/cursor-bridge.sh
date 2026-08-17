@@ -4,6 +4,7 @@
 # every fallible step is guarded explicitly with `|| true` / `if`. `-u`/pipefail
 # stay on to catch real bugs.
 set -uo pipefail
+CURSOR_BRIDGE_ORIGINAL_ARGS=("$@")
 
 # cursor-bridge.sh — headless, read-only Cursor reviewer worker for agmsg.
 #
@@ -129,6 +130,8 @@ SCRIPTS_DIR="$SKILL_DIR/scripts"
 RUN_DIR="$SKILL_DIR/run"
 # shellcheck disable=SC1091
 source "$SCRIPTS_DIR/lib/storage.sh"
+# shellcheck disable=SC1091
+source "$SCRIPTS_DIR/lib/process-identity.sh"
 # Defense-in-depth (the parent _spawn.sh validates too): TEAM/NAME compose the
 # pidfile/meta/log AND the rm -rf'd scratch CFGDIR. Reuse the same UTF-8-safe
 # path-segment deny-list as join.sh (rejects '/','\\','.'/'..', leading '-',
@@ -139,11 +142,20 @@ agmsg_validate_team_name "$TEAM" >/dev/null 2>&1 || { echo "cursor-bridge: team 
 agmsg_validate_team_name "$NAME" >/dev/null 2>&1 || { echo "cursor-bridge: agent name '$NAME' is not a path-safe segment (no '/', '\\', '.', '..', leading '-', or control chars)" >&2; exit 1; }
 
 CURSOR_BIN="${AGMSG_CURSOR_AGENT_CMD:-cursor-agent}"
-# perl gives us a robust per-turn timeout that kills the WHOLE process group
-# (cursor-agent + every descendant) — the primitive bash lacks on macOS (no
-# setsid(1)/timeout(1)). perl ships on macOS, Linux and Git-for-Windows, so this
-# is the normal path; without it the turn runs unbounded (see run_with_timeout).
+# A per-turn group runner kills cursor-agent and every descendant on timeout or
+# bridge shutdown. Prefer perl, then a python3 whose os module provides setsid;
+# command existence alone is insufficient in restricted sandboxes.
 PERL_BIN="$(command -v perl 2>/dev/null || true)"
+PYTHON_BIN="$(command -v python3 2>/dev/null || true)"
+GROUP_RUNNER=""
+if [ -n "$PERL_BIN" ] && "$PERL_BIN" -e 'exit 0' >/dev/null 2>&1; then
+  GROUP_RUNNER=perl
+elif [ -n "$PYTHON_BIN" ] && "$PYTHON_BIN" -c 'import os; assert hasattr(os, "setsid")' >/dev/null 2>&1; then
+  GROUP_RUNNER=python
+else
+  echo "cursor-bridge: perl or python3 with setsid is required for process-group isolation" >&2
+  exit 1
+fi
 US=$'\x1f'
 
 mkdir -p "$RUN_DIR" 2>/dev/null || true
@@ -159,20 +171,24 @@ PROMPTFILE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.prompt"
 # retrying a permanently-broken message forever. A sanctioned permanent teardown
 # (despawn.sh, incl. session-end's worker) retires it.
 FAILSTATE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.failstate"
+CURSOR_OWNER_SCOPE="cursor-bridge|$TEAM.$NAME"
 
 # --- single instance: refuse a second bridge for the same identity ------------
-if [ -f "$PIDFILE" ]; then
-  oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
-  if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-    echo "cursor-bridge: already running for $TEAM/$NAME (pid $oldpid)" >&2
-    exit 1
-  fi
+if agmsg_process_assert_bootstrap cursor-bridge "$PIDFILE" "$CURSOR_OWNER_SCOPE"; then
+  :
+else
+  _owner_bootstrap_rc=$?
+  [ "$_owner_bootstrap_rc" -eq 75 ] || exit "$_owner_bootstrap_rc"
+  exec "$SCRIPTS_DIR/internal/process-owner-launch.sh" \
+    --kind cursor-bridge --pidfile "$PIDFILE" --scope "$CURSOR_OWNER_SCOPE" \
+    --legacy-needle cursor-bridge.sh --legacy-needle "$TEAM" \
+    --legacy-needle "$NAME" -- \
+    bash "$SCRIPT_DIR/cursor-bridge.sh" "${CURSOR_BRIDGE_ORIGINAL_ARGS[@]}"
 fi
-echo "$$" > "$PIDFILE"
 printf 'pid=%s\nproject=%s\nteam=%s\nname=%s\ntype=cursor\n' "$$" "$PROJECT" "$TEAM" "$NAME" > "$METAFILE"
 
 # In-flight turn pid, tracked so a despawn (SIGTERM) tears down the running turn
-# instead of orphaning it. With perl this is the perl wrapper's pid; its SIGTERM
+# instead of orphaning it. This is the perl or python wrapper's pid; its SIGTERM
 # handler kills the whole cursor process group, so signalling it tears the turn
 # down cleanly. run_with_timeout maintains this.
 CHILD_PID=""
@@ -183,8 +199,8 @@ CFGDIR=""            # scratch cwd holding .cursor/cli.json (the deny rules)
 ADD_DIRS_NOTE=""     # prompt fragment advertising extra readable dirs
 WORKSPACE_ARGS=()    # (--workspace <project>) when read-only is enforced
 
-# Kill the in-flight turn: SIGTERM (perl forwards it to the whole cursor process
-# group), wait out a grace longer than perl's own 2s group-kill window, then
+# Kill the in-flight turn: SIGTERM (the runner forwards it to the whole cursor
+# process group), wait out a grace longer than its own 2s group-kill window, then
 # SIGKILL the wrapper and its children as a backstop. So a despawn during an
 # active turn can't leave an orphaned cursor-agent.
 kill_inflight() {
@@ -206,13 +222,14 @@ cleanup() {
   # codex's bridge does). A re-spawn always create-chats a fresh id, so dropping
   # .chat here is safe.
   if [ "$(cat "$PIDFILE" 2>/dev/null || true)" = "$$" ]; then
-    rm -f "$PIDFILE" "$METAFILE" "$OUTFILE" "$PROMPTFILE" \
+    rm -f "$METAFILE" "$OUTFILE" "$PROMPTFILE" \
           "$OUTFILE.one" "$OUTFILE.cand" "$OUTFILE.err" \
           "$RUN_DIR/cursor-bridge.$TEAM.$NAME.chat" \
           "$RUN_DIR/cursor-bridge.$TEAM.$NAME.role" \
           "${ADD_DIRS_FILE:-}" 2>/dev/null || true
     # The scratch cwd holds our generated .cursor/cli.json — drop the whole dir.
     [ -n "${CFGDIR:-}" ] && rm -rf "$CFGDIR" 2>/dev/null || true
+    agmsg_process_cleanup_self cursor-bridge "$PIDFILE" "$CURSOR_OWNER_SCOPE"
   fi
 }
 trap cleanup EXIT
@@ -228,32 +245,26 @@ unescape() { printf '%s' "$1" | awk '{ gsub(/\\t/, "\t"); gsub(/\\n/, "\n"); pri
 # timeout, or 128+signal if the command was killed by a signal — so the caller
 # treats anything but a clean exit 0 as a failure and retries.
 #
-# perl path (taken whenever perl exists, even when timeout is disabled): perl runs
+# Runner path (taken even when timeout is disabled): the wrapper runs
 # the command in its OWN session/process group (setsid) and, on its alarm
 # (timeout) OR a forwarded SIGTERM (despawn), kills the WHOLE group — cursor-agent
-# and every descendant. It is a single tracked process (CHILD_PID = the perl
+# and every descendant. It is a single tracked process (CHILD_PID = the
 # wrapper) with no shared marker file and no watchdog subshell, so there is no
 # cross-turn / re-spawn race: the 124 is internal to this one invocation and can
 # never affect another turn. `alarm 0` (secs<=0) keeps the group management but
-# disables the timeout. perl reports signal deaths as 128+signal (not 0), so a
+# disables the timeout. The runner reports signal deaths as 128+signal (not 0), so a
 # cursor-agent killed externally / crashing is never mistaken for success even if
 # a complete JSON happens to sit in stdout. The command runs via the list form of
 # exec (execvp, no shell) — no shell-injection surface. Signals are numeric (15/9)
 # so the program needs no single quotes and embeds in the single-quoted -e below.
 # (A child finishing in the same instant the alarm fires can still be scored a
 # timeout — an inherent, fail-closed, this-turn-only retry.)
-#
-# No-perl fallback (degraded): run unbounded as a direct background child, tracked
-# so kill_inflight can SIGTERM/SIGKILL it on despawn. Without setsid there is no
-# process-group kill, so a cursor-agent that leaves descendants could orphan them.
-# perl is present on macOS / Linux / Git-for-Windows, so this path is for exotic
-# environments only.
 run_with_timeout() {
   local secs="$1"; shift
   local rc=0
   case "$secs" in ''|*[!0-9-]*) secs=0 ;; esac
   [ "$secs" -ge 0 ] 2>/dev/null || secs=0
-  if [ -n "$PERL_BIN" ]; then
+  if [ "$GROUP_RUNNER" = perl ]; then
     "$PERL_BIN" -e '
       use POSIX qw(setsid);
       my $secs = shift @ARGV;
@@ -269,13 +280,54 @@ run_with_timeout() {
       alarm 0;
       my $st = $?;
       exit($st & 127 ? 128 + ($st & 127) : ($st >> 8));
-    ' "$secs" "$@" &
+    ' "$secs" "$@" 19>&- &
     CHILD_PID=$!
     if wait "$CHILD_PID" 2>/dev/null; then rc=0; else rc=$?; fi
     CHILD_PID=""
     return "$rc"
   fi
-  "$@" &
+  "$PYTHON_BIN" -c '
+import os
+import signal
+import sys
+import time
+
+secs = int(sys.argv[1])
+grace = 2.0
+argv = sys.argv[2:]
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    os.execvp(argv[0], argv)
+    os._exit(127)
+
+def kill_group(exit_code):
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    time.sleep(grace)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    os._exit(exit_code)
+
+signal.signal(signal.SIGTERM, lambda _s, _f: kill_group(143))
+signal.signal(signal.SIGINT, lambda _s, _f: kill_group(130))
+signal.signal(signal.SIGALRM, lambda _s, _f: kill_group(124))
+if secs > 0:
+    signal.alarm(secs)
+_, status = os.waitpid(pid, 0)
+signal.alarm(0)
+if os.WIFSIGNALED(status):
+    sys.exit(128 + os.WTERMSIG(status))
+sys.exit(os.WEXITSTATUS(status))
+' "$secs" "$@" 19>&- &
   CHILD_PID=$!
   if wait "$CHILD_PID" 2>/dev/null; then rc=0; else rc=$?; fi
   CHILD_PID=""
@@ -722,5 +774,5 @@ while true; do
   fi
   sleep_for="$INTERVAL"
   [ "$backoff" -gt 0 ] && sleep_for="$backoff"
-  sleep "$sleep_for"
+  sleep "$sleep_for" 19>&-
 done

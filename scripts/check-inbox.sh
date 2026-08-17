@@ -18,6 +18,8 @@ source "$SCRIPT_DIR/lib/actas-lock.sh"
 source "$SCRIPT_DIR/lib/resolve-project.sh"  # agmsg_agent_pid, for instance-id derivation
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/type-registry.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/process-identity.sh"
 
 # Some Stop-hook runtimes (codex, copilot) want an explicit JSON status object
 # even when there is nothing to deliver; others (claude-code) stay silent. This
@@ -72,11 +74,14 @@ if [ -n "$SESSION_ID" ]; then
   # same token so this Stop-hook defers to a live watcher in `both` mode instead
   # of double-delivering.
   SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$TYPE")"
+  WATCH_PROJECT="$(agmsg_resolve_project "$PROJECT" "$TYPE")"
   PIDFILE="$SKILL_DIR/run/watch.$SESSION_ID.pid"
   if [ -f "$PIDFILE" ]; then
     WATCH_PID=$(cat "$PIDFILE" 2>/dev/null || true)
     # EPERM-aware liveness (_agmsg_pid_alive): a sandbox-unsignalable watcher is still alive.
-    if [ -n "$WATCH_PID" ] && _agmsg_pid_alive "$WATCH_PID"; then
+    if agmsg_process_dedup_should_suppress watch "$PIDFILE" \
+        "watch|$SESSION_ID|$WATCH_PROJECT|$TYPE" \
+        "$SCRIPT_DIR/watch.sh" "$SESSION_ID" "$PROJECT" "$TYPE"; then
       exit 0
     fi
   fi

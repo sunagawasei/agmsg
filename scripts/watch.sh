@@ -2,6 +2,7 @@
 set -u
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
+WATCH_ORIGINAL_ARGS=("$@")
 
 # Stream new agmsg messages for the current session as they arrive.
 #
@@ -94,6 +95,8 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/process-identity.sh"
 
 # Fail loudly on an unknown agent_type instead of running with zero
 # subscriptions. The dominant real-world cause is a shifted argument list: a
@@ -192,6 +195,50 @@ fi
 DB="$(agmsg_db_path)"
 RUN_DIR="$SKILL_DIR/run"
 PIDFILE="$RUN_DIR/watch.$SESSION_ID.pid"
+mkdir -p "$RUN_DIR" 2>/dev/null || true
+WATCH_OWNER_SCOPE="watch|$SESSION_ID|$PROJECT_PATH|$AGENT_TYPE"
+if agmsg_process_assert_bootstrap watch "$PIDFILE" "$WATCH_OWNER_SCOPE"; then
+  WATCH_OWNER_SCOPE_HASH="$AGMSG_PROCESS_SCOPE_HASH"
+else
+  _owner_bootstrap_rc=$?
+  [ "$_owner_bootstrap_rc" -eq 75 ] || exit "$_owner_bootstrap_rc"
+  exec "$SCRIPT_DIR/internal/process-owner-launch.sh" \
+    --kind watch --pidfile "$PIDFILE" --scope "$WATCH_OWNER_SCOPE" --replace-owned \
+    --legacy-needle "$SCRIPT_DIR/watch.sh" --legacy-needle "$SESSION_ID" \
+    --legacy-needle "$PROJECT_PATH" --legacy-needle "$AGENT_TYPE" \
+    -- "$SCRIPT_DIR/watch.sh" "${WATCH_ORIGINAL_ARGS[@]}"
+fi
+
+# The acquire-then-exec bootstrap above is the single-owner claim.  Do not add
+# a PID-based takeover here: signal authorization belongs exclusively to
+# agmsg_process_signal_owned, and a duplicate never reaches this body.
+# Readiness sentinels this watcher created (see #108). Populated once the
+# subscription is resolved; removed on exit so the file is present iff a live
+# watcher is currently receiving for that role.
+READY_FILES=""
+cleanup() {
+  # EXIT only removes the pidfile if it still records our pid. A successor
+  # watcher (Monitor re-invoked for the same session_id) overwrites $PIDFILE
+  # with its own pid before killing us; without this guard our EXIT trap
+  # would erase the successor's record. See #66.
+  agmsg_process_cleanup_self watch "$PIDFILE" "@hash:$WATCH_OWNER_SCOPE_HASH"
+  if [ -n "$READY_FILES" ]; then
+    while IFS= read -r _rf; do
+      [ -z "$_rf" ] && continue
+      # Only remove a sentinel we still own. A successor actas watcher for the
+      # same (team, name) overwrites it with its own session_id before this one
+      # exits; without this guard our EXIT could delete the live successor's
+      # sentinel. Mirrors the pidfile guard above. See #108 review.
+      local _owner=""
+      [ -f "$_rf" ] && IFS= read -r _owner < "$_rf" || true
+      [ "$_owner" = "$SESSION_ID" ] && rm -f "$_rf" 2>/dev/null || true
+    done <<< "$READY_FILES"
+  fi
+}
+# Install these traps as early as re-entry permits because owner publication
+# can precede the target becoming signal-ready.
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
 
 # Resolve poll interval. Env var wins over config, default 5s.
 INTERVAL="${AGMSG_WATCH_INTERVAL:-}"
@@ -277,7 +324,7 @@ maybe_run_watchdog() {
   now="$(date +%s 2>/dev/null)" || date_status=$?
   if [ "$date_status" -ne 0 ]; then
     if [ "$WATCHDOG_DATE_ERROR_LAUNCHED" -eq 0 ]; then
-      "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" &
+      "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
       WATCHDOG_DATE_ERROR_LAUNCHED=1
     fi
     return 0
@@ -285,7 +332,7 @@ maybe_run_watchdog() {
   case "$now" in
     ''|*[!0-9]*)
       if [ "$WATCHDOG_DATE_ERROR_LAUNCHED" -eq 0 ]; then
-        "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" &
+        "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
         WATCHDOG_DATE_ERROR_LAUNCHED=1
       fi
       return 0
@@ -303,64 +350,10 @@ maybe_run_watchdog() {
 
   WATCHDOG_LAST_RUN="$now"
   watchdog_tombstone_fresh "$now" && return 0
-  "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" &
+  "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
 }
 
 mkdir -p "$RUN_DIR" 2>/dev/null || true
-
-# Sequential re-invocation of Monitor for this same session_id leaves the
-# previous watch.sh running but loses track of it (pidfile gets clobbered).
-# Stop the prior holder before claiming the slot. ps args check defends
-# against pid recycling — only touch processes whose cmdline still matches
-# our watch.sh. See #66.
-#
-# When ps is unavailable (e.g. Claude Code sandbox), fall back to _agmsg_pid_alive
-# which confirms the pid is alive but cannot validate the cmdline. It is EPERM-aware
-# so a live-but-unsignalable sibling watcher isn't misread as dead and left running.
-if [ -f "$PIDFILE" ]; then
-  prev_pid=$(cat "$PIDFILE" 2>/dev/null || true)
-  if [ -n "$prev_pid" ] && [ "$prev_pid" != "$$" ] && _agmsg_pid_alive "$prev_pid"; then
-    prev_cmd=$(compat_get_cmdline "$prev_pid" 2>/dev/null || true)
-    if [ -n "$prev_cmd" ]; then
-      case "$prev_cmd" in
-        *"$SKILL_DIR/scripts/watch.sh"*) kill "$prev_pid" 2>/dev/null || true ;;
-      esac
-    else
-      # ps unavailable (sandboxed) — skip cmdline validation, rely on the
-      # _agmsg_pid_alive check above
-      kill "$prev_pid" 2>/dev/null || true
-    fi
-  fi
-fi
-
-echo $$ > "$PIDFILE"
-# Readiness sentinels this watcher created (see #108). Populated once the
-# subscription is resolved; removed on exit so the file is present iff a live
-# watcher is currently receiving for that role.
-READY_FILES=""
-cleanup() {
-  # EXIT only removes the pidfile if it still records our pid. A successor
-  # watcher (Monitor re-invoked for the same session_id) overwrites $PIDFILE
-  # with its own pid before killing us; without this guard our EXIT trap
-  # would erase the successor's record. See #66.
-  local pidfile_pid=""
-  [ -f "$PIDFILE" ] && IFS= read -r pidfile_pid < "$PIDFILE" || true
-  [ "$pidfile_pid" = "$$" ] && rm -f "$PIDFILE"
-  if [ -n "$READY_FILES" ]; then
-    while IFS= read -r _rf; do
-      [ -z "$_rf" ] && continue
-      # Only remove a sentinel we still own. A successor actas watcher for the
-      # same (team, name) overwrites it with its own session_id before this one
-      # exits; without this guard our EXIT could delete the live successor's
-      # sentinel. Mirrors the pidfile guard above. See #108 review.
-      local _owner=""
-      [ -f "$_rf" ] && IFS= read -r _owner < "$_rf" || true
-      [ "$_owner" = "$SESSION_ID" ] && rm -f "$_rf" 2>/dev/null || true
-    done <<< "$READY_FILES"
-  fi
-}
-trap cleanup EXIT
-trap 'exit 0' INT TERM HUP
 
 # Resolve subscription set.
 PAIRS="$("$SCRIPT_DIR/identities.sh" "$PROJECT_PATH" "$AGENT_TYPE")"
@@ -645,6 +638,6 @@ while true; do
   # Run sleep in the background and `wait` for it so signal traps fire
   # immediately. Bash defers traps while a foreground builtin like `sleep`
   # is blocking, which would otherwise delay shutdown by up to $INTERVAL.
-  sleep "$INTERVAL" &
+  sleep "$INTERVAL" 19>&- &
   wait $! 2>/dev/null
 done

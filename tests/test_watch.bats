@@ -117,8 +117,16 @@ _max_message_id() {
 
 @test "watch: persists a watermark file for the session" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
-  run_watcher_for "sess-wm" "$TEST_SKILL_DIR/wm.log" 1.5
-  [ -f "$TEST_SKILL_DIR/run/watch.$(_iid sess-wm).watermark" ]
+  local sid="sess-wm" out="$TEST_SKILL_DIR/wm.log"
+  local wm="$TEST_SKILL_DIR/run/watch.$(_iid "$sid").watermark"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code \
+    >"$out" 2>/dev/null 3>&- &
+  local w=$!
+  test_fixture_register_owned_pid "$w"
+  wait_for_file "$wm"
+  kill "$w" 2>/dev/null || true
+  wait "$w" 2>/dev/null || true
+  [ -f "$wm" ]
 }
 
 @test "watch: exits within one interval when its session dies, without advancing the watermark past an undelivered row (#67)" {

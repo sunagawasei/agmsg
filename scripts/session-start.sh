@@ -50,6 +50,8 @@ source "$SCRIPT_DIR/lib/type-registry.sh"
 source "$SCRIPT_DIR/lib/session-team.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/role-session.sh"  # role->session reverse lookup (#339)
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/process-identity.sh"
 
 # Read the hook input JSON (stdin) up-front. The hook's session_id is the
 # authoritative source for the session team, and stdin can be read only once —
@@ -162,6 +164,7 @@ fi
 # --continue/--resume processes that share a session_id stay isolated (#93).
 # The cc-instance dedup record and the emitted watch.sh directive both use it.
 INSTANCE_ID="$(agmsg_instance_id_from_pid "$SESSION_ID" "$CC_PID")"
+WATCH_PROJECT="$(agmsg_resolve_project "$PROJECT" "$TYPE")"
 
 # --- Cleanup of stale cc-instance files and their orphan watchers. ---
 # A cc-instance.<pid> whose CC pid is dead is left over from a previous CC.
@@ -195,35 +198,31 @@ for f in "$RUN_DIR"/cc-instance.*; do
       && ! printf '%s\n' "$live_sids" | tr '|' '\n' | grep -Fxq "$dead_sid"; then
     orphan_pidfile="$RUN_DIR/watch.$dead_sid.pid"
     if [ -f "$orphan_pidfile" ]; then
-      orphan_pid=$(cat "$orphan_pidfile" 2>/dev/null || true)
-      if [ -n "$orphan_pid" ] && _agmsg_pid_alive "$orphan_pid"; then
-        # Defensive: only kill if the pid's command line actually matches
-        # our watch.sh. Defends against pid recycling — a stale pidfile
-        # could point at an unrelated process that took the same pid.
-        cmd=$(compat_get_cmdline "$orphan_pid" 2>/dev/null || true)
-        case "$cmd" in
-          *"$SKILL_DIR/scripts/watch.sh"*) kill "$orphan_pid" 2>/dev/null || true ;;
-          *) ;;  # not our watcher anymore; leave it alone
-        esac
+      agmsg_process_identity_state watch "$orphan_pidfile" "" \
+        "$SKILL_DIR/scripts/watch.sh" "$dead_sid"
+      if [ "$AGMSG_PROCESS_STATE" = owned ]; then
+        agmsg_process_signal_owned watch "$orphan_pidfile" \
+          "@hash:$AGMSG_PROCESS_SCOPE_HASH" TERM \
+          "$SKILL_DIR/scripts/watch.sh" "$dead_sid" >/dev/null || true
       fi
-      rm -f "$orphan_pidfile"
+      case "$AGMSG_PROCESS_STATE" in
+        stale|legacy-dead|legacy-foreign-live|legacy-unverified-live|degraded-dead|unverified-dead)
+          agmsg_process_cleanup_observed "$orphan_pidfile" || true ;;
+      esac
     fi
   fi
   rm -f "$f"
 done
 
-# Same defensive pass for stale watcher pidfiles. A pidfile whose recorded
-# pid is dead (or empty) means a watcher exited without running its EXIT
-# trap — usually an edge case like SIGKILL or a synthesized session_id
-# that SessionEnd's lookup couldn't match.
+# Same defensive pass for stale watcher pidfiles. A live leased owner holds its
+# lease for its whole life, so an unheld lease means the recorded pid was reused.
 for f in "$RUN_DIR"/watch.*.pid; do
   [ -f "$f" ] || continue
-  pid=$(cat "$f" 2>/dev/null || true)
-  if [ -z "$pid" ]; then
-    rm -f "$f"
-    continue
-  fi
-  _agmsg_pid_alive "$pid" || rm -f "$f"
+  agmsg_process_identity_state watch "$f" ""
+  case "$AGMSG_PROCESS_STATE" in
+    stale|legacy-dead|legacy-foreign-live|degraded-dead|unverified-dead)
+      agmsg_process_cleanup_observed "$f" || true ;;
+  esac
 done
 
 # Garbage-collect actas exclusivity locks whose owner session_id no longer
@@ -271,10 +270,10 @@ if [ -n "$CC_PID" ]; then
     if [ -n "$prev" ] && [ "$prev" != "$INSTANCE_ID" ]; then
       prev_pidfile="$RUN_DIR/watch.$prev.pid"
       if [ -f "$prev_pidfile" ]; then
-        prev_pid=$(cat "$prev_pidfile" 2>/dev/null || true)
-        if [ -n "$prev_pid" ] && _agmsg_pid_alive "$prev_pid"; then
-          kill "$prev_pid" 2>/dev/null || true
-        fi
+        agmsg_process_signal_owned watch "$prev_pidfile" \
+          "watch|$prev|$WATCH_PROJECT|$TYPE" TERM \
+          "$SCRIPT_DIR/watch.sh" "$prev" "$PROJECT" "$TYPE" \
+          >/dev/null || true
       fi
     fi
   fi
@@ -389,7 +388,9 @@ fi
 WATCHER_PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
 if [ -f "$WATCHER_PIDFILE" ]; then
   existing=$(cat "$WATCHER_PIDFILE" 2>/dev/null || true)
-  if [ -n "$existing" ] && _agmsg_pid_alive "$existing"; then
+  if agmsg_process_dedup_should_suppress watch "$WATCHER_PIDFILE" \
+      "watch|$INSTANCE_ID|$WATCH_PROJECT|$TYPE" \
+      "$SCRIPT_DIR/watch.sh" "$INSTANCE_ID" "$PROJECT" "$TYPE"; then
     cat <<EOF
 AGMSG monitor mode: a watch.sh is already streaming for this session (pid $existing).
 No action needed — the existing watcher is the active one.

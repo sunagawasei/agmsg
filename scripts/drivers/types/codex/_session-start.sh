@@ -164,11 +164,11 @@ EOF
     bridge_pairs+=(--pair "$candidate_team"$'\t'"$candidate_name")
   done <<< "$PAIRS"
   pidfile="$RUN_DIR/codex-bridge.$bridge_key.pid"
-  if [ -f "$pidfile" ]; then
-    bridge_pid=$(cat "$pidfile" 2>/dev/null || true)
-    if [ -n "$bridge_pid" ] && kill -0 "$bridge_pid" 2>/dev/null; then
-      exit 0
-    fi
+  bridge_scope="codex-bridge|$bridge_key"
+  if [ -f "$pidfile" ] \
+      && agmsg_process_dedup_should_suppress codex-bridge "$pidfile" "$bridge_scope" \
+        codex-bridge "$bridge_key"; then
+    exit 0
   fi
 
   log="$RUN_DIR/codex-bridge.$bridge_key.log"
@@ -183,7 +183,10 @@ EOF
   fi
   local storage_dir
   storage_dir="$(agmsg_storage_dir)"
-  nohup "${bridge_run[@]}" \
+  nohup "$SKILL_DIR/scripts/internal/process-owner-launch.sh" \
+    --kind codex-bridge --pidfile "$pidfile" --scope "$bridge_scope" \
+    --legacy-needle codex-bridge --legacy-needle "$bridge_key" -- \
+    "${bridge_run[@]}" \
     --project "$PROJECT" \
     --workspace-root "$storage_dir" \
     --workspace-root "$SKILL_DIR/teams" \

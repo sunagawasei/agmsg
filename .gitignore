@@ -10,6 +10,7 @@ teams/
 # Nix devShell: direnv が allow 時に生成するローカルcache。
 # flake.nix/.envrc/flake.lock はコミット済みで、生成物だけ除外する。
 .direnv/
+__pycache__/
 
 /.omc/
 /.omx/

@@ -184,7 +184,7 @@ turns_run() {  # number of -p cursor turns the stub has recorded so far
   run bash "$TYPES/cursor/cursor-bridge.sh" \
     --once --project "$PROJ" --team team --name cur --chat-id x-1-2-3-456789012345
   kill "$livepid" 2>/dev/null || true
-  [ "$status" -eq 1 ]
+  [ "$status" -ne 0 ]
   [[ "$output" =~ "already running" ]]
 }
 

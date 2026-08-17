@@ -458,10 +458,12 @@ JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
 
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sigterm-test "$TEST_PROJECT" claude-code 3>&- &
+  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sigterm-test "$TEST_PROJECT" claude-code alice 3>&- &
   local pid=$!
+  test_fixture_register_owned_pid "$pid"
   wait_for_file "$TEST_SKILL_DIR/run/watch.sigterm-test.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
+  wait_for_file "$TEST_SKILL_DIR/run/ready.myteam__alice"
   kill -TERM "$pid"
   wait_for_pid_exit "$pid"
   ! kill -0 "$pid" 2>/dev/null
@@ -1051,7 +1053,7 @@ JSON
 
 # --- session-start.sh orphan watcher cleanup ---
 
-@test "session-start.sh kills orphan watchers whose owning CC instance is gone" {
+@test "session-start.sh cleans an orphan watcher record without killing an unverifiable PID" {
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
@@ -1062,6 +1064,7 @@ JSON
   # Orphan: watcher referenced by a cc-instance.<dead-pid> file.
   sleep 30 3>&- &
   local orphan_pid=$!
+  test_fixture_register_owned_pid "$orphan_pid"
   echo "$orphan_pid" > "$TEST_SKILL_DIR/run/watch.orphan-sid.pid"
   # Use a PID that's almost certainly not in use as the dead CC ancestor.
   local dead_cc_pid=999999
@@ -1071,12 +1074,13 @@ JSON
   # leave it alone (we have no evidence the CC is dead).
   sleep 30 3>&- &
   local untracked_pid=$!
+  test_fixture_register_owned_pid "$untracked_pid"
   echo "$untracked_pid" > "$TEST_SKILL_DIR/run/watch.untracked-sid.pid"
 
   echo "{\"session_id\":\"current-sid\"}" \
     | bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" >/dev/null
 
-  ! kill -0 "$orphan_pid" 2>/dev/null
+  kill -0 "$orphan_pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.orphan-sid.pid" ]
   [ ! -f "$TEST_SKILL_DIR/run/cc-instance.$dead_cc_pid" ]
   # Untracked watcher untouched

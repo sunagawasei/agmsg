@@ -138,6 +138,8 @@ preflight_seatbelt_nesting() {
 . "$SCRIPT_DIR/lib/validate.sh"
 # shellcheck source=../../lib/identity-key.sh
 . "$SCRIPT_DIR/lib/identity-key.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/process-identity.sh"
 agmsg_reviewer_add_dir_roots() {
   # Wrap the shared harvest: format each collected dir as a codex filesystem-table
   # read entry (`, "<dir>"="read"`) to splice into the reviewer profile body. The
@@ -595,9 +597,12 @@ agmsg_spawn_headless() {
   _idkey="$(agmsg_identity_key "$TEAM" "$NAME")"
 
   local pidfile="$run_dir/codex-bridge.$TEAM.$NAME.pid"
+  local bridge_scope="codex-bridge|$TEAM.$NAME"
   local running="" recorded_pid=""
   [ -f "$pidfile" ] && recorded_pid="$(cat "$pidfile" 2>/dev/null || true)"
-  if [ -n "$recorded_pid" ] && _agmsg_pid_alive "$recorded_pid"; then
+  if [ -f "$pidfile" ] \
+      && agmsg_process_dedup_should_suppress codex-bridge "$pidfile" "$bridge_scope" \
+        codex-bridge "$_idkey"; then
     running="$recorded_pid"
   else
     # Fallback: list codex-bridge candidates, then confirm identity by the opaque
@@ -642,7 +647,10 @@ agmsg_spawn_headless() {
   local -a role_args=()
   [ -n "$rolefile" ] && role_args+=(--role-file "$rolefile")
   local log="$run_dir/codex-bridge.$TEAM.$NAME.log"
-  AGMSG_CODEX_APP_SERVER_CMD="$appcmd" AGMSG_CODEX_CLIENT_NAME="$codex_client_name" AGMSG_CODEX_BRIDGE_TURN_TIMEOUT="$codex_turn_timeout" nohup "$bridge" \
+  AGMSG_CODEX_APP_SERVER_CMD="$appcmd" AGMSG_CODEX_CLIENT_NAME="$codex_client_name" AGMSG_CODEX_BRIDGE_TURN_TIMEOUT="$codex_turn_timeout" \
+    nohup "$SCRIPT_DIR/internal/process-owner-launch.sh" \
+    --kind codex-bridge --pidfile "$pidfile" --scope "$bridge_scope" \
+    --legacy-needle codex-bridge --legacy-needle "$_idkey" -- "$bridge" \
     --project "$cwd" --type codex --inline-inbox \
     --identity-key "$_idkey" \
     --pair "$TEAM"$'\t'"$NAME" \

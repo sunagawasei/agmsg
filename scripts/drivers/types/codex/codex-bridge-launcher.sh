@@ -45,6 +45,8 @@ TAB="$(printf '\t')"
 source "$SCRIPT_DIR/../../../lib/role-session.sh"
 # shellcheck source=../../../lib/resolve-project.sh
 source "$SCRIPT_DIR/../../../lib/resolve-project.sh"
+# shellcheck source=../../../lib/process-identity.sh
+source "$SCRIPT_DIR/../../../lib/process-identity.sh"
 # Canonicalize once so the record's project (stored from the codex actas flow's
 # cwd) compares equal to this launcher's project even across a symlinked path.
 PROJECT_PHYS="$(agmsg_canonical_path "$PROJECT" 2>/dev/null || printf '%s' "$PROJECT")"
@@ -352,6 +354,7 @@ while IFS="$TAB" read -r candidate_team candidate_name; do
   bridge_pairs+=(--pair "$candidate_team"$'\t'"$candidate_name")
 done <<< "$ids"
 pidfile="$RUN_DIR/codex-bridge.$bridge_key.pid"
+bridge_scope="codex-bridge|$bridge_key"
 log="$RUN_DIR/codex-bridge.$bridge_key.log"
 # Records the app-server URL the live bridge was launched against, so a later
 # launcher instance can tell a bridge bound to a stale app-server (old port,
@@ -362,6 +365,20 @@ appserver_file="$RUN_DIR/codex-bridge.$bridge_key.appserver"
 # appears for a bridge first launched on "loaded", it is torn down and relaunched
 # on the recorded thread instead of clinging to the ambiguous "loaded" one.
 thread_file="$RUN_DIR/codex-bridge.$bridge_key.thread"
+
+stop_owned_bridge_and_cleanup_binding() {
+  local observed_pid="$AGMSG_PROCESS_PID"
+  local observed_generation="$AGMSG_PROCESS_GENERATION"
+  local observed_scope="$AGMSG_PROCESS_SCOPE_HASH"
+  agmsg_process_signal_owned codex-bridge "$pidfile" "$bridge_scope" TERM \
+    --expected-owner "$observed_pid" "$observed_generation" "$observed_scope" \
+    --wait-release 5 codex-bridge || return 75
+  AGMSG_PROCESS_PID="$observed_pid"
+  AGMSG_PROCESS_GENERATION="$observed_generation"
+  agmsg_process_cleanup_observed "$pidfile" --allow-missing-owner \
+    "$appserver_file" "$thread_file"
+}
+
 # An explicit AGMSG_CODEX_BRIDGE_CMD is a complete runnable (tests, custom
 # wrappers) — run it as-is. Only the default codex-bridge.js is launched through
 # a resolved Node, since its env-node shebang fails where a version-manager Node
@@ -391,9 +408,8 @@ while kill -0 "$PARENT_PID" 2>/dev/null; do
     deregistered_ticks=$((deregistered_ticks + 1))
     if [ "$deregistered_ticks" -ge 2 ]; then
       if [ -f "$pidfile" ]; then
-        old_pid=""
-        IFS= read -r old_pid < "$pidfile" 2>/dev/null || true
-        [ -n "$old_pid" ] && kill "$old_pid" 2>/dev/null || true
+        agmsg_process_signal_owned codex-bridge "$pidfile" \
+          "$bridge_scope" TERM codex-bridge >/dev/null || true
       fi
       exit 0
     fi
@@ -408,9 +424,8 @@ while kill -0 "$PARENT_PID" 2>/dev/null; do
   build_safety_state "$current_ids"
   if [ "$SAFETY_STATE" != "$safety_state" ]; then
     if [ -f "$pidfile" ]; then
-      old_pid=""
-      IFS= read -r old_pid < "$pidfile" 2>/dev/null || true
-      [ -n "$old_pid" ] && kill "$old_pid" 2>/dev/null || true
+      agmsg_process_signal_owned codex-bridge "$pidfile" \
+        "$bridge_scope" TERM codex-bridge >/dev/null || true
     fi
     exec "$0" "$TYPE" "$PROJECT" "$APP_SERVER" "$PARENT_PID" "$ROLE_PAIR"
   fi
@@ -451,7 +466,8 @@ EOF
   if [ -f "$pidfile" ]; then
     bridge_pid=""
     IFS= read -r bridge_pid < "$pidfile" 2>/dev/null || true
-    if [ -n "$bridge_pid" ] && kill -0 "$bridge_pid" 2>/dev/null; then
+    agmsg_process_identity_state codex-bridge "$pidfile" "$bridge_scope" codex-bridge
+    if [ "$AGMSG_PROCESS_STATE" = owned ]; then
       # Reuse only when the live bridge is bound to the CURRENT app-server. A
       # codex upgrade makes codex-monitor.sh kill the stale app-server and start a
       # fresh one on a new port (#237); a bridge still bound to the old URL stays
@@ -463,21 +479,55 @@ EOF
       # first launched on the ambiguous "loaded" thread rebind once this role's
       # recorded thread becomes known -- otherwise the app-server match alone
       # would keep the wrong-thread bridge alive indefinitely.
-      bound_url=""; bound_thread=""
-      IFS= read -r bound_url < "$appserver_file" 2>/dev/null || true
-      IFS= read -r bound_thread < "$thread_file" 2>/dev/null || true
-      if [ "$bound_url" = "$req_app_server" ] && [ "$bound_thread" = "$thread_id" ]; then
+      binding_lockf="$(_agmsg_process_lockf_bin)"
+      [ -n "$binding_lockf" ] || { poll_sleep; continue; }
+      binding_claim="$(agmsg_process_lease_path "$pidfile")"
+      if "$binding_lockf" -k -s -t 0 "$binding_claim" \
+          "$SKILL_DIR/scripts/internal/process-owner-launch.sh" \
+          --internal-companions-match "$pidfile" "$AGMSG_PROCESS_PID" \
+          "$AGMSG_PROCESS_GENERATION" -- \
+          "$appserver_file" "$req_app_server" "$thread_file" "$thread_id"; then
         poll_sleep
         continue
+      else
+        binding_rc=$?
       fi
-      kill "$bridge_pid" 2>/dev/null || true
-      rm -f "$pidfile" "$appserver_file" "$thread_file"
-    else
-      rm -f "$pidfile" "$appserver_file" "$thread_file"
+      # Exit 1 means this same generation has a stale binding. Claim contention
+      # or a changed generation is only a transient snapshot, so never signal it.
+      [ "$binding_rc" -eq 1 ] || { poll_sleep; continue; }
+      stop_owned_bridge_and_cleanup_binding || true
+      # Let TERM release the lease before attempting the successor.  Re-entering
+      # this loop also repeats the generation check if ownership changed.
+      poll_sleep
+      continue
+    fi
+    case "$AGMSG_PROCESS_STATE" in
+      held-unverified|legacy-exact-live|legacy-unverified-live|degraded-live|unverified-live)
+        agmsg_process_dedup_should_suppress codex-bridge "$pidfile" \
+          "$bridge_scope" codex-bridge || true
+        poll_sleep
+        continue
+        ;;
+      stale|legacy-dead|legacy-foreign-live|degraded-dead|unverified-dead)
+        if ! agmsg_process_cleanup_observed "$pidfile" \
+            "$appserver_file" "$thread_file"; then
+          poll_sleep
+          continue
+        fi
+        ;;
+    esac
+    if [ -f "$pidfile" ]; then
+      poll_sleep
+      continue
     fi
   fi
 
-  nohup "${bridge_run[@]}" \
+  nohup "$SKILL_DIR/scripts/internal/process-owner-launch.sh" \
+    --kind codex-bridge --pidfile "$pidfile" --scope "$bridge_scope" \
+    --companion "$appserver_file" "$req_app_server" \
+    --companion "$thread_file" "$thread_id" \
+    --legacy-needle codex-bridge -- \
+    "${bridge_run[@]}" \
     --project "$PROJECT" \
     --workspace-root "$STORAGE_DIR" \
     --workspace-root "$SKILL_DIR/teams" \
@@ -489,16 +539,15 @@ EOF
     --inline-inbox \
     >>"$log" 2>&1 3>&- 4>&- &
   launched_pid=$!
-  printf '%s\n' "$launched_pid" > "$pidfile"
   if [ -n "${AGMSG_CODEX_BRIDGE_CMD:-}" ]; then
     wait "$launched_pid" 2>/dev/null || true
-    recorded_pid=""
-    IFS= read -r recorded_pid < "$pidfile" 2>/dev/null || true
-    [ "$recorded_pid" != "$launched_pid" ] || rm -f "$pidfile"
+    agmsg_process_identity_state codex-bridge "$pidfile" "$bridge_scope" codex-bridge
+    case "$AGMSG_PROCESS_STATE:$AGMSG_PROCESS_PID" in
+      stale:"$launched_pid"|degraded-dead:"$launched_pid"|unverified-dead:"$launched_pid")
+        agmsg_process_cleanup_observed "$pidfile" \
+          "$appserver_file" "$thread_file" || true ;;
+    esac
   fi
-  # Record what this bridge is bound to so a later launcher can detect staleness.
-  printf '%s' "$req_app_server" > "$appserver_file"
-  printf '%s' "$thread_id" > "$thread_file"
   poll_reset
   sleep 1
 done
