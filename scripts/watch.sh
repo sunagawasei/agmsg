@@ -46,47 +46,10 @@ WATCH_ORIGINAL_ARGS=("$@")
 # subscription to one team for session-team mode.
 ARG_COUNT=$#
 SESSION_ID="${1:-}"
-[ "$SESSION_ID" = "-" ] && SESSION_ID=""
-PROJECT_PATH="${2:-}"
-AGENT_TYPE="${3:-}"
-
-# Missing required args fail on STDOUT, not via ${n:?}: bash prints the :?
-# message to stderr, which the monitor tool consuming this stream never
-# surfaces — the launch would die invisibly. A short arg list is also how a
-# shifted three-argument launch (no active_name; empty session id dropped by
-# the caller shell, see above) presents, so name that cause here too.
-if [ -z "$PROJECT_PATH" ] || [ -z "$AGENT_TYPE" ]; then
-  echo "ERROR: watch.sh needs <session_id> <project_path> <agent_type> [active_name] [--team <team>]; got $ARG_COUNT argument(s). A caller shell may have dropped an empty session_id argument and shifted the rest. Pass the sentinel '-' (e.g. \"\${GROK_SESSION_ID:--}\") instead of an empty string."
-  exit 1
-fi
-shift 3
-
-# [active_name] narrows the subscription to one agent name (actas mode).
-# [--team <team>] pins the subscription to a single team — required by
-# session-team mode, where one project dir is registered into many s-<uuid>
-# teams and identities.sh would otherwise enumerate all of them (cross-session
-# delivery). With the pin, only the current session's team is subscribed.
-ACTIVE_NAME=""
-TEAM_PIN=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --team)
-      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-        echo "ERROR: watch.sh --team needs a value"
-        exit 1
-      fi
-      TEAM_PIN="$2"
-      shift 2
-      ;;
-    *)
-      if [ -z "$ACTIVE_NAME" ]; then ACTIVE_NAME="$1"; shift
-      else
-        echo "ERROR: watch.sh unexpected argument: $1"
-        exit 1
-      fi
-      ;;
-  esac
-done
+[ "$SESSION_ID" = "-" ] && SESSION_ID="" # #477: caller sentinel for empty session id
+PROJECT_PATH="${2:?Missing project_path}"
+AGENT_TYPE="${3:?Missing agent_type}"
+ACTIVE_NAME="${4:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
