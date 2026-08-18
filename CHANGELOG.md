@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-08-18
+
+### Added
+- Windows can use the hosted service: connect reaches the server, the fingerprint is real, and doctor names a wedged lock (#868)
+
+### Fixed
+- Bound the wait on the local child without spawning anything to do it (#821)
+- Record provenance when git answers in another path space (#830) (#842)
+- Stop telling every agent that key rotate is unavailable (#841)
+- The guard was on the wrong job's step, and it silenced a real one
+
 ## [1.2.0] - 2026-08-15
 
 ### Fixed
