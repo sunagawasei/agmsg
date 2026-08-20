@@ -340,15 +340,66 @@ turns_run() {  # number of -p cursor turns the stub has recorded so far
   [ "$output" -eq 2 ]
 }
 
-@test "cursor-bridge: refuses a second instance for the same identity" {
-  sleep 30 &
-  local livepid=$!
-  echo "$livepid" > "$TEST_SKILL_DIR/run/cursor-bridge.team.cur.pid"
+@test "cursor-bridge: refuses a second instance while the leased owner is alive" {
+  local pidfile="$TEST_SKILL_DIR/run/cursor-bridge.team.cur.pid"
+  local ownerfile="$TEST_SKILL_DIR/run/cursor-bridge.team.cur.owner"
+  local metafile="$TEST_SKILL_DIR/run/cursor-bridge.team.cur.meta"
+  bash "$TYPES/cursor/cursor-bridge.sh" \
+    --interval 30 --project "$PROJ" --team team --name cur \
+    --chat-id x-1-2-3-456789012345 \
+    >"$TEST_SKILL_DIR/owner.stdout" 2>"$TEST_SKILL_DIR/owner.stderr" &
+  local owner_pid=$!
+  test_fixture_register_owned_pid "$owner_pid"
+  wait_for_file "$metafile"
+  wait_for_file "$ownerfile"
+
+  local generation
+  generation="$(sed -n 's/^generation=//p' "$ownerfile" | head -1)"
+  [ "$(sed -n 's/^pid=//p' "$ownerfile" | head -1)" = "$owner_pid" ]
+  [ "$(sed -n 's/^kind=//p' "$ownerfile" | head -1)" = cursor-bridge ]
+  [ "$(sed -n 's/^lease=//p' "$ownerfile" | head -1)" = leased ]
+  [ -n "$generation" ]
+  [ -e "${pidfile%.pid}.lease.$generation" ]
+
   run bash "$TYPES/cursor/cursor-bridge.sh" \
     --once --project "$PROJ" --team team --name cur --chat-id x-1-2-3-456789012345
-  kill "$livepid" 2>/dev/null || true
   [ "$status" -ne 0 ]
   [[ "$output" =~ "already running" ]]
+
+  kill "$owner_pid" 2>/dev/null || true
+  wait "$owner_pid" 2>/dev/null || true
+}
+
+@test "cursor-bridge: replaces a live foreign legacy pidfile owner" {
+  local pidfile="$TEST_SKILL_DIR/run/cursor-bridge.team.cur.pid"
+  sleep 30 &
+  local foreign_pid=$!
+  test_fixture_register_owned_pid "$foreign_pid"
+  printf '%s\n' "$foreign_pid" > "$pidfile"
+
+  # Make the kind mismatch deterministic even when the host denies process
+  # cmdline inspection: only this PID gets a fixed foreign command line.
+  local real_ps stub_bin="$TEST_SKILL_DIR/ps-stub"
+  real_ps="$(command -v ps)"
+  mkdir -p "$stub_bin"
+  cat > "$stub_bin/ps" <<'STUB'
+#!/usr/bin/env bash
+if [ "$#" -eq 4 ] && [ "$1" = -o ] && [ "$2" = args= ] \
+    && [ "$3" = -p ] && [ "$4" = "$FAKE_FOREIGN_PID" ]; then
+  printf '%s\n' 'foreign-worker --serve'
+  exit 0
+fi
+exec "$REAL_PS" "$@"
+STUB
+  chmod +x "$stub_bin/ps"
+
+  run env PATH="$stub_bin:$PATH" REAL_PS="$real_ps" \
+    FAKE_FOREIGN_PID="$foreign_pid" \
+    bash "$TYPES/cursor/cursor-bridge.sh" \
+    --once --project "$PROJ" --team team --name cur --chat-id x-1-2-3-456789012345
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"already running"* ]]
+  kill -0 "$foreign_pid"
 }
 
 @test "cursor-bridge: a hung turn is timed out and the message stays unread" {
