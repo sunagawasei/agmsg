@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-08-20
+
+### Fixed
+- Keep curl's stderr on the GET path, in the shape the POST side ended up with (#850) (#854)
+- Correct a binding an older release left writable, and say what to run if you do not upgrade (#902)
+- Keep curl's stderr, and hold the temporaries in one condemned directory (#850) (#903)
+- Pass the history and unread-marker SQL on stdin (#777) (#899)
+- Pull a team larger than a command line, and say what it is doing (#882) (#895)
+- Keep the binding a re-point replaces instead of destroying it (#884)
+- Pin count-invisible heavy test files apart, raise the shard timeout with real margin (#885)
+- Derive --update's type re-detection from the same list as TPL_TYPE (#846) (#880)
+- Take the basename of the whole ps comm path (#770) (#771)
+- Map grok-build to grok in the pid walk (#860)
+- Fold sentinel '-' into the empty session-id path (#857)
+
+### Documentation
+- Say that main takes squash commits only (#845)
+
 ## [1.2.1] - 2026-08-18
 
 ### Added
