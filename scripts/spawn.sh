@@ -67,10 +67,12 @@ set -euo pipefail
 #                      codex. --no-implementer forces it off. Mutually exclusive
 #                      with --reviewer. Defaults from config
 #                      spawn.codex_implementer.<name>.
-#   --model <id>       launch the agent on a specific model. The id is passed
-#                      through to the CLI unchecked (the CLI rejects unknown
-#                      ids); the flag spelling comes from the type's manifest
-#                      `model_arg=`. Refused for a type with no model_arg.
+#   --model <id>       launch the agent on a specific model. The flag spelling
+#                      comes from the type's manifest `model_arg=`. Interactive
+#                      CLIs reject unknown ids themselves; headless cursor first
+#                      rejects malformed/option-shaped ids, while character-valid
+#                      unknown ids are left for the first Cursor turn to reject.
+#                      Refused for a type with no model_arg.
 #   --fresh            force a brand-new session even when the role has a
 #                      resumable prior session. Without it, a type that supports
 #                      resume (manifest `resume_arg=`) is brought back into its

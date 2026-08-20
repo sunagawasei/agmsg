@@ -54,6 +54,7 @@ EOF
   # live session.
   unset TMUX
   unset HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID
+  unset AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL
   export AGMSG_TERMINAL="$STUB_BIN/record.sh {cmd}"
 
   export PROJ="$TEST_SKILL_DIR/proj"
@@ -894,6 +895,28 @@ EOF
   chmod +x "$STUB_BIN/fake-bridge.sh"
 }
 
+# Fake Cursor create-chat + bridge pair for headless spawn argv tests. The
+# bridge exits immediately after recording its argv; no real cursor turn runs.
+_make_fake_cursor_headless() {
+  export CURSOR_CLI_CAPTURE="$TEST_SKILL_DIR/cursor-cli-capture.txt"
+  : > "$CURSOR_CLI_CAPTURE"
+  cat > "$STUB_BIN/cursor-agent" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$CURSOR_CLI_CAPTURE"
+if [ "${1:-}" = create-chat ]; then
+  printf '%s\n' 11111111-2222-3333-4444-555555555555
+  exit 0
+fi
+exit 1
+STUB
+  cat > "$STUB_BIN/fake-cursor-bridge.sh" <<EOF
+#!/usr/bin/env bash
+printf 'CURSOR_ARGS: %s\n' "\$*" >> "$CAPTURE"
+exit 0
+EOF
+  chmod +x "$STUB_BIN/cursor-agent" "$STUB_BIN/fake-cursor-bridge.sh"
+}
+
 @test "spawn: --headless is rejected for gemini" {
   bash "$SCRIPTS/join.sh" myteam existing gemini "$PROJ"
   run bash "$SCRIPTS/spawn.sh" gemini alice --project "$PROJ" --headless
@@ -1027,6 +1050,184 @@ STUB
   [[ "$output" != *"already running"* ]]
   wait_for_file_contains "$CAPTURE" "--identity-key $short_key"
   grep -qF -- "--identity-key $short_key" "$CAPTURE"
+}
+
+# --- headless cursor model pin / label / fallback resolution -----------------
+
+@test "spawn: unpinned headless cursor preserves legacy model and fallback defaults" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  _make_fake_cursor_headless
+
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" != *"--model "* ]]
+  [[ "$output" != *"--fallback-model"* ]]
+  [[ "$output" != *"--no-fallback"* ]]
+  [[ "$output" != *"--model none"* ]]
+}
+
+@test "spawn: cursor config pin and label are passed to the bridge" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.cursor_model.cur grok-4.6
+  bash "$SCRIPTS/config.sh" set spawn.cursor_model_label.cur "Cursor Grok 4.6 High Fast"
+  _make_fake_cursor_headless
+
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" == *"--model grok-4.6"* ]]
+  [[ "$output" == *"--model-label Cursor Grok 4.6 High Fast"* ]]
+  [[ "$output" == *"--no-fallback"* ]]
+}
+
+@test "spawn: explicit cursor --model wins over the matching worker config" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.cursor_model.cur from-config
+  _make_fake_cursor_headless
+
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" \
+      --headless --model from-flag
+  [ "$status" -eq 0 ]
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" == *"--model from-flag"* ]]
+  [[ "$output" != *"from-config"* ]]
+}
+
+@test "spawn: cursor model config never leaks to another worker" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.cursor_model.cur grok-4.6
+  _make_fake_cursor_headless
+
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" cursor other --team myteam --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" != *"grok-4.6"* ]]
+  [[ "$output" != *"--model "* ]]
+}
+
+@test "spawn: per-worker cursor fallback config wins over a non-empty environment" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.cursor_fallback_model.cur configured-fallback
+  _make_fake_cursor_headless
+
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL=env-fallback \
+    bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" == *"--fallback-model configured-fallback"* ]]
+  [[ "$output" != *"env-fallback"* ]]
+}
+
+@test "spawn: non-empty and explicitly-empty fallback env remain distinct" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  _make_fake_cursor_headless
+
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL=env-fallback \
+    bash "$SCRIPTS/spawn.sh" cursor envworker --team myteam --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  wait_until 10 _capture_nonempty
+  grep -q -- "--fallback-model env-fallback" "$CAPTURE"
+
+  : > "$CAPTURE"
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL= \
+    bash "$SCRIPTS/spawn.sh" cursor emptyworker --team myteam --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  wait_until 10 _capture_nonempty
+  grep -q -- "--no-fallback" "$CAPTURE"
+  ! grep -q -- "--model none" "$CAPTURE"
+}
+
+@test "spawn: malformed cursor model ids fail before create-chat while unknown safe ids pass through" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  _make_fake_cursor_headless
+  local value
+  for value in "" " " "-option" $'bad\nmodel' $'bad\x1bmodel'; do
+    run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+      bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" \
+        --headless --model "$value"
+    [ "$status" -ne 0 ]
+  done
+  [ ! -s "$CURSOR_CLI_CAPTURE" ]
+  [ ! -s "$CAPTURE" ]
+
+  # Character-valid unknown ids cannot be resolved without calling the external
+  # CLI. Spawn accepts them; a real worker would surface rejection on turn one.
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" \
+      --headless --model future-model_9.9
+  [ "$status" -eq 0 ]
+  wait_until 10 _capture_nonempty
+  grep -q -- "--model future-model_9.9" "$CAPTURE"
+}
+
+@test "spawn: malformed cursor fallback values fail closed without option injection" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  _make_fake_cursor_headless
+  local value
+  for value in "bad fallback" "-option"; do
+    bash "$SCRIPTS/config.sh" set spawn.cursor_fallback_model.cur "$value" >/dev/null
+    run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+      bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" --headless
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unsafe cursor fallback model id"* ]]
+  done
+  for value in $'bad\nfallback' $'bad\x1bfallback'; do
+    run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+      AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL="$value" \
+      bash "$SCRIPTS/spawn.sh" cursor envworker --team myteam --project "$PROJ" --headless
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unsafe cursor fallback model id"* ]]
+  done
+  [ ! -s "$CURSOR_CLI_CAPTURE" ]
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: cursor model rejection sanitizes newline and control bytes" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  _make_fake_cursor_headless
+  local value
+  value="$(printf 'bad\nFORGED\x1bmodel')"
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" \
+      --headless --model "$value"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unsafe cursor model id"* ]]
+  [[ "$output" != *$'\n'"FORGED"* ]]
+  [[ "$output" != *$'\x1b'* ]]
+}
+
+@test "spawn: cursor per-worker config read failure never degrades to unpinned" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  _make_fake_cursor_headless
+  mv "$SCRIPTS/config.sh" "$SCRIPTS/config-real.sh"
+  cat > "$SCRIPTS/config.sh" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = get ] && [[ "\${2:-}" == spawn.cursor_model.* ]]; then
+  exit 9
+fi
+exec "$SCRIPTS/config-real.sh" "\$@"
+EOF
+  chmod +x "$SCRIPTS/config.sh"
+
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" --headless
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"failed to read spawn.cursor_model.cur"* ]]
+  [ ! -s "$CURSOR_CLI_CAPTURE" ]
+  [ ! -s "$CAPTURE" ]
 }
 
 @test "spawn: codex bridge runtime roots include write extra roots but exclude read-only extra roots" {

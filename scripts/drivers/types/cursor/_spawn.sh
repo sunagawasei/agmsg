@@ -9,7 +9,7 @@
 # same Template Method convention as codex/_spawn.sh.
 #
 # Why this is so much smaller than codex/_spawn.sh: cursor-agent's headless
-# interface is a ONE-SHOT CLI (`cursor-agent -p --output-format json --resume
+# interface is a ONE-SHOT CLI (`cursor-agent -p --output-format stream-json --resume
 # <chatId>`), NOT a long-lived app-server. There is no JSON-RPC daemon to manage,
 # no turn-lifecycle protocol, and — crucially — the bridge runs cursor READ-ONLY
 # (`--trust`, never `--force`) and sends the reply itself (approach b). cursor
@@ -51,6 +51,24 @@ CURSOR_BIN="${AGMSG_CURSOR_AGENT_CMD:-cursor-agent}"
 # shellcheck source=../../lib/identity-key.sh
 . "$SCRIPT_DIR/lib/identity-key.sh"
 
+# Cursor model ids are passed as argv tokens, not shell text, but still reject
+# option-shaped or malformed values before spawning. This keeps the accepted
+# contract narrow and matches the headless codex model-value policy: non-empty
+# ASCII [A-Za-z0-9._-]+ only, with a leading '-' additionally forbidden.
+agmsg_cursor_safe_model_id() {
+  local val="$1" rest
+  [ -n "$val" ] || return 1
+  case "$val" in -*) return 1 ;; esac
+  rest="$(printf '%s' "$val" | LC_ALL=C tr -d 'A-Za-z0-9._-'; printf 'X%s' "$?")"
+  [ "$rest" = "X0" ]
+}
+
+agmsg_cursor_sanitize_for_log() {
+  local val
+  val="$(printf '%s' "$1" | LC_ALL=C tr -d '[:cntrl:]')"
+  printf '%s' "${val:0:80}"
+}
+
 # Resolve the headless default from config when no explicit flag was given.
 #   precedence: --headless / --interactive  >  config spawn.cursor_headless  >  TUI
 agmsg_spawn_resolve_modes() {
@@ -87,6 +105,35 @@ agmsg_spawn_headless() {
   # scratch CFGDIR is composed from TEAM/NAME. UTF-8-safe (deny-list, not ASCII).
   agmsg_validate_team_name "$TEAM" >/dev/null 2>&1 || die "spawn: team name '$TEAM' is not a path-safe segment"
   agmsg_validate_agent_name "$NAME" >/dev/null 2>&1 || die "spawn: agent name '$NAME' is not valid (same rule join.sh applies: no '.', '..', '/', '\\', '\"', '[', ']', leading '-', or control chars)"
+
+  # Resolve all per-worker Cursor settings before create-chat or any run/
+  # artifact. Unlike older cursor config reads, a config.sh failure is NOT
+  # treated as an unset key: silently starting unpinned would violate the model
+  # pin contract. --model wins over the per-worker model key.
+  local pinned_model="${MODEL_ID:-}" configured_model="" model_label="" configured_fallback=""
+  if configured_model="$("$SCRIPT_DIR/config.sh" get "spawn.cursor_model.$NAME" "" 2>/dev/null)"; then :; else
+    die "spawn: failed to read spawn.cursor_model.$NAME; refusing to start cursor unpinned"
+  fi
+  if model_label="$("$SCRIPT_DIR/config.sh" get "spawn.cursor_model_label.$NAME" "" 2>/dev/null)"; then :; else
+    die "spawn: failed to read spawn.cursor_model_label.$NAME; refusing to start cursor without model verification settings"
+  fi
+  if configured_fallback="$("$SCRIPT_DIR/config.sh" get "spawn.cursor_fallback_model.$NAME" "" 2>/dev/null)"; then :; else
+    die "spawn: failed to read spawn.cursor_fallback_model.$NAME; refusing to start cursor with an unknown fallback policy"
+  fi
+  [ -n "$pinned_model" ] || pinned_model="$configured_model"
+
+  if [ -n "$pinned_model" ] && ! agmsg_cursor_safe_model_id "$pinned_model"; then
+    die "spawn: unsafe cursor model id '$(agmsg_cursor_sanitize_for_log "$pinned_model")' (must match ^[A-Za-z0-9._-]+$ and not start with '-')"
+  fi
+  if [ -n "$configured_fallback" ] && ! agmsg_cursor_safe_model_id "$configured_fallback"; then
+    die "spawn: unsafe cursor fallback model id '$(agmsg_cursor_sanitize_for_log "$configured_fallback")' (must match ^[A-Za-z0-9._-]+$ and not start with '-')"
+  fi
+  if [ -z "$configured_fallback" ] \
+      && [ -n "${AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL+x}" ] \
+      && [ -n "${AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL:-}" ] \
+      && ! agmsg_cursor_safe_model_id "$AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL"; then
+    die "spawn: unsafe cursor fallback model id '$(agmsg_cursor_sanitize_for_log "$AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL")' from AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL (must match ^[A-Za-z0-9._-]+$ and not start with '-')"
+  fi
 
   # Establish a persistent Cursor chat up-front so the bridge can --resume it on
   # every turn (server-side conversation memory). create-chat is cwd-independent
@@ -199,6 +246,23 @@ agmsg_spawn_headless() {
 
   local -a extra_args=()
   [ "$readonly_on" = 1 ] && extra_args+=(--readonly)
+  [ -n "$pinned_model" ] && extra_args+=(--model "$pinned_model")
+  [ -n "$model_label" ] && extra_args+=(--model-label "$model_label")
+  # Resolve fallback policy to explicit bridge argv. Config wins over the env;
+  # an explicitly-empty env and the pinned/no-override default become the
+  # flag --no-fallback (never a sentinel model id such as "none"). With no pin
+  # and no override, omit both flags so the bridge retains composer-2.5.
+  if [ -n "$configured_fallback" ]; then
+    extra_args+=(--fallback-model "$configured_fallback")
+  elif [ -n "${AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL+x}" ]; then
+    if [ -n "${AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL:-}" ]; then
+      extra_args+=(--fallback-model "$AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL")
+    else
+      extra_args+=(--no-fallback)
+    fi
+  elif [ -n "$pinned_model" ]; then
+    extra_args+=(--no-fallback)
+  fi
   if [ -n "$add_dir_list" ]; then
     printf '%s\n' "$add_dir_list" > "$adddirs_file"
     extra_args+=(--add-dirs-file "$adddirs_file")

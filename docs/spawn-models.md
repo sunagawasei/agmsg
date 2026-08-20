@@ -1,23 +1,71 @@
-# spawn-models — per-worker model / reasoning-effort for headless codex
+# spawn-models — per-worker models for headless workers
 
-A headless `codex` worker (see `docs/codex-monitor-beta.md` / `--headless`) can be
-given its own model id and reasoning effort, keyed by its spawned actas name, so
-e.g. a `codex-research` worker can run a different model than the default
-`codex` reviewer without touching global config.
+Headless `codex` and `cursor` workers can be given a model id keyed by their
+spawned actas name, so a persistent worker can use a different model without
+changing the runtime's global configuration. Codex also supports per-worker
+reasoning effort. Cursor can verify the effective model display label reported
+by `cursor-agent` on every turn.
 
-**Scope: headless `codex` only.**
+**Scope: headless `codex` and headless `cursor`.**
 
 - An interactive (TUI) spawn of any type already has a working `--model` flag
   (wired via the manifest's `model_arg=`, e.g. `-m` for codex) — unaffected by
   this doc.
-- Headless `cursor` is not covered — its model comes entirely from cursor's own
-  global config (`~/.config/cursor/cli-config.json`).
 - With no override, a headless codex worker falls back to its global
   `~/.codex/config.toml` model — the app-server command's tail is unchanged
   (still ends at `approval_policy=never`, with no model/effort `-c` clause
   appended).
 
-## Resolution
+## Headless cursor
+
+The pinned model resolution order is:
+
+1. `spawn.sh cursor <name> --headless --model <id>`.
+2. config `spawn.cursor_model.<name>`.
+3. unset, preserving the Cursor global/default model behavior.
+
+`spawn.cursor_model_label.<name>` is optional. When both a pin and label are
+configured, the bridge compares the label byte-for-byte with the display name
+in each stream-json `system/init` event. It does not normalize ids or use
+substring matching. Without a label the effective display name is recorded but
+not compared; without a pin, the bridge does not require the init event to have
+a model field.
+
+```sh
+agmsg config set spawn.cursor_model.wall grok-4.6
+agmsg config set spawn.cursor_model_label.wall "Cursor Grok 4.6 High Fast"
+```
+
+Cursor fallback resolution is:
+
+1. bridge `--no-fallback` (explicit disable).
+2. config `spawn.cursor_fallback_model.<name>` when non-empty.
+3. `AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL`, preserving the distinction between
+   unset and explicitly empty.
+4. disabled by default when a model is pinned.
+5. legacy `composer-2.5` default when unpinned.
+
+An explicitly empty environment variable becomes the bridge flag
+`--no-fallback`; no sentinel model id is used. A configured fallback is opt-in
+for pinned workers because an implicit fallback would break the meaning of a
+model pin. An exact model-label mismatch is terminal: the generated answer is
+discarded and the input is immediately dead-lettered without a fallback turn.
+
+Model and fallback ids must be non-empty ASCII values matching
+`^[A-Za-z0-9._-]+$` and must not start with `-`. Spawn rejects malformed values
+before `create-chat`. Character-valid unknown ids pass spawn because agmsg does
+not call the external model catalog; Cursor reports them as a first-turn error.
+
+`ensure-headless.sh cursor <project>` is intentionally session-team-only. It is
+a no-op outside a Claude session team, so a long-lived wall/brainstorming Cursor
+worker must be operated manually:
+
+```sh
+scripts/spawn.sh cursor wall --team <team> --project <repo> --headless
+scripts/despawn.sh <team> <leader-name> wall --force
+```
+
+## Headless codex
 
 **Model** (first hit wins):
 

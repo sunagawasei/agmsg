@@ -9,7 +9,7 @@ CURSOR_BRIDGE_ORIGINAL_ARGS=("$@")
 # cursor-bridge.sh — headless, read-only Cursor reviewer worker for agmsg.
 #
 # The cursor-side analogue of codex-bridge.js, but far smaller: cursor-agent's
-# headless interface is a ONE-SHOT CLI (`cursor-agent -p --output-format json
+# headless interface is a ONE-SHOT CLI (`cursor-agent -p --output-format stream-json
 # --resume <chatId>`), not a long-lived app-server. So there is no JSON-RPC
 # daemon, no turn-lifecycle protocol, and no watchdog — a turn is one process that
 # exits. The loop is:
@@ -17,7 +17,7 @@ CURSOR_BRIDGE_ORIGINAL_ARGS=("$@")
 #   1. poll the inbox (inbox.sh --format ids: id-tagged unread, NEVER marked read)
 #   2. group unread by sender (from the DB id-list, not a fragile text parse)
 #   3. per sender: run cursor-agent READ-ONLY (--trust, never --force) with their
-#      messages, capture the JSON `.result`
+#      messages, validate the JSONL init/result events, capture result `.result`
 #   4. on a valid result: the BRIDGE sends it back via send.sh --stdin, THEN marks
 #      exactly those message ids read. cursor never runs send.sh — it stays a pure
 #      read-only reviewer (approach b).
@@ -36,8 +36,8 @@ CURSOR_BRIDGE_ORIGINAL_ARGS=("$@")
 # out of usage — often clears on another model; set empty to disable). If that
 # also fails, the ids are dead-lettered: the bridge sends the sender a
 # `[bridge-error]` notice via the normal reply path, then marks the ids read (same
-# as success) so the loop stops retrying. Normal turns never pass --model, so the
-# user's global cursor model config applies outside the fallback.
+# as success) so the loop stops retrying. An unpinned normal turn omits --model;
+# a pinned worker passes its requested model on every normal turn.
 #
 # Once a payload is DETERMINED (a successful fallback reply, or the dead-letter
 # notice) but its SEND fails, the ids stay unread (loss-safe) and the payload is
@@ -52,6 +52,8 @@ CURSOR_BRIDGE_ORIGINAL_ARGS=("$@")
 usage() {
   cat <<EOF
 Usage: cursor-bridge.sh --project <path> --team <team> --name <agent> --chat-id <id>
+                        [--model <id>] [--model-label <display-name>]
+                        [--fallback-model <id> | --no-fallback]
                         [--interval <sec>] [--once] [--help]
 
 Headless read-only Cursor reviewer worker for agmsg.
@@ -60,6 +62,10 @@ Headless read-only Cursor reviewer worker for agmsg.
   --team <team>      agmsg team to receive/reply on.
   --name <agent>     this worker's agmsg identity.
   --chat-id <id>     Cursor chat id to --resume each turn (from create-chat).
+  --model <id>       pin every normal turn to this model id.
+  --model-label <s>  when pinned, require init.model to exactly equal this label.
+  --fallback-model <id>  retry a terminal turn once on this model.
+  --no-fallback      disable fallback even if another source configured one.
   --interval <sec>   inbox poll interval (default 2).
   --readonly         enforce read-only: write a scratch-cwd .cursor/cli.json that
                      denies Write/Shell (+ a secret-path Read denylist) and run
@@ -80,8 +86,9 @@ Env:
                                 unread ids group before giving up and dead-lettering
                                 them (default 10; see the dead-letter note above).
   AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL  model to retry a terminal failure with, ONCE,
-                                before dead-lettering (default composer-2.5; set to
-                                an empty string to disable the fallback retry).
+                                before dead-lettering (default composer-2.5 only
+                                when unpinned; a pin defaults it off; set empty to
+                                disable the fallback retry explicitly).
 EOF
 }
 
@@ -92,6 +99,11 @@ TURN_TIMEOUT="${AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT:-180}"
 READONLY=0          # --readonly: enforce read-only via a scratch-cwd .cursor/cli.json
 ADD_DIRS_FILE=""    # --add-dirs-file: newline-listed extra readable dirs to advertise
 ROLE_FILE=""        # --role-file: standing role prompt prepended to each turn (empty = generic reviewer intro)
+PINNED_MODEL=""     # --model: requested model id for every normal turn
+PINNED_MODEL_LABEL="" # --model-label: exact init.model display label for pinned turns
+FALLBACK_ARG=""
+FALLBACK_ARG_SET=0
+NO_FALLBACK=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -99,6 +111,10 @@ while [ "$#" -gt 0 ]; do
     --team)    TEAM="${2:?--team needs a name}"; shift 2 ;;
     --name)    NAME="${2:?--name needs a name}"; shift 2 ;;
     --chat-id) CHAT_ID="${2:?--chat-id needs an id}"; shift 2 ;;
+    --model) PINNED_MODEL="${2:?--model needs an id}"; shift 2 ;;
+    --model-label) PINNED_MODEL_LABEL="${2:?--model-label needs a display name}"; shift 2 ;;
+    --fallback-model) FALLBACK_ARG="${2:?--fallback-model needs an id}"; FALLBACK_ARG_SET=1; shift 2 ;;
+    --no-fallback) NO_FALLBACK=1; shift ;;
     --interval) INTERVAL="${2:?--interval needs seconds}"; shift 2 ;;
     --readonly) READONLY=1; shift ;;
     --add-dirs-file) ADD_DIRS_FILE="${2:?--add-dirs-file needs a path}"; shift 2 ;;
@@ -120,9 +136,54 @@ case "$INTERVAL" in ''|*[!0-9]*) echo "cursor-bridge: --interval must be a whole
 case "$TURN_TIMEOUT" in ''|*[!0-9]*) echo "cursor-bridge: AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT must be a whole number of seconds" >&2; exit 1 ;; esac
 MAX_CONSEC_FAILURES="${AGMSG_CURSOR_BRIDGE_MAX_CONSEC_FAILURES:-10}"
 case "$MAX_CONSEC_FAILURES" in ''|*[!0-9]*) echo "cursor-bridge: AGMSG_CURSOR_BRIDGE_MAX_CONSEC_FAILURES must be a whole number" >&2; exit 1 ;; esac
-# Unset-only default (${VAR-...}, not ${VAR:-...}): an explicitly EMPTY value
-# means "no fallback retry, dead-letter terminal failures immediately".
-FALLBACK_MODEL="${AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL-composer-2.5}"
+
+# Byte-level model-id validation. The sentinel preserves trailing control bytes
+# across command substitution and carries tr's status, so a broken validator
+# cannot turn malformed or option-shaped input into a fail-open acceptance.
+cursor_safe_model_id() {
+  local val="$1" rest
+  [ -n "$val" ] || return 1
+  case "$val" in -*) return 1 ;; esac
+  rest="$(printf '%s' "$val" | LC_ALL=C tr -d 'A-Za-z0-9._-'; printf 'X%s' "$?")"
+  [ "$rest" = "X0" ]
+}
+
+sanitize_model_label_for_log() {
+  local val
+  val="$(printf '%s' "$1" | LC_ALL=C tr -d '[:cntrl:]')"
+  printf '%s' "${val:0:160}"
+}
+
+if [ -n "$PINNED_MODEL" ] && ! cursor_safe_model_id "$PINNED_MODEL"; then
+  echo "cursor-bridge: unsafe --model value (must match ^[A-Za-z0-9._-]+$ and not start with '-')" >&2
+  exit 1
+fi
+if [ "$NO_FALLBACK" != 1 ] && [ "$FALLBACK_ARG_SET" = 1 ] && ! cursor_safe_model_id "$FALLBACK_ARG"; then
+  echo "cursor-bridge: unsafe --fallback-model value (must match ^[A-Za-z0-9._-]+$ and not start with '-')" >&2
+  exit 1
+fi
+if [ "$NO_FALLBACK" != 1 ] && [ "$FALLBACK_ARG_SET" != 1 ] \
+    && [ -n "${AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL+x}" ] \
+    && [ -n "${AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL:-}" ] \
+    && ! cursor_safe_model_id "$AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL"; then
+  echo "cursor-bridge: unsafe AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL value (must match ^[A-Za-z0-9._-]+$ and not start with '-')" >&2
+  exit 1
+fi
+
+# Fallback precedence for direct bridge use mirrors spawn's resolved argv:
+# --no-fallback > --fallback-model > env (unset and explicit empty differ) >
+# pinned default disabled > legacy unpinned composer-2.5 default.
+if [ "$NO_FALLBACK" = 1 ]; then
+  FALLBACK_MODEL=""
+elif [ "$FALLBACK_ARG_SET" = 1 ]; then
+  FALLBACK_MODEL="$FALLBACK_ARG"
+elif [ -n "${AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL+x}" ]; then
+  FALLBACK_MODEL="${AGMSG_CURSOR_BRIDGE_FALLBACK_MODEL:-}"
+elif [ -n "$PINNED_MODEL" ]; then
+  FALLBACK_MODEL=""
+else
+  FALLBACK_MODEL="composer-2.5"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
@@ -163,6 +224,7 @@ PIDFILE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.pid"
 METAFILE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.meta"
 LOG="$RUN_DIR/cursor-bridge.$TEAM.$NAME.log"
 OUTFILE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.last.json"
+STREAMFILE="$OUTFILE.stream"
 PROMPTFILE="$RUN_DIR/cursor-bridge.$TEAM.$NAME.prompt"
 # Per-sender consecutive-failure counters for the dead-letter gate, keyed by
 # (sender, ids-group). Deliberately NOT cleaned up in cleanup() below (like the
@@ -223,7 +285,12 @@ cleanup() {
   # .chat here is safe.
   if [ "$(cat "$PIDFILE" 2>/dev/null || true)" = "$$" ]; then
     rm -f "$METAFILE" "$OUTFILE" "$PROMPTFILE" \
-          "$OUTFILE.one" "$OUTFILE.cand" "$OUTFILE.err" \
+          "$OUTFILE.init" "$OUTFILE.result" "$OUTFILE.lines.json" \
+          "$OUTFILE.parse.status" "$OUTFILE.parse.model" \
+          "$OUTFILE.parse.model-type" "$OUTFILE.parse.subtype" \
+          "$OUTFILE.parse.is-error-type" "$OUTFILE.parse.is-error-value" \
+          "$OUTFILE.parse.session" "$OUTFILE.parse.text" \
+          "$OUTFILE.next" "$OUTFILE.err" "$STREAMFILE" \
           "$RUN_DIR/cursor-bridge.$TEAM.$NAME.chat" \
           "$RUN_DIR/cursor-bridge.$TEAM.$NAME.role" \
           "${ADD_DIRS_FILE:-}" 2>/dev/null || true
@@ -434,9 +501,171 @@ ids_subset() {
   return 0
 }
 
-# Run one read-only cursor turn for $1=prompt, optionally forcing $2=model via
-# --model (the fallback retry; omitted on normal turns so the user's global cursor
-# model config keeps applying). On a valid, non-error result with a matching
+# Parse a cursor stream-json stdout file. Every non-empty line must be a JSON
+# object. The stream must contain exactly one system/init before exactly one
+# result, and result must be the final non-empty event. On success, globals hold
+# the init model metadata and result fields, and OUTFILE is atomically replaced
+# with ONLY the init and result events. The raw stream is never copied there.
+TURN_INIT_MODEL=""
+TURN_INIT_MODEL_TYPE=""
+TURN_RESULT_SUBTYPE=""
+TURN_RESULT_IS_ERROR_TYPE=""
+TURN_RESULT_IS_ERROR_VALUE=""
+TURN_RESULT_SESSION_ID=""
+TURN_RESULT_TEXT=""
+parse_cursor_stream() {
+  local raw="$1" lines_json="$OUTFILE.lines.json"
+  local status_file="$OUTFILE.parse.status" model_file="$OUTFILE.parse.model"
+  local model_type_file="$OUTFILE.parse.model-type" subtype_file="$OUTFILE.parse.subtype"
+  local is_error_type_file="$OUTFILE.parse.is-error-type" is_error_value_file="$OUTFILE.parse.is-error-value"
+  local session_file="$OUTFILE.parse.session" text_file="$OUTFILE.parse.text"
+  local raw_esc status_esc init_esc result_esc model_esc model_type_esc
+  local subtype_esc is_error_type_esc is_error_value_esc session_esc text_esc
+  local status ok invalid_count init_count result_count init_index result_index last_index
+
+  rm -f "$lines_json" "$OUTFILE.init" "$OUTFILE.result" "$status_file" \
+        "$model_file" "$model_type_file" "$subtype_file" \
+        "$is_error_type_file" "$is_error_value_file" "$session_file" \
+        "$text_file" 2>/dev/null || true
+
+  # Preserve physical JSONL boundaries by encoding every non-empty input line as
+  # an outer JSON string. This prevents two individually-invalid fragments on
+  # adjacent lines from being joined into one valid JSON value. The resulting
+  # array is parsed and aggregated by ONE sqlite process regardless of line count.
+  if ! awk '
+    BEGIN { printf "["; first=1 }
+    length($0) > 0 {
+      s=$0; out=""
+      for (i=1; i<=length(s); i++) {
+        c=substr(s,i,1)
+        if (c == "\\") out=out "\\\\"
+        else if (c == "\"") out=out "\\\""
+        else if (c == "\t") out=out "\\t"
+        else if (c == "\r") out=out "\\r"
+        else out=out c
+      }
+      if (!first) printf ","
+      printf "\"%s\"", out
+      first=0
+    }
+    END { print "]" }
+  ' "$raw" > "$lines_json"; then
+    echo "cursor-bridge: failed to stage stream-json lines for validation" >&2
+    rm -f "$lines_json" 2>/dev/null || true
+    return 1
+  fi
+
+  raw_esc="$(agmsg_sql_readfile_path "$lines_json")"
+  status_esc="$(agmsg_sql_readfile_path "$status_file")"
+  init_esc="$(agmsg_sql_readfile_path "$OUTFILE.init")"
+  result_esc="$(agmsg_sql_readfile_path "$OUTFILE.result")"
+  model_esc="$(agmsg_sql_readfile_path "$model_file")"
+  model_type_esc="$(agmsg_sql_readfile_path "$model_type_file")"
+  subtype_esc="$(agmsg_sql_readfile_path "$subtype_file")"
+  is_error_type_esc="$(agmsg_sql_readfile_path "$is_error_type_file")"
+  is_error_value_esc="$(agmsg_sql_readfile_path "$is_error_value_file")"
+  session_esc="$(agmsg_sql_readfile_path "$session_file")"
+  text_esc="$(agmsg_sql_readfile_path "$text_file")"
+
+  if ! agmsg_sqlite_mem "
+WITH root AS (
+  SELECT CAST(readfile('$raw_esc') AS TEXT) AS doc
+), root_state AS (
+  SELECT doc,
+         CASE WHEN json_valid(doc) AND json_type(doc)='array' THEN 1 ELSE 0 END AS doc_ok
+  FROM root
+), events AS (
+  SELECT CAST(j.key AS INTEGER) + 1 AS seq,
+         j.value AS line,
+         CASE
+           WHEN NOT json_valid(j.value) THEN NULL
+           ELSE json_type(j.value)
+         END AS line_type,
+         CASE
+           WHEN NOT json_valid(j.value) THEN NULL
+           WHEN json_type(j.value) <> 'object' THEN NULL
+           ELSE json_extract(j.value,'\$.type')
+         END AS kind,
+         CASE
+           WHEN NOT json_valid(j.value) THEN NULL
+           WHEN json_type(j.value) <> 'object' THEN NULL
+           ELSE json_extract(j.value,'\$.subtype')
+         END AS subtype
+  FROM root_state AS r,
+       json_each(CASE WHEN r.doc_ok=1 THEN r.doc ELSE '[]' END) AS j
+), stats AS (
+  SELECT r.doc_ok,
+         COALESCE(SUM(CASE WHEN e.seq IS NOT NULL AND (e.line_type IS NULL OR e.line_type <> 'object') THEN 1 ELSE 0 END),0) AS invalid_count,
+         COALESCE(SUM(CASE WHEN e.kind='system' AND e.subtype='init' THEN 1 ELSE 0 END),0) AS init_count,
+         COALESCE(SUM(CASE WHEN e.kind='result' THEN 1 ELSE 0 END),0) AS result_count,
+         COALESCE(MAX(CASE WHEN e.kind='system' AND e.subtype='init' THEN e.seq END),0) AS init_seq,
+         COALESCE(MAX(CASE WHEN e.kind='result' THEN e.seq END),0) AS result_seq,
+         COALESCE(MAX(e.seq),0) AS last_seq,
+         MAX(CASE WHEN e.kind='system' AND e.subtype='init' THEN e.line END) AS init_line,
+         MAX(CASE WHEN e.kind='result' THEN e.line END) AS result_line
+  FROM root_state AS r LEFT JOIN events AS e ON 1=1
+), summary AS (
+  SELECT *, CASE
+    WHEN doc_ok=1 AND invalid_count=0 AND init_count=1 AND result_count=1
+      AND init_seq < result_seq AND result_seq=last_seq THEN 1 ELSE 0 END AS ok
+  FROM stats
+)
+SELECT
+  writefile('$status_esc', CAST(printf('%d|%d|%d|%d|%d|%d|%d',
+    ok, invalid_count, init_count, result_count, init_seq, result_seq, last_seq) AS BLOB)),
+  CASE WHEN ok=1 THEN writefile('$init_esc', CAST(init_line || char(10) AS BLOB)) ELSE 0 END,
+  CASE WHEN ok=1 THEN writefile('$result_esc', CAST(result_line || char(10) AS BLOB)) ELSE 0 END,
+  CASE WHEN ok=1 THEN writefile('$model_type_esc', CAST(COALESCE(json_type(init_line,'\$.model'),'') AS BLOB)) ELSE 0 END,
+  CASE WHEN ok=1 THEN writefile('$model_esc', CAST(COALESCE(json_extract(init_line,'\$.model'),'') AS BLOB)) ELSE 0 END,
+  CASE WHEN ok=1 THEN writefile('$subtype_esc', CAST(COALESCE(json_extract(result_line,'\$.subtype'),'') AS BLOB)) ELSE 0 END,
+  CASE WHEN ok=1 THEN writefile('$is_error_type_esc', CAST(COALESCE(json_type(result_line,'\$.is_error'),'') AS BLOB)) ELSE 0 END,
+  CASE WHEN ok=1 THEN writefile('$is_error_value_esc', CAST(COALESCE(json_extract(result_line,'\$.is_error'),'') AS BLOB)) ELSE 0 END,
+  CASE WHEN ok=1 THEN writefile('$session_esc', CAST(COALESCE(json_extract(result_line,'\$.session_id'),'') AS BLOB)) ELSE 0 END,
+  CASE WHEN ok=1 THEN writefile('$text_esc', CAST(COALESCE(json_extract(result_line,'\$.result'),'') AS BLOB)) ELSE 0 END
+FROM summary;
+" >/dev/null 2>&1; then
+    echo "cursor-bridge: sqlite failed while validating stream-json" >&2
+    rm -f "$lines_json" "$OUTFILE.init" "$OUTFILE.result" "$status_file" \
+          "$model_file" "$model_type_file" "$subtype_file" \
+          "$is_error_type_file" "$is_error_value_file" "$session_file" \
+          "$text_file" 2>/dev/null || true
+    return 1
+  fi
+  rm -f "$lines_json" 2>/dev/null || true
+
+  status="$(cat "$status_file" 2>/dev/null || true)"
+  IFS='|' read -r ok invalid_count init_count result_count init_index result_index last_index <<< "$status"
+  if [ "$ok" != 1 ]; then
+    echo "cursor-bridge: cursor stream violated the JSONL contract (invalid=${invalid_count:-?}, init=${init_count:-?}, result=${result_count:-?}, init-index=${init_index:-?}, result-index=${result_index:-?}, last-index=${last_index:-?})" >&2
+    rm -f "$OUTFILE.init" "$OUTFILE.result" "$status_file" \
+          "$model_file" "$model_type_file" "$subtype_file" \
+          "$is_error_type_file" "$is_error_value_file" "$session_file" \
+          "$text_file" 2>/dev/null || true
+    return 1
+  fi
+
+  TURN_INIT_MODEL_TYPE="$(cat "$model_type_file" 2>/dev/null || true)"
+  TURN_INIT_MODEL="$(cat "$model_file" 2>/dev/null || true)"
+  TURN_RESULT_SUBTYPE="$(cat "$subtype_file" 2>/dev/null || true)"
+  TURN_RESULT_IS_ERROR_TYPE="$(cat "$is_error_type_file" 2>/dev/null || true)"
+  TURN_RESULT_IS_ERROR_VALUE="$(cat "$is_error_value_file" 2>/dev/null || true)"
+  TURN_RESULT_SESSION_ID="$(cat "$session_file" 2>/dev/null || true)"
+  TURN_RESULT_TEXT="$(cat "$text_file" 2>/dev/null || true)"
+
+  { cat "$OUTFILE.init"; cat "$OUTFILE.result"; } > "$OUTFILE.next" \
+    && mv "$OUTFILE.next" "$OUTFILE"
+  local keep_rc=$?
+  rm -f "$OUTFILE.init" "$OUTFILE.result" "$OUTFILE.next" "$status_file" \
+        "$model_file" "$model_type_file" "$subtype_file" \
+        "$is_error_type_file" "$is_error_value_file" "$session_file" \
+        "$text_file" 2>/dev/null || true
+  [ "$keep_rc" -eq 0 ] || { echo "cursor-bridge: failed to retain filtered init/result audit output" >&2; return 1; }
+  return 0
+}
+
+# Run one read-only cursor turn for $1=prompt. $2, when non-empty, overrides the
+# pinned model for a fallback turn; otherwise PINNED_MODEL applies. On a valid,
+# non-error result with a matching
 # session id and non-empty text, set REPLY_TEXT and return 0; else return 1
 # (caller leaves the messages unread for a retry, UNLESS TURN_ERR_LINE got set —
 # see below). NEVER passes --force, so cursor cannot write/run shell — it is a
@@ -451,8 +680,13 @@ REPLY_TEXT=""
 # -ne 0) turn. Empty means no terminal pattern was seen this turn. The caller
 # (process_cycle) dead-letters instead of retrying when this is non-empty.
 TURN_ERR_LINE=""
+TURN_TERMINAL_IMMEDIATE=0
 run_cursor_turn() {
-  local prompt="$1" model="${2:-}"
+  local prompt="$1" model_override="${2:-}" model="$PINNED_MODEL" fallback_used=false
+  if [ -n "$model_override" ]; then
+    model="$model_override"
+    fallback_used=true
+  fi
   local model_args=()
   [ -n "$model" ] && model_args=(--model "$model")
   : > "$OUTFILE"
@@ -460,14 +694,15 @@ run_cursor_turn() {
   local errfile="$OUTFILE.err"
   : > "$errfile"
   TURN_ERR_LINE=""
+  TURN_TERMINAL_IMMEDIATE=0
   local rc=0
   # cursor-agent's stderr is captured to a PER-TURN file (not appended straight to
   # $LOG) so a terminal-error scan below sees only THIS turn's output, never a
   # prior turn's leftover text. It is still appended to $LOG right after, so the
   # cumulative debug log is unchanged.
   run_with_timeout "$TURN_TIMEOUT" \
-    "$CURSOR_BIN" -p --trust ${WORKSPACE_ARGS[@]+"${WORKSPACE_ARGS[@]}"} ${model_args[@]+"${model_args[@]}"} --output-format json --resume "$CHAT_ID" \
-    <"$PROMPTFILE" >"$OUTFILE" 2>"$errfile" || rc=$?
+    "$CURSOR_BIN" -p --trust ${WORKSPACE_ARGS[@]+"${WORKSPACE_ARGS[@]}"} ${model_args[@]+"${model_args[@]}"} --output-format stream-json --resume "$CHAT_ID" \
+    <"$PROMPTFILE" >"$STREAMFILE" 2>"$errfile" || rc=$?
   rm -f "$PROMPTFILE" 2>/dev/null || true
   cat "$errfile" >> "$LOG" 2>/dev/null || true
 
@@ -478,55 +713,61 @@ run_cursor_turn() {
   # then stdout for a terminal, non-retriable error line (checked at line-start,
   # so it never matches the string appearing mid-sentence in ordinary text).
   if [ "$rc" -ne 0 ]; then
-    TURN_ERR_LINE="$(awk '/^(NonRetriableError|ActionRequiredError):/ { print; exit }' "$errfile" "$OUTFILE" 2>/dev/null || true)"
-    rm -f "$errfile" 2>/dev/null || true
+    TURN_ERR_LINE="$(awk '/^(NonRetriableError|ActionRequiredError):/ { print; exit }' "$errfile" "$STREAMFILE" 2>/dev/null || true)"
+    rm -f "$errfile" "$STREAMFILE" 2>/dev/null || true
     echo "cursor-bridge: cursor-agent exited non-zero or timed out (rc=$rc); leaving message unread" >&2
     return 1
   fi
   rm -f "$errfile" 2>/dev/null || true
 
-  # Resolve a SINGLE JSON document from stdout. The whole file must be one valid
-  # JSON object; if not (e.g. a warning line precedes it) accept ONLY when exactly
-  # one line is itself valid JSON. 0 or >1 valid-JSON lines → reject fail-closed,
-  # so a multi-object / stream-json / garbage stdout never yields a false reply.
-  local jsonfile=""
-  if json_valid_file "$OUTFILE"; then
-    jsonfile="$OUTFILE"
-  else
-    local ln count=0
-    : > "$OUTFILE.one"
-    while IFS= read -r ln; do
-      [ -n "$ln" ] || continue
-      printf '%s\n' "$ln" > "$OUTFILE.cand"
-      if json_valid_file "$OUTFILE.cand"; then count=$((count + 1)); cp "$OUTFILE.cand" "$OUTFILE.one"; fi
-    done < "$OUTFILE"
-    rm -f "$OUTFILE.cand" 2>/dev/null || true
-    if [ "$count" -eq 1 ]; then
-      jsonfile="$OUTFILE.one"
-    else
-      rm -f "$OUTFILE.one" 2>/dev/null || true
-      echo "cursor-bridge: cursor output was not a single JSON object ($count valid-json lines)" >&2
+  if ! parse_cursor_stream "$STREAMFILE"; then
+    rm -f "$STREAMFILE" 2>/dev/null || true
+    : > "$OUTFILE"
+    return 1
+  fi
+  rm -f "$STREAMFILE" 2>/dev/null || true
+
+  local requested_log reported_log
+  requested_log="${model:-<default>}"
+  reported_log="${TURN_INIT_MODEL:-<unreported>}"
+  printf "cursor-bridge: model-audit requested='%s' reported='%s' fallback=%s\n" \
+    "$(sanitize_model_label_for_log "$requested_log")" \
+    "$(sanitize_model_label_for_log "$reported_log")" "$fallback_used" >> "$LOG"
+
+  # An unpinned turn preserves legacy behavior: no model field or label match is
+  # required. A pinned turn requires a non-empty string model; an explicitly
+  # configured display label is compared byte-for-byte, with no normalization.
+  if [ -n "$PINNED_MODEL" ]; then
+    if [ "$TURN_INIT_MODEL_TYPE" != text ] || [ -z "$TURN_INIT_MODEL" ]; then
+      echo "cursor-bridge: pinned turn init event did not report a non-empty model label" >&2
+      return 1
+    fi
+    # A configured fallback intentionally abandons pinned-model purity. Its
+    # effective label remains audited, but only normal pinned turns are matched.
+    if [ "$fallback_used" != true ] && [ -n "$PINNED_MODEL_LABEL" ] && [ "$TURN_INIT_MODEL" != "$PINNED_MODEL_LABEL" ]; then
+      TURN_ERR_LINE="model label mismatch (requested '$PINNED_MODEL', reported '$(sanitize_model_label_for_log "$TURN_INIT_MODEL")', expected '$(sanitize_model_label_for_log "$PINNED_MODEL_LABEL")')"
+      TURN_TERMINAL_IMMEDIATE=1
+      echo "cursor-bridge: $TURN_ERR_LINE; dead-lettering without a model fallback" >&2
       return 1
     fi
   fi
 
-  local esc is_err sid res
-  esc="$(agmsg_sql_readfile_path "$jsonfile")"
-  is_err="$(agmsg_sqlite_mem "SELECT COALESCE(json_extract(CAST(readfile('$esc') AS TEXT),'\$.is_error'),'true')" 2>/dev/null || echo true)"
-  sid="$(agmsg_sqlite_mem "SELECT COALESCE(json_extract(CAST(readfile('$esc') AS TEXT),'\$.session_id'),'')" 2>/dev/null || echo '')"
-  res="$(agmsg_sqlite_mem "SELECT COALESCE(json_extract(CAST(readfile('$esc') AS TEXT),'\$.result'),'')" 2>/dev/null || echo '')"
-  rm -f "$OUTFILE.one" 2>/dev/null || true
-
-  case "$is_err" in
-    0|false) ;;
-    *) echo "cursor-bridge: cursor reported is_error=$is_err" >&2; return 1 ;;
-  esac
-  if [ "$sid" != "$CHAT_ID" ]; then
-    echo "cursor-bridge: session_id mismatch (got '$sid', expected '$CHAT_ID')" >&2
+  if [ "$TURN_RESULT_SUBTYPE" != success ]; then
+    echo "cursor-bridge: cursor result subtype was '$TURN_RESULT_SUBTYPE' (expected success)" >&2
     return 1
   fi
-  [ -n "$res" ] || { echo "cursor-bridge: empty result" >&2; return 1; }
-  REPLY_TEXT="$res"
+  # Preserve the legacy result contract: Cursor has emitted boolean false in
+  # practice, while older bridge parsing also accepted the integer value 0.
+  case "$TURN_RESULT_IS_ERROR_TYPE:$TURN_RESULT_IS_ERROR_VALUE" in
+    false:0|integer:0) ;;
+    *) echo "cursor-bridge: cursor reported is_error type=$TURN_RESULT_IS_ERROR_TYPE value=$TURN_RESULT_IS_ERROR_VALUE" >&2; return 1 ;;
+  esac
+  if [ "$TURN_RESULT_SESSION_ID" != "$CHAT_ID" ]; then
+    echo "cursor-bridge: session_id mismatch (got '$TURN_RESULT_SESSION_ID', expected '$CHAT_ID')" >&2
+    return 1
+  fi
+  [ -n "$TURN_RESULT_TEXT" ] || { echo "cursor-bridge: empty result" >&2; return 1; }
+  REPLY_TEXT="$TURN_RESULT_TEXT"
   return 0
 }
 
@@ -636,7 +877,7 @@ Reply with ONLY your final answer for '$sender'. Do NOT run agmsg, send.sh, or a
       # Before dead-lettering, retry the SAME turn once on the fallback model —
       # a terminal error is often per-model (e.g. only the fast tier is out of
       # usage), so one forced-model attempt can still salvage the reply.
-      if [ -n "$reason" ] && [ -n "$FALLBACK_MODEL" ]; then
+      if [ -n "$reason" ] && [ "$TURN_TERMINAL_IMMEDIATE" != 1 ] && [ -n "$FALLBACK_MODEL" ]; then
         echo "cursor-bridge: terminal failure for $sender ($reason); retrying once with fallback model $FALLBACK_MODEL" >&2
         if run_cursor_turn "$prompt" "$FALLBACK_MODEL"; then
           if printf '%s' "$REPLY_TEXT" | "$SCRIPTS_DIR/send.sh" "$TEAM" "$NAME" "$sender" --stdin >/dev/null 2>&1; then
