@@ -100,25 +100,43 @@ SESSION_ID=$(printf '%s' "$INPUT" \
 # Deferral was an optimisation, not a correctness requirement. The read state
 # is the correctness requirement, and it was already there.
 
-# Identify agent and teams
-WHOAMI=$("$SCRIPT_DIR/whoami.sh" "$PROJECT" "$TYPE")
-# suggest=true means this identity is registered only under a DIFFERENT
-# project, so it is not joined here -> deliver nothing (mirror not_joined).
-# Without this the else-branch extracts "agents=" as the agent name.
-if echo "$WHOAMI" | grep -Eq "not_joined=true|suggest=true"; then
-  exit 0
-fi
+# Resolve the invocation path to the registered project root (session marker /
+# nearest ancestor / sibling worktree) before the identity lookup — the
+# whoami.sh path did this resolution, and identities.sh itself is an exact
+# registry lookup by design (its other callers rely on that).
+PROJECT="$(agmsg_resolve_project "$PROJECT" "$TYPE")"
 
-# Handle multiple identities: use first agent name
-if echo "$WHOAMI" | grep -q "multiple=true"; then
-  AGENT=$(echo "$WHOAMI" | sed -n 's/.*agents=\([^,]*\).*/\1/p')
-else
-  # Anchor on a leading "agent=" so "agents=" (multiple/suggest) cannot match.
-  AGENT=$(echo "$WHOAMI" | sed -n 's/^agent=\([^ ]*\).*/\1/p')
-fi
-TEAMS=$(echo "$WHOAMI" | sed -n 's/.*teams=\([^ ]*\).*/\1/p')
+# Consume exact (team, agent) TSV rows instead of independently flattened
+# agent/team lists. For multiple agents, preserve the existing first-agent
+# policy, but subscribe only to that agent's actual team rows.
+IDENTITIES=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE")
+[ -n "$IDENTITIES" ] || exit 0
 
-if [ -z "$AGENT" ] || [ -z "$TEAMS" ]; then
+AGENT=""
+TEAM_LIST=()
+IDENTITIES_VALID=1
+while IFS=$'\t' read -r identity_team identity_agent identity_extra; do
+  if [ -z "$identity_team" ] || [ -z "$identity_agent" ] || [ -n "$identity_extra" ]; then
+    IDENTITIES_VALID=0
+    break
+  fi
+
+  [ -n "$AGENT" ] || AGENT="$identity_agent"
+  [ "$identity_agent" = "$AGENT" ] || continue
+
+  team_seen=0
+  # ${arr[@]+...} guards the empty-array expansion: under `set -u` bash 3.2
+  # (macOS default) treats "${TEAM_LIST[@]}" on an empty array as unbound.
+  for selected_team in ${TEAM_LIST[@]+"${TEAM_LIST[@]}"}; do
+    if [ "$selected_team" = "$identity_team" ]; then
+      team_seen=1
+      break
+    fi
+  done
+  [ "$team_seen" -eq 1 ] || TEAM_LIST+=("$identity_team")
+done <<< "$IDENTITIES"
+
+if [ "$IDENTITIES_VALID" -ne 1 ] || [ -z "$AGENT" ] || [ "${#TEAM_LIST[@]}" -eq 0 ]; then
   exit 0
 fi
 
@@ -170,30 +188,81 @@ if [ ! -f "$DB" ]; then exit 0; fi
 # poll was partial; only when there is nothing to deliver does the status carry
 # the failure.
 OUTPUT=""
-# Messages are marked read per team INSIDE this loop, but emitted only AFTER
-# it. Under errexit, a failure while processing a later team (either command
-# substitution below) would abort between those two points: earlier teams'
-# messages end up read_at-stamped yet never delivered, and never re-offered
-# (#637). So loop failures stop the loop instead of the script — whatever was
-# already accumulated still reaches an emit point, teams after the failing one
-# stay untouched (unread), and the failure status is re-raised on exit.
-CLAIM_RC=0
-CLAIM_FAILED_TEAM=""
-IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
+LOOP_RC=0
+LOOP_FAILED_TEAM=""
 for team in "${TEAM_LIST[@]}"; do
   storage_store_exists "$team" || continue
 
   # ONE guarded boundary for everything that reads or formats — and it must NOT
   # be invoked from a condition context.
   #
-  # Note: AGENT comes from whoami.sh, which returns the first registered
-  # agent for (project, type). It is NOT the session's in-memory actas
-  # role. That asymmetry is the Codex caveat documented in README — if a
-  # Codex session actas'd into <name>, check-inbox is still polling
-  # whatever whoami chose first, not <name>.
-  state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}") || { CLAIM_RC=$?; CLAIM_FAILED_TEAM="$team"; break; }
-  case "$state" in
-    other:*) continue ;;
+  # `RESULT=$(...) || _rc=$?` looks equivalent and is not. Putting the
+  # substitution on the left of `||` makes the whole thing a tested command, and
+  # errexit is then suppressed for what runs inside it — including the `set -e`
+  # the subshell sets for itself. Measured: storage_init returned 13,
+  # storage_list_unread carried on regardless, the assignment landed empty and
+  # SUCCEEDED, and the `[ -n "" ] || exit 98` two lines later became the
+  # subshell's status. A backend failure arrived at the caller as "this team has
+  # no unread messages", and the poll reported a clean turn.
+  #
+  # A single non-conditional assignment with errexit lifted around it does not
+  # have that property: the subshell's own `set -e` aborts at the first failure
+  # and its status is what `$?` holds. The lift is two lines wide and restored
+  # immediately.
+  #
+  # This is also why the failing operations are not listed with `|| return`
+  # inside: an enumeration is short by one the next time an operation is added,
+  # which is the defect this file exists to fix.
+  #
+  # The first attempt listed the substitutions and guarded each -- and missed
+  # one (`_arr`), which is the whole failure mode this file is about: an
+  # enumeration is short by one and the one it is short by is the defect. A
+  # subshell with its own errexit does not need the list. Anything in here that
+  # fails ends the subshell, and its status is read from `$?` below instead of
+  # ending the script.
+  #
+  # 97 and 98 are the two ordinary reasons to skip a team, carried as statuses
+  # because a subshell cannot `continue` its caller's loop.
+  set +e
+  RESULT=$(
+    set -euo pipefail
+    # Honor actas exclusivity locks. If (team, AGENT) is held by another live
+    # session, that session owns that role's inbox — don't deliver here.
+    # Mirrors watch.sh's per-pair filtering (#62).
+    #
+    # AGENT comes from identities.sh: the first registered agent for
+    # (project, type), NOT the session's in-memory actas role — the Codex
+    # caveat documented in README.
+    state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}")
+    # The leading `(` is load-bearing, not style. bash 3.2 -- which is /bin/bash
+    # on macOS, and what the macOS CI jobs run -- scans `$( ... )` for its
+    # closing paren without understanding `case`, so an unbalanced pattern paren
+    # ends the substitution early and the `;;` that follows is a syntax error.
+    # The whole file failed to parse; every check-inbox test on macOS died with
+    # "syntax error near unexpected token `;;'". Balancing the paren fixes it and
+    # is identical under bash 5.
+    case "$state" in (other:*) exit 97 ;; esac
+
+    # Unread via the storage facade (§2.1 storage_list_unread = events ∪ legacy),
+    # JSONL parsed in one pass with sqlite's JSON funcs (no jq; cf. lib/hooks-json.sh).
+    # id is kept so the mark step below targets exactly the rows shown.
+    UNREAD_JSONL=$(storage_list_unread "$team" "$AGENT")
+    [ -n "$UNREAD_JSONL" ] || exit 98
+    _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
+    agmsg_sqlite ':memory:' "
+      SELECT json_extract(value,'\$.from') || char(31) ||
+             replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
+             json_extract(value,'\$.at') || char(31) ||
+             json_extract(value,'\$.id')
+      FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
+    "
+  )
+  _rc=$?
+  set -e
+  case "$_rc" in
+    0)     ;;
+    97|98) continue ;;
+    *)     LOOP_RC=$_rc; LOOP_FAILED_TEAM="$team"; break ;;
   esac
 
   RESULT=$(agmsg_sqlite "$DB" "
