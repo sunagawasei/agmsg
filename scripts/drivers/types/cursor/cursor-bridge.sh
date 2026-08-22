@@ -63,7 +63,8 @@ Headless read-only Cursor reviewer worker for agmsg.
   --name <agent>     this worker's agmsg identity.
   --chat-id <id>     Cursor chat id to --resume each turn (from create-chat).
   --model <id>       pin every normal turn to this model id.
-  --model-label <s>  when pinned, require init.model to exactly equal this label.
+  --model-label <s>  when pinned, require init.model to exactly equal this
+                     label, or one of several '|'-separated alternatives.
   --fallback-model <id>  retry a terminal turn once on this model.
   --no-fallback      disable fallback even if another source configured one.
   --interval <sec>   inbox poll interval (default 2).
@@ -100,7 +101,7 @@ READONLY=0          # --readonly: enforce read-only via a scratch-cwd .cursor/cl
 ADD_DIRS_FILE=""    # --add-dirs-file: newline-listed extra readable dirs to advertise
 ROLE_FILE=""        # --role-file: standing role prompt prepended to each turn (empty = generic reviewer intro)
 PINNED_MODEL=""     # --model: requested model id for every normal turn
-PINNED_MODEL_LABEL="" # --model-label: exact init.model display label for pinned turns
+PINNED_MODEL_LABEL="" # --model-label: exact init.model label, or '|'-separated alternatives
 FALLBACK_ARG=""
 FALLBACK_ARG_SET=0
 NO_FALLBACK=0
@@ -152,6 +153,33 @@ sanitize_model_label_for_log() {
   local val
   val="$(printf '%s' "$1" | LC_ALL=C tr -d '[:cntrl:]')"
   printf '%s' "${val:0:160}"
+}
+
+# True when $1 equals PINNED_MODEL_LABEL, or any '|'-separated alternative in
+# it. Each alternative is compared byte-for-byte with the reported init.model;
+# the reported value is never trimmed. ASCII space/tab adjacent to '|' are
+# stripped from the spec only, so "A | B" accepts "A" or "B". Cursor can report
+# more than one init.model string for one --model id; a single-label pin
+# dead-letters the others. An empty spec, or a spec that splits to nothing,
+# never matches.
+cursor_model_label_matches() {
+  local reported="$1" spec="$PINNED_MODEL_LABEL" item rest
+  [ -n "$spec" ] || return 1
+  rest="$spec"
+  while :; do
+    case "$rest" in
+      *\|*) item="${rest%%|*}"; rest="${rest#*|}" ;;
+      *) item="$rest"; rest="" ;;
+    esac
+    while [ "${item# }" != "$item" ]; do item="${item# }"; done
+    while [ "${item#$'\t'}" != "$item" ]; do item="${item#$'\t'}"; done
+    while [ "${item% }" != "$item" ]; do item="${item% }"; done
+    while [ "${item%$'\t'}" != "$item" ]; do item="${item%$'\t'}"; done
+    if [ -n "$item" ] && [ "$reported" = "$item" ]; then
+      return 0
+    fi
+    [ -n "$rest" ] || return 1
+  done
 }
 
 if [ -n "$PINNED_MODEL" ] && ! cursor_safe_model_id "$PINNED_MODEL"; then
@@ -736,7 +764,8 @@ run_cursor_turn() {
 
   # An unpinned turn preserves legacy behavior: no model field or label match is
   # required. A pinned turn requires a non-empty string model; an explicitly
-  # configured display label is compared byte-for-byte, with no normalization.
+  # configured display label (or '|'-separated alternatives) is compared
+  # byte-for-byte, with no normalization of the reported value.
   if [ -n "$PINNED_MODEL" ]; then
     if [ "$TURN_INIT_MODEL_TYPE" != text ] || [ -z "$TURN_INIT_MODEL" ]; then
       echo "cursor-bridge: pinned turn init event did not report a non-empty model label" >&2
@@ -744,7 +773,7 @@ run_cursor_turn() {
     fi
     # A configured fallback intentionally abandons pinned-model purity. Its
     # effective label remains audited, but only normal pinned turns are matched.
-    if [ "$fallback_used" != true ] && [ -n "$PINNED_MODEL_LABEL" ] && [ "$TURN_INIT_MODEL" != "$PINNED_MODEL_LABEL" ]; then
+    if [ "$fallback_used" != true ] && [ -n "$PINNED_MODEL_LABEL" ] && ! cursor_model_label_matches "$TURN_INIT_MODEL"; then
       TURN_ERR_LINE="model label mismatch (requested '$PINNED_MODEL', reported '$(sanitize_model_label_for_log "$TURN_INIT_MODEL")', expected '$(sanitize_model_label_for_log "$PINNED_MODEL_LABEL")')"
       TURN_TERMINAL_IMMEDIATE=1
       echo "cursor-bridge: $TURN_ERR_LINE; dead-lettering without a model fallback" >&2

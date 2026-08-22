@@ -577,6 +577,33 @@ STUB
   [[ "$output" == *"fallback=false"* ]]
 }
 
+@test "cursor-bridge: pipe-separated labels accept any exact alternative" {
+  bash "$SCRIPTS/send.sh" team alice cur "verify" >/dev/null
+  bridge --model grok-4.6 --model-label "Wrong Label|Cursor Grok 4.6 High Fast|Also Wrong"
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [[ "$output" == *"STUB_REPLY"* ]]
+}
+
+@test "cursor-bridge: pipe-separated labels trim spaces next to the separator" {
+  bash "$SCRIPTS/send.sh" team alice cur "verify" >/dev/null
+  bridge --model grok-4.6 --model-label " Wrong Label | Cursor Grok 4.6 High Fast | Also Wrong "
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [[ "$output" == *"STUB_REPLY"* ]]
+}
+
+@test "cursor-bridge: pipe-separated labels still dead-letter a miss" {
+  bash "$SCRIPTS/send.sh" team alice cur "verify" >/dev/null
+  bridge --model grok-4.6 --model-label "Cursor Grok 4.60|Other Label" --fallback-model composer-2.5
+  [ "$status" -eq 0 ]
+  [ "$(turns_run)" -eq 1 ]
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [[ "$output" == *"[bridge-error]"* ]]
+  [[ "$output" == *"model label mismatch"* ]]
+  [[ "$output" != *"STUB_REPLY"* ]]
+}
+
 @test "cursor-bridge: model label mismatch immediately dead-letters without replying or retrying" {
   bash "$SCRIPTS/send.sh" team alice cur "verify" >/dev/null
   bridge --model grok-4.6 --model-label "Cursor Grok 4.60" --fallback-model composer-2.5

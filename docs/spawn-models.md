@@ -25,15 +25,21 @@ The pinned model resolution order is:
 3. unset, preserving the Cursor global/default model behavior.
 
 `spawn.cursor_model_label.<name>` is optional. When both a pin and label are
-configured, the bridge compares the label byte-for-byte with the display name
-in each stream-json `system/init` event. It does not normalize ids or use
-substring matching. Without a label the effective display name is recorded but
-not compared; without a pin, the bridge does not require the init event to have
-a model field.
+configured, the bridge compares each alternative byte-for-byte with the display
+name in each stream-json `system/init` event. A `|` in the configured value is a
+separator of exact alternatives (ASCII space/tab next to `|` is stripped from
+the spec only). It does not normalize the reported label, match ids, or use
+substrings. Without a label the effective display name is recorded but not
+compared; without a pin, the bridge does not require the init event to have a
+model field. Pin every `init.model` string observed for that id — Cursor's
+catalog rename of one `--model` id can leave two live display names, and a
+single-label pin dead-letters the other.
 
 ```sh
 agmsg config set spawn.cursor_model.wall grok-4.6
 agmsg config set spawn.cursor_model_label.wall "Cursor Grok 4.6 High Fast"
+# Same model id, two observed init.model strings:
+# agmsg config set spawn.cursor_model_label.wall "Catalog Name|Stale Init Name"
 ```
 
 Cursor fallback resolution is:
