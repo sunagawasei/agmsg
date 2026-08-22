@@ -5,6 +5,7 @@ const { spawn, spawnSync } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
 const net = require("net");
+const os = require("os");
 const path = require("path");
 const readline = require("readline");
 
@@ -1018,21 +1019,13 @@ class CodexBridge {
       : crypto.createHash("sha1").update(identities.map((p) => `${p.team}\t${p.name}`).join("\n")).digest("hex");
     this.pidfile = path.join(RUN_DIR, `codex-bridge.${key}.pid`);
     this.metafile = path.join(RUN_DIR, `codex-bridge.${key}.meta`);
-    this.drainFence = path.join(RUN_DIR, `drain.${encodeRunKey(this.identity.team)}.fence`);
-    this.drainMarker = path.join(
-      RUN_DIR,
-      `draining.${encodeRunKey(this.identity.team)}__${encodeRunKey(this.identity.name)}.${process.pid}`,
-    );
-    this.drainLeaseStaleSeconds = drainLeaseStaleSeconds();
-    // Failure notices whose send failed, persisted so they survive a restart and
-    // are retried before each new turn (cursor-bridge's outbound-first rule).
-    // Keep the spool keyed by the worker name even though bridge PID state is
-    // role-scoped: it has one consumer and must never be shared across workers.
-    this.outboundFile = path.join(
-      RUN_DIR,
-      `codex-bridge.${this.identity.team}.${this.identity.name}.outbound.json`,
-    );
-    this._pidStartToken = "";
+    // A per-PID identity lease the launcher reaper reads to tell an orphan of THIS
+    // (project, role) from any other bridge, without reconstructing argv from ps
+    // (#943). Keyed by pid so duplicates are each enumerable; content is hashes,
+    // so no raw project/role value with a separator can be misread.
+    this.leasefile = path.join(RUN_DIR, `codex-bridge-lease.${process.pid}`);
+    this.leaseStart = "";
+    this.leaseStartSrc = "";
   }
 
   inflightCli(...args) {
@@ -1248,6 +1241,94 @@ class CodexBridge {
         "drain_capable=1",
       ].join("\n") + "\n",
     );
+    this.writeLease();
+  }
+
+  // The reaper's authority. It is published atomically (temp + rename) so a
+  // reader never sees a half-written file, and BEFORE any thread/network work,
+  // so a bridge is reapable the instant it exists. project and pairs are stored
+  // as SHA-1 hashes -- the launcher hashes its own PROJECT and sorted pair set
+  // the same way and compares hex, so no separator inside a project path or role
+  // can make one identity read as another (the whole class of bugs argv parsing
+  // hit). host and the process start time are what let the reaper reject a
+  // recycled pid or another machine before it kills anything.
+  // This process's start token, at the best precision the platform offers and by
+  // the SAME method _reap_orphan_bridges (codex-bridge-launcher.sh) recomputes it
+  // for a live pid, so the two agree:
+  //   Linux -> /proc/<pid>/stat field 22 (starttime in clock ticks): lossless, so
+  //            a recycled pid is always distinguishable from the one we leased.
+  //   else  -> `ps -o lstart=` (second precision): a pid reused within the SAME
+  //            second is the documented residual on such platforms; no external
+  //            observer can do better there (etime/mtime are second-grained too),
+  //            and the only victim would be a same-(project,pair) bridge in the
+  //            sub-ms window before it overwrites this pid's lease, self-corrected
+  //            by the launcher respawning it.
+  startToken() {
+    try {
+      const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+      const after = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+      const ticks = after[19];
+      if (/^\d+$/.test(ticks || "")) return { src: "proc", token: ticks };
+    } catch (_) { /* no /proc (macOS/BSD) or unreadable */ }
+    const ps = spawnSync("ps", ["-o", "lstart=", "-p", String(process.pid)], { encoding: "utf8" });
+    const token = (ps.status === 0 ? (ps.stdout || "") : "").trim();
+    return { src: "ps", token };
+  }
+
+  writeLease() {
+    const { src, token } = this.startToken();
+    // Fail CLOSED at the source. A bridge that cannot publish a well-formed,
+    // enumerable lease must not go on to arm its network/thread -- that is exactly
+    // the authority-less orphan #906 is about. Each failure below throws, and run()
+    // publishes the lease before client.start(), so the throw aborts startup rather
+    // than leaving a live-but-unreapable bridge.
+    if (!token) throw new Error("cannot determine process start token for identity lease");
+    const host = os.hostname();
+    if (!host) throw new Error("cannot determine hostname for identity lease");
+    const projectHash = crypto.createHash("sha1").update(this.opts.project).digest("hex");
+    // Canonicalize the pair SET before hashing: hash each "team\tname" pair, then
+    // sort the hex hashes (pure ASCII, so a byte sort in the launcher and a JS
+    // code-unit sort here agree even for non-ASCII names) and hash the joined
+    // list. codex-bridge-launcher.sh computes BRIDGE_PAIRS_HASH identically.
+    const pairsHash = crypto.createHash("sha1")
+      .update(
+        this.identities
+          .map((pair) => crypto.createHash("sha1").update(`${pair.team}\t${pair.name}`).digest("hex"))
+          .sort()
+          .join("\n"),
+      )
+      .digest("hex");
+    this.leaseStart = token;
+    this.leaseStartSrc = src;
+    const body = [
+      "v=1",
+      `project=${projectHash}`,
+      `pairs=${pairsHash}`,
+      `host=${host}`,
+      `pid=${process.pid}`,
+      `start=${token}`,
+      `startsrc=${src}`,
+    ].join("\n") + "\n";
+    const tmp = `${this.leasefile}.tmp`;
+    // writeFileSync / renameSync throw on failure -> fatal, by design (see above).
+    // rename is atomic, so a reader never sees a half-written lease.
+    fs.writeFileSync(tmp, body, { mode: 0o600 });
+    fs.renameSync(tmp, this.leasefile);
+  }
+
+  // Remove only OUR lease: read it back and unlink only when both the pid and the
+  // start token still name this process, so a lease a recycled pid's new owner
+  // may have written to the same path is never deleted from under it.
+  cleanupLease() {
+    try {
+      if (!fs.existsSync(this.leasefile)) return;
+      const text = fs.readFileSync(this.leasefile, "utf8");
+      const pid = (text.match(/^pid=(.*)$/mu) || [])[1];
+      const start = (text.match(/^start=(.*)$/mu) || [])[1];
+      if (pid === String(process.pid) && start === this.leaseStart) {
+        fs.unlinkSync(this.leasefile);
+      }
+    } catch (_) { /* best effort */ }
   }
 
   installSignals() {
@@ -1272,6 +1353,7 @@ class CodexBridge {
     process.on("exit", () => {
       this.client.stop();
       this.cleanupMeta();
+      this.cleanupLease();
     });
   }
 
