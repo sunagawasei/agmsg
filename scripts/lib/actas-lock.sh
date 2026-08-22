@@ -225,10 +225,26 @@ actas_lock_owner() {
 # instance id (composite "<sid>.<pid>" or bare "<sid>" fallback); liveness is
 # delegated to agmsg_instance_alive (composite → kill -0 the embedded pid; bare
 # → live cc-instance.<pid> scan, with upgrade compat). Kept as a thin wrapper
-# so existing callers (gc_stale, watch.sh subscription, session-start GC) need
-# no change. Empty token → not alive.
+# so existing callers (watch.sh subscription, session-start GC) need no change.
+# Empty token → not alive. A false result is NOT proof of death; reclaim uses
+# actas_lock_owner_reclaimable.
 actas_lock_sid_alive() {
   agmsg_instance_alive "$1"
+}
+
+# Return 0 only when owner death is positively proved and the lock may be
+# deleted or stolen. Bare UUIDs never authorize reclaim: missing cc-instance
+# is false-dead, the same accident as #3/#22. Composite tokens reclaim only
+# when the embedded pid is gone. Empty owner (corrupt lock) is reclaimable.
+actas_lock_owner_reclaimable() {
+  local token="${1:-}" pid
+  [ -n "$token" ] || return 0
+  if agmsg_instance_is_composite "$token"; then
+    pid="${token##*.}"
+    _agmsg_pid_alive "$pid" && return 1
+    return 0
+  fi
+  return 1
 }
 
 # Internal: attempt one atomic claim. Echoes "ok" on success, "held:<sid>"
@@ -256,7 +272,11 @@ _actas_lock_try_claim() {
     echo "ok"
     return 0
   fi
-  if [ -z "$existing" ] || ! actas_lock_sid_alive "$existing"; then
+  if actas_lock_sid_alive "$existing"; then
+    printf 'held:%s\n' "$existing"
+    return 0
+  fi
+  if actas_lock_owner_reclaimable "$existing"; then
     echo "stale"
     return 0
   fi
@@ -292,7 +312,7 @@ actas_lock_claim() {
         # leave it — the next try_claim observes it as held.
         if mkdir "$reclaim_dir" 2>/dev/null; then
           _owner="$(actas_lock_owner "$team" "$agent")"
-          if [ -z "$_owner" ] || ! actas_lock_sid_alive "$_owner"; then
+          if actas_lock_owner_reclaimable "$_owner"; then
             rm -f "$lock_path"
           fi
           rmdir "$reclaim_dir" 2>/dev/null
@@ -348,7 +368,7 @@ actas_lock_gc_stale() {
   for f in "$dir"/actas.*.session; do
     [ -f "$f" ] || continue
     owner="$(head -1 "$f" 2>/dev/null || true)"
-    if [ -z "$owner" ] || ! actas_lock_sid_alive "$owner"; then
+    if actas_lock_owner_reclaimable "$owner"; then
       rm -f "$f"
       count=$((count + 1))
     fi
@@ -370,7 +390,9 @@ actas_lock_state() {
   fi
   if actas_lock_sid_alive "$owner"; then
     printf 'other:%s\n' "$owner"
+  elif actas_lock_owner_reclaimable "$owner"; then
+    echo "free"
   else
-    echo "free"  # stale owner — effectively free, GC will remove it later
+    printf 'other:%s\n' "$owner"
   fi
 }

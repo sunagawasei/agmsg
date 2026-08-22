@@ -427,7 +427,7 @@ EOF
   printf '%s\t%s\n' "$mismatch" "$(printf 'pid:%s\t%s\tclaude-code' "$mismatch_pid" /old/project)" > "$snapshot"
   printf '%s\t%s\n' "$peer" "$(printf 'pid:%s\t%s\tclaude-code' "$peer_pid" "$PROJ")" >> "$snapshot"
 
-  run bash "$SCRIPTS/session-end-worker.sh" claude-code "$PROJ" "$session" "$session" "$snapshot"
+  run bash "$SCRIPTS/session-end-worker.sh" claude-code "$PROJ" "$session" "$session.2147483647" "$snapshot"
   [ "$status" -eq 0 ]
   run kill -0 "$mismatch_pid"
   [ "$status" -eq 0 ]
@@ -438,7 +438,7 @@ EOF
   [ -f "$(agmsg_spawn_path "$steam" interactive-worker)" ]
 }
 
-@test "session-start orphan GC reaps claude-code records and preserves interactive records" {
+@test "session-start orphan GC reports claude-code records and preserves every record" {
   local orphan_team='s-C0DE-101' interactive_team='s-C0DE-104'
   local orphan_name='orphan-worker' orphan_pid
   mkdir -p "$TEST_SKILL_DIR/teams/$orphan_team" "$TEST_SKILL_DIR/teams/$interactive_team"
@@ -451,12 +451,14 @@ EOF
 
   run bash -c "printf '{\"session_id\":\"DEAD-BEEF-0001\"}' | bash '$SCRIPTS/session-start.sh' claude-code '$PROJ'"
   [ "$status" -eq 0 ]
+  local start_output="$output"
   run kill -0 "$orphan_pid"
-  [ "$status" -ne 0 ]
-  [ ! -e "$(agmsg_spawn_path "$orphan_team" "$orphan_name")" ]
+  [ "$status" -eq 0 ]
+  [ -e "$(agmsg_spawn_path "$orphan_team" "$orphan_name")" ]
   [ -f "$(agmsg_spawn_path "$interactive_team" interactive-worker)" ]
   [ -d "$TEST_SKILL_DIR/teams/$orphan_team" ]
   [ -d "$TEST_SKILL_DIR/teams/$interactive_team" ]
+  [[ "$start_output" == *"agmsg: orphan candidate team=$orphan_team worker=$orphan_name bridge_pid=$orphan_pid spawn_age_s="* ]]
 }
 
 @test "session-start TTL GC reaps stale claude-code artifacts and preserves fresh and interactive state" {

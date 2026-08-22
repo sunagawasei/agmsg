@@ -105,6 +105,8 @@ source "$SCRIPTS_DIR/lib/validate.sh"
 # shellcheck disable=SC1091
 source "$SCRIPTS_DIR/lib/process-identity.sh"
 # shellcheck disable=SC1091
+source "$SCRIPTS_DIR/lib/inflight.sh"
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/_delivery.sh"
 
 agmsg_validate_team_name "$TEAM" >/dev/null 2>&1 \
@@ -174,6 +176,9 @@ case "$BATCH_CAP" in ''|*[!0-9]*) BATCH_CAP=1048576 ;; esac
 [ "$BATCH_CAP" -le 1048576 ] || BATCH_CAP=1048576
 [ "$BATCH_CAP" -gt 0 ] || BATCH_CAP=1048576
 US=$'\x1f'
+INFLIGHT_SEQ=0
+CURRENT_INFLIGHT_EPOCH=""
+CURRENT_INFLIGHT_START=""
 
 log() {
   printf 'claude-code-bridge: %s\n' "$*" >&2
@@ -291,6 +296,8 @@ cleanup() {
 }
 
 on_signal() {
+  local signal="${1:-UNKNOWN}"
+  printf 'claude-code-bridge: received %s; shutting down\n' "$signal" >&2
   STOPPING=1
   kill_inflight
   [ -n "${WATCH_PID:-}" ] && kill "$WATCH_PID" 2>/dev/null || true
@@ -298,7 +305,8 @@ on_signal() {
 }
 
 trap cleanup EXIT
-trap on_signal INT TERM
+trap 'on_signal SIGINT' INT
+trap 'on_signal SIGTERM' TERM
 
 drain_checkpoint() {
   DRAIN_SIGNAL=0
@@ -433,8 +441,42 @@ selected_ids() {
   awk -F"$US" 'NF >= 1 { ids = ids (ids ? "," : "") $1 } END { print ids }' "$1"
 }
 
+publish_inflight() {
+  local consumers="$1" start
+  [ -s "$consumers" ] || return 1
+  start="$(agmsg_pid_start_token $$ 2>/dev/null)" || return 1
+  [ -n "$start" ] || return 1
+  INFLIGHT_SEQ=$((INFLIGHT_SEQ + 1))
+  CURRENT_INFLIGHT_EPOCH="$INFLIGHT_SEQ"
+  CURRENT_INFLIGHT_START="$start"
+  agmsg_inflight_write "$TEAM" "$NAME" claude-code \
+    "$CURRENT_INFLIGHT_EPOCH" "$$" "$start" "$consumers"
+}
+
+drop_inflight() {
+  [ -n "${CURRENT_INFLIGHT_EPOCH:-}" ] || return 0
+  agmsg_inflight_settle "$TEAM" "$NAME" "$CURRENT_INFLIGHT_EPOCH" \
+    "${CURRENT_INFLIGHT_START:-}" || true
+  CURRENT_INFLIGHT_EPOCH=""
+  CURRENT_INFLIGHT_START=""
+}
+
+settle_inflight() {
+  drop_inflight
+}
+
+compensate_inflight() {
+  local reason="$1" prefix="${2:-turn failed}"
+  [ -n "${CURRENT_INFLIGHT_EPOCH:-}" ] || return 0
+  if AGMSG_INFLIGHT_PREFIX="$prefix" AGMSG_INFLIGHT_NOTICE="$reason" \
+      agmsg_inflight_compensate "$(agmsg_inflight_path "$TEAM" "$NAME" "$CURRENT_INFLIGHT_EPOCH" "$CURRENT_INFLIGHT_START")"; then
+    CURRENT_INFLIGHT_EPOCH=""
+    CURRENT_INFLIGHT_START=""
+  fi
+}
+
 reject_poison_row() {
-  local line="$1" rendered_bytes="$2" id sender _body _ts notice
+  local line="$1" rendered_bytes="$2" id sender _body _ts notice mark_rc=0
   IFS="$US" read -r id sender _body _ts <<< "$line"
   case "$id" in ''|*[!0-9]*) return 1 ;; esac
   [ -n "$sender" ] || return 1
@@ -442,12 +484,30 @@ reject_poison_row() {
   # This row cannot become deliverable on a later wake: it exceeds the hard
   # cap even when rendered alone. Consume exactly this id and compensate its
   # sender explicitly; ordinary combined overflow never enters this path.
-  if ! agmsg_claude_code_mark_exact "$TEAM" "$NAME" "$id"; then
-    log "could not exact-mark terminally undeliverable message id $id"
+  printf '%s%s%s\n' "$sender" "$US" "$id" > "$CONSUMED_FILE.poison"
+  if ! publish_inflight "$CONSUMED_FILE.poison"; then
+    rm -f "$CONSUMED_FILE.poison" 2>/dev/null || true
+    CURRENT_INFLIGHT_EPOCH=""
+    CURRENT_INFLIGHT_START=""
+    log "could not publish in-flight record for terminally undeliverable message id $id"
     return 1
   fi
-  notice="[bridge-error] claude-code message id $id is terminally undeliverable: its rendered prompt is $rendered_bytes bytes, exceeding the stdin batch cap of $BATCH_CAP bytes. The message was consumed; resend a smaller message."
-  send_notice "$sender" "$notice" || true
+  rm -f "$CONSUMED_FILE.poison" 2>/dev/null || true
+  mark_rc=0
+  agmsg_claude_code_mark_exact "$TEAM" "$NAME" "$id" || mark_rc=$?
+  case "$mark_rc" in
+    0) ;;
+    1)
+      drop_inflight
+      log "could not exact-mark terminally undeliverable message id $id"
+      return 1
+      ;;
+    *)
+      log "mark-read outcome unverified for terminally undeliverable message id $id; keeping in-flight record"
+      return 1
+      ;;
+  esac
+  compensate_inflight "message id $id is terminally undeliverable: its rendered prompt is $rendered_bytes bytes, exceeding the stdin batch cap of $BATCH_CAP bytes" "message rejected"
   log "terminally rejected message id $id at $rendered_bytes bytes (stdin batch cap $BATCH_CAP)"
   return 0
 }
@@ -456,7 +516,7 @@ reject_poison_row() {
 # Combined overflow stops at the first deferred row. A row that cannot fit by
 # itself is terminally compensated, after which scanning continues in this wake.
 prepare_batch_admitted() {
-  local eligible line bytes ids selected_before terminal_count=0
+  local eligible line bytes ids selected_before terminal_count=0 mark_rc=0
   rm -f "$ROWS_FILE" "$SELECTED_FILE" "$CONSUMED_FILE" \
     "$PROMPT_FILE" "$SELECTED_FILE.next" "$PROMPT_FILE.next" 2>/dev/null || true
 
@@ -499,14 +559,30 @@ prepare_batch_admitted() {
   fi
   [ -s "$PROMPT_FILE" ] || build_prompt_from_rows "$SELECTED_FILE" "$PROMPT_FILE"
   make_consumed_snapshot "$SELECTED_FILE" "$CONSUMED_FILE"
-  ids="$(selected_ids "$SELECTED_FILE")"
-  [ -n "$ids" ] || return 1
-  if ! agmsg_claude_code_mark_exact "$TEAM" "$NAME" "$ids"; then
-    notify_consumed "database error while confirming exact mark-read; no Claude turn was started"
+  if ! publish_inflight "$CONSUMED_FILE"; then
+    log "could not publish in-flight record; leaving unread"
     rm -f "$CONSUMED_FILE" 2>/dev/null || true
+    CURRENT_INFLIGHT_EPOCH=""
+    CURRENT_INFLIGHT_START=""
     return 1
   fi
-  return 0
+  ids="$(selected_ids "$SELECTED_FILE")"
+  [ -n "$ids" ] || { drop_inflight; return 1; }
+  mark_rc=0
+  agmsg_claude_code_mark_exact "$TEAM" "$NAME" "$ids" || mark_rc=$?
+  case "$mark_rc" in
+    0) return 0 ;;
+    1)
+      drop_inflight
+      rm -f "$CONSUMED_FILE" 2>/dev/null || true
+      return 1
+      ;;
+    *)
+      log "mark-read outcome unverified; keeping in-flight record and not starting a turn"
+      rm -f "$CONSUMED_FILE" 2>/dev/null || true
+      return 1
+      ;;
+  esac
 }
 
 prepare_batch() {
@@ -585,11 +661,15 @@ send_notice() {
 
 notify_consumed() {
   local reason="$1" prefix="${2:-turn failed}" sender ids body
+  if [ -n "${CURRENT_INFLIGHT_EPOCH:-}" ]; then
+    compensate_inflight "$reason" "$prefix"
+    return 0
+  fi
   [ -s "$CONSUMED_FILE" ] || return 0
   while IFS="$US" read -r sender ids; do
     [ -n "$sender" ] && [ -n "$ids" ] || continue
     body="[bridge-error] claude-code $prefix (ids $ids): $reason. Messages consumed; resend to retry."
-    send_notice "$sender" "$body" || true
+    _agmsg_inflight_send_or_queue "$TEAM" "$NAME" "$sender" "$body" || true
   done < "$CONSUMED_FILE"
 }
 
@@ -604,6 +684,7 @@ notify_context_loss() {
 }
 
 flush_outbound() {
+  agmsg_inflight_outbox_flush "$TEAM" "$NAME" || true
   local esc count i to body failed="" tmp="$SPOOL_FILE.tmp.$$"
   [ -f "$SPOOL_FILE" ] || return 0
   if ! spool_valid "$SPOOL_FILE"; then
@@ -891,6 +972,7 @@ process_wake() {
 
   case "$rc" in
     0)
+      settle_inflight
       rm -f "$CONSUMED_FILE" 2>/dev/null || true
       log "completed turn on session $sid with verified outbound"
       ;;

@@ -49,6 +49,14 @@ setup_test_env() {
   # clearing the ambient value keeps unrelated ancestry and bare-id cases
   # independent of the CLI process that launched bats.
   unset CLAUDE_PID
+  # SessionEnd teardown waits for a composite owner PID to disappear
+  # (S1-c). The ancestry walk would otherwise pick up the Claude/Cursor
+  # process that launched bats, treat it as a still-live owner, and skip
+  # every legitimate teardown assertion. Empty AGMSG_AGENT_PID forces the
+  # documented bare-sid fallback for watchers and instance-id helpers.
+  # SessionEnd tests that want destructive teardown must pass a composite
+  # INSTANCE_ID whose owner PID is already dead; a bare id now skips teardown.
+  export AGMSG_AGENT_PID=""
 
   # Keep ordinary tests fast without changing production defaults. Intervals
   # are seconds (0.05s = 20 polls/s, inside the validated 0.01..60 range);
@@ -65,6 +73,22 @@ setup_test_env() {
 teardown_test_env() {
   test_fixture_cleanup
   rm -rf "$TEST_SKILL_DIR"
+}
+
+# Bind SessionEnd tests to a live owner PID so session-end.sh publishes a
+# composite INSTANCE_ID. Artifacts (pidfiles, cc-instance, actas owners)
+# created after this call must use that same AGMSG_AGENT_PID. Kill the owner
+# after session-end.sh returns so the detached worker can authorize teardown.
+agmsg_test_start_session_owner() {
+  test_fixture_start_reaped_process sleep 300
+  export AGMSG_TEST_OWNER_PID="$TEST_REAPED_PID"
+  export AGMSG_AGENT_PID="$AGMSG_TEST_OWNER_PID"
+  export AGMSG_OWNER_EXIT_GRACE_S="${AGMSG_OWNER_EXIT_GRACE_S:-2}"
+}
+
+agmsg_test_stop_session_owner() {
+  kill "${AGMSG_TEST_OWNER_PID:-}" 2>/dev/null || true
+  wait "${AGMSG_TEST_OWNER_PID:-}" 2>/dev/null || true
 }
 
 # --- Owned long-lived test fixtures -----------------------------------------

@@ -923,7 +923,106 @@ class CodexBridge {
       RUN_DIR,
       `codex-bridge.${this.identity.team}.${this.identity.name}.outbound.json`,
     );
+    this._pidStartToken = "";
   }
+
+  inflightCli(...args) {
+    return spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, "inflight.sh"), ...args], {
+      encoding: "utf8",
+      env: this.inflightEnv || process.env,
+    });
+  }
+
+  pidStartToken() {
+    if (this._pidStartToken) return this._pidStartToken;
+    const result = this.inflightCli("start-token", String(process.pid));
+    const token = String(result.stdout || "").trim();
+    if (!result.error && result.status === 0 && token) this._pidStartToken = token;
+    return this._pidStartToken;
+  }
+
+  publishInflight(pair, epoch, bySender) {
+    const token = this.pidStartToken();
+    if (!token || !bySender.size) return false;
+    fs.mkdirSync(RUN_DIR, { recursive: true });
+    const tmp = path.join(
+      RUN_DIR,
+      `.inflight-consumers.${process.pid}.${epoch}.${crypto.randomBytes(4).toString("hex")}`,
+    );
+    const lines = [];
+    for (const [sender, ids] of bySender) {
+      lines.push(`${sender}\t${ids.join(",")}`);
+    }
+    try {
+      fs.writeFileSync(tmp, `${lines.join("\n")}\n`);
+      const result = this.inflightCli(
+        "write",
+        pair.team,
+        pair.name,
+        "codex",
+        String(epoch),
+        String(process.pid),
+        token,
+        tmp,
+      );
+      if (result.error || result.status !== 0) {
+        console.error(
+          `codex-bridge: in-flight publish failed for ${pair.team}/${pair.name}: ${(result.stderr || "").trim()}`,
+        );
+        return false;
+      }
+      return true;
+    } catch (error) {
+      console.error(`codex-bridge: in-flight publish failed for ${pair.team}/${pair.name}: ${error.message}`);
+      return false;
+    } finally {
+      try { fs.unlinkSync(tmp); } catch (_) { /* ignore */ }
+    }
+  }
+
+  settleInflightEpoch(epoch) {
+    if (!epoch) return;
+    const token = this.pidStartToken();
+    if (!token) return;
+    for (const pair of this.identities) {
+      this.inflightCli("settle", pair.team, pair.name, String(epoch), token);
+    }
+  }
+
+  // Failure compensation: send.sh --force plus the spawn-free inflight outbox.
+  // The durable record is deleted only after every notice is sent or queued.
+  // Do not call settleInflightEpoch on this path.
+  compensateInflightEpoch(epoch, prefix, notice) {
+    if (!epoch) return;
+    const token = this.pidStartToken();
+    if (!token) return;
+    this.inflightEnv = {
+      ...process.env,
+      AGMSG_INFLIGHT_PREFIX: prefix || "turn interrupted",
+      AGMSG_INFLIGHT_NOTICE: notice || "the worker ended before the turn settled",
+    };
+    try {
+      for (const pair of this.identities) {
+        const result = this.inflightCli("compensate", pair.team, pair.name, String(epoch), token);
+        const err = String((result && result.stderr) || "").trim();
+        if (err) console.error(err);
+      }
+    } finally {
+      this.inflightEnv = null;
+    }
+  }
+
+  flushInflightOutbox() {
+    for (const pair of this.identities) {
+      const result = this.inflightCli("flush-outbox", pair.team, pair.name);
+      const err = String((result && result.stderr) || "").trim();
+      if (err) console.error(err);
+      else if (result && result.status) {
+        console.error(`codex-bridge: inflight outbox flush ${pair.team}/${pair.name} status=${result.status}`);
+      }
+    }
+  }
+
 
   async run() {
     fs.mkdirSync(RUN_DIR, { recursive: true });
@@ -934,8 +1033,10 @@ class CodexBridge {
     // during this startup window.
     this.writeMeta();
     // Deliver failure notices a previous bridge run spooled (send.sh was failing
-    // when it stopped) before doing anything else.
+    // when it stopped) before doing anything else. The inflight outbox is the
+    // durable path; the JSON spool is only leftover pre-T1 state.
     this.flushOutbound();
+    this.flushInflightOutbox();
     // Any thread-scoped app-server activity for OUR active turn re-arms the
     // idle watchdog -- reasoning, tool-call/command progress, agent-message
     // deltas, all of it, not just one specific notification type. See
@@ -1015,7 +1116,8 @@ class CodexBridge {
   }
 
   installSignals() {
-    const stop = () => {
+    const stop = (signal) => {
+      console.error(`codex-bridge: received ${signal}; shutting down`);
       this.shutdown().finally(() => process.exit(0));
     };
     process.on("SIGINT", stop);
@@ -1302,16 +1404,17 @@ class CodexBridge {
   async onTurnCompleted(params = {}) {
     if (params.threadId && params.threadId !== this.threadId) return;
     if (params.turn && params.turn.error) {
-      console.error(`codex-bridge: turn completed with error: ${JSON.stringify(params.turn.error)}`);
-    } else {
-      console.error(`codex-bridge: turn completed on thread ${this.threadId}`);
+      await this.onTurnFailed(params);
+      return;
     }
+    console.error(`codex-bridge: turn completed on thread ${this.threadId}`);
     const { epoch, turnId } = this.resolveTurnEpoch(params);
-    if (epoch) {
+    if (epoch && this.turnSnapshots.has(epoch)) {
       this.dropTurnEpoch(epoch);   // settled: the turn handled its consumed messages
     } else if (turnId) {
       console.error(`codex-bridge: turn/completed for unknown turn ${turnId}; no snapshot to settle`);
     }
+    this.settleInflightEpoch(epoch);
     await this.onTurnEnded({ authoritative: true });
   }
 
@@ -1330,30 +1433,15 @@ class CodexBridge {
     const { epoch, turnId } = this.resolveTurnEpoch(params);
     console.error(`codex-bridge: turn failed${turnId ? ` (turn ${turnId})` : ""}: ${reason}`);
     if (epoch && this.turnSnapshots.has(epoch)) {
-      const bySender = this.turnSnapshots.get(epoch);
       this.dropTurnEpoch(epoch);
-      this.notifyConsumed(bySender, (ids) =>
-        `[bridge-error] codex turn failed (ids ${ids}): ${reason}. Messages consumed; resend to retry.`);
+      this.compensateInflightEpoch(epoch, "turn failed", reason);
     } else if (epoch || turnId) {
       console.error(
         `codex-bridge: turn/failed for ${turnId ? `turn ${turnId}` : "the last turn"} has no pending snapshot (already settled or orphan-drained); nothing to notify`,
       );
+      this.compensateInflightEpoch(epoch, "turn failed", reason);
     }
     await this.onTurnEnded({ authoritative: true });
-  }
-
-  // Send a compensation notice to every sender in a consumption snapshot;
-  // buildNotice(idsCsv) composes the body. Send failures spool to outboundFile.
-  notifyConsumed(bySender, buildNotice) {
-    for (const [sender, ids] of bySender) {
-      const notice = buildNotice(ids.join(","));
-      if (this.sendAgmsg(sender, notice)) {
-        console.error(`codex-bridge: notified ${sender} (ids ${ids.join(",")})`);
-      } else {
-        this.queueOutbound(sender, notice);
-        console.error(`codex-bridge: could not notify ${sender}; notice spooled to ${this.outboundFile}`);
-      }
-    }
   }
 
   // Single exit point for "the turn is no longer running", reachable from
@@ -1407,15 +1495,16 @@ class CodexBridge {
     if (!this.pendingWake || this.turnActive || !this.threadIdle) return;
     // Retry spooled failure notices BEFORE burning a new turn (outbound-first).
     this.flushOutbound();
+    this.flushInflightOutbox();
     // Orphaned snapshots: a previous turn ended via idle/watchdog and neither
     // turn/completed nor turn/failed claimed its consumption snapshot before the
     // NEXT turn starts. The fate of those consumed ids is unknown — tell the
     // senders rather than stay silent, then drop the entry.
-    for (const [epoch, bySender] of Array.from(this.turnSnapshots)) {
+    for (const [epoch] of Array.from(this.turnSnapshots)) {
       console.error(`codex-bridge: orphaned snapshot for turn epoch ${epoch}; notifying its senders and dropping it`);
       this.dropTurnEpoch(epoch);
-      this.notifyConsumed(bySender, (ids) =>
-        `[bridge-error] codex turn outcome unknown (ids ${ids}): the turn ended without a completion signal. Messages consumed; resend if you got no reply.`);
+      this.compensateInflightEpoch(epoch, "turn outcome unknown",
+        "the turn ended without a completion signal");
     }
     if (this.opts.inlineInbox) {
       this.inlineInboxText = this.readInboxForPrompt();
@@ -1431,10 +1520,13 @@ class CodexBridge {
     this.threadIdle = false;
     this.authoritativeIdle = false;
     this.drainHeldAssumedEnd = false;
-    // Register this turn's consumption under a fresh local epoch BEFORE the
+    // Register this turn's consumption under a local epoch BEFORE the
     // request: turn/started (which binds the server's turn id to this epoch)
-    // can arrive while the request is still in flight.
-    this.turnEpoch += 1;
+    // can arrive while the request is still in flight. readInboxForPrompt
+    // already reserved the epoch when it published durable in-flight records.
+    if (!this.pendingConsumption || !this.pendingConsumption.size) {
+      this.turnEpoch += 1;
+    }
     this.activeTurnEpoch = this.turnEpoch;
     if (this.pendingConsumption && this.pendingConsumption.size) {
       this.turnSnapshots.set(this.turnEpoch, this.pendingConsumption);
@@ -1457,7 +1549,9 @@ class CodexBridge {
       this.turnActive = false;
       this.threadIdle = true;
       this.clearTurnWatchdog();
-      this.dropTurnEpoch(this.activeTurnEpoch);
+      const snap = this.turnSnapshots.get(this.activeTurnEpoch);
+      if (snap) this.dropTurnEpoch(this.activeTurnEpoch);
+      this.compensateInflightEpoch(this.activeTurnEpoch, "turn/start failed", error.message);
       this.activeTurnEpoch = 0;
       throw error;
     }
@@ -1683,12 +1777,9 @@ class CodexBridge {
     ].join("\n");
   }
 
-  // Inline-inbox fetch. Reads the unread snapshot WITH ids (--format ids does not
-  // mark read), remembers {id, from} per message so a failed turn can notify the
-  // senders (onTurnFailed), renders the same human-style text the plain inbox.sh
-  // path produced, then marks EXACTLY those ids read. Net consume-at-fetch
-  // semantics are unchanged (and the mark is now scoped to the snapshot instead
-  // of blanket-marking everything unread); the bridge just knows the ids.
+  // Inline-inbox fetch. Reads unread rows WITH ids (does not mark read),
+  // publishes a durable in-flight record, THEN marks exactly those ids read.
+  // Publish failure leaves the messages unread and does not start a turn.
   readInboxForPrompt() {
     this.pendingConsumption = null;
     // Re-resolve locks immediately before reading. watch-once only tells us
@@ -1704,6 +1795,8 @@ class CodexBridge {
     const allowed = new Set((eligible.stdout || "").split(/\r?\n/).filter(Boolean));
     const sections = [];
     const bySender = new Map();
+    const nextEpoch = this.turnEpoch + 1;
+    let reservedEpoch = false;
     for (const pair of this.identities) {
       if (!allowed.has(`${pair.team}\t${pair.name}`)) continue;
       const result = spawnSync(
@@ -1724,17 +1817,42 @@ class CodexBridge {
         })
         .filter((row) => /^\d+$/.test(row.id) && row.from);
       if (!rows.length) continue;
+      const pairBySender = new Map();
       for (const row of rows) {
-        if (!bySender.has(row.from)) bySender.set(row.from, []);
-        bySender.get(row.from).push(row.id);
+        if (!pairBySender.has(row.from)) pairBySender.set(row.from, []);
+        pairBySender.get(row.from).push(row.id);
       }
+      if (!this.publishInflight(pair, nextEpoch, pairBySender)) {
+        console.error(`codex-bridge: leaving ${pair.team}/${pair.name} unread after in-flight publish failure`);
+        continue;
+      }
+      const idsCsv = rows.map((row) => row.id).join(",");
       const ack = spawnSync(
         BASH_BIN,
-        [path.join(SCRIPTS_DIR, "inbox.sh"), pair.team, pair.name, "--mark-read-ids", rows.map((row) => row.id).join(",")],
+        [path.join(SCRIPTS_DIR, "inbox.sh"), pair.team, pair.name, "--mark-read-ids", idsCsv],
         { cwd: this.opts.project, encoding: "utf8" },
       );
-      if (ack.error || ack.status !== 0) {
-        console.error(`codex-bridge: mark-read-ids failed for ${pair.team}/${pair.name}; the same messages may be re-delivered next wake`);
+      if (ack.error) {
+        console.error(`codex-bridge: mark-read-ids unverified for ${pair.team}/${pair.name}; keeping in-flight record and leaving the turn unstarted`);
+        reservedEpoch = true;
+        continue;
+      }
+      const unread = this.inflightCli("unread-count", pair.team, pair.name, idsCsv);
+      const countText = String((unread && unread.stdout) || "").trim();
+      const verified = !!(unread && !unread.error && unread.status === 0 && /^\d+$/.test(countText));
+      if (!verified) {
+        console.error(`codex-bridge: mark-read verification failed for ${pair.team}/${pair.name}; keeping in-flight record and leaving the turn unstarted`);
+        reservedEpoch = true;
+        continue;
+      }
+      if (countText !== "0") {
+        console.error(`codex-bridge: mark-read-ids left unread rows for ${pair.team}/${pair.name}; dropping in-flight record`);
+        this.inflightCli("settle", pair.team, pair.name, String(nextEpoch), this.pidStartToken());
+        continue;
+      }
+      for (const [sender, ids] of pairBySender) {
+        if (!bySender.has(sender)) bySender.set(sender, []);
+        bySender.get(sender).push(...ids);
       }
       sections.push([
         `${rows.length} new message(s):`,
@@ -1743,7 +1861,14 @@ class CodexBridge {
         "",
       ].join("\n"));
     }
-    if (!sections.length) return "";
+    if (!sections.length) {
+      // A kept record occupies nextEpoch. Advance so the next unread cannot
+      // reuse that generation+epoch (no-clobber write would otherwise stall
+      // the worker until restart).
+      if (reservedEpoch) this.turnEpoch = nextEpoch;
+      return "";
+    }
+    this.turnEpoch = nextEpoch;
     this.pendingConsumption = bySender;
     return sections.join("\n\n");
   }

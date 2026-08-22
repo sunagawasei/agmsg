@@ -8,6 +8,7 @@ setup() {
   export RUN="$TEST_SKILL_DIR/run"
   export SESSION_ID="teardown-session"
   export STEAM="s-$SESSION_ID"
+  export DEAD_INSTANCE="${SESSION_ID}.2147483647"
   export PROJ="/tmp/agmsg-session-end-teardown"
   export TEST_PIDS=""
   mkdir -p "$RUN"
@@ -43,7 +44,9 @@ write_snapshot_row() {
 }
 
 @test "session-end tears down every headless worker and preserves interactive records" {
-  local codex_one_pid codex_two_pid cursor_pid
+  local codex_one_pid codex_two_pid cursor_pid owner_pid
+  test_fixture_start_reaped_process sleep 300
+  owner_pid="$TEST_REAPED_PID"
   start_headless "codex__one" codex
   codex_one_pid="$HEADLESS_PID"
   start_headless "codex two" codex
@@ -55,8 +58,12 @@ write_snapshot_row() {
   printf '@42\t%s\tclaude-code\n' "$PROJ" > "$(agmsg_spawn_path "$STEAM" "window worker")"
   printf 'herdr:wT:p43\t%s\tclaude-code\n' "$PROJ" > "$(agmsg_spawn_path "$STEAM" "herdr worker")"
 
-  printf '{"session_id":"%s"}' "$SESSION_ID" \
-    | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
+  AGMSG_AGENT_PID="$owner_pid" AGMSG_OWNER_EXIT_GRACE_S=2 \
+    printf '{"session_id":"%s"}' "$SESSION_ID" \
+    | env AGMSG_AGENT_PID="$owner_pid" AGMSG_OWNER_EXIT_GRACE_S=2 \
+      bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
+  kill "$owner_pid" 2>/dev/null || true
+  wait "$owner_pid" 2>/dev/null || true
 
   wait_until 8 bash -c \
     "[ ! -e '$(agmsg_spawn_path "$STEAM" "codex__one")' ] &&
@@ -118,7 +125,7 @@ write_snapshot_row() {
   chmod +x "$SCRIPTS/despawn.sh"
 
   run env DESPAWN_CALLS="$calls" bash "$SCRIPTS/session-end-worker.sh" \
-    claude-code "$PROJ" "$SESSION_ID" "$SESSION_ID" "$snapshot"
+    claude-code "$PROJ" "$SESSION_ID" "$DEAD_INSTANCE" "$snapshot"
   [ "$status" -eq 0 ]
   [ "$(sed -n '1p' "$calls")" = bad ]
   [ "$(sed -n '2p' "$calls")" = good ]
@@ -138,7 +145,7 @@ write_snapshot_row() {
   write_snapshot_row "$snapshot" peer "$peer_record"
 
   run bash "$SCRIPTS/session-end-worker.sh" \
-    claude-code "$PROJ" "$SESSION_ID" "$SESSION_ID" "$snapshot"
+    claude-code "$PROJ" "$SESSION_ID" "$DEAD_INSTANCE" "$snapshot"
   [ "$status" -eq 0 ]
 
   kill -0 "$survivor_pid" 2>/dev/null
@@ -156,13 +163,13 @@ write_snapshot_row() {
   : > "$empty"
 
   run bash "$SCRIPTS/session-end-worker.sh" \
-    claude-code "$PROJ" "$SESSION_ID" "$SESSION_ID" "$empty"
+    claude-code "$PROJ" "$SESSION_ID" "$DEAD_INSTANCE" "$empty"
   [ "$status" -eq 0 ]
   kill -0 "$worker_pid" 2>/dev/null
   [ "$(cat "$(agmsg_spawn_path "$STEAM" untouched)")" = "$worker_record" ]
 
   run bash "$SCRIPTS/session-end-worker.sh" \
-    claude-code "$PROJ" "$SESSION_ID" "$SESSION_ID" "$RUN/missing.snapshot"
+    claude-code "$PROJ" "$SESSION_ID" "$DEAD_INSTANCE" "$RUN/missing.snapshot"
   [ "$status" -eq 0 ]
   kill -0 "$worker_pid" 2>/dev/null
   [ "$(cat "$(agmsg_spawn_path "$STEAM" untouched)")" = "$worker_record" ]
@@ -181,7 +188,7 @@ write_snapshot_row() {
   printf '%s.%s\n' "$SESSION_ID" "$sibling" > "$RUN/cc-instance.$sibling"
 
   run bash "$SCRIPTS/session-end-worker.sh" \
-    claude-code "$PROJ" "$SESSION_ID" "$SESSION_ID" "$snapshot"
+    claude-code "$PROJ" "$SESSION_ID" "$DEAD_INSTANCE" "$snapshot"
   [ "$status" -eq 0 ]
   kill -0 "$worker_pid" 2>/dev/null
   [ "$(cat "$(agmsg_spawn_path "$STEAM" shared)")" = "$worker_record" ]

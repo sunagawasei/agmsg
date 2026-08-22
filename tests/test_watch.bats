@@ -151,8 +151,9 @@ _max_message_id() {
   local wm="$TEST_SKILL_DIR/run/watch.$iid.watermark"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
   local out="$TEST_SKILL_DIR/liveness-delivery.log"
+  local err="$TEST_SKILL_DIR/liveness-exit.log"
 
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- &
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >"$out" 2>"$err" 3>&- &
   local w=$!
   # Wait for the watermark file, not just the pidfile: the pidfile is written
   # early (before the subscription is resolved and LAST is seeded), so sending a
@@ -178,6 +179,7 @@ _max_message_id() {
   run kill -0 "$w"; [ "$status" -ne 0 ]
   [ "$first_id" != "$second_id" ]
   [ "$(cat "$wm")" = "$first_id" ]
+  [ "$(grep -c "^agmsg watch: owner token=$iid exit_reason=owner-dead$" "$err")" -eq 1 ]
   ! grep -q "M2-undelivered" "$out"
 }
 
@@ -212,11 +214,13 @@ _max_message_id() {
 }
 
 @test "session-end: removes the session watermark file" {
+  agmsg_test_start_session_owner
   # Key the watermark under the same instance id session-end will derive.
   local wm="$TEST_SKILL_DIR/run/watch.$(_iid sess-end).watermark"
   mkdir -p "$TEST_SKILL_DIR/run"
   echo 5 > "$wm"
   printf '{"session_id":"sess-end"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
+  agmsg_test_stop_session_owner
   wait_until 8 bash -c "[ ! -f '$wm' ]"   # teardown is detached now
   [ ! -f "$wm" ]
 }

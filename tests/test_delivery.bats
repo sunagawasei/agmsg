@@ -653,19 +653,22 @@ has_session_end() {
   # name claims. Converting the wait to a poll is what surfaced it: polling
   # reports the process is still there, where the single post-sleep check did
   # not.
+  agmsg_test_start_session_owner
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sess-A "$TEST_PROJECT" claude-code 3>&- &
   local target_pid=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.sess-A.pid"
+  local pidfile="$TEST_SKILL_DIR/run/watch.sess-A.$AGMSG_TEST_OWNER_PID.pid"
+  wait_for_file "$pidfile"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
+  agmsg_test_stop_session_owner
   # Teardown is detached; poll for the pidfile removal (its last watcher step).
-  wait_until 8 bash -c "[ ! -f '$TEST_SKILL_DIR/run/watch.sess-A.pid' ]"
+  wait_until 8 bash -c "[ ! -f '$pidfile' ]"
   wait_for_pid_exit "$target_pid"
   ! kill -0 "$target_pid" 2>/dev/null
-  [ ! -f "$TEST_SKILL_DIR/run/watch.sess-A.pid" ]
+  [ ! -f "$pidfile" ]
   run kill -0 "$target_pid"; [ "$status" -ne 0 ]   # watcher killed (enforced; bare ! is set-e exempt)
   kill "$target_pid" 2>/dev/null || true
 }
@@ -683,9 +686,12 @@ JSON
 
 @test "session-end.sh removes cc-instance file that points to this session" {
   mkdir -p "$TEST_SKILL_DIR/run"
-  echo "sess-A" > "$TEST_SKILL_DIR/run/cc-instance.12345"
+  agmsg_test_start_session_owner
+  local instance="sess-A.$AGMSG_TEST_OWNER_PID"
+  echo "$instance" > "$TEST_SKILL_DIR/run/cc-instance.12345"
   echo "sess-B" > "$TEST_SKILL_DIR/run/cc-instance.67890"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
+  agmsg_test_stop_session_owner
   # Teardown is detached; poll for the matching cc-instance removal.
   wait_until 8 bash -c "[ ! -f '$TEST_SKILL_DIR/run/cc-instance.12345' ]"
   [ ! -f "$TEST_SKILL_DIR/run/cc-instance.12345" ]

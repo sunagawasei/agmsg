@@ -176,6 +176,21 @@ teardown() { teardown_test_env; }
   _agmsg_pid_alive 42
 }
 
+@test "pid start token ps fallback pins UTC across caller timezones" {
+  local capture="$TEST_SKILL_DIR/ps-timezones" tokyo_token la_token
+  ps() {
+    printf '%s\n' "${TZ:-unset}" >> "$capture"
+    printf 'Fri Aug 21 00:00:00 2026\n'
+  }
+
+  tokyo_token="$(TZ=Asia/Tokyo agmsg_pid_start_token 2147483646)"
+  la_token="$(TZ=America/Los_Angeles agmsg_pid_start_token 2147483646)"
+  [ "$tokyo_token" = "ps:Fri Aug 21 00:00:00 2026" ]
+  [ "$la_token" = "$tokyo_token" ]
+  [ "$(sed -n '1p' "$capture")" = UTC ]
+  [ "$(sed -n '2p' "$capture")" = UTC ]
+}
+
 # --- agmsg_normalize_instance_id ---
 
 @test "normalize: a composite token passes through unchanged (idempotent)" {

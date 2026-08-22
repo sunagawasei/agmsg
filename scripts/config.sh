@@ -195,6 +195,8 @@ delivery:
   # session_team_ttl_days: 7
 
 drain:
+  # Wait for the composite SessionEnd owner PID to disappear before cleanup.
+  owner_exit_grace_s: 10
   # SessionEnd cooperative bridge-drain deadline, seconds.
   deadline_s: 600
   # Fence/tombstone lease refresh cadence, seconds.

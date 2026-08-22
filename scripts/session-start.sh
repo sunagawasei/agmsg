@@ -52,6 +52,10 @@ source "$SCRIPT_DIR/lib/session-team.sh"
 source "$SCRIPT_DIR/lib/role-session.sh"  # role->session reverse lookup (#339)
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/process-identity.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/pending-teardown.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/inflight.sh"
 
 # Read the hook input JSON (stdin) up-front. The hook's session_id is the
 # authoritative source for the session team, and stdin can be read only once —
@@ -287,18 +291,30 @@ if [ -n "$CC_PID" ]; then
     exit 0
   fi
   printf '%s\n' "$INSTANCE_ID" > "$STATE"
+  # Recover this team under the same lock that published cc-instance so a
+  # resume's bare-sid veto and the kill decision cannot straddle another
+  # SessionStart. Other teams are recovered after release to avoid holding
+  # two team locks at once.
+  AGMSG_TEAM_LIFECYCLE_HELD="$_lifecycle_team" \
+    AGMSG_PENDING_ONLY_TEAM="$_lifecycle_team" \
+    agmsg_pending_teardown_recover_all "$SCRIPT_DIR/despawn.sh" || true
   agmsg_team_lifecycle_lock_release "$_lifecycle_team"
+  AGMSG_PENDING_SKIP_TEAM="$_lifecycle_team" \
+    agmsg_pending_teardown_recover_all "$SCRIPT_DIR/despawn.sh" || true
+  agmsg_inflight_reap_dead || true
+else
+  # A bare SessionStart cannot publish cc-instance, so it cannot veto
+  # recovery for its own team. Do not recover here. In-flight reap is not
+  # teardown: it only dead-letters records whose process generation is gone.
+  agmsg_inflight_reap_dead || true
 fi
 
-# --- Orphan headless GC (session-team mode). ---
-# A per-session headless worker whose owning Claude session is gone (SessionEnd
-# did not fire — e.g. the terminal was force-closed) would otherwise linger.
-# Tear down every headless placement for s-<uuid> teams whose owner session is
-# no longer alive. Runs AFTER this session's cc-instance is recorded above, so
-# a resuming session's own workers (same uuid → seen alive via upgrade-compat)
-# are never reaped. Best-effort; never blocks the directive below.
+# --- Orphan headless inventory (session-team mode). ---
+# Bare session-id liveness is advisory: its absence cannot authorize teardown.
+# Report every headless placement that would historically have been reaped, but
+# never signal a process or remove registration here. Deferred teardown above
+# is the sole automatic recovery path and requires direct owner-process proof.
 if agmsg_session_team_enabled; then
-  _orphan_gc_unverified_teams=""
   # Spawn records use the same reversible encoding as actas locks:
   #   spawn.<encoded-team>__<encoded-agent>
   # Session-team names use the UUID-safe `s-<hex-and-dash>` contract, so the
@@ -306,7 +322,9 @@ if agmsg_session_team_enabled; then
   # contain `__` and are decoded after stripping the team segment.
   _orphan_gc_record() {
     local _gc_rec="$1" _gc_key _gc_enc_team _gc_enc_name
-    local _gc_team _gc_sid _gc_name _gc_snapshot _gc_id _gc_project _gc_type _gc_rc
+    local _gc_team _gc_sid _gc_name _gc_snapshot _gc_id _gc_project _gc_type
+    local _gc_pid _gc_now _gc_mtime _gc_age _gc_pending_state _gc_pending_field
+    local _gc_log_team _gc_log_name
     _gc_key="${_gc_rec##*/spawn.}"
     _gc_enc_team="${_gc_key%%__*}"
     _gc_enc_name="${_gc_key#*__}"
@@ -328,17 +346,29 @@ if agmsg_session_team_enabled; then
     IFS=$'\t' read -r _gc_id _gc_project _gc_type <<<"$_gc_snapshot" || return 0
     case "${_gc_id:-}" in
       pid:*)
-        if "$SCRIPT_DIR/despawn.sh" "$_gc_team" claude "$_gc_name" --force \
-            --expect-record "$_gc_snapshot" >/dev/null 2>&1; then
-          :
-        else
-          _gc_rc=$?
-          case "$_orphan_gc_unverified_teams" in
-            *"|$_gc_team|"*) ;;
-            *) _orphan_gc_unverified_teams="$_orphan_gc_unverified_teams|$_gc_team|" ;;
-          esac
-          echo "agmsg: orphan GC incomplete for $_gc_team/$_gc_name (despawn status $_gc_rc); preserving its placement record" >&2
-        fi
+        _gc_pid="${_gc_id#pid:}"
+        _gc_age=unknown
+        _gc_now="$(date +%s 2>/dev/null || true)"
+        _gc_mtime="$(compat_file_mtime "$_gc_rec" 2>/dev/null || true)"
+        case "$_gc_now:$_gc_mtime" in
+          *[!0-9:]*) ;;
+          *:|:*) ;;
+          *)
+            if [ "$_gc_now" -ge "$_gc_mtime" ]; then
+              _gc_age=$((_gc_now - _gc_mtime))
+            fi
+            ;;
+        esac
+        _gc_pending_state="$(agmsg_pending_teardown_owner_state \
+          "$_gc_team" "$_gc_name" 2>/dev/null || true)"
+        _gc_pending_field=""
+        [ "$_gc_pending_state" = unverified ] \
+          && _gc_pending_field=" pending_owner=unverified"
+        _gc_log_team="$(agmsg_pending_log_sanitize "$_gc_team")"
+        _gc_log_name="$(agmsg_pending_log_sanitize "$_gc_name")"
+        printf 'agmsg: orphan candidate team=%s worker=%s bridge_pid=%s spawn_age_s=%s%s\n' \
+          "$_gc_log_team" "$_gc_log_name" "$_gc_pid" "$_gc_age" \
+          "$_gc_pending_field" >&2
         ;;
       *) ;; # interactive placements (%*, @*, herdr:*) are preserved
     esac
@@ -364,17 +394,76 @@ if agmsg_session_team_enabled; then
   for _d in "$SKILL_DIR"/teams/s-*/; do
     [ -d "$_d" ] || continue
     _tn="$(basename "$_d")"                                       # s-<uuid>
-    agmsg_instance_alive "${_tn#s-}" 2>/dev/null && continue      # owner alive → keep
-    case "${_orphan_gc_unverified_teams:-}" in *"|$_tn|"*) continue ;; esac
+    _ttl_log_team="$(agmsg_pending_log_sanitize "$_tn")"
+    if agmsg_instance_alive "${_tn#s-}" 2>/dev/null; then
+      printf 'agmsg: session-team TTL GC skipped team=%s reason=bare-owner-alive\n' \
+        "$_ttl_log_team" >&2
+      continue
+    fi
+    # A live bridge recorded by this exact team is an independent veto.
+    # Malformed or unverifiable pid: placements also veto: they must not grant
+    # deletion the way HEAD's unverified despawn used to keep the team.
+    _ttl_live_bridge_pid=""
+    _ttl_unverified_placement=0
+    for _ttl_rec in "$RUN_DIR/spawn.${_tn}__"*; do
+      [ -f "$_ttl_rec" ] || continue
+      _ttl_line=""
+      IFS= read -r _ttl_line <"$_ttl_rec" 2>/dev/null || true
+      _ttl_placement="${_ttl_line%%$'\t'*}"
+      case "$_ttl_placement" in
+        pid:*)
+          _ttl_pid="${_ttl_placement#pid:}"
+          case "$_ttl_pid" in
+            ''|*[!0-9]*)
+              _ttl_unverified_placement=1
+              break
+              ;;
+          esac
+          if ! [ "$_ttl_pid" -gt 0 ] 2>/dev/null; then
+            _ttl_unverified_placement=1
+            break
+          fi
+          if _agmsg_pid_alive "$_ttl_pid"; then
+            _ttl_live_bridge_pid="$_ttl_pid"
+            break
+          fi
+          ;;
+        %*|@*|herdr:*) ;;
+        *)
+          [ -n "$_ttl_line" ] || continue
+          _ttl_unverified_placement=1
+          break
+          ;;
+      esac
+    done
+    if [ -n "$_ttl_live_bridge_pid" ]; then
+      printf 'agmsg: session-team TTL GC skipped team=%s reason=live-bridge bridge_pid=%s\n' \
+        "$_ttl_log_team" "$_ttl_live_bridge_pid" >&2
+      continue
+    fi
+    if [ "$_ttl_unverified_placement" -eq 1 ]; then
+      printf 'agmsg: session-team TTL GC skipped team=%s reason=unverified-placement\n' \
+        "$_ttl_log_team" >&2
+      continue
+    fi
     # `find -mtime` exits 0 whether or not the dir matches, so gate on its
     # OUTPUT (non-empty == older than the TTL), not its exit code.
     [ -n "$(find "$_d" -maxdepth 0 -mtime +"$_ttl" 2>/dev/null)" ] || continue  # too recent → keep
+    # Live/unverified inflight is independent proof of a still-consumed turn.
+    # Spawn may already be gone, so the live-bridge veto above cannot see it.
+    # Reap dead generations first; if any record remains, keep the whole team.
+    if ! agmsg_inflight_gc_team "$_tn"; then
+      printf 'agmsg: session-team TTL GC skipped team=%s reason=live-inflight\n' \
+        "$_ttl_log_team" >&2
+      continue
+    fi
     rm -rf "$_d" 2>/dev/null || true
     rm -rf "$SKILL_DIR/run/codex-$_tn-cwd" 2>/dev/null || true
     rm -f "$SKILL_DIR/run/codex-bridge.$_tn".* 2>/dev/null || true
     rm -rf "$SKILL_DIR/run/claude-code-$_tn-"*-cwd 2>/dev/null || true
     rm -f "$SKILL_DIR/run/claude-code-bridge.$_tn".* 2>/dev/null || true
     rm -f "$SKILL_DIR/run/spawn.$_tn"__* 2>/dev/null || true
+    rm -f "$SKILL_DIR/run/pending-teardown.$_tn"__* 2>/dev/null || true
     rm -rf "$SKILL_DIR/run/placement.$_tn"__*.lock 2>/dev/null || true
   done
 fi

@@ -109,6 +109,8 @@ source "$SCRIPT_DIR/lib/identity-key.sh"
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/type-registry.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/pending-teardown.sh"
 
 PROCESS_TIMEOUT="${AGMSG_WATCHDOG_PROCESS_TIMEOUT:-60}"
 PROCESS_GRACE="${AGMSG_WATCHDOG_PROCESS_GRACE:-1}"
@@ -383,6 +385,7 @@ watchdog_tombstone_fresh() {
   local path="$1" now="$2" stamp extra mtime age
   local mtime_status=0 read_status extra_status valid=1
   local -a probe_status=()
+  WATCHDOG_TOMBSTONE_OWNER=""
   [ -f "$path" ] || return 1
   [ ! -L "$path" ] || return 1
   [ -O "$path" ] || return 1
@@ -421,7 +424,53 @@ watchdog_tombstone_fresh() {
   case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
   [ "$now" -ge "$mtime" ] || return 1
   age=$((now - mtime))
-  [ "$age" -le 600 ]
+  [ "$age" -le 600 ] || return 1
+  WATCHDOG_TOMBSTONE_OWNER="$stamp"
+  return 0
+}
+
+write_compensation_pending() {
+  local name="$1" type="$2" record="$3"
+  local env_owner="${AGMSG_WATCHDOG_OWNER_INSTANCE:-}"
+  local env_start="${AGMSG_WATCHDOG_OWNER_START:-}"
+  local tomb_owner="${WATCHDOG_TOMBSTONE_OWNER:-}"
+  local owner_state=unverified owner_instance="" owner_pid="" owner_start=""
+  local current_start="" owner_ambiguous=0
+
+  if [ -n "$env_owner" ] && [ -n "$tomb_owner" ] \
+      && [ "$env_owner" != "$tomb_owner" ]; then
+    owner_instance="$env_owner"
+    owner_ambiguous=1
+  elif [ -n "$env_owner" ]; then
+    owner_instance="$env_owner"
+    owner_start="$env_start"
+  else
+    owner_instance="$tomb_owner"
+  fi
+
+  if [ "$owner_ambiguous" -eq 0 ] \
+      && agmsg_instance_is_composite "$owner_instance"; then
+    owner_pid="${owner_instance##*.}"
+    if [ -z "$owner_start" ] && _agmsg_pid_alive "$owner_pid"; then
+      owner_start="$(agmsg_pid_start_token "$owner_pid" 2>/dev/null || true)"
+    fi
+    if [ -n "$owner_start" ]; then
+      if _agmsg_pid_alive "$owner_pid"; then
+        current_start="$(agmsg_pid_start_token "$owner_pid" 2>/dev/null || true)"
+        if [ -n "$current_start" ] && [ "$current_start" = "$owner_start" ]; then
+          owner_state=verified
+        fi
+      else
+        # The watcher supplied the generation while the owner was live. Its
+        # later disappearance is affirmative evidence for deferred recovery.
+        owner_state=verified
+      fi
+    fi
+  fi
+
+  agmsg_pending_teardown_write "$TEAM" "$name" "$type" \
+    watchdog-compensation-incomplete "$record" "$owner_state" \
+    "$owner_instance" "$owner_pid" "$owner_start" "$env_owner" "$tomb_owner"
 }
 
 load_attempts() {
@@ -701,10 +750,13 @@ while IFS= read -r NAME; do
   # fresh tombstone, while spawn is running. Recheck only after the exact new
   # record is verified. If fenced, compare-and-act against that captured record
   # rather than any later reread. Compensation is bounded best-effort; an
-  # uncompensated worker is reaped by SessionEnd teardown / SessionStart orphan
-  # GC.
+  # uncompensated worker is recorded for owner-verified deferred teardown.
+  post_tombstone_fresh=0
+  if watchdog_tombstone_fresh "$TOMBSTONE" "$POST_NOW"; then
+    post_tombstone_fresh=1
+  fi
   if ! intent_is_owned "$INTENT" "$OWNER" "$RECORD" "$POST_NOW" \
-      || watchdog_tombstone_fresh "$TOMBSTONE" "$POST_NOW"; then
+      || [ "$post_tombstone_fresh" -eq 1 ]; then
     compensation_rc=0
     if run_bounded env AGMSG_WATCHDOG_INTENT_TOKEN="$OWNER" \
         "$SCRIPT_DIR/despawn.sh" "$TEAM" claude "$NAME" --force \
@@ -716,9 +768,17 @@ while IFS= read -r NAME; do
     if [ "$compensation_rc" -ne 0 ] \
         || printf '%s\n' "$LAST_PROCESS_OUTPUT" \
           | grep -q 'status=skipped .*reason=record-changed'; then
+      pending_state=write-failed
+      if write_compensation_pending "$NAME" "$TYPE" "$NEW_RECORD"; then
+        pending_path="$(agmsg_pending_teardown_path "$TEAM" "$NAME")"
+        if agmsg_pending_teardown_read "$pending_path" >/dev/null 2>&1; then
+          pending_state="$AGMSG_PENDING_OWNER_STATE"
+        fi
+      fi
       # Stable incomplete-compensation notification (stdout, never agmsg send):
-      #   watchdog: compensation incomplete <team>/<name>
-      printf 'watchdog: compensation incomplete %s/%s\n' "$TEAM" "$NAME"
+      #   watchdog: compensation incomplete <team>/<name> pending=<state>
+      printf 'watchdog: compensation incomplete %s/%s pending=%s\n' \
+        "$TEAM" "$NAME" "$pending_state"
     fi
     intent_remove_owned "$INTENT" "$OWNER" "$RECORD" "$POST_NOW"
     if [ "$compensation_rc" -eq 124 ]; then

@@ -258,12 +258,14 @@ STUB
   # Fake a spawned headless codex: a live process, its placement record, and the
   # bridge meta the real worker writes — so despawn's pid-reuse guard confirms the
   # recorded pid against meta and proceeds to kill it.
+  agmsg_test_start_session_owner
   test_fixture_start_reaped_process sleep 300
   local fake="$TEST_REAPED_PID"
   mkdir -p "$TEST_SKILL_DIR/run"
   printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-end" > "$TEST_SKILL_DIR/run/spawn.s-sessEND__codex"
   printf 'pid=%s\n' "$fake" > "$TEST_SKILL_DIR/run/codex-bridge.s-sessEND.codex.meta"
   printf '{"session_id":"sessEND"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
+  agmsg_test_stop_session_owner
   # Teardown is detached now; poll for the placement-record removal (its last step).
   wait_until 8 bash -c "[ ! -f '$TEST_SKILL_DIR/run/spawn.s-sessEND__codex' ]"
   [ ! -f "$TEST_SKILL_DIR/run/spawn.s-sessEND__codex" ]          # placement removed
@@ -294,10 +296,12 @@ exit 1
 STUB
   chmod +x "$stub_bin/ps"
   mkdir -p "$TEST_SKILL_DIR/run"
+  agmsg_test_start_session_owner
   printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-aps" > "$TEST_SKILL_DIR/run/spawn.s-sessAPS__codex"
   printf '{"session_id":"sessAPS"}' | env PATH="$stub_bin:$PATH" \
     FAKE_BRIDGE_PID="$fake" FAKE_IDENTITY_KEY="$key" \
     bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
+  agmsg_test_stop_session_owner
   wait_until 8 bash -c "[ ! -f '$TEST_SKILL_DIR/run/spawn.s-sessAPS__codex' ]"
   [ ! -f "$TEST_SKILL_DIR/run/spawn.s-sessAPS__codex" ]
   run kill -0 "$fake"; [ "$status" -ne 0 ]
@@ -342,7 +346,9 @@ STUB
   test_fixture_start_reaped_process sleep 300
   local sib="$TEST_REAPED_PID"
   printf 'sessSIB.%s\n' "$sib" > "$TEST_SKILL_DIR/run/cc-instance.$sib"
+  agmsg_test_start_session_owner
   printf '{"session_id":"sessSIB"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
+  agmsg_test_stop_session_owner
   # Retained negative window: sibling preservation has no completion artifact
   # to poll, so keep one watchdog cadence before asserting survival.
   sleep 1
@@ -359,22 +365,23 @@ STUB
   kill "$fake" 2>/dev/null || true
 }
 
-@test "session-start: orphan-codex GC reaps a bridge whose owner session is dead" {
+@test "session-start: orphan-codex GC reports a bridge whose owner session is unverified" {
   enable_st
-  # Fake a headless codex bridge for a DEAD session (no live cc-instance for it).
-  local key
-  key="$(agmsg_identity_key s-DEADCA codex)"
-  test_fixture_start_reaped_process bash -c \
-    'exec -a "$1" sleep 300' _ \
-    "node /x/codex-bridge.js --identity-key $key --pair s-DEADCA	codex --inline-inbox"
+  # Report-only GC must leave the process and placement alone. A plain sleep is
+  # enough: nix coreutils is a multicall binary, so `exec -a` with a bridge
+  # argv0 makes `sleep` exit immediately (`unknown program`).
+  test_fixture_start_reaped_process sleep 300
   local fake="$TEST_REAPED_PID"
   mkdir -p "$TEST_SKILL_DIR/run"
   printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-gc" > "$TEST_SKILL_DIR/run/spawn.s-DEADCA__codex"
   printf 'pid=%s\nidentities=s-DEADCA/codex\ntype=codex\n' "$fake" > "$TEST_SKILL_DIR/run/codex-bridge.s-DEADCA.codex.meta"
   # A live (different) session start runs the GC pass.
-  printf '{"session_id":"sess-gc-self"}' | bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
-  wait_for_pid_exit "$fake"
-  ! kill -0 "$fake" 2>/dev/null
+  run bash -c "printf '{\"session_id\":\"sess-gc-self\"}' | bash '$SCRIPTS/session-start.sh' claude-code '$PROJ'"
+  [ "$status" -eq 0 ]
+  kill -0 "$fake" 2>/dev/null
+  [ -f "$TEST_SKILL_DIR/run/spawn.s-DEADCA__codex" ]
+  [[ "$output" == *"agmsg: orphan candidate team=s-DEADCA worker=codex bridge_pid=$fake spawn_age_s="* ]]
+  kill "$fake" 2>/dev/null || true
 }
 
 # --- PR3: stale session-team TTL GC ------------------------------------------

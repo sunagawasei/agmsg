@@ -28,6 +28,10 @@ source "$SCRIPT_DIR/lib/session-team.sh"
 source "$SCRIPT_DIR/lib/identity-key.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/team-lifecycle.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/pending-teardown.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/inflight.sh"
 
 duration_config() {
   local env_name="$1" key="$2" default="$3" raw
@@ -41,6 +45,9 @@ duration_config() {
 DRAIN_DEADLINE_S="$(duration_config AGMSG_DRAIN_DEADLINE_S drain.deadline_s 600)"
 DRAIN_LEASE_INTERVAL_S="$(duration_config AGMSG_DRAIN_LEASE_INTERVAL_S drain.lease_interval_s 30)"
 DRAIN_LEASE_STALE_S="$(duration_config AGMSG_DRAIN_LEASE_STALE_S drain.lease_stale_s 120)"
+OWNER_EXIT_GRACE_S="$(duration_config AGMSG_OWNER_EXIT_GRACE_S drain.owner_exit_grace_s 10)"
+OWNER_EXIT_POLL_INTERVAL="$(agmsg_wait_knob_resolve \
+  "${AGMSG_OWNER_EXIT_POLL_INTERVAL-}" 0.1 0.01 1 decimal)"
 DRAIN_POLL_INTERVAL="$(agmsg_wait_knob_resolve \
   "${AGMSG_DRAIN_POLL_INTERVAL-}" 1 0.01 60 decimal)"
 LIFECYCLE_LOCK_TIMEOUT="${AGMSG_LIFECYCLE_LOCK_TIMEOUT:-10}"
@@ -49,6 +56,15 @@ case "$LIFECYCLE_LOCK_TIMEOUT" in ''|*[!0-9]*) LIFECYCLE_LOCK_TIMEOUT=10 ;; esac
 DRAIN_NONCE=""
 DRAIN_FENCE="$(agmsg_drain_fence_path "$STEAM")"
 DRAIN_ABORTED=0
+
+# Retry teardown left by earlier SessionEnd/watchdog races. A bare instance
+# cannot publish cc-instance, so it cannot veto recovery for its own team.
+# Skip recovery entirely rather than authorizing teardown from missing
+# registration.
+if agmsg_instance_is_composite "$INSTANCE_ID"; then
+  agmsg_pending_teardown_recover_all "$SCRIPT_DIR/despawn.sh" || true
+fi
+agmsg_inflight_reap_dead || true
 
 cleanup_owned_artifacts() {
   local current marker remove_tombstone=1
@@ -281,6 +297,7 @@ cleanup_target_locked() {
     echo "session-end-worker: teardown incomplete for $STEAM/$name (despawn status $despawn_rc); preserving its placement record" >&2
     return 4
   fi
+  rm -f -- "$(agmsg_pending_teardown_path "$STEAM" "$name")" 2>/dev/null || true
   return 0
 }
 
@@ -357,8 +374,100 @@ cleanup_session_artifacts() {
   actas_lock_release_all "$INSTANCE_ID" 2>/dev/null || true
 }
 
-# Existing per-session cleanup before the drain decision.
+# Success means the embedded owner PID still identifies the generation seen at
+# worker startup. A missing start token cannot prove replacement and therefore
+# fails closed as "same" while the PID remains live.
+owner_process_same_generation() {
+  local current_start="" owner_method current_method
+  _agmsg_pid_alive "$OWNER_PID" || return 1
+  [ -n "$OWNER_START" ] || return 0
+  current_start="$(agmsg_pid_start_token "$OWNER_PID" 2>/dev/null)" || return 0
+  owner_method="$(agmsg_pid_start_token_method "$OWNER_START" 2>/dev/null || true)"
+  current_method="$(agmsg_pid_start_token_method "$current_start" 2>/dev/null || true)"
+  [ -n "$owner_method" ] && [ -n "$current_method" ] \
+    && [ "$owner_method" = "$current_method" ] || return 0
+  [ "$current_start" = "$OWNER_START" ]
+}
+
+wait_for_owner_exit() {
+  local started now deadline
+  owner_process_same_generation || return 1
+  started="$(_agmsg_wait_epoch_seconds 2>/dev/null)" || {
+    sleep "$OWNER_EXIT_GRACE_S"
+    owner_process_same_generation
+    return $?
+  }
+  deadline=$((started + OWNER_EXIT_GRACE_S))
+  while owner_process_same_generation; do
+    now="$(_agmsg_wait_epoch_seconds 2>/dev/null)" || {
+      sleep "$OWNER_EXIT_POLL_INTERVAL"
+      continue
+    }
+    [ "$now" -ge "$deadline" ] && return 0
+    sleep "$OWNER_EXIT_POLL_INTERVAL"
+  done
+  return 1
+}
+
+write_owner_pending_records() {
+  local owner_state=verified reason=session-end-owner-alive i=0 written=0 failed=0
+  if [ -z "$OWNER_START" ]; then
+    owner_state=unverified
+    reason=session-end-owner-unverified
+  fi
+  while [ "$i" -lt "$SNAPSHOT_COUNT" ]; do
+    if agmsg_pending_teardown_write "$STEAM" "${SNAPSHOT_NAMES[$i]}" \
+        "${SNAPSHOT_RECORDS[$i]##*$'\t'}" "$reason" \
+        "${SNAPSHOT_RECORDS[$i]}" "$owner_state" "$INSTANCE_ID" \
+        "$OWNER_PID" "$OWNER_START" "$INSTANCE_ID" "$INSTANCE_ID"; then
+      written=$((written + 1))
+    else
+      failed=$((failed + 1))
+    fi
+    i=$((i + 1))
+  done
+  printf 'session-end-worker: teardown skipped instance=%s owner_pid=%s reason=owner-still-alive pending=%s pending_write_failed=%s\n' \
+    "$INSTANCE_ID" "$OWNER_PID" "$written" "$failed" >&2
+}
+
+# Load the immutable hook snapshot before any owner wait. The wait never holds
+# the lifecycle lock, and the snapshot remains the compare-and-act guard if the
+# owner exits and normal teardown proceeds.
+SNAPSHOT_NAMES=()
+SNAPSHOT_RECORDS=()
+SNAPSHOT_COUNT=0
+if [ -s "$SNAPSHOT_PATH" ]; then
+  while IFS=$'\t' read -r _name _record || [ -n "${_name:-}${_record:-}" ]; do
+    case "${_record%%$'\t'*}" in
+      pid:*)
+        SNAPSHOT_NAMES+=("$_name")
+        SNAPSHOT_RECORDS+=("$_record")
+        SNAPSHOT_COUNT=$((SNAPSHOT_COUNT + 1))
+        ;;
+    esac
+  done < "$SNAPSHOT_PATH"
+fi
+
+# Existing non-destructive bookkeeping remains first. Destructive cleanup is
+# authorized only after a composite owner's process generation disappears.
+# A bare instance id cannot prove owner death, so it never authorizes teardown.
 agmsg_marker_gc_stale 2>/dev/null || true
+if ! agmsg_instance_is_composite "$INSTANCE_ID"; then
+  printf 'session-end-worker: teardown skipped instance=%s reason=bare-instance-id\n' \
+    "$(agmsg_pending_log_sanitize "$INSTANCE_ID")" >&2
+  exit 0
+fi
+OWNER_PID="${INSTANCE_ID##*.}"
+OWNER_START="$(agmsg_pid_start_token "$OWNER_PID" 2>/dev/null || true)"
+if wait_for_owner_exit; then
+  write_owner_pending_records
+  # Close the timeout/write race: if the owner exited while records were being
+  # published, continue normal teardown now. Otherwise the pending records
+  # preserve the work for the next lifecycle pass. A live same-sid sibling
+  # cannot suppress the pending write; recover's bare-sid veto holds the kill.
+  owner_process_same_generation && exit 0
+fi
+
 PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
 if [ -f "$PIDFILE" ] && [ ! -L "$PIDFILE" ]; then
   pid="$(cat "$PIDFILE" 2>/dev/null || true)"
@@ -379,23 +488,6 @@ if session_sibling_alive; then
   exit 0
 fi
 
-# Load the immutable hook snapshot before competing for fence ownership. A
-# duplicate worker may unlink the shared temp path on its own exit; both workers
-# must already hold the same rows in memory before one can become the winner.
-SNAPSHOT_NAMES=()
-SNAPSHOT_RECORDS=()
-SNAPSHOT_COUNT=0
-if [ -s "$SNAPSHOT_PATH" ]; then
-  while IFS=$'\t' read -r _name _record || [ -n "${_name:-}${_record:-}" ]; do
-    case "${_record%%$'\t'*}" in
-      pid:*)
-        SNAPSHOT_NAMES+=("$_name")
-        SNAPSHOT_RECORDS+=("$_record")
-        SNAPSHOT_COUNT=$((SNAPSHOT_COUNT + 1))
-        ;;
-    esac
-  done < "$SNAPSHOT_PATH"
-fi
 if [ "$SNAPSHOT_COUNT" -eq 0 ]; then
   cleanup_session_artifacts
   exit 0

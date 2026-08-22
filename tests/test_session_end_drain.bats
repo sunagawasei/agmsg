@@ -8,6 +8,7 @@ setup() {
   export RUN="$TEST_SKILL_DIR/run"
   export SESSION_ID="drain-session"
   export STEAM="s-$SESSION_ID"
+  export DEAD_INSTANCE="${SESSION_ID}.2147483647"
   export PROJ="$TEST_SKILL_DIR/project"
   export TEST_PIDS=""
   mkdir -p "$RUN" "$PROJ"
@@ -83,7 +84,7 @@ start_stub_bridge() {
 }
 
 run_worker() {
-  local snapshot="$1" instance="${2:-$SESSION_ID}"
+  local snapshot="$1" instance="${2:-$DEAD_INSTANCE}"
   AGMSG_DRAIN_DEADLINE_S="${AGMSG_DRAIN_DEADLINE_S:-3}" \
   AGMSG_DRAIN_LEASE_INTERVAL_S="${AGMSG_DRAIN_LEASE_INTERVAL_S:-1}" \
   AGMSG_DRAIN_LEASE_STALE_S="${AGMSG_DRAIN_LEASE_STALE_S:-3}" \
@@ -133,22 +134,21 @@ write_snapshot() {
   [ "$(wc -l < "$fence" | tr -d ' ')" -eq 4 ]
 }
 
-@test "non-capable bridge gets no USR2 and force cleanup leaves no child orphan" {
+@test "bare INSTANCE_ID skips destructive teardown for a non-capable bridge" {
   local snapshot="$RUN/noncap.snapshot" pid child
   start_stub_bridge old-worker 0 ignore-usr2
   pid="$STUB_PID"
   child="$(cat "$STUB_CHILD_PATH")"
   write_snapshot "$snapshot" old-worker "$STUB_RECORD"
 
-  run run_worker "$snapshot"
+  run run_worker "$snapshot" "$SESSION_ID"
   [ "$status" -eq 0 ]
-  run grep -q '^USR2$' "$STUB_EVENTS_PATH"
+  [ "$(printf '%s\n' "$output" | grep -c '^session-end-worker: teardown skipped .*reason=bare-instance-id$')" -eq 1 ]
+  run grep -q '^TERM$' "$STUB_EVENTS_PATH"
   [ "$status" -ne 0 ]
-  grep -q '^TERM$' "$STUB_EVENTS_PATH"
-  run kill -0 "$pid"
-  [ "$status" -ne 0 ]
-  wait_for_pid_exit "$child"
-  [ ! -e "$(agmsg_spawn_path "$STEAM" old-worker)" ]
+  kill -0 "$pid" 2>/dev/null
+  kill -0 "$child" 2>/dev/null
+  [ -e "$(agmsg_spawn_path "$STEAM" old-worker)" ]
 }
 
 @test "two concurrent workers produce one fence owner and one bridge nudge" {
@@ -156,7 +156,7 @@ write_snapshot() {
   start_stub_bridge capable 1 exit-on-usr2
   pid="$STUB_PID"
   write_snapshot "$snapshot" capable "$STUB_RECORD"
-  printf '%s\n' "$SESSION_ID" > "$RUN/watchdog.$STEAM.tombstone"
+  printf '%s\n' "$DEAD_INSTANCE" > "$RUN/watchdog.$STEAM.tombstone"
 
   run_worker "$snapshot" > "$TEST_SKILL_DIR/worker1.log" 2>&1 & w1=$!
   run_worker "$snapshot" > "$TEST_SKILL_DIR/worker2.log" 2>&1 & w2=$!
@@ -314,7 +314,7 @@ STUB
   sleep 1.4
   second_mtime="$(stat -c '%Y' "$tombstone" 2>/dev/null || stat -f '%m' "$tombstone")"
   [ "$second_mtime" -gt "$first_mtime" ]
-  [ "$(cat "$tombstone")" = "$SESSION_ID" ]
+  [ "$(cat "$tombstone")" = "$DEAD_INSTANCE" ]
   wait "$worker"
 }
 

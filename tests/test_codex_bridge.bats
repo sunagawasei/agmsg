@@ -1094,6 +1094,57 @@ EOF
   printf '%s\n' "$fake"
 }
 
+write_turn_completed_error_fake() {
+  local fake="$TEST_SKILL_DIR/fake-app-server-turn-completed-error.js"
+  cat >"$fake" <<'EOF'
+const readline = require("readline");
+const rl = readline.createInterface({ input: process.stdin });
+
+function send(value) {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  } else if (message.method === "thread/start") {
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: { thread: { id: "thread-1", status: { type: "idle" } } },
+    });
+  } else if (message.method === "process/spawn") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+    setTimeout(() => {
+      send({
+        jsonrpc: "2.0",
+        method: "process/exited",
+        params: {
+          processHandle: message.params.processHandle,
+          exitCode: 0,
+          stdout: "status=pending count=1 max_id=1\n",
+          stderr: "",
+        },
+      });
+    }, 10);
+  } else if (message.method === "turn/start") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+    setTimeout(() => {
+      send({
+        jsonrpc: "2.0",
+        method: "turn/completed",
+        params: { threadId: message.params.threadId, turn: { error: { message: "model exploded" } } },
+      });
+    }, 10);
+  } else if (message.method === "process/kill") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  }
+});
+EOF
+  printf '%s\n' "$fake"
+}
+
 @test "codex-bridge: inline-inbox turn/failed notifies the sender instead of losing the message" {
   run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
   if [ "$status" -ne 0 ]; then
@@ -1118,9 +1169,80 @@ EOF
   [[ "$output" == *"[bridge-error] codex turn failed (ids $mid)"* ]]
   [[ "$output" == *"model exploded"* ]]
   [[ "$output" == *"resend to retry"* ]]
+  # durable in-flight is settled after the authoritative failure
+  shopt -s nullglob
+  leftover=("$TEST_SKILL_DIR"/run/inflight-record.*)
+  [ "${#leftover[@]}" -eq 0 ]
   # the message stays consumed — no unread-retry loop (the cursor incident)
   run bash "$SCRIPTS/inbox.sh" team alice --format ids
   [ -z "$output" ]
+}
+
+@test "codex-bridge: turn/completed with turn.error compensates instead of settling as success" {
+  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
+  if [ "$status" -ne 0 ]; then
+    skip "node child_process.spawn is not available in this sandbox"
+  fi
+
+  bash "$SCRIPTS/send.sh" team bob alice "doomed body" >/dev/null
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  local mid="${output%%$'\x1f'*}"
+  [ -n "$mid" ]
+
+  local fake
+  fake="$(write_turn_completed_error_fake)"
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake" run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --max-wakes 1 --inline-inbox
+
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "turn failed" ]]
+  run bash "$SCRIPTS/inbox.sh" team bob
+  [[ "$output" == *"[bridge-error] codex turn failed (ids $mid)"* ]]
+  [[ "$output" == *"model exploded"* ]]
+  shopt -s nullglob
+  leftover=("$TEST_SKILL_DIR"/run/inflight-record.*)
+  [ "${#leftover[@]}" -eq 0 ]
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [ -z "$output" ]
+}
+
+@test "codex-bridge: unverified unread-count keeps inflight and does not reuse the epoch" {
+  bash "$SCRIPTS/send.sh" team bob alice "first consumed" >/dev/null
+  run node - "$TYPES/codex/codex-bridge.js" "$PROJ" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const { CodexBridge } = require(process.argv[2]);
+const project = process.argv[3];
+const skillDir = path.resolve(path.dirname(process.argv[2]), "..", "..", "..", "..");
+const runDir = path.join(skillDir, "run");
+const inflight = () => fs.readdirSync(runDir).filter((name) => name.startsWith("inflight-record."));
+const bridge = new CodexBridge({
+  project,
+  type: "codex",
+  requestTimeoutMs: 0,
+  turnTimeout: 0,
+  maxWakes: 0,
+  inlineInbox: true,
+}, [{ team: "team", name: "alice" }]);
+const orig = bridge.inflightCli.bind(bridge);
+bridge.inflightCli = (...args) => {
+  if (args[0] === "unread-count") {
+    return { error: null, status: 1, stdout: "", stderr: "" };
+  }
+  return orig(...args);
+};
+const first = bridge.readInboxForPrompt();
+if (first.trim() !== "") process.exit(1);
+if (inflight().length !== 1) process.exit(2);
+if (bridge.turnEpoch !== 1) process.exit(3);
+if (!bridge.publishInflight({ team: "team", name: "alice" }, bridge.turnEpoch + 1, new Map([["bob", ["99"]]]))) {
+  process.exit(4);
+}
+if (inflight().length !== 2) process.exit(5);
+process.stdout.write("ok\n");
+NODE
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ok"* ]]
 }
 
 @test "codex-bridge: a turn-failed notice that cannot be sent is spooled and delivered on the next run" {
@@ -1141,20 +1263,28 @@ EOF
   AGMSG_CODEX_APP_SERVER_CMD="node $fake" run node "$TYPES/codex/codex-bridge.js" \
     --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --max-wakes 1 --inline-inbox
   [ "$status" -eq 0 ]
-  [[ "$output" == *"notice spooled"* ]]
-  [ -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.outbound.json" ]
-  grep -q "bridge-error" "$TEST_SKILL_DIR/run/codex-bridge.team.alice.outbound.json"
+  [[ "$output" == *"inflight compensated"* ]]
+  [ -d "$TEST_SKILL_DIR/run/inflight-outbox.team=alice" ]
+  [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.outbound.json" ]
+  # A confirmed despawn must not drop the inflight outbox (gc_bridge_state
+  # still deletes the old JSON spool).
+  rm -f "$TEST_SKILL_DIR/run/"*"-bridge.team.alice.outbound."* 2>/dev/null || true
+  [ -d "$TEST_SKILL_DIR/run/inflight-outbox.team=alice" ]
+  shopt -s nullglob
+  queued=("$TEST_SKILL_DIR/run/inflight-outbox.team=alice"/*.to)
+  [ "${#queued[@]}" -ge 1 ]
 
-  # Send path recovers; a fresh bridge run flushes the spool at startup (this run
-  # then stops on the stale-wake guard — no unread left — which is fine).
+  # Send path recovers; a fresh bridge run flushes the inflight outbox at startup.
   mv "$SCRIPTS/send.sh.orig" "$SCRIPTS/send.sh"
   chmod +x "$SCRIPTS/send.sh"
   AGMSG_CODEX_APP_SERVER_CMD="node $fake" run node "$TYPES/codex/codex-bridge.js" \
     --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --max-wakes 1 --inline-inbox
-  [[ "$output" == *"delivered spooled notice to bob"* ]]
-  [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.outbound.json" ]
+  # The retry run flushes at startup, then may stop on a stale wake (the original
+  # request was already consumed). Delivery is what this test asserts.
+  [[ "$output" == *"inflight outbox delivered"* ]]
   run bash "$SCRIPTS/inbox.sh" team bob
   [[ "$output" == *"[bridge-error] codex turn failed"* ]]
+  [ ! -e "$TEST_SKILL_DIR/run/inflight-outbox.team=alice" ]
 }
 
 # Fake app-server driving the LATE turn/failed race: turn1 gets turn/started

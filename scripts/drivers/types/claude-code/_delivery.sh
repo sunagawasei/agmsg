@@ -90,15 +90,17 @@ agmsg_claude_code_mark_exact() {
   agmsg_claude_code_db_fault mark && return 1
   "$SKILL_DIR/scripts/inbox.sh" "$team" "$name" \
     --mark-read-ids "$ids" >/dev/null 2>&1 || return 1
-  db="$(agmsg_db_path)" || return 1
-  [ -f "$db" ] || return 1
+  agmsg_claude_code_db_fault verify && return 2
+  db="$(agmsg_db_path)" || return 2
+  [ -f "$db" ] || return 2
   t_esc="$(agmsg_claude_code_sql_escape "$team")"
   n_esc="$(agmsg_claude_code_sql_escape "$name")"
   count="$(agmsg_sqlite "$db" "
     SELECT COUNT(*) FROM messages
     WHERE team='$t_esc' AND to_agent='$n_esc'
       AND read_at IS NULL AND id IN ($ids);
-  " 2>/dev/null)" || return 1
+  " 2>/dev/null)" || return 2
   count="$(printf '%s' "$count" | tr -d '\r\n')"
+  case "$count" in ''|*[!0-9]*) return 2 ;; esac
   [ "$count" = 0 ]
 }

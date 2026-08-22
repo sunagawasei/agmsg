@@ -146,12 +146,15 @@ fake_session() {
   fake_register T alice
   fake_register T bob
   fake_register U alice /tmp/p2
-  actas_lock_claim T alice "sid-going"
-  actas_lock_claim T bob   "sid-going"
+  agmsg_test_start_session_owner
+  local instance="sid-going.$AGMSG_TEST_OWNER_PID"
+  actas_lock_claim T alice "$instance"
+  actas_lock_claim T bob   "$instance"
   fake_session "sid-keeper" >/dev/null
   echo "sid-keeper" > "$(actas_lock_path U alice)"
 
   printf '{"session_id":"sid-going"}' | bash "$SKILL_DIR/scripts/session-end.sh" claude-code /tmp/p1
+  agmsg_test_stop_session_owner
 
   # Teardown (incl. actas_lock_release_all) is detached now — poll for it.
   wait_until 8 bash -c "[ ! -f '$(actas_lock_path T alice)' ] && [ ! -f '$(actas_lock_path T bob)' ]"
@@ -162,17 +165,18 @@ fake_session() {
 
 # --- session-start.sh GCs stale locks ---
 
-@test "session-start: GCs stale locks (owner sid no longer alive)" {
-  # Stale lock — owner sid has no cc-instance.
-  echo "sid-ghost" > "$(actas_lock_path T alice)"
-  # Need an identity so session-start doesn't short-circuit.
+@test "session-start: GCs composite locks whose owner pid is dead and keeps bare false-dead locks" {
+  echo "sid-ghost.2147483647" > "$(actas_lock_path T alice)"
+  echo "sid-bare-ghost" > "$(actas_lock_path T bob)"
   fake_register T alice
+  fake_register T bob
   echo "sid-current" > "$RUN_DIR/cc-instance.$$"
 
   printf '{"session_id":"sid-current"}' \
     | bash "$SKILL_DIR/scripts/session-start.sh" claude-code /tmp/p1 >/dev/null 2>&1 || true
 
   [ ! -f "$(actas_lock_path T alice)" ]
+  [ -f "$(actas_lock_path T bob)" ]
 }
 
 # --- watch.sh subscription exclusion ---

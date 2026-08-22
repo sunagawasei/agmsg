@@ -117,13 +117,21 @@ live_pid() { echo "$$"; }
   [ "$(actas_lock_owner "T" "alice")" = "sid-other" ]
 }
 
-@test "claim: reclaims a stale lock whose owner is dead" {
-  # Lock exists but no live cc-instance references that sid.
-  echo "sid-dead" > "$(actas_lock_path "T" "alice")"
+@test "claim: reclaims a stale lock whose composite owner pid is dead" {
+  echo "sid-dead.2147483647" > "$(actas_lock_path "T" "alice")"
 
   run actas_lock_claim "T" "alice" "sid-mine"
   [ "$status" -eq 0 ]
   [ "$(actas_lock_owner "T" "alice")" = "sid-mine" ]
+}
+
+@test "claim: does not steal a bare lock when cc-instance is missing" {
+  echo "sid-ghost" > "$(actas_lock_path "T" "alice")"
+
+  run actas_lock_claim "T" "alice" "sid-mine"
+  [ "$status" -eq 1 ]
+  [[ "$output" == "held:sid-ghost" ]]
+  [ "$(actas_lock_owner "T" "alice")" = "sid-ghost" ]
 }
 
 # Regression for #65 review finding 1, then re-review of 48339d8: a naive
@@ -141,7 +149,6 @@ live_pid() { echo "$$"; }
 # exclusivity sanity check).
 @test "claim: a live owner is never replaced by a serial peer's claim" {
   skip_on_windows "actas live-session liveness under Git Bash (#182)"
-  echo "sid-dead" > "$(actas_lock_path "T" "alice")"
   setup_live_owner "$RUN_DIR" "sid-A"
   actas_lock_claim "T" "alice" "sid-A"
   run actas_lock_claim "T" "alice" "sid-B"
@@ -229,12 +236,13 @@ live_pid() { echo "$$"; }
 
 # --- gc_stale ---
 
-@test "gc_stale: removes locks whose owner is dead, returns count" {
+@test "gc_stale: removes locks whose composite owner pid is dead, returns count" {
   skip_on_windows "actas live-session liveness under Git Bash (#182)"
-  echo "sid-dead-1" > "$(actas_lock_path "T1" "alice")"
-  echo "sid-dead-2" > "$(actas_lock_path "T2" "bob")"
+  echo "sid-dead-1.2147483647" > "$(actas_lock_path "T1" "alice")"
+  echo "sid-dead-2.2147483646" > "$(actas_lock_path "T2" "bob")"
   fake_cc_instance "$(live_pid)" "sid-live"
   echo "sid-live" > "$(actas_lock_path "T3" "carol")"
+  echo "sid-ghost" > "$(actas_lock_path "T4" "dave")"
 
   run actas_lock_gc_stale
   [ "$status" -eq 0 ]
@@ -242,6 +250,7 @@ live_pid() { echo "$$"; }
   [ ! -f "$(actas_lock_path "T1" "alice")" ]
   [ ! -f "$(actas_lock_path "T2" "bob")" ]
   [ -f   "$(actas_lock_path "T3" "carol")" ]
+  [ -f   "$(actas_lock_path "T4" "dave")" ]
 }
 
 @test "gc_stale: noop when no stale locks" {
@@ -277,8 +286,14 @@ live_pid() { echo "$$"; }
   [ "$output" = "other:sid-other" ]
 }
 
-@test "state: free when held by a dead session (stale)" {
-  echo "sid-dead" > "$(actas_lock_path "T" "alice")"
+@test "state: free when held by a composite whose pid is dead" {
+  echo "sid-dead.2147483647" > "$(actas_lock_path "T" "alice")"
   run actas_lock_state "T" "alice" "sid-me"
   [ "$output" = "free" ]
+}
+
+@test "state: other when a bare owner has no cc-instance (false-dead must not look free)" {
+  echo "sid-ghost" > "$(actas_lock_path "T" "alice")"
+  run actas_lock_state "T" "alice" "sid-me"
+  [ "$output" = "other:sid-ghost" ]
 }

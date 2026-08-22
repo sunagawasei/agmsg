@@ -56,6 +56,8 @@ STUB
   source "$SCRIPTS/lib/actas-lock.sh"
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/identity-key.sh"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/pending-teardown.sh"
 }
 
 teardown() {
@@ -131,7 +133,7 @@ case "${WATCHDOG_MODE:-ok}" in
   fail-first-despawn)
     [ "$name" = aaa ] && exit 17
     ;;
-  compensation-fail)
+  compensation-fail|compensation-fail-mismatch)
     if grep -q '^spawn:' "$WATCHDOG_CALLS" 2>/dev/null; then
       exit 17
     fi
@@ -203,6 +205,11 @@ case "${WATCHDOG_MODE:-ok}" in
     ;;
   delete-intent-during-spawn|compensation-fail)
     rm -f "$root/run/watchdog.$team.$name.intent"
+    ;;
+  compensation-fail-mismatch)
+    rm -f "$root/run/watchdog.$team.$name.intent"
+    printf '%s\n' "$MISMATCH_TOMBSTONE_OWNER" \
+      > "$root/run/watchdog.$team.tombstone"
     ;;
   tombstone-during-spawn)
     printf 'session-end\n' >"$root/run/watchdog.$team.tombstone"
@@ -384,7 +391,7 @@ STUB
   [ ! -e "$RUN/watchdog.$TEAM.worker-tombstone-during-spawn.intent" ]
 }
 
-@test "failed post-spawn compensation emits exact notice and leaves no compensation marker" {
+@test "failed post-spawn compensation emits one notice and writes unverified pending teardown" {
   join_worker worker codex
   write_record worker 888888
   install_recovery_stubs
@@ -392,14 +399,67 @@ STUB
 
   run_watchdog
   [ "$status" -eq 0 ]
-  [ "$output" = "watchdog: compensation incomplete $TEAM/worker" ]
+  [ "$output" = "watchdog: compensation incomplete $TEAM/worker pending=unverified" ]
   [ "$(grep -c '^despawn:worker$' "$WATCHDOG_CALLS")" -eq 2 ]
   grep -Fxq "$(printf 'expect:pid:999999\t%s\tcodex' "$PROJ")" "$WATCHDOG_CALLS"
   [ -f "$(agmsg_spawn_path "$TEAM" worker)" ]
   [ ! -e "$RUN/watchdog.$TEAM.worker.intent" ]
-  run find "$RUN" -maxdepth 1 -name 'watchdog*.compensation*' -print
+  [ -f "$(agmsg_pending_teardown_path "$TEAM" worker)" ]
+  agmsg_pending_teardown_read "$(agmsg_pending_teardown_path "$TEAM" worker)"
+  [ "$AGMSG_PENDING_OWNER_STATE" = unverified ]
+  [ "$AGMSG_PENDING_REASON" = watchdog-compensation-incomplete ]
+}
+
+@test "watchdog pending from another session cannot reap a live team owner's worker" {
+  join_worker worker codex
+  write_record worker 888888
+  install_recovery_stubs
+  export WATCHDOG_MODE=compensation-fail
+  export AGMSG_WATCHDOG_OWNER_INSTANCE=watcher-session.2147483647
+  export AGMSG_WATCHDOG_OWNER_START=ps:dead-watcher
+
+  sleep 300 &
+  local team_owner_pid=$!
+  TEST_PIDS="$TEST_PIDS $team_owner_pid"
+  printf '%s.%s\n' "${TEAM#s-}" "$team_owner_pid" \
+    > "$RUN/cc-instance.$team_owner_pid"
+
+  run_watchdog
   [ "$status" -eq 0 ]
-  [ -z "$output" ]
+  local pending
+  pending="$(agmsg_pending_teardown_path "$TEAM" worker)"
+  agmsg_pending_teardown_read "$pending"
+  [ "$AGMSG_PENDING_OWNER_STATE" = verified ]
+  [ "$AGMSG_PENDING_OWNER_INSTANCE" = "$AGMSG_WATCHDOG_OWNER_INSTANCE" ]
+
+  : > "$WATCHDOG_CALLS"
+  run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
+  [ "$status" -eq 0 ]
+  [ "$output" = "agmsg: pending teardown retained team=$TEAM worker=worker reason=bare-owner-alive" ]
+  [ ! -s "$WATCHDOG_CALLS" ]
+  kill -0 "$team_owner_pid" 2>/dev/null
+  [ -f "$(agmsg_spawn_path "$TEAM" worker)" ]
+  [ -f "$pending" ]
+}
+
+@test "watchdog preserves owner ambiguity when env and fresh tombstone disagree" {
+  join_worker worker codex
+  write_record worker 888888
+  install_recovery_stubs
+  export WATCHDOG_MODE=compensation-fail-mismatch
+  export AGMSG_WATCHDOG_OWNER_INSTANCE=session-a.99999991
+  export AGMSG_WATCHDOG_OWNER_START=ps:historical
+  export MISMATCH_TOMBSTONE_OWNER=session-b.99999992
+
+  run_watchdog
+  [ "$status" -eq 0 ]
+  [ "$output" = "watchdog: compensation incomplete $TEAM/worker pending=unverified" ]
+  local pending
+  pending="$(agmsg_pending_teardown_path "$TEAM" worker)"
+  agmsg_pending_teardown_read "$pending"
+  [ "$AGMSG_PENDING_OWNER_STATE" = unverified ]
+  [ "$AGMSG_PENDING_OWNER_ENV" = "$AGMSG_WATCHDOG_OWNER_INSTANCE" ]
+  [ "$AGMSG_PENDING_OWNER_TOMBSTONE" = "$MISMATCH_TOMBSTONE_OWNER" ]
 }
 
 @test "pre-existing tombstone prevents despawn and spawn" {

@@ -181,6 +181,10 @@ db_scalar() {
   sqlite3 "$FAKE_DB" "$1" | tr -d '\r'
 }
 
+worker_unread_is_zero() {
+  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE to_agent='worker' AND read_at IS NULL;")" -eq 0 ]
+}
+
 session_file() {
   printf '%s/claude-code-bridge.team.worker.session' "$RUN"
 }
@@ -190,6 +194,21 @@ publish_drain_fence() {
   now="$(date +%s)"
   printf 'nonce=test-drain\nowner=test-owner\nteam=team\nlease_epoch=%s\n' "$now" > "$tmp"
   mv "$tmp" "$RUN/drain.team.fence"
+}
+
+@test "claude-code bridge SIGTERM logs the received signal exactly once" {
+  local bridge_pid log="$TEST_SKILL_DIR/signal.log"
+  bash "$TYPES/claude-code/claude-code-bridge.sh" \
+    --project "$PROJ" --team team --name worker --identity-key test-key. \
+    --watch-timeout 30 --interval 1 --turn-timeout 5 > "$log" 2>&1 &
+  bridge_pid=$!
+  test_fixture_register_owned_pid "$bridge_pid"
+  wait_for_file_contains "$log" 'claude-code-bridge: armed team/worker'
+
+  kill -TERM "$bridge_pid"
+  wait "$bridge_pid"
+
+  [ "$(grep -c '^claude-code-bridge: received SIGTERM; shutting down$' "$log")" -eq 1 ]
 }
 
 @test "claude-code bridge exits from watch wait on USR2 without leaving a duplicate watch" {
@@ -587,7 +606,7 @@ WRAPPER
   [ "$(printf '%s\n' "$output" | grep -c 'started turn')" -eq 0 ]
 }
 
-@test "failed notice send spools JSON and retries at next startup without another turn" {
+@test "failed notice send queues the inflight outbox and retries at next startup without another turn" {
   send_to_worker alice broken
   export FAKE_MODE=exit7
   mv "$SCRIPTS/send.sh" "$SCRIPTS/send.sh.real"
@@ -603,15 +622,14 @@ STUB
 
   run bridge
   [ "$status" -eq 0 ]
-  spool="$RUN/claude-code-bridge.team.worker.outbound.json"
-  [ -f "$spool" ]
-  [ "$(sqlite_mem "SELECT json_valid(readfile('$(rf "$spool")'));")" = 1 ]
+  [ -d "$RUN/inflight-outbox.team=worker" ]
+  [ ! -f "$RUN/claude-code-bridge.team.worker.outbound.json" ]
   [ "$(cat "$CAPTURE/call-count")" -eq 1 ]
 
   mv "$SCRIPTS/send.sh.real" "$SCRIPTS/send.sh"
   run bridge
   [ "$status" -eq 0 ]
-  [ ! -e "$spool" ]
+  [ ! -e "$RUN/inflight-outbox.team=worker" ]
   [ "$(cat "$CAPTURE/call-count")" -eq 1 ]
   [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE from_agent='worker' AND body LIKE '%outcome is unknown%';")" -eq 1 ]
 }
@@ -700,4 +718,78 @@ STUB
   [[ "$output" == *"no available subscription"* ]]
   [ ! -e "$CAPTURE/call-count" ]
   [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE to_agent='worker' AND read_at IS NULL;")" -eq 1 ]
+}
+
+@test "successful turn settles inflight without a compensation notice" {
+  send_to_worker alice hello
+  run bridge
+  [ "$status" -eq 0 ]
+  shopt -s nullglob
+  leftover=("$RUN"/inflight-record.*)
+  [ "${#leftover[@]}" -eq 0 ]
+  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE to_agent='alice' AND body LIKE '%bridge-error%';")" -eq 0 ]
+}
+
+@test "SIGKILL after mark-read is compensated by inflight reap without restoring unread" {
+  send_to_worker alice doomed
+  export FAKE_MODE=hang
+  bridge > "$TEST_SKILL_DIR/hang-inflight.out" 2>&1 3>&- &
+  local bpid=$!
+  test_fixture_register_owned_pid "$bpid"
+  wait_until 15 bash -c "compgen -G '$RUN/inflight-record.*' >/dev/null"
+  wait_until 15 worker_unread_is_zero
+  wait_for_file "$RUN/claude-code-bridge.team.worker.pid"
+  local bridge_pid
+  bridge_pid="$(cat "$RUN/claude-code-bridge.team.worker.pid")"
+  kill -9 "$bridge_pid" "$bpid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  wait_until 5 _pid_gone "$bridge_pid"
+  if [ -f "$CAPTURE/hang-pids" ]; then
+    read -r parent child < "$CAPTURE/hang-pids" || true
+    kill -9 "$parent" "$child" 2>/dev/null || true
+  fi
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/inflight.sh"
+  agmsg_inflight_reap_dead
+  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE from_agent='worker' AND to_agent='alice' AND body LIKE '%turn interrupted%';")" -ge 1 ]
+  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE to_agent='worker' AND read_at IS NULL;")" -eq 0 ]
+  shopt -s nullglob
+  leftover=("$RUN"/inflight-record.*)
+  [ "${#leftover[@]}" -eq 0 ]
+}
+
+@test "unverified mark-read after a committed UPDATE keeps inflight and does not start a turn" {
+  send_to_worker alice keep-me
+  export AGMSG_CLAUDE_BRIDGE_DB_FAIL_AT=verify
+  run bridge
+  [ ! -e "$CAPTURE/call-count" ]
+  shopt -s nullglob
+  leftover=("$RUN"/inflight-record.*)
+  [ "${#leftover[@]}" -eq 1 ]
+  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE to_agent='worker' AND read_at IS NULL;")" -eq 0 ]
+}
+
+@test "missing DB during mark-read verify keeps inflight instead of treating it as unmarked" {
+  send_to_worker alice keep-me
+  local mid
+  mid="$(db_scalar "SELECT id FROM messages WHERE to_agent='worker' AND read_at IS NULL;")"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  # shellcheck disable=SC1091
+  source "$TYPES/claude-code/_delivery.sh"
+  rm -f "$TEST_SKILL_DIR/db/messages.db"
+  run agmsg_claude_code_mark_exact team worker "$mid"
+  [ "$status" -eq 2 ]
+}
+
+@test "a second unverified mark-read publishes a new epoch instead of stalling" {
+  send_to_worker alice keep-me
+  export AGMSG_CLAUDE_BRIDGE_DB_FAIL_AT=verify
+  run bridge
+  send_to_worker alice keep-me-2
+  run bridge
+  [ ! -e "$CAPTURE/call-count" ]
+  shopt -s nullglob
+  leftover=("$RUN"/inflight-record.*)
+  [ "${#leftover[@]}" -eq 2 ]
 }

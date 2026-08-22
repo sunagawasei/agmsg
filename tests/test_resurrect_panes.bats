@@ -80,12 +80,10 @@ make_transcript() {
   [ -z "$output" ]
 }
 
-@test "plan: still reseats when the lock is stale (owner sid dead) (#339)" {
-  # A dead owner (no live cc-instance references the sid) is a stale lock ->
-  # actas_lock_state reports free -> the role really needs reseating.
+@test "plan: still reseats when the lock is stale (composite owner pid dead) (#339)" {
   put_record agmsg aggie "sess-1" /proj
   pane_line agmsg 0 0 "* agmsg-aggie" /proj bash "claude -n agmsg-aggie /agmsg actas aggie"
-  echo "dead-owner" > "$(actas_lock_path agmsg aggie)"   # no cc-instance -> not alive
+  echo "dead-owner.2147483647" > "$(actas_lock_path agmsg aggie)"
 
   run agmsg_resurrect_plan "$FIXTURE"
   [[ "$output" == "agmsg:0.0"* ]]

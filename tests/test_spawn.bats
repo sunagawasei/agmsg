@@ -1085,6 +1085,20 @@ STUB
   [[ "$output" == *"--no-fallback"* ]]
 }
 
+@test "spawn: cursor pipe-separated model label is one argv to the bridge" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.cursor_model.cur grok-4.6
+  bash "$SCRIPTS/config.sh" set spawn.cursor_model_label.cur "Cursor Grok 4.6 Extra High|Cursor Grok 4.6 High Fast"
+  _make_fake_cursor_headless
+
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" == *"--model-label Cursor Grok 4.6 Extra High|Cursor Grok 4.6 High Fast"* ]]
+}
+
 @test "spawn: explicit cursor --model wins over the matching worker config" {
   bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
   bash "$SCRIPTS/config.sh" set spawn.cursor_model.cur from-config

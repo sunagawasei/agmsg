@@ -316,6 +316,31 @@ STUB
   [ ! -f "$RUN/spawn.team__codex" ]                  # record removed
 }
 
+@test "despawn --force --expect-bridge-start skips a live PID with a different generation" {
+  bash "$SCRIPTS/join.sh" team codex codex "$PROJ" >/dev/null
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/instance-id.sh"
+  sleep 300 &
+  local pid=$!
+  local rec token method
+  rec="$(printf 'pid:%s\t%s\tcodex' "$pid" "$PROJ")"
+  printf '%s\n' "$rec" > "$RUN/spawn.team__codex"
+  printf 'pid=%s\n' "$pid" > "$RUN/codex-bridge.team.codex.meta"
+  token="$(agmsg_pid_start_token "$pid")"
+  method="${token%%:*}"
+
+  run bash "$SCRIPTS/despawn.sh" team leader codex --force \
+    --expect-record "$rec" --expect-bridge-start "$method:not-this-generation"
+  [ "$status" -eq 5 ]
+  [[ "$output" == *"status=skipped"* ]]
+  [[ "$output" == *"reason=bridge-generation-changed"* ]]
+  kill -0 "$pid" 2>/dev/null
+  [ -f "$RUN/spawn.team__codex" ]
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 @test "despawn --force: kills a herdr: placement via herdr pane close" {
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
   # Record a herdr-tagged placement (herdr: scheme prefix).

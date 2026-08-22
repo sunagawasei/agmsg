@@ -40,6 +40,8 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"  # actas-lock.sh requires SKILL_DIR
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/identity-key.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/inflight.sh"
 
 die() { echo "despawn: $*" >&2; exit 1; }
 
@@ -52,11 +54,14 @@ FORCE=0
 TIMEOUT=30
 EXPECT_RECORD=""        # --expect-record <line>: compare-and-act guard (force only)
 EXPECT_SET=0
+EXPECT_BRIDGE_START=""  # --expect-bridge-start <token>: live PID generation guard
+EXPECT_BRIDGE_START_SET=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --force) FORCE=1; shift ;;
     --timeout) TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
     --expect-record) EXPECT_RECORD="${2-}"; EXPECT_SET=1; shift 2 ;;
+    --expect-bridge-start) EXPECT_BRIDGE_START="${2-}"; EXPECT_BRIDGE_START_SET=1; shift 2 ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -108,6 +113,7 @@ kill_headless_pid() {
   local kill_poll_interval kill_poll_max
   local -a argv=() arg
   local bridge_token=0 identity_token=0 expect_identity=0
+  local current_start="" expect_method current_method
   kill_poll_interval="$(agmsg_wait_knob_resolve \
     "${AGMSG_KILL_POLL_INTERVAL-}" 1 0.01 60 decimal)"
   kill_poll_max="$(agmsg_wait_knob_resolve \
@@ -165,12 +171,51 @@ kill_headless_pid() {
       return 4
     fi
   fi
+  if [ "${EXPECT_BRIDGE_START_SET:-0}" = 1 ]; then
+    if [ -z "${EXPECT_BRIDGE_START:-}" ]; then
+      echo "despawn: --expect-bridge-start is empty for live pid $pid for $team/$name — identity unverified" >&2
+      return 4
+    fi
+    current_start="$(agmsg_pid_start_token "$pid" 2>/dev/null)" || {
+      echo "despawn: could not read start token for live pid $pid for $team/$name — identity unverified" >&2
+      return 4
+    }
+    expect_method="$(agmsg_pid_start_token_method "$EXPECT_BRIDGE_START" 2>/dev/null || true)"
+    current_method="$(agmsg_pid_start_token_method "$current_start" 2>/dev/null || true)"
+    if [ -z "$expect_method" ] || [ -z "$current_method" ] \
+        || [ "$expect_method" != "$current_method" ]; then
+      echo "despawn: start-token method unverifiable for live pid $pid for $team/$name — skipping kill" >&2
+      return 4
+    fi
+    if [ "$current_start" != "$EXPECT_BRIDGE_START" ]; then
+      echo "despawn: live pid $pid for $team/$name is a different process generation — skipping kill" >&2
+      return 5
+    fi
+    current_start="$(agmsg_pid_start_token "$pid" 2>/dev/null)" || {
+      echo "despawn: could not re-read start token for live pid $pid for $team/$name — identity unverified" >&2
+      return 4
+    }
+    if [ "$current_start" != "$EXPECT_BRIDGE_START" ]; then
+      echo "despawn: live pid $pid for $team/$name is a different process generation — skipping kill" >&2
+      return 5
+    fi
+  fi
   kill "$pid" 2>/dev/null || true
   while _agmsg_pid_alive "$pid" && [ "$n" -lt "$kill_poll_max" ]; do
     sleep "$kill_poll_interval"
     n=$((n + 1))
   done
   if _agmsg_pid_alive "$pid"; then
+    if [ "${EXPECT_BRIDGE_START_SET:-0}" = 1 ]; then
+      current_start="$(agmsg_pid_start_token "$pid" 2>/dev/null)" || {
+        echo "despawn: could not re-read start token before SIGKILL for live pid $pid for $team/$name — identity unverified" >&2
+        return 4
+      }
+      if [ "$current_start" != "$EXPECT_BRIDGE_START" ]; then
+        echo "despawn: live pid $pid for $team/$name is a different process generation — skipping SIGKILL" >&2
+        return 5
+      fi
+    fi
     kill -9 "$pid" 2>/dev/null || true
     echo "despawn: bridge pid $pid did not exit on SIGTERM — sent SIGKILL" >&2
     n=0
@@ -229,12 +274,16 @@ kill_recorded_placement() {
 
 if [ "$FORCE" = "1" ]; then
   # Serialize against a concurrent spawn-record write (spawn.sh launch_headless),
-  # so the compare and the rm below can't straddle a fresh lazy-respawn. Fail-open
-  # on acquire timeout — the --expect-record compare is the backstop. Release on
-  # every exit path only when this process acquired the lock.
+  # so the compare and the rm below can't straddle a fresh lazy-respawn.
+  # Compare-and-act recovery (--expect-record) fail-closes if the lock cannot
+  # be held: the record compare is not a substitute for excluding a concurrent
+  # spawn rewrite.
   placement_lock_held=0
   if agmsg_placement_lock_acquire "$TEAM" "$NAME" 10; then
     placement_lock_held=1
+  elif [ "$EXPECT_SET" = 1 ]; then
+    echo "status=unverified name=$NAME team=$TEAM reason=placement-lock"
+    exit 4
   fi
 
   # Resolve the record line to act on. With --expect-record, the live record must
@@ -280,8 +329,27 @@ if [ "$FORCE" = "1" ]; then
     echo "status=unverified name=$NAME team=$TEAM reason=process-state"
     exit 4
   fi
+  if [ "$placement_result" -eq 5 ]; then
+    if [ "$placement_lock_held" -eq 1 ]; then
+      agmsg_placement_lock_release "$TEAM" "$NAME"
+    fi
+    echo "status=skipped name=$NAME team=$TEAM reason=bridge-generation-changed"
+    exit 5
+  fi
+  if [ "${EXPECT_BRIDGE_START_SET:-0}" = 1 ] && [ "$placement_result" -eq 2 ]; then
+    if [ "$placement_lock_held" -eq 1 ]; then
+      agmsg_placement_lock_release "$TEAM" "$NAME"
+    fi
+    echo "status=unverified name=$NAME team=$TEAM reason=identity-mismatch"
+    exit 2
+  fi
   [ -n "$WATCHDOG_INTENT" ] && [ -z "$WATCHDOG_TOKEN" ] \
     && rm -f -- "$WATCHDOG_INTENT" 2>/dev/null || true
+  # Confirmed kill (or already-dead placement): dead-letter outstanding turns.
+  # Identity mismatch / generation change never reach here. Notices use --force
+  # and an inflight outbox, so they do not need the spawn record we are about
+  # to delete.
+  agmsg_inflight_deadletter_for "$TEAM" "$NAME" || true
   # Drop the member's registration, and release its (now-stale) lock.
   if [ -n "${_proj:-}" ] && [ -n "${_type:-}" ]; then
     # Internal teardown must not remove an equivalent registration in another team.
@@ -312,6 +380,7 @@ state="$(actas_lock_state "$TEAM" "$NAME" "" 2>/dev/null || echo free)"
 case "$state" in
   free)
     echo "despawn: '$NAME' holds no live actas lock — nothing to confirm a teardown against (a codex member has no watcher; a tmux member may already be gone). If a window remains, use --force." >&2
+    agmsg_inflight_deadletter_for "$TEAM" "$NAME" || true
     rm -f "$SPAWN_REC" 2>/dev/null || true
     gc_bridge_state
     echo "status=ok name=$NAME team=$TEAM note=no-live-lock"
@@ -357,6 +426,7 @@ while true; do
   sleep "$despawn_poll_interval"
 done
 
+agmsg_inflight_deadletter_for "$TEAM" "$NAME" || true
 rm -f "$SPAWN_REC" 2>/dev/null || true
 gc_bridge_state
 # Refresh telemetry after a successful state transition when the clock is

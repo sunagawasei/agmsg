@@ -313,6 +313,12 @@ watchdog_tombstone_fresh() {
   return 0
 }
 
+WATCHDOG_OWNER_START=""
+if agmsg_instance_is_composite "$SESSION_ID"; then
+  WATCHDOG_OWNER_START="$(agmsg_pid_start_token \
+    "${SESSION_ID##*.}" 2>/dev/null || true)"
+fi
+
 # Bash has no portable monotonic-clock builtin, so the watchdog cadence uses
 # wall-clock seconds. If the clock moves backward, resetting this process-local
 # baseline prevents a negative delta from wedging future watchdog runs.
@@ -324,7 +330,9 @@ maybe_run_watchdog() {
   now="$(date +%s 2>/dev/null)" || date_status=$?
   if [ "$date_status" -ne 0 ]; then
     if [ "$WATCHDOG_DATE_ERROR_LAUNCHED" -eq 0 ]; then
-      "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
+      AGMSG_WATCHDOG_OWNER_INSTANCE="$SESSION_ID" \
+        AGMSG_WATCHDOG_OWNER_START="$WATCHDOG_OWNER_START" \
+        "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
       WATCHDOG_DATE_ERROR_LAUNCHED=1
     fi
     return 0
@@ -332,7 +340,9 @@ maybe_run_watchdog() {
   case "$now" in
     ''|*[!0-9]*)
       if [ "$WATCHDOG_DATE_ERROR_LAUNCHED" -eq 0 ]; then
-        "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
+        AGMSG_WATCHDOG_OWNER_INSTANCE="$SESSION_ID" \
+          AGMSG_WATCHDOG_OWNER_START="$WATCHDOG_OWNER_START" \
+          "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
         WATCHDOG_DATE_ERROR_LAUNCHED=1
       fi
       return 0
@@ -350,7 +360,9 @@ maybe_run_watchdog() {
 
   WATCHDOG_LAST_RUN="$now"
   watchdog_tombstone_fresh "$now" && return 0
-  "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
+  AGMSG_WATCHDOG_OWNER_INSTANCE="$SESSION_ID" \
+    AGMSG_WATCHDOG_OWNER_START="$WATCHDOG_OWNER_START" \
+    "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
 }
 
 mkdir -p "$RUN_DIR" 2>/dev/null || true
@@ -556,6 +568,7 @@ while true; do
   # _agmsg_pid_alive). Gated on a composite id only: a bare id (degraded, no
   # resolved agent pid) keeps the prior behavior and is not liveness-gated.
   if agmsg_instance_is_composite "$SESSION_ID" && ! agmsg_instance_alive "$SESSION_ID"; then
+    printf 'agmsg watch: owner token=%s exit_reason=owner-dead\n' "$SESSION_ID" >&2
     exit 0
   fi
   maybe_run_watchdog
