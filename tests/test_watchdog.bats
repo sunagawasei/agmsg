@@ -772,6 +772,52 @@ STUB
   [ "$(grep -c '^spawn:worker$' "$WATCHDOG_CALLS")" -eq 1 ]
 }
 
+@test "lockf team lock keeps its inode after the holder exits" {
+  command -v lockf >/dev/null 2>&1 || skip "lockf(1) is unavailable on this host"
+  local isolated_bin="$TEST_SKILL_DIR/no-flock-bin"
+  local path_entry candidate command_name
+  mkdir -p "$isolated_bin"
+
+  # Rebuild PATH from symlinks while omitting flock, so the watchdog must use
+  # the lockf branch even on hosts that provide both commands in one directory.
+  local old_ifs="$IFS"
+  IFS=:
+  for path_entry in $PATH; do
+    [ -d "$path_entry" ] || continue
+    for candidate in "$path_entry"/*; do
+      [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+      command_name="${candidate##*/}"
+      [ "$command_name" = flock ] && continue
+      [ -e "$isolated_bin/$command_name" ] && continue
+      /bin/ln -s "$candidate" "$isolated_bin/$command_name" 2>/dev/null || true
+    done
+  done
+  IFS="$old_ifs"
+
+  local lock_path="$RUN/watchdog.$TEAM.lock"
+  local first_inode second_inode
+  run env PATH="$isolated_bin" AGMSG_WATCHDOG_PROCESS_TIMEOUT=5 \
+    AGMSG_WATCHDOG_PROCESS_GRACE=0 bash "$SCRIPTS/watchdog.sh" "$TEAM"
+  [ "$status" -eq 0 ]
+  [ -e "$lock_path" ]
+
+  if [ "$(uname -s)" = Darwin ]; then
+    first_inode="$(stat -f %i "$lock_path")"
+  else
+    first_inode="$(stat -c %i "$lock_path")"
+  fi
+
+  run env PATH="$isolated_bin" lockf -k -s -t 0 "$lock_path" true
+  [ "$status" -eq 0 ]
+
+  if [ "$(uname -s)" = Darwin ]; then
+    second_inode="$(stat -f %i "$lock_path")"
+  else
+    second_inode="$(stat -c %i "$lock_path")"
+  fi
+  [ "$second_inode" = "$first_inode" ]
+}
+
 @test "despawn timeout kills its whole group, aborts the pass, and next pass recovers" {
   join_worker aaa codex
   join_worker zzz cursor

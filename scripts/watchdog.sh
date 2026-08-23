@@ -72,7 +72,7 @@ if command -v flock >/dev/null 2>&1; then
     env -u BASH_ENV -u ENV bash -c "$lock_holder_script" watchdog-lock \
       "$LOCK_READY" "$LOCK_RELEASE" "$$" &
 elif command -v lockf >/dev/null 2>&1; then
-  lockf -s -t 0 "$TEAM_LOCK" \
+  lockf -k -s -t 0 "$TEAM_LOCK" \
     env -u BASH_ENV -u ENV bash -c "$lock_holder_script" watchdog-lock \
       "$LOCK_READY" "$LOCK_RELEASE" "$$" &
 else
