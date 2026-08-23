@@ -9,6 +9,8 @@ setup() {
   # when the suite runs under an agent process. Composite path: test_watch.bats.
   export AGMSG_AGENT_PID=""
   export TEST_PROJECT="$(mktemp -d)"
+  export RUN="$TEST_SKILL_DIR/run"
+  mkdir -p "$RUN"
 }
 
 teardown() {
@@ -42,6 +44,64 @@ has_check_inbox() {
 
 settings_file() {
   echo "$TEST_PROJECT/.claude/settings.local.json"
+}
+
+skip_without_lockf() {
+  command -v lockf >/dev/null 2>&1 || skip "lockf(1) is unavailable on this host"
+}
+
+install_delayed_watch_stub() {
+  cat >"$SCRIPTS/watch.sh" <<'STUB'
+#!/usr/bin/env bash
+set -u
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/lib/process-identity.sh"
+source "$SCRIPT_DIR/lib/resolve-project.sh"
+
+session="$1"
+project="$(agmsg_resolve_project "$2" "$3")"
+type="$3"
+pidfile="$SKILL_DIR/run/watch.$session.pid"
+scope="watch|$session|$project|$type"
+if [ -z "${AGMSG_PROCESS_OWNER_FD:-}" ]; then
+  exec "$SCRIPT_DIR/internal/process-owner-launch.sh" \
+    --kind watch --pidfile "$pidfile" --scope "$scope" -- \
+    "$SCRIPT_DIR/watch.sh" "$@"
+fi
+
+scope_hash="$(agmsg_process_scope_hash "$scope")"
+release="${AGMSG_TEST_WATCH_RELEASE_FILE:?}"
+term="${AGMSG_TEST_WATCH_TERM_FILE:?}"
+cleanup() {
+  agmsg_process_cleanup_self watch "$pidfile" "@hash:$scope_hash"
+}
+trap 'touch "$term"; while [ ! -e "$release" ]; do sleep 0.05; done; exit 0' TERM
+trap cleanup EXIT
+touch "${AGMSG_TEST_WATCH_READY_FILE:?}"
+while :; do sleep 0.05; done
+STUB
+  chmod +x "$SCRIPTS/watch.sh"
+}
+
+start_delayed_watch() {
+  local session="$1" project="$2" type="${3:-claude-code}"
+  mkdir -p "$RUN"
+  export AGMSG_TEST_WATCH_RELEASE_FILE="$RUN/watch.$session.release"
+  export AGMSG_TEST_WATCH_TERM_FILE="$RUN/watch.$session.term"
+  export AGMSG_TEST_WATCH_READY_FILE="$RUN/watch.$session.ready"
+  rm -f "$AGMSG_TEST_WATCH_RELEASE_FILE" "$AGMSG_TEST_WATCH_TERM_FILE" \
+    "$AGMSG_TEST_WATCH_READY_FILE" "$RUN/watch.$session.pid"
+  bash "$SCRIPTS/watch.sh" "$session" "$project" "$type" 3>&- &
+  TEST_WATCH_PID=$!
+  test_fixture_register_owned_pid "$TEST_WATCH_PID"
+  wait_for_file "$AGMSG_TEST_WATCH_READY_FILE"
+  wait_for_file "$RUN/watch.$session.pid"
+}
+
+release_delayed_watch() {
+  : >"$AGMSG_TEST_WATCH_RELEASE_FILE"
+  wait_for_pid_exit "$TEST_WATCH_PID"
 }
 
 # --- set <mode> ---
@@ -346,8 +406,8 @@ JSON
   run bash "$SCRIPTS/delivery.sh" stop
   [[ "$output" =~ "Killed 1 watch" ]]
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
-  [ ! -f "$TEST_SKILL_DIR/run/watch.stop-test.pid" ]
   wait_for_pid_exit "$watch_pid"
+  [ ! -f "$TEST_SKILL_DIR/run/watch.stop-test.pid" ]
   ! kill -0 "$watch_pid" 2>/dev/null
 }
 
@@ -362,6 +422,107 @@ JSON
   # The unrelated sleep process must still be alive.
   kill -0 "$unrelated_pid" 2>/dev/null
   kill "$unrelated_pid" 2>/dev/null || true
+}
+
+@test "delivery stop waits for watcher lease release before returning" {
+  skip_without_lockf
+  install_delayed_watch_stub
+  local session="wait-release-ok" stop_pid stop_output
+  start_delayed_watch "$session" "$TEST_PROJECT"
+
+  bash "$SCRIPTS/delivery.sh" stop >"$RUN/stop.out" 2>&1 &
+  stop_pid=$!
+  wait_for_file "$AGMSG_TEST_WATCH_TERM_FILE"
+  [ -f "$RUN/watch.$session.pid" ]
+  sleep 0.2
+  ! grep -q 'Killed' "$RUN/stop.out"
+
+  release_delayed_watch
+  wait "$stop_pid"
+  stop_output="$(cat "$RUN/stop.out")"
+  [[ "$stop_output" == *"Killed 1 watch"* ]]
+  [ ! -f "$RUN/watch.$session.pid" ]
+}
+
+@test "delivery stop returns after wait-release timeout without counting the watcher" {
+  skip_without_lockf
+  install_delayed_watch_stub
+  local session="wait-release-timeout" started elapsed generation
+  start_delayed_watch "$session" "$TEST_PROJECT"
+
+  started="$SECONDS"
+  run bash "$SCRIPTS/delivery.sh" stop
+  elapsed=$((SECONDS - started))
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Killed 0 watch"* ]]
+  [[ "$output" == *"TERM sent, lease release not confirmed within 5s"* ]]
+  [ -f "$AGMSG_TEST_WATCH_TERM_FILE" ]
+  [ -f "$RUN/watch.$session.pid" ]
+  generation="$(sed -n 's/^generation=//p' "$RUN/watch.$session.owner")"
+  [ -n "$generation" ]
+  [ -f "$RUN/watch.$session.lease.$generation" ]
+  kill -0 "$TEST_WATCH_PID" 2>/dev/null
+  [ "$elapsed" -ge 4 ]
+  [ "$elapsed" -lt 15 ]
+
+  release_delayed_watch
+  [ ! -f "$RUN/watch.$session.pid" ]
+}
+
+@test "delivery restart suppresses monitor directive while timed-out watcher is alive" {
+  skip_without_lockf
+  install_delayed_watch_stub
+  local session="dedup-after-timeout" started elapsed generation
+  export CLAUDE_CODE_SESSION_ID="$session"
+  start_delayed_watch "$session" "$TEST_PROJECT"
+
+  started="$SECONDS"
+  run bash "$SCRIPTS/delivery.sh" restart claude-code "$TEST_PROJECT"
+  elapsed=$((SECONDS - started))
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Killed 0 watch"* ]]
+  [[ "$output" == *"already streaming"* ]]
+  [[ "$output" == *"TERM sent, lease release not confirmed within 5s"* ]]
+  ! [[ "$output" == *"invoke the Monitor tool"* ]]
+  [ -f "$AGMSG_TEST_WATCH_TERM_FILE" ]
+  [ -f "$RUN/watch.$session.pid" ]
+  generation="$(sed -n 's/^generation=//p' "$RUN/watch.$session.owner")"
+  [ -n "$generation" ]
+  [ -f "$RUN/watch.$session.lease.$generation" ]
+  [ "$elapsed" -ge 4 ]
+  [ "$elapsed" -lt 15 ]
+
+  release_delayed_watch
+  unset CLAUDE_CODE_SESSION_ID
+  [ ! -f "$RUN/watch.$session.pid" ]
+}
+
+@test "delivery restart can leave no watcher after timed-out old watcher exits" {
+  skip_without_lockf
+  install_delayed_watch_stub
+  local session="watcher-absence-after-timeout" started elapsed
+  export CLAUDE_CODE_SESSION_ID="$session"
+  start_delayed_watch "$session" "$TEST_PROJECT"
+
+  started="$SECONDS"
+  run bash "$SCRIPTS/delivery.sh" restart claude-code "$TEST_PROJECT"
+  elapsed=$((SECONDS - started))
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already streaming"* ]]
+  [[ "$output" == *"TERM sent, lease release not confirmed within 5s"* ]]
+  [ -f "$AGMSG_TEST_WATCH_TERM_FILE" ]
+  [ -f "$RUN/watch.$session.pid" ]
+  [ "$elapsed" -ge 4 ]
+  [ "$elapsed" -lt 15 ]
+
+  release_delayed_watch
+  [ ! -f "$RUN/watch.$session.pid" ]
+  ! [[ "$output" == *"invoke the Monitor tool"* ]]
+
+  run bash "$SCRIPTS/delivery.sh" restart claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"invoke the Monitor tool"* ]]
+  unset CLAUDE_CODE_SESSION_ID
 }
 
 # --- restart subcommand ---

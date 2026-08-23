@@ -583,7 +583,7 @@ kill_all_watchers() {
   if [ -d "$RUN_DIR" ]; then
     for f in "$RUN_DIR"/watch.*.pid; do
       [ -f "$f" ] || continue
-      local pid cmd instance expected_scope
+      local pid cmd instance expected_scope signal_rc
       pid=$(cat "$f" 2>/dev/null || echo "")
       instance=${f##*/watch.}; instance=${instance%.pid}
       expected_scope=""
@@ -601,8 +601,14 @@ kill_all_watchers() {
         [ -n "$expected_scope" ] \
           || expected_scope="@hash:$AGMSG_PROCESS_SCOPE_HASH"
         if agmsg_process_signal_owned watch "$f" "$expected_scope" TERM \
+            --wait-release 5 \
             "$SKILL_DIR/scripts/watch.sh" "$instance" "$project" "$type"; then
           killed=$((killed + 1))
+        else
+          signal_rc=$?
+          if [ "$signal_rc" -eq 75 ]; then
+            echo "watch $instance: TERM sent, lease release not confirmed within 5s" >&2
+          fi
         fi
       fi
       case "$AGMSG_PROCESS_STATE" in
