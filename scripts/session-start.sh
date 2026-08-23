@@ -61,26 +61,209 @@ source "$SCRIPT_DIR/lib/inflight.sh"
 # authoritative source for the session team, and stdin can be read only once —
 # the type plug and the claude-code path below both rely on this single read.
 # Fall back to the env, then to a synthetic id outside the hook flow.
-INPUT=$(cat 2>/dev/null || true)
+#
+# mkdir -p is idempotent and RUN_DIR is created again further down once this
+# script's later state needs it; done early here too because the claude-code
+# branch below needs RUN_DIR to exist before mktemp can place a file in it.
+mkdir -p "$RUN_DIR" 2>/dev/null || true
+#
+# Only the claude-code + session-team-mode-on gate below needs stdin captured
+# byte-for-byte on disk (to check for a raw NUL that $(...) would otherwise
+# drop silently, splicing the surrounding bytes together — verified
+# empirically 2026-08-23). Every other type/mode keeps the plain read: writing
+# every SessionStart's hook payload (which can include cwd/session_id) to
+# disk as a side effect of a check that only fires in one mode is not a cost
+# to impose on codex/cursor/gemini/grok/copilot and the (default) mode-off
+# path. $TYPE and agmsg_session_team_enabled are both already resolvable here.
+if [ "$TYPE" = "claude-code" ] && agmsg_session_team_enabled; then
+  # Template + $RUN_DIR (not bare mktemp in $TMPDIR) match this repo's other
+  # temp-file conventions (delivery.sh, hooks-json.sh, driver-registry.sh) so
+  # a leftover is identifiable as agmsg's. Nothing currently sweeps
+  # agmsg-hookin.* on a later SessionStart (unlike cc-instance.*/watch.*.pid),
+  # so an untrapped kill (SIGTERM/SIGKILL skip the EXIT trap below) leaves it
+  # with no automatic recovery short of a full uninstall (keep-data mode
+  # doesn't touch run/) — that gap is a known, accepted tradeoff for
+  # attribution + staying inside the sandboxed writable root, not a claim
+  # that hygiene already covers it.
+  _claude_raw_input_file="$(mktemp "$RUN_DIR/agmsg-hookin.XXXXXX" 2>/dev/null || true)"
+  _claude_raw_capture_ok=0
+  INPUT=""
+  if [ -n "$_claude_raw_input_file" ]; then
+    trap 'rm -f "$_claude_raw_input_file"' EXIT
+    # Both the write and the read-back must succeed for capture to count:
+    # a read-back failure (rare, but e.g. a mid-read I/O error) must not
+    # silently hand a truncated INPUT to the gate below as if it were the
+    # complete hook payload.
+    if cat > "$_claude_raw_input_file" 2>/dev/null \
+        && INPUT="$(cat "$_claude_raw_input_file" 2>/dev/null)"; then
+      _claude_raw_capture_ok=1
+    else
+      INPUT=""
+    fi
+  else
+    INPUT=$(cat 2>/dev/null || true)
+  fi
+else
+  _claude_raw_input_file=""
+  _claude_raw_capture_ok=0
+  INPUT=$(cat 2>/dev/null || true)
+fi
 SESSION_ID=""
 if [ -n "$INPUT" ]; then
   # The session id field name differs by vendor: Claude Code emits snake_case
   # "session_id"; Grok Build (and Cursor) emit camelCase "sessionId". Try snake
   # first (claude-code unaffected), then camel.
+  #
+  # This runs for every type, not just claude-code, and is a best-effort
+  # extraction (env/synthetic fallbacks follow below) — not the fail-closed
+  # gate. A bare assignment would let a sed/head failure (bad locale,
+  # malformed UTF-8 in the payload, missing binary) kill the whole script
+  # via errexit before that gate even runs, so a failure here falls through
+  # to those fallbacks instead (verified: reproduces on macOS's BSD sed with
+  # LC_ALL=C.UTF-8 + invalid UTF-8 input; nix's GNU sed 4.9 does not fail on
+  # that same input, but a hook actually runs under the host's shell, so the
+  # BSD-sed exposure is real regardless of what this repo's tests use).
   SESSION_ID=$(printf '%s' "$INPUT" \
     | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -1)
-  [ -z "$SESSION_ID" ] && SESSION_ID=$(printf '%s' "$INPUT" \
-    | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -1)
+    | head -1) || SESSION_ID=""
+  if [ -z "$SESSION_ID" ]; then
+    SESSION_ID=$(printf '%s' "$INPUT" \
+      | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      | head -1) || SESSION_ID=""
+  fi
 fi
 [ -z "$SESSION_ID" ] && SESSION_ID="${CLAUDE_CODE_SESSION_ID:-}"
 [ -z "$SESSION_ID" ] && SESSION_ID="${GROK_SESSION_ID:-}"
 
+# Claude Code's session-team registration is fail-closed: only a valid,
+# top-level, non-empty string session_id from the hook payload is authoritative.
+# Keep the generic SESSION_ID resolver above for watcher compatibility, but in
+# Claude Code session-team mode replace its fallback result with the validated
+# stdin value below, never with its camelCase/env fallbacks.
+if [ "$TYPE" = "claude-code" ] && agmsg_session_team_enabled; then
+  # If the temp-file capture above didn't fully succeed (mktemp failed, or
+  # the write into it failed), there is no way to check stdin for a raw NUL
+  # byte, and a partial write could register a truncated payload as if it
+  # were the whole hook input. Fail closed instead of falling back to the
+  # NUL-blind INPUT read: "can't verify NUL-freedom" is a rejection here,
+  # not license to skip the check.
+  if [ "$_claude_raw_capture_ok" != "1" ]; then
+    echo "agmsg: refusing Claude Code session-team registration: stdin must contain a non-empty top-level string session_id" >&2
+    exit 0
+  fi
+  # A raw NUL byte in stdin (not the JSON \u0000 escape) never reaches the
+  # SQL gate below as a NUL at all: $(...) command substitution silently
+  # drops it. Comparing byte counts against INPUT would false-positive on
+  # any trailing newline (also stripped by $(...) -- verified empirically
+  # 2026-08-23), so instead measure NUL bytes directly in the saved file:
+  # if stripping them changes its length, stdin had a raw NUL that INPUT
+  # can no longer show.
+  # set -e means a bare `x="$(pipeline)"` assignment where the pipeline
+  # fails (pipefail) would kill the script right here with no message —
+  # the digit checks below would never run. Guarding with `if !`, like the
+  # sqlite3 call above, keeps a wc/tr failure inside this fail-closed path
+  # instead of an unannounced non-zero exit.
+  if ! _claude_raw_len="$(wc -c < "$_claude_raw_input_file" 2>/dev/null | tr -d '[:space:]')" \
+      || ! _claude_nonul_len="$(LC_ALL=C tr -d '\000' < "$_claude_raw_input_file" 2>/dev/null | wc -c | tr -d '[:space:]')"; then
+    echo "agmsg: refusing Claude Code session-team registration: stdin must contain a non-empty top-level string session_id" >&2
+    exit 0
+  fi
+  # Require both to actually be digit strings too: a successful wc/tr that
+  # printed something non-numeric must not be compared as if it were a length.
+  case "$_claude_raw_len" in
+    ''|*[!0-9]*)
+      echo "agmsg: refusing Claude Code session-team registration: stdin must contain a non-empty top-level string session_id" >&2
+      exit 0
+      ;;
+  esac
+  case "$_claude_nonul_len" in
+    ''|*[!0-9]*)
+      echo "agmsg: refusing Claude Code session-team registration: stdin must contain a non-empty top-level string session_id" >&2
+      exit 0
+      ;;
+  esac
+  if [ "$_claude_raw_len" != "$_claude_nonul_len" ]; then
+    echo "agmsg: refusing Claude Code session-team registration: stdin must contain a non-empty top-level string session_id" >&2
+    exit 0
+  fi
+  # Same reasoning as the wc/tr guard above: a bare assignment here would let
+  # a sed failure (missing binary, locale error) kill the script via errexit
+  # with no message instead of falling into this fail-closed path.
+  if ! _claude_input_sql="$(printf '%s' "$INPUT" | sed "s/'/''/g")"; then
+    echo "agmsg: refusing Claude Code session-team registration: stdin must contain a non-empty top-level string session_id" >&2
+    exit 0
+  fi
+  # INVARIANT: keep the substitution inside this open string literal. sqlite3's
+  # stdin mode treats a line starting with "." as a dot-command only when no
+  # statement is open, so an embedded ".shell"/".print" payload line cannot
+  # execute here (verified empirically 2026-08-22).
+  _claude_session_sql="
+    WITH raw(j) AS (SELECT '$_claude_input_sql'),
+    valid(j) AS (SELECT j FROM raw WHERE json_valid(j)),
+    candidate(sid) AS (
+      SELECT trim(json_extract(j, '\$.session_id'))
+      FROM valid
+      WHERE json_type(j) = 'object'
+        AND json_type(j, '\$.session_id') = 'text'
+    )
+    SELECT sid
+    FROM candidate
+    WHERE length(sid) > 0
+      AND length(sid) <= 128
+      AND instr(sid, char(0)) = 0
+      AND sid NOT GLOB '*[^0-9A-Za-z._-]*'
+      AND sid NOT GLOB '.*'
+    LIMIT 1;
+  "
+  # -init /dev/null skips a host ~/.sqliterc that could otherwise change the
+  # output rendering (.headers on, .mode line, ...) before we treat this
+  # value as validated. -noheader -list pins that rendering explicitly.
+  #
+  # length()/GLOB stop at the first NUL byte, but json_extract's decoded
+  # value keeps every byte after it (verified via hex()). instr(sid, char(0))
+  # sees those trailing bytes, so it — not length()/GLOB — is what actually
+  # rejects a NUL-embedded session_id above.
+  if ! _claude_stdin_session_id="$(printf '%s\n' "$_claude_session_sql" \
+      | sqlite3 -init /dev/null -noheader -list :memory: 2>/dev/null | tr -d '\r')" \
+      || [ -z "$_claude_stdin_session_id" ]; then
+    echo "agmsg: refusing Claude Code session-team registration: stdin must contain a non-empty top-level string session_id" >&2
+    exit 0
+  fi
+  # Defense in depth against two distinct failure modes, do not remove as
+  # "redundant with the SQL predicates":
+  # (a) sqlite3's CLI TEXT output truncates at the first NUL byte (bash's
+  #     own command substitution does not truncate — it only drops NUL
+  #     bytes and splices the surrounding text together, per the raw-input
+  #     capture above), so this re-check cannot catch that specific attack
+  #     (instr() above already did) — but the SQL predicates could be
+  #     edited independently later.
+  # (b) it is the only check that catches a value corrupted by CLI output
+  #     rendering (a hostile ~/.sqliterc, a build where -init is a no-op, a
+  #     future -escape default change): such corruption injects allowlist-
+  #     violating bytes (newlines, quotes, spaces) that only this catches.
+  # LC_ALL=C in a subshell keeps the character ranges byte-value-based
+  # instead of collation-order-based (bash's globasciiranges default differs
+  # by version), so this matches the same ASCII set as the SQL GLOB above.
+  if ! (LC_ALL=C
+        case "$_claude_stdin_session_id" in
+          .*|*[!0-9A-Za-z._-]*) exit 1 ;;
+        esac); then
+    echo "agmsg: refusing Claude Code session-team registration: stdin must contain a non-empty top-level string session_id" >&2
+    exit 0
+  fi
+  if [ "${#_claude_stdin_session_id}" -gt 128 ]; then
+    echo "agmsg: refusing Claude Code session-team registration: stdin must contain a non-empty top-level string session_id" >&2
+    exit 0
+  fi
+  SESSION_ID="$_claude_stdin_session_id"
+fi
+
 # Session-team mode: a claude-code session belongs to its own team s-<uuid>,
-# resolved from the REAL session id (stdin/env) only — NOT the synthetic
-# fallback below. So a genuinely absent session_id falls back to the normal
-# project->team resolution instead of fabricating an s-unknown-<pid> team.
+# resolved from the REAL session id in the validated stdin payload above — NOT
+# the generic env or synthetic fallback below. This applies only when the
+# gate above ran (claude-code AND session-team mode on): invalid input has
+# already exited in that case. Mode-off and non-Claude paths never reach the
+# gate and keep their legacy rules below.
 # Gated to claude-code (codex never gets a session team here).
 SESSION_TEAM=""
 [ "$TYPE" = "claude-code" ] && SESSION_TEAM="$(agmsg_session_team_name_from_id "$SESSION_ID")"
@@ -139,12 +322,20 @@ fi
 # named e.g. ".claude-tools/my-worktrees-app".
 HOOK_CWD=""
 if [ -n "$INPUT" ]; then
+  # Same failure mode as the SESSION_ID extraction above and the same fix:
+  # a bare assignment would let a sed failure (malformed UTF-8 in the
+  # payload, bad locale) kill the whole script via errexit. This one runs
+  # unconditionally for every type/mode, so it's reachable even more often.
   HOOK_CWD=$(printf '%s' "$INPUT" \
     | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -1)
+    | head -1) || HOOK_CWD=""
 fi
 [ -z "$HOOK_CWD" ] && HOOK_CWD="${PWD:-}"
-HOOK_CWD_NORM=$(printf '%s' "$HOOK_CWD" | tr '\\' '/' | sed 's#//*#/#g')
+# Same reasoning, but falling back to the un-normalized value (not "") if
+# this sed fails: an empty HOOK_CWD_NORM would never match the worktree
+# case below, silently skipping the worktree guard instead of just losing
+# path normalization for this one hook invocation.
+HOOK_CWD_NORM=$(printf '%s' "$HOOK_CWD" | tr '\\' '/' | sed 's#//*#/#g') || HOOK_CWD_NORM="$HOOK_CWD"
 case "$HOOK_CWD_NORM" in
   */.claude/worktrees|*/.claude/worktrees/*|.claude/worktrees|.claude/worktrees/*) exit 0 ;;
 esac

@@ -316,10 +316,508 @@ STUB
   [[ "$out" == *"--team s-sess-STDIN"* ]]              # watcher pinned to it
 }
 
+@test "session-start: session-team gate uses SQLite JSON1 without Node" {
+  enable_st
+  local stub_bin="$TEST_SKILL_DIR/no-node-bin"
+  mkdir -p "$stub_bin"
+  cat > "$stub_bin/node" <<'STUB'
+#!/usr/bin/env bash
+echo "node must not be invoked by session-start" >&2
+exit 91
+STUB
+  chmod +x "$stub_bin/node"
+
+  run env PATH="$stub_bin:$PATH" bash "$SCRIPTS/session-start.sh" \
+    claude-code "$PROJ" <<< '{"session_id":"sess-SQLITE"}'
+  [ "$status" -eq 0 ]
+  [ -d "$TEST_SKILL_DIR/teams/s-sess-SQLITE" ]
+  [[ "$output" == *"--team s-sess-SQLITE"* ]]
+  [[ "$output" != *"node must not be invoked"* ]]
+}
+
+@test "session-start: codex is not rejected by the Claude-only session gate" {
+  enable_st
+  run env -u CLAUDE_CODE_SESSION_ID bash "$SCRIPTS/session-start.sh" \
+    codex "$PROJ" </dev/null
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"refusing Claude Code session-team registration"* ]]
+}
+
+@test "session-start: trims a padded stdin session_id before team registration" {
+  enable_st
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" \
+    <<< '{"session_id":" sess-PAD "}'
+  [ "$status" -eq 0 ]
+  [ -d "$TEST_SKILL_DIR/teams/s-sess-PAD" ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s- sess-PAD " ]
+  [[ "$output" == *"--team s-sess-PAD"* ]]
+}
+
+@test "session-start: rejects a leading-dot session_id before creating s-" {
+  enable_st
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" \
+    <<< '{"session_id":".abc"}'
+  [ "$status" -eq 0 ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-" ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+  [[ "$output" != *".abc"* ]]
+}
+
+@test "session-start: accepts a large valid hook payload without argv overflow" {
+  enable_st
+  local padding payload
+  padding="$(printf '%*s' 300000 '' | tr ' ' x)"
+  payload="{\"session_id\":\"sess-LARGE\",\"padding\":\"$padding\"}"
+
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< "$payload"
+  [ "$status" -eq 0 ]
+  [ -d "$TEST_SKILL_DIR/teams/s-sess-LARGE" ]
+  [[ "$output" == *"--team s-sess-LARGE"* ]]
+}
+
+@test "session-start: embedded dot-command in payload cannot execute (sqlite3 stdin mode)" {
+  enable_st
+  local sentinel="$TEST_SKILL_DIR/injection-sentinel"
+  rm -f "$sentinel"
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<EOF
+{"session_id":"sess-DOT",
+.shell touch $sentinel
+"x":"y"}
+EOF
+  [ "$status" -eq 0 ]
+  [ ! -f "$sentinel" ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+}
+
+@test "session-start: dot-command after an embedded single quote still cannot execute" {
+  enable_st
+  local sentinel="$TEST_SKILL_DIR/injection-sentinel-quote"
+  rm -f "$sentinel"
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<EOF
+{"session_id":"sess-DOT-quote'",
+.shell touch $sentinel
+"x":"y"}
+EOF
+  [ "$status" -eq 0 ]
+  [ ! -f "$sentinel" ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+}
+
+@test "session-start: exploit-shaped payload (CTE-closing dot-command) is rejected" {
+  enable_st
+  local sentinel="$TEST_SKILL_DIR/injection-sentinel-exploit"
+  rm -f "$sentinel"
+  # Closes the raw(j) CTE with the embedded quote, appends a syntactically
+  # complete statement ending in `;`, then a line starting with `.` — the
+  # shape sqlite3 stdin mode needs to leave the string literal and run a
+  # dot-command (verified to execute when escaping is removed, see the
+  # negative-control test below). Uses `.output` (a sqlite3 built-in) rather
+  # than `.shell touch` so the probe has no dependency on an external `touch`
+  # binary being on PATH.
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<EOF
+{"session_id":"x'),z(a) AS (SELECT 1) SELECT 1;
+.output $sentinel
+SELECT 1;
+","y":"y"}
+EOF
+  [ "$status" -eq 0 ]
+  [ ! -f "$sentinel" ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+}
+
+@test "session-start: exploit-shaped payload executes once escaping is removed (negative control)" {
+  enable_st
+  local sentinel="$TEST_SKILL_DIR/injection-sentinel-negctl"
+  rm -f "$sentinel"
+  local match_count line_no orig_line mutant
+  match_count="$(grep -c '_claude_input_sql=' "$SCRIPTS/session-start.sh")"
+  # Fails closed (instead of silently mutating the wrong line) if the
+  # escaping call moved, was renamed, or was duplicated.
+  [ "$match_count" -eq 1 ]
+  line_no="$(grep -n '_claude_input_sql=' "$SCRIPTS/session-start.sh" | cut -d: -f1)"
+  orig_line="$(sed -n "${line_no}p" "$SCRIPTS/session-start.sh")"
+  [[ "$orig_line" == *"sed \"s/'/''/g\""* ]]
+  mutant="$SCRIPTS/session-start-mutant.sh"
+  # The real line is `if ! _claude_input_sql="$(... | sed ...)"; then`,
+  # followed by a reject-and-exit body and `fi`. Replacing just this line
+  # with a bare assignment would leave that `then`/`fi` dangling (syntax
+  # error); replacing it with `if false; then` would skip the reject body
+  # but also skip the assignment itself. Doing the assignment first, then
+  # opening an always-false `if`, keeps both: escaping is disabled AND the
+  # reject body stays unreachable.
+  sed "${line_no}s#.*#  _claude_input_sql=\"\$(printf '%s' \"\$INPUT\" | cat)\"; if false; then#" \
+    "$SCRIPTS/session-start.sh" > "$mutant"
+  chmod +x "$mutant"
+
+  run bash "$mutant" claude-code "$PROJ" <<EOF
+{"session_id":"x'),z(a) AS (SELECT 1) SELECT 1;
+.output $sentinel
+SELECT 1;
+","y":"y"}
+EOF
+  # Proves the positive test above actually detects an escaping regression,
+  # rather than being rejected by json_valid for unrelated reasons.
+  [ -f "$sentinel" ]
+}
+
+@test "session-start: a NUL byte inside session_id is rejected, not silently truncated" {
+  enable_st
+  # SQLite's length()/GLOB predicates stop at the first NUL, so if the CLI or
+  # bash forwarded bytes after it unfiltered, this would smuggle a path
+  # traversal past the allowlist. \u0000 is valid JSON; sqlite3's json1
+  # decodes it to a real NUL byte.
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" \
+    <<< '{"session_id":"a\u0000/../../tmp/evil"}'
+  [ "$status" -eq 0 ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-a" ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+}
+
+@test "session-start: path-separator and traversal shapes in session_id are rejected" {
+  enable_st
+  local payload
+  for payload in '{"session_id":"../../tmp/x"}' '{"session_id":"a/b"}' \
+    '{"session_id":"a\\\\b"}'; do
+    run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< "$payload"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+  done
+}
+
+@test "session-start: an over-length session_id is rejected" {
+  enable_st
+  local long_sid payload
+  long_sid="$(printf '%*s' 200 '' | tr ' ' a)"
+  payload="{\"session_id\":\"$long_sid\"}"
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< "$payload"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+  run bash -c "ls -d '$TEST_SKILL_DIR'/teams/s-a* 2>/dev/null"
+  [ -z "$output" ]
+}
+
+@test "session-start: session_id length boundary — 128 accepted, 129 rejected" {
+  enable_st
+  local sid128 sid129
+  sid128="$(printf '%*s' 128 '' | tr ' ' a)"
+  sid129="$(printf '%*s' 129 '' | tr ' ' a)"
+
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< "{\"session_id\":\"$sid128\"}"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--team s-$sid128"* ]]
+
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< "{\"session_id\":\"$sid129\"}"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+}
+
+@test "session-start: a sed failure in the pre-gate SESSION_ID extraction does not kill the script via errexit" {
+  # Regression guard: the pre-gate SESSION_ID extraction (shared by every
+  # type, not just claude-code) used to be a bare `sed | head` assignment.
+  # Originally this was tested with a real malformed-UTF-8 byte, reproduced
+  # against the macOS system sed. But this repo's tests run under nix's
+  # GNU sed 4.9, which does NOT fail on that byte (verified directly) — a
+  # real malformed-byte payload exercises nothing here, so the sed call is
+  # stubbed to fail directly instead. Only the session_id-matching sed
+  # invocation fails; the gate's own sed calls (which don't match this
+  # pattern) still run normally.
+  enable_st
+  local stub_bin="$TEST_SKILL_DIR/no-sed-sessionid-bin" real_sed
+  mkdir -p "$stub_bin"
+  real_sed="$(command -v sed)"
+  cat > "$stub_bin/sed" <<STUB
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case "\$arg" in
+    *'"session_id"'*) exit 1 ;;
+  esac
+done
+exec "$real_sed" "\$@"
+STUB
+  chmod +x "$stub_bin/sed"
+
+  # An invalid charset (space) makes the gate itself reject independent of
+  # whether pre-gate extraction succeeded, so the asserts below hold either
+  # way — what this test actually pins down is that the stubbed sed failure
+  # doesn't crash the script before reaching that gate.
+  run env PATH="$stub_bin:$PATH" bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" \
+    <<< '{"session_id":"in valid"}'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+  run bash -c "ls -d '$TEST_SKILL_DIR'/teams/s-* 2>/dev/null"
+  [ -z "$output" ]
+}
+
+@test "session-start: a sed failure in the cwd extraction does not kill the script via errexit (unconditional path)" {
+  # Same regression class as the session_id test above, for the cwd
+  # extraction. Unlike session_id, this one runs for every type/mode with
+  # no gate downstream to converge on a guaranteed rejection, so this test
+  # only pins "doesn't crash" (status 0), not a specific outcome. Same GNU
+  # sed caveat as above: stub the cwd-matching sed call to fail directly
+  # rather than relying on a real malformed byte.
+  #
+  # Without a joined pair, PAIRS and SESSION_TEAM are both empty and the
+  # script exits early (before the cwd extraction this test targets) —
+  # join first so execution actually reaches that code.
+  bash "$SCRIPTS/join.sh" base alice claude-code "$PROJ" >/dev/null
+  # Also fails the path-normalization sed (`s#//*#/#g`), unique to this one
+  # call site, so the `|| HOOK_CWD_NORM="$HOOK_CWD"` guard gets teeth too —
+  # not just the extraction guard above it.
+  local stub_bin="$TEST_SKILL_DIR/no-sed-cwd-bin" real_sed
+  mkdir -p "$stub_bin"
+  real_sed="$(command -v sed)"
+  cat > "$stub_bin/sed" <<STUB
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case "\$arg" in
+    *'"cwd"'*|*'s#//*#/#g'*) exit 1 ;;
+  esac
+done
+exec "$real_sed" "\$@"
+STUB
+  chmod +x "$stub_bin/sed"
+
+  run env PATH="$stub_bin:$PATH" bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" \
+    <<< '{"session_id":"sess-OK","cwd":"/some/path"}'
+  [ "$status" -eq 0 ]
+}
+
+@test "session-start: a raw NUL byte in stdin (not JSON-escaped) is rejected" {
+  enable_st
+  # Unlike the earlier \u0000 JSON-escape test above, this NUL is a literal byte in
+  # the hook's stdin. bash's own $(cat) command substitution silently drops
+  # it and splices "a" and "b" together, so by the time INPUT is built the
+  # NUL is already gone — instr(sid, char(0)) never sees it. Only stripping
+  # NUL bytes from the saved raw file and comparing its length before/after
+  # catches this (comparing against INPUT's length would false-positive on
+  # any trailing newline, which $(...) also strips).
+  local payload_file="$TEST_SKILL_DIR/raw-nul-payload.json"
+  printf '{"session_id":"a' > "$payload_file"
+  printf '\0' >> "$payload_file"
+  printf 'b"}' >> "$payload_file"
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" < "$payload_file"
+  [ "$status" -eq 0 ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-ab" ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+}
+
+@test "session-start: a sed failure while building the SQL literal fails closed with a message" {
+  # Same regression class as the wc test below, for the sibling bare
+  # assignment (_claude_input_sql) that had the identical errexit exposure.
+  # session-start.sh calls sed elsewhere too (the session_id/sessionId
+  # extraction above the gate), so the stub only fails the specific
+  # escaping invocation and delegates everything else to the real sed —
+  # otherwise this would test that earlier, unrelated sed call instead.
+  enable_st
+  local stub_bin="$TEST_SKILL_DIR/no-sed-bin" real_sed
+  mkdir -p "$stub_bin"
+  real_sed="$(command -v sed)"
+  cat > "$stub_bin/sed" <<STUB
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case "\$arg" in
+    *"s/'/''/g"*) exit 1 ;;
+  esac
+done
+exec "$real_sed" "\$@"
+STUB
+  chmod +x "$stub_bin/sed"
+
+  run env PATH="$stub_bin:$PATH" bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" \
+    <<< '{"session_id":"sess-SEDFAIL"}'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+}
+
+@test "session-start: a wc failure in the byte-count check fails closed with a message, not a silent errexit" {
+  # Regression guard: an earlier version of this check was a bare
+  # `x="$(wc ... | tr ...)"` assignment, which under set -e -o pipefail dies
+  # right there on a wc/tr failure with NO message and a non-zero exit —
+  # the digit-string checks below it would never even run.
+  enable_st
+  local stub_bin="$TEST_SKILL_DIR/no-wc-bin"
+  mkdir -p "$stub_bin"
+  cat > "$stub_bin/wc" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+  chmod +x "$stub_bin/wc"
+
+  run env PATH="$stub_bin:$PATH" bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" \
+    <<< '{"session_id":"sess-WCFAIL"}'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+}
+
+@test "session-start: mktemp failure fails closed, not falling back to the NUL-blind read" {
+  enable_st
+  local stub_bin="$TEST_SKILL_DIR/no-mktemp-bin"
+  mkdir -p "$stub_bin"
+  cat > "$stub_bin/mktemp" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+  chmod +x "$stub_bin/mktemp"
+
+  local payload_file="$TEST_SKILL_DIR/raw-nul-payload-mktempfail.json"
+  printf '{"session_id":"a' > "$payload_file"
+  printf '\0' >> "$payload_file"
+  printf 'b"}' >> "$payload_file"
+
+  run env PATH="$stub_bin:$PATH" bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" < "$payload_file"
+  [ "$status" -eq 0 ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-ab" ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+}
+
+@test "session-start: no leftover temp file after a rejection or a normal run" {
+  enable_st
+  local before after
+
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< '{"session_id":"sess-CLEANUP"}'
+  [ "$status" -eq 0 ]
+  before="$(find "$TEST_SKILL_DIR/run" -maxdepth 1 -name 'agmsg-hookin.*' 2>/dev/null | wc -l | tr -d '[:space:]')"
+  [ "$before" -eq 0 ]
+
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< '{"session_id":".rejected"}'
+  [ "$status" -eq 0 ]
+  after="$(find "$TEST_SKILL_DIR/run" -maxdepth 1 -name 'agmsg-hookin.*' 2>/dev/null | wc -l | tr -d '[:space:]')"
+  [ "$after" -eq 0 ]
+}
+
+@test "session-start: non-claude-code and mode-off types never write a hook-input temp file" {
+  # The temp-file capture (and its disk-write side effect) is scoped to the
+  # claude-code + session-team-mode-on gate only — codex/mode-off must keep
+  # the plain, no-disk-write read.
+  run bash "$SCRIPTS/session-start.sh" codex "$PROJ" <<< '{"sessionId":"sess-CODEX"}'
+  [ "$status" -eq 0 ]
+  run bash -c "find '$TEST_SKILL_DIR/run' -maxdepth 1 -name 'agmsg-hookin.*' 2>/dev/null"
+  [ -z "$output" ]
+
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< '{"session_id":"sess-MODEOFF"}'
+  [ "$status" -eq 0 ]
+  run bash -c "find '$TEST_SKILL_DIR/run' -maxdepth 1 -name 'agmsg-hookin.*' 2>/dev/null"
+  [ -z "$output" ]
+}
+
+@test "session-start: without the raw-byte-count check, a raw NUL would smuggle bytes past instr() (negative control)" {
+  enable_st
+  local match_count line_no mutant payload_file
+  match_count="$(grep -c '_claude_raw_len" != "' "$SCRIPTS/session-start.sh")"
+  # Fails closed (instead of silently mutating the wrong line) if this
+  # check moved, was renamed, or was duplicated.
+  [ "$match_count" -eq 1 ]
+  line_no="$(grep -n '_claude_raw_len" != "' "$SCRIPTS/session-start.sh" | cut -d: -f1)"
+  mutant="$SCRIPTS/session-start-mutant-rawlen.sh"
+  sed "${line_no}s#.*#    if false; then#" "$SCRIPTS/session-start.sh" > "$mutant"
+  chmod +x "$mutant"
+
+  payload_file="$TEST_SKILL_DIR/raw-nul-payload-negctl.json"
+  printf '{"session_id":"a' > "$payload_file"
+  printf '\0' >> "$payload_file"
+  printf 'b"}' >> "$payload_file"
+  run bash "$mutant" claude-code "$PROJ" < "$payload_file"
+  # Proves the positive test above actually detects the raw-NUL regression,
+  # rather than being rejected by some unrelated check.
+  [ -d "$TEST_SKILL_DIR/teams/s-ab" ]
+}
+
+@test "session-start: mode off, claude-code SessionStart is unaffected by the gate" {
+  # Regression guard for the default (session-team mode off) configuration:
+  # the gate must not fire, and legacy behavior must be unchanged.
+  run env CLAUDE_CODE_SESSION_ID=sess-DEFAULT bash "$SCRIPTS/session-start.sh" \
+    claude-code "$PROJ" <<< '{"session_id":"sess-DEFAULT"}'
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"refusing Claude Code session-team registration"* ]]
+  [[ "$output" != *"--team s-"* ]]
+}
+
+@test "session-start: env-only Claude session id is rejected before registration" {
+  enable_st
+  run env CLAUDE_CODE_SESSION_ID=sess-OTHER \
+    bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" </dev/null
+  [ "$status" -eq 0 ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-sess-OTHER" ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+  [[ "$output" != *"sess-OTHER"* ]]
+}
+
+@test "session-start: rejected env-only id skips stale session-team TTL GC" {
+  enable_st
+  mkdir -p "$TEST_SKILL_DIR/teams/s-victim"
+  printf '%s\n' '{"name":"s-victim","agents":{}}' \
+    > "$TEST_SKILL_DIR/teams/s-victim/config.json"
+  touch -t 202501010000 "$TEST_SKILL_DIR/teams/s-victim" \
+    "$TEST_SKILL_DIR/teams/s-victim/config.json"
+
+  run env CLAUDE_CODE_SESSION_ID=sess-OTHER \
+    bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" </dev/null
+  [ "$status" -eq 0 ]
+  [ -d "$TEST_SKILL_DIR/teams/s-victim" ]
+}
+
+@test "session-start: camelCase sessionId is rejected for Claude session teams" {
+  enable_st
+  run bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" \
+    <<< '{"sessionId":"cursorCamel"}'
+  [ "$status" -eq 0 ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-cursorCamel" ]
+  [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+}
+
+@test "session-start: snake_case wins over camelCase and inherited env" {
+  enable_st
+  run env CLAUDE_CODE_SESSION_ID=sess-ENV \
+    bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" \
+    <<< '{"session_id":"sess-REAL","sessionId":"cursorCamel"}'
+  [ "$status" -eq 0 ]
+  [ -d "$TEST_SKILL_DIR/teams/s-sess-REAL" ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-sess-ENV" ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-cursorCamel" ]
+  [[ "$output" == *"--team s-sess-REAL"* ]]
+  [[ "$output" != *"sess-ENV"* ]]
+  [[ "$output" != *"cursorCamel"* ]]
+}
+
+@test "session-start: rejected payload skips hygiene for stale pidfiles and actas locks" {
+  enable_st
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' 999999 > "$TEST_SKILL_DIR/run/watch.stale.pid"
+  printf '%s\n' sess-OTHER > "$TEST_SKILL_DIR/run/actas.s-victim__claude.session"
+
+  run env CLAUDE_CODE_SESSION_ID=sess-OTHER \
+    bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" </dev/null
+  [ "$status" -eq 0 ]
+  [ -f "$TEST_SKILL_DIR/run/watch.stale.pid" ]
+  [ -f "$TEST_SKILL_DIR/run/actas.s-victim__claude.session" ]
+}
+
+@test "session-start: malformed and non-string session_id payloads fail closed" {
+  enable_st
+  mkdir -p "$TEST_SKILL_DIR/teams/s-victim"
+  printf '%s\n' '{"name":"s-victim","agents":{}}' \
+    > "$TEST_SKILL_DIR/teams/s-victim/config.json"
+  touch -t 202501010000 "$TEST_SKILL_DIR/teams/s-victim" \
+    "$TEST_SKILL_DIR/teams/s-victim/config.json"
+
+  local payload
+  for payload in '{}' '{' '{"session_id":""}' '{"session_id":null}' \
+    '{"session_id":42}' '{"nested":{"session_id":"nested-only"}}'; do
+    run env CLAUDE_CODE_SESSION_ID=sess-ENV \
+      bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< "$payload"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"refusing Claude Code session-team registration"* ]]
+    [[ "$output" != *"sess-ENV"* ]]
+    [[ "$output" != *"nested-only"* ]]
+  done
+  [ ! -d "$TEST_SKILL_DIR/teams/s-sess-ENV" ]
+  [ -d "$TEST_SKILL_DIR/teams/s-victim" ]
+}
+
 @test "session-start: a genuinely absent session_id makes NO synthetic session team" {
   enable_st
   env -u CLAUDE_CODE_SESSION_ID bash -c 'printf "{}" | bash "'"$SCRIPTS"'/session-start.sh" claude-code "'"$PROJ"'"' >/dev/null 2>&1 || true
-  # No s-unknown-* team fabricated → falls back to normal project->team.
+  # No s-unknown-* team fabricated; the rejected hook must not scan or register.
   run bash -c "ls -d '$TEST_SKILL_DIR'/teams/s-unknown-* 2>/dev/null"
   [ -z "$output" ]
 }
