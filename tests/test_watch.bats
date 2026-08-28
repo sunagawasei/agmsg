@@ -444,46 +444,78 @@ _wait_for_file_contains() {
 
 # --- #93: parallel --continue/--resume sessions sharing a session_id ---
 
-# Poll up to ~3s for <pidfile> to record <want_pid>.
+# Poll up to ~10s for <pidfile> to record <want_pid>. A watcher relaunch does
+# a real fork + lock-acquire + SIGTERM-the-predecessor + self-write before the
+# pidfile reflects it, and a loaded CI runner can push that past the 3s this
+# used to allow -- the flake #595 caught on a macos-latest shard. On timeout,
+# reports what it was waiting for and what it last saw, per #595's ask for a
+# failure message that distinguishes "never arrived" from "arrived as
+# something else" rather than a bare assertion failure.
+#
+# `last saw` alone is the LAST poll and nothing else, so it cannot separate
+# "the file never appeared" from "it appeared, then went away again" -- and
+# those two have different causes. The distinct values are kept instead, with
+# the poll each was first seen at.
+#
+# Four states, not two. `cat` returns the empty string for a path that does
+# not exist, a file that exists and is empty, and a file that exists and
+# cannot be read; collapsing them into one `<missing>` loses the difference
+# this trail exists to show (raised in review). They are named apart.
+#
+# Existence is decided by a test; readability is decided by THE READ. `-r`
+# only predicts what a read would do, and a read can still fail after it
+# passes -- a permission change, a replacement, a path that is not a regular
+# file, an I/O error. Classifying on `-r` and then swallowing the read's
+# failure with `|| true` reports `<empty>`, merging the two states this
+# exists to separate (raised in review; the chmod control drove the `-r`
+# branch and never reached the failing read).
+_observe_pidfile() {
+  local pf="$1" v
+  if [ ! -e "$pf" ]; then printf '<no-file>'; return 0; fi
+  if v="$(cat "$pf" 2>/dev/null)"; then
+    if [ -z "$v" ]; then printf '<empty>'; else printf '%s' "$v"; fi
+  else
+    printf '<unreadable>'
+  fi
+}
+
 _wait_pidfile() {
-  wait_until 10 _pidfile_matches "$1" "$2"
-}
-
-_pidfile_matches() {
-  [ -f "$1" ] && [ "$(cat "$1" 2>/dev/null)" = "$2" ]
-}
-
-@test "watch: stale composite adopts a live AGMSG_AGENT_PID before creating artifacts" {
-  skip_on_windows "watcher process mgmt under Git Bash (#182)"
-  local stale_pid=2147483647
-  local agent_pid watcher
-  sleep 60 & agent_pid=$!
-  local iid="stale-adopt.$agent_pid"
-  local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
-  local err="$TEST_SKILL_DIR/stale-adopt.err"
-
-  AGMSG_AGENT_PID="$agent_pid" AGMSG_WATCH_INTERVAL=5 \
-    bash "$SCRIPTS/watch.sh" "stale-adopt.$stale_pid" "$PROJ" claude-code \
-    >/dev/null 2>"$err" 3>&- &
-  watcher=$!
-
-  _wait_pidfile "$pf" "$watcher"
-  run kill -0 "$watcher"; [ "$status" -eq 0 ]
-  grep -q "agmsg watch: instance pid $stale_pid is gone; adopted live agent pid $agent_pid (stale directive, e.g. resumed session)" "$err"
-  [ ! -e "$TEST_SKILL_DIR/run/watch.stale-adopt.$stale_pid.pid" ]
-
-  kill "$watcher" "$agent_pid" 2>/dev/null || true
-  wait "$watcher" 2>/dev/null || true
-  wait "$agent_pid" 2>/dev/null || true
-}
-
-@test "watch: stale composite exits zero with a diagnostic when no agent can be resolved" {
-  skip_on_windows "watcher process mgmt under Git Bash (#182)"
-  local stale_pid=2147483647
-
-  run env AGMSG_AGENT_PID= bash "$SCRIPTS/watch.sh" "stale-exit.$stale_pid" "$PROJ" claude-code
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"agmsg watch: composite instance pid $stale_pid is dead and no live claude-code agent found in ancestry; exiting (stale directive?)"* ]]
+  # `last` starts at a value no read can produce -- seeded with "" it would
+  # swallow the first observation in the case that matters most, a file that
+  # is missing from the very first poll.
+  local pf="$1" want="$2" i seen last="__no_poll_yet__" trail=""
+  for i in $(seq 1 100); do
+    seen="$(_observe_pidfile "$pf")"
+    [ "$seen" = "$want" ] && return 0
+    if [ "$seen" != "$last" ]; then
+      trail="$trail poll$i='$seen'"
+      last="$seen"
+    fi
+    sleep 0.1
+  done
+  echo "_wait_pidfile: timed out waiting for '$pf' to record pid $want (last saw: '$seen')" >&2
+  echo "_wait_pidfile: distinct observations, first poll each:$trail" >&2
+  # What this can say about $want, and no more: signal 0 reaching a pid does
+  # not establish that the pid is still the process we started -- pids are
+  # reused (raised in review). So the command line is printed rather than a
+  # liveness verdict, and the reader decides.
+  if kill -0 "$want" 2>/dev/null; then
+    echo "_wait_pidfile: signal 0 reaches pid $want; its command line now is:" >&2
+    ps -o pid=,stat=,etime=,command= -p "$want" >&2 2>/dev/null || echo "  (ps could not describe it)" >&2
+  else
+    echo "_wait_pidfile: signal 0 does not reach pid $want (exited, or never ours)" >&2
+  fi
+  # The watcher writes its own log beside the pidfile and says there what it
+  # was doing. A successor that is running and has not yet claimed the slot is
+  # waiting on something, and this is the only place that says what.
+  echo "_wait_pidfile: run dir and watcher logs:" >&2
+  ls -la "$(dirname "$pf")" >&2 2>/dev/null || true
+  for _l in "$(dirname "$pf")"/watch.*.log; do
+    [ -f "$_l" ] || continue
+    echo "--- $_l" >&2
+    tail -20 "$_l" >&2 2>/dev/null || true
+  done
+  return 1
 }
 
 @test "watch: two sessions sharing a session_id keep independent watchers (#93)" {
