@@ -236,3 +236,76 @@ SHIM
   # The late message was not silently marked read by the first run
   [ "$(unread_count alice)" -eq 1 ]
 }
+
+# --- #1003: codex mid-turn delivery via PostToolUse emits the shape 0.149.1 wants ---
+#
+# These guard the "broken but green" tl named: a test that only checks a
+# PostToolUse hook entry EXISTS stays green even if check-inbox emits the wrong
+# shape. So they assert the SHAPE check-inbox actually emits, per event. (Whether
+# the model then receives it is unobserved — see the PR; measured here is only the
+# wire shape codex-cli 0.149.1's parser accepts vs rejects.)
+
+_codex_proj() {
+  local p="$TEST_SKILL_DIR/codexproj"
+  mkdir -p "$p"
+  bash "$SCRIPTS/join.sh" ctm alice codex "$p" >/dev/null
+  bash "$SCRIPTS/join.sh" ctm bob   codex "$p" >/dev/null
+  printf '%s' "$p"
+}
+
+@test "check-inbox codex PostToolUse: a pending message emits a hookSpecificOutput object (#1003)" {
+  local p; p=$(_codex_proj)
+  bash "$SCRIPTS/send.sh" ctm bob alice "mid-turn ping"
+  run bash -c 'printf "{}" | "$1" codex "$2" PostToolUse' _ "$SCRIPTS/check-inbox.sh" "$p"
+  [ "$status" -eq 0 ]
+  grep -q '"hookSpecificOutput"' <<<"$output"
+  grep -q '"hookEventName":"PostToolUse"' <<<"$output"
+  grep -q '"additionalContext"' <<<"$output"
+  grep -q 'mid-turn ping' <<<"$output"
+  # Must NOT emit the Stop-event shapes for a PostToolUse event.
+  refute grep -q '"decision"' <<<"$output"
+  refute grep -q '"systemMessage"' <<<"$output"
+}
+
+@test "check-inbox codex PostToolUse: nothing to deliver emits no bytes (#1003)" {
+  local p; p=$(_codex_proj)
+  # No message sent. A malformed/empty JSON body is a failure to codex 0.149.1,
+  # so a no-op turn must emit nothing at all (not an empty additionalContext).
+  run bash -c 'printf "{}" | "$1" codex "$2" PostToolUse' _ "$SCRIPTS/check-inbox.sh" "$p"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "check-inbox codex Stop (default event) shape is unchanged by #1003" {
+  local p; p=$(_codex_proj)
+  bash "$SCRIPTS/send.sh" ctm bob alice "at stop"
+  run bash -c 'printf "{}" | "$1" codex "$2"' _ "$SCRIPTS/check-inbox.sh" "$p"
+  [ "$status" -eq 0 ]
+  grep -q '"decision": "block"' <<<"$output"
+  grep -q 'at stop' <<<"$output"
+  refute grep -q 'hookSpecificOutput' <<<"$output"
+}
+
+@test "check-inbox codex PostToolUse is additive: displays without consuming, and does not gate Stop (#1003)" {
+  # The #677/#1004 intersection control. PostToolUse is the UNVERIFIED path
+  # (model receipt unobserved); it must neither consume read state nor suppress
+  # the verified Stop path via the shared cooldown marker.
+  local p; p=$(_codex_proj)
+  bash "$SCRIPTS/send.sh" ctm bob alice "additive"
+  [ "$(pair_unread_count ctm alice)" -eq 1 ]
+
+  # PostToolUse displays it ...
+  run bash -c 'printf "{}" | "$1" codex "$2" PostToolUse' _ "$SCRIPTS/check-inbox.sh" "$p"
+  [ "$status" -eq 0 ]
+  grep -q 'additive' <<<"$output"
+  # ... but does NOT consume it: an unverified path must not mark read.
+  [ "$(pair_unread_count ctm alice)" -eq 1 ]
+
+  # Stop, immediately and with no time advance, must STILL deliver and consume it.
+  # If PostToolUse shared Stop's cooldown marker, this Stop would exit at the gate
+  # and deliver nothing — the unverified path silencing the verified one.
+  run bash -c 'printf "{}" | "$1" codex "$2"' _ "$SCRIPTS/check-inbox.sh" "$p"
+  [ "$status" -eq 0 ]
+  grep -q 'additive' <<<"$output"
+  [ "$(pair_unread_count ctm alice)" -eq 0 ]
+}

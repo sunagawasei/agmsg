@@ -21,11 +21,27 @@ source "$SCRIPT_DIR/lib/type-registry.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/process-identity.sh"
 
+# Which hook event fired. The Stop entry runs `check-inbox.sh <type> <project>`
+# (EVENT defaults to Stop); the mid-turn PostToolUse entry (#1003) appends the
+# event as a 3rd arg so this script emits the shape that event's runtime accepts,
+# without branching on the type name.
+EVENT="${3:-Stop}"
+
 # Some Stop-hook runtimes (codex, copilot) want an explicit JSON status object
 # even when there is nothing to deliver; others (claude-code) stay silent. This
 # is the type's manifest `stop_output=` (data), not a hardcoded type list.
 STOP_OUTPUT="$(agmsg_type_get "$TYPE" stop_output 2>/dev/null || true)"
+# The wire shape for a PostToolUse payload, from the type manifest (#1003) — the
+# same data-driven approach as stop_output. Measured on codex-cli 0.149.1:
+# hookSpecificOutput. An unknown/unset value emits nothing rather than a guess.
+POSTTOOL_OUTPUT="$(agmsg_type_get "$TYPE" posttooluse_output 2>/dev/null || true)"
+
+# Status (nothing-to-deliver / cooldown) output. For PostToolUse this stays
+# SILENT: codex 0.149.1 treats malformed post-tool-use JSON as a failure, and an
+# empty additionalContext on every tool call would be pure noise — so a no-op
+# turn emits no bytes, which every runtime reads as "hook did nothing".
 emit_status_json() {
+  [ "$EVENT" = "PostToolUse" ] && return 0
   [ "$STOP_OUTPUT" = "json" ] || return 0
   printf '{\n  "continue": true,\n  "systemMessage": "%s"\n}\n' "$1"
 }
@@ -144,7 +160,19 @@ fi
 # lives in the skill's run dir — independent of AGMSG_STORAGE_PATH. Keeping it
 # out of the store means an overridden/sandboxed store still gets delivery even
 # when the default db dir doesn't exist.
-MARKER="$SKILL_DIR/run/.lastcheck-$AGENT"
+#
+# PostToolUse (#1003) uses a SEPARATE marker so the two events' cooldowns do not
+# bind. This event is the UNVERIFIED path (model receipt of its output is not
+# observed), and it must not be able to suppress the verified Stop path: if they
+# shared one marker, a PostToolUse poll would record the cooldown and the very
+# next Stop would exit at the gate without delivering. Its own marker bounds the
+# per-tool-call cost to one read/minute without touching Stop's. (This one value
+# was answering two questions — the same shape reviews keep flagging.)
+if [ "$EVENT" = "PostToolUse" ]; then
+  MARKER="$SKILL_DIR/run/.lastcheck-$AGENT.posttooluse"
+else
+  MARKER="$SKILL_DIR/run/.lastcheck-$AGENT"
+fi
 
 if [ -f "$MARKER" ]; then
   last=$(compat_file_mtime "$MARKER")
@@ -265,39 +293,42 @@ for team in "${TEAM_LIST[@]}"; do
     *)     LOOP_RC=$_rc; LOOP_FAILED_TEAM="$team"; break ;;
   esac
 
-  RESULT=$(agmsg_sqlite "$DB" "
-    SELECT id || char(31) || from_agent || char(31) || replace(replace(body, char(10), '\n'), char(9), '\t') || char(31) || created_at
-    FROM messages WHERE team='$team_sql' AND to_agent='$AGENT_SQL' AND read_at IS NULL
-    ORDER BY created_at ASC;
-  ") || { CLAIM_RC=$?; CLAIM_FAILED_TEAM="$team"; break; }
-  if [ -n "$RESULT" ]; then
-    COUNT=$(echo "$RESULT" | wc -l | tr -d ' ')
-    OUTPUT+="$COUNT new message(s) in $team:"$'\n'
-    IDS=""
-    while IFS=$'\x1f' read -r id from body ts; do
-      OUTPUT+="  [$ts] $from: $body"$'\n'
-      case "$id" in
-        ''|*[!0-9]*) ;; # defensive: never splice a non-numeric value into SQL
-        *) IDS="${IDS:+$IDS,}$id" ;;
-      esac
-    done <<< "$RESULT"
-    OUTPUT+=$'\n'
-    # Test seam: a two-file barrier that lets the race regression test land a
-    # message deterministically between display and mark. No-op unless set.
-    if [ -n "${AGMSG_TEST_MARK_BARRIER:-}" ]; then
-      : > "$AGMSG_TEST_MARK_BARRIER.reached"
-      _agmsg_barrier_waited=0
-      while [ ! -e "$AGMSG_TEST_MARK_BARRIER.release" ]; do
-        sleep 0.05
-        _agmsg_barrier_waited=$((_agmsg_barrier_waited + 1))
-        [ "$_agmsg_barrier_waited" -ge 200 ] && break # 10s safety cap
-      done
-    fi
-    # Mark as read — only the ids captured above, so a message that arrives
-    # between the SELECT and this UPDATE is not marked read unseen.
-    if [ -n "$IDS" ]; then
-      agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id IN ($IDS);" 2>/dev/null || true
-    fi
+  COUNT=$(printf '%s\n' "$RESULT" | grep -c . || true)
+  OUTPUT+="$COUNT new message(s) in $team:"$'\n'
+  IDS=()
+  while IFS=$'\x1f' read -r from body ts id; do
+    [ -n "$id" ] || continue
+    OUTPUT+="  [$ts] $from: $body"$'\n'
+    IDS+=("$id")
+  done <<< "$RESULT"
+  OUTPUT+=$'\n'
+  # Test seam: a two-file barrier that lets the race regression test land a
+  # message deterministically between display and mark. No-op unless set.
+  if [ -n "${AGMSG_TEST_MARK_BARRIER:-}" ]; then
+    : > "$AGMSG_TEST_MARK_BARRIER.reached"
+    _agmsg_barrier_waited=0
+    while [ ! -e "$AGMSG_TEST_MARK_BARRIER.release" ]; do
+      sleep 0.05
+      _agmsg_barrier_waited=$((_agmsg_barrier_waited + 1))
+      [ "$_agmsg_barrier_waited" -ge 200 ] && break # 10s safety cap
+    done
+  fi
+  # Mark read via the facade (§2.1 storage_mark_read_batch): recipient-scoped,
+  # idempotent; a legacy id records a message_read event without mutating the
+  # legacy row (§2.4). Only the ids collected from the rows actually displayed
+  # above — never a blanket match — so a message that arrives after the SELECT
+  # can never be marked read unseen.
+  #
+  # PostToolUse (#1003) does NOT mark read: read state is consumed only by a path
+  # whose delivery is verified, and this event's model receipt is not observed.
+  # "displayed" here means "formatted", not "received" — so consuming here would
+  # be exactly "consumed and never shown", which this file already names below as
+  # worse than the failure the status reports. Mid-turn delivery is therefore
+  # ADDITIVE: it may show a message earlier, but Stop still fetches, shows, and
+  # consumes it as before. A duplicate display is harmless; an invisible loss is
+  # not.
+  if [ "$EVENT" != "PostToolUse" ] && [ "${#IDS[@]}" -gt 0 ]; then
+    storage_mark_read_batch "$team" "$AGENT" "${IDS[@]}" >/dev/null 2>&1 || true
   fi
 done
 
@@ -359,11 +390,28 @@ if [ -n "$OUTPUT" ]; then
   fi
   # Escape for JSON: backslash, double-quote, newlines, tabs (macOS/Linux compatible)
   ESCAPED=$(printf '%s' "$OUTPUT" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | awk '{if(NR>1) printf "\\n"; printf "%s",$0}')
-  cat <<ENDJSON
+  if [ "$EVENT" = "PostToolUse" ]; then
+    # Mid-turn delivery (#1003). The shape is data, from the manifest — not a
+    # type-name branch. codex-cli 0.149.1 requires a hookSpecificOutput object
+    # (hookEventName=PostToolUse, body in additionalContext) and rejects anything
+    # else as "invalid post-tool-use JSON output"; an unknown/unset shape emits
+    # nothing rather than a malformed guess. Reaching the model with this is the
+    # unverified part (see PR): this is the shape the 0.149.1 parser accepts.
+    case "$POSTTOOL_OUTPUT" in
+      hookSpecificOutput)
+        printf '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"%s"}}\n' "$ESCAPED"
+        ;;
+      *) : ;;
+    esac
+  else
+    cat <<ENDJSON
 {
   "decision": "block",
   "reason": "$ESCAPED"
 }
 ENDJSON
+  fi
+  # Exit 0 even when the poll failed part-way: this is the delivering path, and
+  # a non-zero status here throws the delivery away.
   exit 0
 fi

@@ -84,6 +84,39 @@ _agmsg_shq() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+# True (0) iff <cli>'s reported version is >= <min>, compared as MAJOR.MINOR.PATCH.
+# FAIL-CLOSED: returns non-zero when the cli is not on PATH, `--version` fails, or
+# neither the output nor <min> yields a dotted-numeric version — an unknown
+# version must not pass, because the caller installs a hook only for a version
+# confirmed to accept it (#1003). No env override: a version is READ from the CLI,
+# never asserted; tests place a fake `codex` on PATH (both the pass and the fail
+# cases), so no operator seam to claim an unmeasured capability is added.
+_agmsg_cli_version_ge() {
+  local cli="$1" min="$2" raw ver
+  [ -n "$cli" ] && [ -n "$min" ] || return 1
+  command -v "$cli" >/dev/null 2>&1 || return 1
+  raw="$("$cli" --version 2>/dev/null || true)"
+  ver="$(printf '%s' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+|[0-9]+\.[0-9]+' | head -1)"
+  [ -n "$ver" ] || return 1
+  _agmsg_ver_ge "$ver" "$min"
+}
+
+# True (0) iff dotted-numeric $1 >= $2, compared component by component (a missing
+# component reads as 0). Patch is significant: the floor is the exact measured
+# version, so a same-minor build BELOW it (0.149.0 vs a 0.149.1 floor) is refused.
+_agmsg_ver_ge() {
+  local a="$1" b="$2" i av bv
+  for i in 1 2 3; do
+    av=$(printf '%s.0.0.0' "$a" | cut -d. -f"$i")
+    bv=$(printf '%s.0.0.0' "$b" | cut -d. -f"$i")
+    case "$av" in ''|*[!0-9]*) av=0 ;; esac
+    case "$bv" in ''|*[!0-9]*) bv=0 ;; esac
+    [ "$av" -gt "$bv" ] && return 0
+    [ "$av" -lt "$bv" ] && return 1
+  done
+  return 0
+}
+
 # The per-project delivery hooks file is the type's manifest `hooks_file=`
 # (project-relative), not a hardcoded per-type case. The hook FORMAT written into
 # it is still type-specific (apply_settings_* below).
@@ -123,6 +156,42 @@ agmsg_delivery_apply_default() {
   local ww
   ww=$(agmsg_type_get "$type" hook_windows_wrap 2>/dev/null || true)
 
+  # Mid-turn delivery (#1003): a type whose manifest carries a posttooluse_output
+  # datum also gets a PostToolUse hook running check-inbox between tool calls, not
+  # only at Stop. The datum's PRESENCE opts the type in (kept type-agnostic here —
+  # no `if type = codex`); its value is the wire shape check-inbox emits.
+  #
+  # But opt-in is not enough to INSTALL: the entry is meaningless to a CLI that
+  # cannot execute PostToolUse, and — the concern that first motivated the gate —
+  # an older parser that rejected it at startup/hooks-review would break turn
+  # delivery before check-inbox runs. So a second datum, posttooluse_min_cli,
+  # gates on the detected CLI version, FAIL-CLOSED: the entry is installed only
+  # when the CLI is confirmed at or above it. Older, or a version we cannot read,
+  # gets Stop only. (That older-parser concern was later measured — see the next
+  # paragraph — so this stays as defense-in-depth, not the sole protection.)
+  #
+  # What this gate does and does NOT do (#1003 review): it narrows the POPULATION
+  # of projects that get the entry WRITTEN to those where a supporting CLI was
+  # seen at install time. It does NOT by itself govern how an OLDER CLI handles a
+  # persisted entry later — hooks.json outlives this call, and a downgrade or a
+  # different codex binary can read the same file without the gate running again.
+  # That handling was measured separately: codex 0.116.0 (pre-PostToolUse) reads a
+  # PostToolUse-carrying hooks.json and silently ignores the unknown key, no
+  # startup/parse error, positive-control confirmed — the Hooks Review screen was
+  # not directly reached (inferred harmless). So the gate is defense-in-depth on
+  # top of that measurement, not the sole protection against an unknown.
+  local pt_output pt_min pt_cli pt_install=0
+  pt_output=$(agmsg_type_get "$type" posttooluse_output 2>/dev/null || true)
+  if [ -n "$pt_output" ]; then
+    pt_min=$(agmsg_type_get "$type" posttooluse_min_cli 2>/dev/null || true)
+    pt_cli=$(agmsg_type_get "$type" cli 2>/dev/null || true)
+    if [ -z "$pt_min" ]; then
+      pt_install=1                              # opted in with no version floor
+    elif _agmsg_cli_version_ge "$pt_cli" "$pt_min"; then
+      pt_install=1                              # CLI confirmed new enough
+    fi
+  fi
+
   # Work on a temp copy so a partially-modified file never replaces the
   # original until the whole chain succeeds.
   local tmp_state
@@ -137,6 +206,10 @@ agmsg_delivery_apply_default() {
   strip_agmsg_event_file "$tmp_state" "SessionStart"
   strip_agmsg_event_file "$tmp_state" "SessionEnd"
   strip_agmsg_event_file "$tmp_state" "Stop"
+  # Always strip PostToolUse too (#1003), so `off`/`monitor`/a mode change removes
+  # the mid-turn entry alongside Stop. Unconditional: a type that never installed
+  # one has nothing to remove.
+  strip_agmsg_event_file "$tmp_state" "PostToolUse"
 
   # 2) Re-add what this mode wants.
   #
@@ -158,6 +231,12 @@ agmsg_delivery_apply_default() {
     turn)
       local cmd="$(_agmsg_shq "$SKILL_DIR/scripts/check-inbox.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       add_event_entry_file "$tmp_state" "Stop" "$cmd" "$ww"
+      # Same inbox check, fired after every tool call (#1003). The trailing event
+      # arg tells check-inbox.sh which wire shape to emit; matcher is empty (all
+      # tools) via add_event_entry_file. The 60s cooldown bounds the cost.
+      if [ "$pt_install" = 1 ]; then
+        add_event_entry_file "$tmp_state" "PostToolUse" "$cmd $(_agmsg_shq "PostToolUse")" "$ww"
+      fi
       ;;
     both)
       local ss="$(_agmsg_shq "$SKILL_DIR/scripts/session-start.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
@@ -166,6 +245,9 @@ agmsg_delivery_apply_default() {
       add_event_entry_file "$tmp_state" "SessionStart" "$ss" "$ww"
       add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$ww"
       add_event_entry_file "$tmp_state" "Stop"         "$st" "$ww"
+      if [ "$pt_install" = 1 ]; then
+        add_event_entry_file "$tmp_state" "PostToolUse" "$st $(_agmsg_shq "PostToolUse")" "$ww"
+      fi
       ;;
     off)
       : # already stripped
@@ -176,6 +258,18 @@ agmsg_delivery_apply_default() {
       return 1
       ;;
   esac
+
+  # Say when mid-turn delivery was WANTED here but not installed, so a silent
+  # absence is not mistaken for "it's on" (#1003; same "silent = can't tell
+  # waiting from broken" hazard #1001 names). Only meaningful for turn/both, and
+  # only when the type opted in (pt_output) but the version gate said no.
+  if [ -n "$pt_output" ] && [ "$pt_install" != 1 ]; then
+    case "$mode" in
+      turn|both)
+        echo "  ~ mid-turn delivery (PostToolUse) not installed: could not confirm the '$pt_cli' CLI is at or above ${pt_min:-?}. Stop-hook delivery is still active."
+        ;;
+    esac
+  fi
 
   prune_empty_hooks_file "$tmp_state"
 
@@ -297,6 +391,11 @@ agmsg_delivery_status_default() {
     count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hf'), '\$.hooks.Stop'));" 2>/dev/null || echo 0)
     case "$count" in ''|*[!0-9]*) count=0 ;; esac
     echo "  Stop entries:         $count"
+    # The mid-turn PostToolUse entry (#1003) sits next to Stop in turn/both for
+    # types whose manifest opts in; show its count so an operator can see it.
+    count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hf'), '\$.hooks.PostToolUse'));" 2>/dev/null || echo 0)
+    case "$count" in ''|*[!0-9]*) count=0 ;; esac
+    echo "  PostToolUse entries:  $count"
   fi
 }
 agmsg_delivery_status() { agmsg_delivery_status_default "$@"; }

@@ -1929,6 +1929,144 @@ JSON
   [ -z "$cw" ]
 }
 
+# --- #1003: codex mid-turn PostToolUse hook install/strip/status wiring ---
+#
+# The install is version-gated (#1003 review): the entry goes in only when the
+# codex CLI is confirmed at or above posttooluse_min_cli, fail-closed otherwise.
+# The version is READ from the CLI, never asserted, so these place a fake `codex`
+# on PATH (both the pass and the fail cases) rather than depending on whether a
+# real codex is installed (CI has none). The gate narrows WHO gets the entry
+# written; it does not establish that an older CLI ignores a persisted entry.
+
+# A fake `codex` whose `--version` prints $1 (empty $1 => it exits non-zero).
+# Echoes a dir to PREPEND to PATH.
+_fake_codex_path() {
+  local dir="$TEST_SKILL_DIR/fakebin"
+  mkdir -p "$dir"
+  if [ -z "${1:-}" ]; then
+    printf '#!/bin/sh\nexit 1\n' > "$dir/codex"
+  else
+    printf '#!/bin/sh\necho "%s"\n' "$1" > "$dir/codex"
+  fi
+  chmod +x "$dir/codex"
+  printf '%s' "$dir"
+}
+
+@test "delivery set turn (codex): installs a PostToolUse entry alongside Stop, carrying the event arg (#1003)" {
+  run env PATH="$(_fake_codex_path 'codex-cli 0.149.1'):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  local hf="$TEST_PROJECT/.codex/hooks.json"
+  [ -f "$hf" ]
+  local n
+  n=$(sqlite_mem "SELECT json_array_length(json_extract(readfile('$(rf "$hf")'), '\$.hooks.PostToolUse'));")
+  [ "$n" = "1" ]
+  # The command runs check-inbox with the PostToolUse event as a 3rd arg, so the
+  # script emits that event's shape — not a copy that would silently use Stop's.
+  local cmd
+  cmd=$(sqlite_mem "SELECT json_extract(readfile('$(rf "$hf")'), '\$.hooks.PostToolUse[0].hooks[0].command');")
+  grep -q 'check-inbox.sh' <<<"$cmd"
+  grep -q 'PostToolUse' <<<"$cmd"
+  local m
+  m=$(sqlite_mem "SELECT json_extract(readfile('$(rf "$hf")'), '\$.hooks.PostToolUse[0].matcher');")
+  [ -z "$m" ]
+  local s
+  s=$(sqlite_mem "SELECT json_array_length(json_extract(readfile('$(rf "$hf")'), '\$.hooks.Stop'));")
+  [ "$s" = "1" ]
+}
+
+@test "delivery set turn (codex): the PostToolUse entry carries commandWindows too (#1003)" {
+  skip_on_windows "commandWindows not written on native Windows (#182)"
+  run env PATH="$(_fake_codex_path '0.149.1'):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  local cw
+  cw=$(sqlite_mem "SELECT json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.PostToolUse[0].hooks[0].commandWindows');")
+  [ -n "$cw" ]
+  grep -q 'check-inbox.sh' <<<"$cw"
+  grep -q 'PostToolUse' <<<"$cw"
+}
+
+@test "delivery set off (codex): strips the PostToolUse entry with Stop (#1003)" {
+  env PATH="$(_fake_codex_path '0.149.1'):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT" >/dev/null
+  run bash "$SCRIPTS/delivery.sh" set off codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  local n
+  n=$(sqlite_mem "SELECT coalesce(json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.PostToolUse')), 0);" 2>/dev/null || echo 0)
+  [ "${n:-0}" = "0" ]
+}
+
+# --- version gate: install only at/above the EXACT measured floor, fail-closed ---
+# Boundary controls on both sides: exact floor, floor-minus-one, and a MAX.
+
+@test "delivery set turn (codex): the exact measured floor 0.149.1 installs (#1003)" {
+  run env PATH="$(_fake_codex_path '0.149.1'):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  local n
+  n=$(sqlite_mem "SELECT coalesce(json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.PostToolUse')), 0);" 2>/dev/null || echo 0)
+  [ "${n:-0}" = "1" ]
+}
+
+@test "delivery set turn (codex): floor-minus-one 0.149.0 does NOT install — patch is significant (#1003)" {
+  run env PATH="$(_fake_codex_path '0.149.0'):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  local n
+  n=$(sqlite_mem "SELECT coalesce(json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.PostToolUse')), 0);" 2>/dev/null || echo 0)
+  [ "${n:-0}" = "0" ]
+  grep -q 'mid-turn delivery (PostToolUse) not installed' <<<"$output"
+  local s
+  s=$(sqlite_mem "SELECT json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.Stop'));")
+  [ "$s" = "1" ]
+}
+
+@test "delivery set turn (codex): a far-newer version installs (MAX side) (#1003)" {
+  run env PATH="$(_fake_codex_path '9.9.9'):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  local n
+  n=$(sqlite_mem "SELECT coalesce(json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.PostToolUse')), 0);" 2>/dev/null || echo 0)
+  [ "${n:-0}" = "1" ]
+}
+
+@test "delivery set turn (codex): an unparseable CLI version does NOT install, fail-closed (#1003)" {
+  run env PATH="$(_fake_codex_path 'banana'):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  local n
+  n=$(sqlite_mem "SELECT coalesce(json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.PostToolUse')), 0);" 2>/dev/null || echo 0)
+  [ "${n:-0}" = "0" ]
+  grep -q 'mid-turn delivery (PostToolUse) not installed' <<<"$output"
+}
+
+@test "delivery set turn (codex): a CLI whose --version fails does NOT install, fail-closed (#1003)" {
+  run env PATH="$(_fake_codex_path ''):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  local n
+  n=$(sqlite_mem "SELECT coalesce(json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.PostToolUse')), 0);" 2>/dev/null || echo 0)
+  [ "${n:-0}" = "0" ]
+  grep -q 'mid-turn delivery (PostToolUse) not installed' <<<"$output"
+}
+
+@test "delivery set monitor (codex): installs NO PostToolUse entry (#1003)" {
+  run env PATH="$(_fake_codex_path '0.149.1'):$PATH" bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  local n
+  n=$(sqlite_mem "SELECT coalesce(json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.PostToolUse')), 0);" 2>/dev/null || echo 0)
+  [ "${n:-0}" = "0" ]
+}
+
+@test "delivery set turn (claude-code): installs NO PostToolUse entry — no manifest datum (#1003)" {
+  run bash "$SCRIPTS/delivery.sh" set turn claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  local n
+  n=$(sqlite_mem "SELECT coalesce(json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.claude/settings.local.json")'), '\$.hooks.PostToolUse')), 0);" 2>/dev/null || echo 0)
+  [ "${n:-0}" = "0" ]
+}
+
+@test "delivery status (codex turn): reports the PostToolUse entry count next to Stop (#1003)" {
+  env PATH="$(_fake_codex_path '0.149.1'):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT" >/dev/null
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  grep -q 'Stop entries:' <<<"$output"
+  grep -q 'PostToolUse entries:  1' <<<"$output"
+}
+
 # --- Hook JSON escaping: build entries via json_object, not by hand (#134) ---
 #
 # The pre-fix code hand-assembled the entry JSON and only escaped the codex
