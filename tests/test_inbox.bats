@@ -80,6 +80,65 @@ await_barrier_reached() {
   [ "$(unread_count alice)" -eq 0 ]
 }
 
+@test "inbox: a mark-read that loses to a concurrent writer is reported, and the message reappears (#1011)" {
+  # Before #1011 the mark's failure was fully swallowed: the message printed,
+  # the row stayed unread, the exit code was 0, and nothing said so. The
+  # display SELECT reads beside a writer (WAL); only the mark write loses.
+  bash "$SCRIPTS/send.sh" testteam bob alice "trapped"
+  local db
+  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_storage_load; agmsg_db_path testteam' 2>/dev/null)"
+  [ -n "$db" ] && [ -f "$db" ]
+
+  # Hold the write lock until told to let go (a fifo, not a sleep, so the hold
+  # cannot expire mid-test however slowly the inbox runs).
+  mkfifo "$TEST_SKILL_DIR/hold.release"
+  ( printf 'BEGIN IMMEDIATE;\nSELECT 1;\n'; cat "$TEST_SKILL_DIR/hold.release"; printf 'COMMIT;\n' ) \
+    | sqlite3 "$db" >/dev/null &
+  holder=$!
+  # Proceed only once a real write attempt has failed — the backgrounded holder
+  # existing is not the lock being held. No assertion may run while the holder
+  # is still parked on the fifo: a failed assert would abort the test body
+  # before the release, leaving a lock-holding process behind instead of a
+  # clean red. So this path, like the main one, releases before it judges.
+  local held=0
+  for _ in $(seq 1 100); do
+    if ! sqlite3 -cmd '.timeout 20' "$db" 'BEGIN IMMEDIATE; COMMIT;' >/dev/null 2>&1; then held=1; break; fi
+    sleep 0.05
+  done
+  if [ "$held" -ne 1 ]; then
+    : > "$TEST_SKILL_DIR/hold.release"
+    wait "$holder"
+    false
+  fi
+
+  local st=0
+  AGMSG_BUSY_TIMEOUT=200 bash "$SCRIPTS/inbox.sh" testteam alice \
+    > "$TEST_SKILL_DIR/held.out" 2> "$TEST_SKILL_DIR/held.err" || st=$?
+  # The run under contention is over; let the holder go BEFORE any assertion.
+  : > "$TEST_SKILL_DIR/hold.release"
+  wait "$holder"
+
+  # Delivered, exit 0 — and the failed mark is now SAID, not swallowed.
+  [ "$st" -eq 0 ]
+  grep -q 'trapped' "$TEST_SKILL_DIR/held.out"
+  grep -q 'failed to record read state for 1 displayed message(s)' "$TEST_SKILL_DIR/held.err"
+  grep -q '#1011' "$TEST_SKILL_DIR/held.err"
+  # All-unread is a fact about THIS driver (sqlite marks in one transaction);
+  # the jsonl driver can legitimately leave a partial batch, which is why the
+  # diagnostic says "some or all".
+  [ "$(unread_count alice)" -eq 1 ]
+
+  # The same inbox once the writer is gone: shown again, marked, and silent.
+  st=0
+  bash "$SCRIPTS/inbox.sh" testteam alice \
+    > "$TEST_SKILL_DIR/free.out" 2> "$TEST_SKILL_DIR/free.err" || st=$?
+  [ "$st" -eq 0 ]
+  grep -q 'trapped' "$TEST_SKILL_DIR/free.out"
+  # Not `! grep -q`: a negated non-last command cannot fail a bats test (#670).
+  [ "$(grep -c '#1011' "$TEST_SKILL_DIR/free.err" || true)" -eq 0 ]
+  [ "$(unread_count alice)" -eq 0 ]
+}
+
 
 # Make ONE team's store unreadable without touching any other team's.
 #
