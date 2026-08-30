@@ -131,12 +131,61 @@ _wait_for_missing() {
   return 1
 }
 
+# Waits up to ten seconds for <needle> to appear in <file>. On timeout it says
+# what it saw, because a bare failure cannot be classified (#1000): whether
+# the file was missing, empty, or holding OTHER lines tells "the watcher never
+# delivered" from "it delivered something else", and an optional <pid> tells
+# "the watcher was still running" from "it had already exited". Three PRs on
+# one night each had this fail once on a different platform, and none of the
+# three logs could answer either question.
 _wait_for_file_contains() {
-  local file="$1" needle="$2" i
+  local file="$1" needle="$2" pid="${3:-}" i
   for i in $(seq 1 100); do
     [ -f "$file" ] && grep -q "$needle" "$file" && return 0
     sleep 0.1
   done
+  echo "_wait_for_file_contains: '$needle' did not appear in $file within 10s" >&2
+  if [ ! -f "$file" ]; then
+    echo "  file: missing" >&2
+  else
+    # ONE observation, reported consistently: the writer is alive, so reading
+    # the live file once per fact (bytes, terminator, content) can interleave
+    # with an append and describe a state that never existed (review finding).
+    # Everything below is computed from a single snapshot copy; the snapshot
+    # is what the dump describes, and it says so.
+    local snap bytes terminated="ends with a newline"
+    snap="$(mktemp "${TMPDIR:-/tmp}/agmsg-wait-dump.XXXXXX")" || snap=""
+    if [ -z "$snap" ] || ! cp "$file" "$snap" 2>/dev/null; then
+      echo "  file: present, but could not be snapshotted for a consistent dump" >&2
+      [ -n "$snap" ] && rm -f "$snap"
+    elif [ ! -s "$snap" ]; then
+      echo "  file: present, empty (at snapshot time)" >&2
+      rm -f "$snap"
+    else
+      # Bytes and terminator, not `wc -l`: that counts newlines, so a partial
+      # line the writer had not finished would be invisible -- "0 lines"
+      # could not tell "wrote nothing" from "mid-write" (review finding).
+      bytes="$(wc -c < "$snap" | tr -d ' ')"
+      [ -n "$(tail -c 1 "$snap")" ] && terminated="last line is UNTERMINATED (a write may be in progress)"
+      echo "  file: snapshot at timeout, $bytes byte(s), $terminated:" >&2
+      sed 's/^/    | /' "$snap" >&2
+      # An unterminated final line leaves the stream mid-line; close it so
+      # the next diagnostic line does not run on.
+      [ -n "$(tail -c 1 "$snap")" ] && echo >&2
+      rm -f "$snap"
+    fi
+  fi
+  if [ -n "$pid" ]; then
+    # `kill -0` failing is NOT proof the process exited: it also fails on
+    # EPERM and on an observation error. The diagnostic says only what was
+    # observed (review finding -- the #996 shape: absence claimed from a
+    # failed presence check).
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "  watcher $pid: running (kill -0 succeeded)" >&2
+    else
+      echo "  watcher $pid: kill -0 could not confirm it running (exited, or not observable)" >&2
+    fi
+  fi
   return 1
 }
 
@@ -239,8 +288,8 @@ _wait_for_file_contains() {
   [ -f "$pf" ]
 
   bash "$SCRIPTS/send.sh" team bob alice "M1-delivered" >/dev/null
-  _wait_for_file_contains "$out" "M1-delivered"
-  local first_id="$(_storage_tip)"
+  _wait_for_file_contains "$out" "M1-delivered" "$w"
+  local first_cursor="$(_read_cursor team alice)"
 
   # Owning session dies (reap it so kill -0 reports gone, not a zombie), then a
   # newer row arrives. The liveness guard runs before the DB poll, so the watcher
