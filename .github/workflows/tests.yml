@@ -1,18 +1,18 @@
 name: tests
 
-# Run the full Bats suite on every PR and on pushes to main. This repo is
-# public, so GitHub-hosted runners are free — running everything every time is
-# simpler and safer than selectively running "only the changed tests", which
-# would miss regressions in shared libs (lib/*.sh) that fan out across many
-# scripts. What we do instead is run the whole suite in parallel shards.
-#
-# Sharding: the suite has grown to ~790 tests, 11 min on ubuntu and 12-17 on
-# macOS, which is the dominant wait on every PR. `bats-shard` splits it across
-# SHARD_TOTAL runners per OS. The split is computed from the tree by
-# .github/scripts/shard-tests.sh, NOT from a list in this file: a static list
-# would put a newly added test file in no shard at all, and CI would go on
-# reporting green while silently not running it. tests/test_ci_sharding.bats
-# pins that the shards stay a partition of tests/*.bats.
+# Run the full Bats suite on PRs targeting main or any `integration/**` branch,
+# and on pushes to main. The filter is a pattern rather than a list of branch
+# names because a list goes quiet exactly when a new integration branch
+# appears: a PR onto an unlisted base has no required checks, so GitHub reports
+# `mergeStateStatus: CLEAN` -- "nothing to check", not "everything checked" --
+# and the PR's summary status alone cannot tell those apart (measured
+# 2026-08-31). The detail views can: `gh pr checks`, `gh run list` and the
+# Checks tab all show zero runs. That is why the merge gate reads a run whose
+# headSha matches the head being merged, and never the PR's status. The suite is
+# fast (~2 min) and this repo is public, so GitHub-hosted runners are free —
+# running everything every time is simpler and safer than selectively running
+# "only the changed tests", which would miss regressions in shared libs
+# (lib/*.sh) that fan out across many scripts.
 #
 # Docs-only skip (without the paths-ignore trap):
 # the bats check is REQUIRED on main. A naive `paths-ignore` would mean it
@@ -43,7 +43,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, 'integration/**']
 
 permissions:
   contents: read
