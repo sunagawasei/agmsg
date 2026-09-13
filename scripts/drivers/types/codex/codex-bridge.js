@@ -990,6 +990,9 @@ class CodexBridge {
     this.turnTimer = null;
     this.authoritativeIdle = true;
     this.pendingWake = false;
+    this.startInFlight = false;
+    this.inFlightTurnId = null;
+    this.inFlightTurnEnded = false;
     this.watchHandle = null;
     this.wakeCount = 0;
     this.lastWakeMaxId = "";
@@ -1152,6 +1155,17 @@ class CodexBridge {
     this.client.on("item/agentMessage/delta", this.clientHandler("item/agentMessage/delta", (params) => this.onAgentMessageDelta(params)));
     this.client.on("thread/status/changed", this.clientHandler("thread/status/changed", (params) => this.onThreadStatus(params)));
     this.client.on("turn/started", this.clientHandler("turn/started", (params) => {
+      // The app-server holds threads beyond ours; another thread's turn must
+      // not flip our state (and, below, must not be mistaken for the turn we
+      // are starting).
+      if (params && params.threadId && params.threadId !== this.threadId) return;
+      // The app-server may notify the turn tryStartTurn() is starting BEFORE
+      // it ACKs the turn/start request. Capture its IDENTITY: only an end
+      // signal carrying this same turn id may be attributed to the new turn
+      // while the request is in flight (see onTurnCompleted).
+      if (this.startInFlight) {
+        this.inFlightTurnId = (params && params.turn && params.turn.id) || null;
+      }
       this.turnActive = true;
       this.threadIdle = false;
       this.authoritativeIdle = false;
@@ -1603,7 +1617,10 @@ class CodexBridge {
       return;
     }
     if (type === "idle") {
-      this.threadIdle = true;
+      // While a turn/start request is in flight, that start owns the state;
+      // a stale idle from the previous turn must not flip threadIdle under
+      // it. onTurnEnded() below decides (and defers) via the same ownership.
+      if (!this.startInFlight) this.threadIdle = true;
       // The real app-server signals idle but may never send turn/completed;
       // treat idle as the end of the turn so detection resumes. See #41.
       this.onTurnEnded({ authoritative: true }).catch((error) =>
@@ -1662,48 +1679,41 @@ class CodexBridge {
       await this.onTurnFailed(params);
       return;
     }
-    console.error(`codex-bridge: turn completed on thread ${this.threadId}`);
-    const { epoch, turnId } = this.resolveTurnEpoch(params);
-    if (epoch && this.turnSnapshots.has(epoch)) {
-      this.dropTurnEpoch(epoch);   // settled: the turn handled its consumed messages
-    } else if (turnId) {
-      console.error(`codex-bridge: turn/completed for unknown turn ${turnId}; no snapshot to settle`);
+    // Attribution while our turn/start request is unanswered. The previous
+    // turn's tail and the NEW turn's own completion are both legal here, and
+    // a phase flag cannot tell them apart (a stale tail can land AFTER the
+    // new turn was seen starting). Identity can: defer the end only when it
+    // carries the SAME turn id turn/started reported for the turn we are
+    // starting. Anything else — a different id, or no id on either side — is
+    // unattributable mid-start and is dropped; if it really was the new
+    // turn's end, the idle watchdog closes the turn (#41).
+    if (this.startInFlight) {
+      const completedId = params.turn && params.turn.id;
+      if (completedId && this.inFlightTurnId && completedId === this.inFlightTurnId) {
+        this.inFlightTurnEnded = true;
+      }
+      return;
     }
-    this.settleInflightEpoch(epoch);
-    await this.onTurnEnded({ authoritative: true });
-  }
-
-  // turn/failed: in inline-inbox mode the messages were already consumed (marked
-  // read at fetch, see readInboxForPrompt), so without compensation the failed
-  // turn loses them silently. Notify each sender via the normal send path instead
-  // of un-reading them — un-reading would re-run the failed turn on every wake,
-  // the runaway-retry pattern behind the cursor-bridge incident. Only THIS turn's
-  // snapshot (resolved via the event's turn id) is notified; a late failure whose
-  // snapshot is gone or whose id was never seen logs and settles nothing. KNOWN
-  // LIMIT: non-inline-inbox mode is not covered — codex itself runs inbox.sh
-  // (which marks read on fetch) and the bridge never learns the ids.
-  async onTurnFailed(params = {}) {
-    if (params.threadId && params.threadId !== this.threadId) return;
-    const reason = turnFailureReason(params);
-    const { epoch, turnId } = this.resolveTurnEpoch(params);
-    console.error(`codex-bridge: turn failed${turnId ? ` (turn ${turnId})` : ""}: ${reason}`);
-    if (epoch && this.turnSnapshots.has(epoch)) {
-      this.dropTurnEpoch(epoch);
-      this.compensateInflightEpoch(epoch, "turn failed", reason);
-    } else if (epoch || turnId) {
-      console.error(
-        `codex-bridge: turn/failed for ${turnId ? `turn ${turnId}` : "the last turn"} has no pending snapshot (already settled or orphan-drained); nothing to notify`,
-      );
-      this.compensateInflightEpoch(epoch, "turn failed", reason);
-    }
-    await this.onTurnEnded({ authoritative: true });
+    await this.onTurnEnded();
   }
 
   // Single exit point for "the turn is no longer running", reachable from
   // turn/completed, turn/failed, thread/status idle, OR the turn watchdog. The
   // real app-server does not reliably deliver turn/completed, so a bridge that
   // gates re-arm on it never re-arms and sleeps after one message. See #41.
-  async onTurnEnded({ authoritative = false } = {}) {
+  async onTurnEnded() {
+    // While our turn/start request is unanswered, the only turn-end signal
+    // that can be attributed to the turn being started is an id-matching
+    // turn/completed — and onTurnCompleted defers that one itself before it
+    // ever reaches here. Everything else that funnels in mid-start (a stale
+    // thread/status idle from the previous turn, an id-less completion, a
+    // watchdog firing) is unattributable: acting on it reset turnActive /
+    // threadIdle under the in-flight start and re-entered tryStartTurn with
+    // the same wake, injecting a duplicate turn whose inbox read — after the
+    // first read consumed the rows — was empty. Drop them; a genuinely-ended
+    // new turn that only signalled ambiguously is closed by the idle
+    // watchdog (#41).
+    if (this.startInFlight) return;
     this.clearTurnWatchdog();
     const drainFence = !authoritative ? this.readDrainFence() : null;
     if (drainFence) {
@@ -1773,20 +1783,16 @@ class CodexBridge {
     const prompt = this.buildPrompt();
     this.turnActive = true;
     this.threadIdle = false;
-    this.authoritativeIdle = false;
-    this.drainHeldAssumedEnd = false;
-    // Register this turn's consumption under a local epoch BEFORE the
-    // request: turn/started (which binds the server's turn id to this epoch)
-    // can arrive while the request is still in flight. readInboxForPrompt
-    // already reserved the epoch when it published durable in-flight records.
-    if (!this.pendingConsumption || !this.pendingConsumption.size) {
-      this.turnEpoch += 1;
-    }
-    this.activeTurnEpoch = this.turnEpoch;
-    if (this.pendingConsumption && this.pendingConsumption.size) {
-      this.turnSnapshots.set(this.turnEpoch, this.pendingConsumption);
-    }
-    this.pendingConsumption = null;
+    // Claim the wake BEFORE the request goes out, not after it succeeds. With
+    // the claim left set across the await, a turn-end signal arriving mid-
+    // request re-entered this method with the same wake and started a second
+    // turn. The claim is restored on failure so the wake fires again (the
+    // inline inbox rows are already marked read by then, so the retry
+    // re-delivers the wake, not the payload — unchanged from before).
+    this.pendingWake = false;
+    this.startInFlight = true;
+    this.inFlightTurnId = null;
+    this.inFlightTurnEnded = false;
     try {
       await this.client.request("turn/start", {
         threadId: this.threadId,
@@ -1795,12 +1801,12 @@ class CodexBridge {
         runtimeWorkspaceRoots: this.opts.workspaceRoots,
       });
       console.error(`codex-bridge: started turn on thread ${this.threadId}`);
-      this.pendingWake = false;
       // Bound how long we treat the turn as active. The real app-server may
       // never send turn/completed; the watchdog (and thread/status idle) drive
       // onTurnEnded so detection re-arms instead of sleeping forever. See #41.
       this.startTurnWatchdog();
     } catch (error) {
+      this.pendingWake = true;
       this.turnActive = false;
       this.threadIdle = true;
       this.clearTurnWatchdog();
@@ -1809,6 +1815,14 @@ class CodexBridge {
       this.compensateInflightEpoch(this.activeTurnEpoch, "turn/start failed", error.message);
       this.activeTurnEpoch = 0;
       throw error;
+    } finally {
+      this.startInFlight = false;
+    }
+    // A fast turn can be fully notified (started AND ended) before the ACK
+    // arrived; its deferred end is processed now that the start is settled.
+    if (this.inFlightTurnEnded) {
+      this.inFlightTurnEnded = false;
+      await this.onTurnEnded();
     }
   }
 
@@ -2056,67 +2070,12 @@ class CodexBridge {
     let reservedEpoch = false;
     for (const pair of this.identities) {
       if (!allowed.has(`${pair.team}\t${pair.name}`)) continue;
-      const result = spawnSync(
-        BASH_BIN,
-        [path.join(SCRIPTS_DIR, "inbox.sh"), pair.team, pair.name, "--format", "ids"],
-        { cwd: this.opts.project, encoding: "utf8" },
-      );
-      if (result.error || result.status !== 0) {
-        console.error(`codex-bridge: inbox.sh failed for ${pair.team}/${pair.name}`);
-        continue;
-      }
-      const rows = String(result.stdout || "")
-        .split(/\r?\n/)
-        .filter(Boolean)
-        .map((line) => {
-          const [id, from, body, ts] = line.split("\x1f");
-          return { id, from, body: body || "", ts: ts || "" };
-        })
-        .filter((row) => /^\d+$/.test(row.id) && row.from);
-      if (!rows.length) continue;
-      const pairBySender = new Map();
-      for (const row of rows) {
-        if (!pairBySender.has(row.from)) pairBySender.set(row.from, []);
-        pairBySender.get(row.from).push(row.id);
-      }
-      if (!this.publishInflight(pair, nextEpoch, pairBySender)) {
-        console.error(`codex-bridge: leaving ${pair.team}/${pair.name} unread after in-flight publish failure`);
-        continue;
-      }
-      const idsCsv = rows.map((row) => row.id).join(",");
-      const ack = spawnSync(
-        BASH_BIN,
-        [path.join(SCRIPTS_DIR, "inbox.sh"), pair.team, pair.name, "--mark-read-ids", idsCsv],
-        { cwd: this.opts.project, encoding: "utf8" },
-      );
-      if (ack.error) {
-        console.error(`codex-bridge: mark-read-ids unverified for ${pair.team}/${pair.name}; keeping in-flight record and leaving the turn unstarted`);
-        reservedEpoch = true;
-        continue;
-      }
-      const unread = this.inflightCli("unread-count", pair.team, pair.name, idsCsv);
-      const countText = String((unread && unread.stdout) || "").trim();
-      const verified = !!(unread && !unread.error && unread.status === 0 && /^\d+$/.test(countText));
-      if (!verified) {
-        console.error(`codex-bridge: mark-read verification failed for ${pair.team}/${pair.name}; keeping in-flight record and leaving the turn unstarted`);
-        reservedEpoch = true;
-        continue;
-      }
-      if (countText !== "0") {
-        console.error(`codex-bridge: mark-read-ids left unread rows for ${pair.team}/${pair.name}; dropping in-flight record`);
-        this.inflightCli("settle", pair.team, pair.name, String(nextEpoch), this.pidStartToken());
-        continue;
-      }
-      for (const [sender, ids] of pairBySender) {
-        if (!bySender.has(sender)) bySender.set(sender, []);
-        bySender.get(sender).push(...ids);
-      }
-      sections.push([
-        `${rows.length} new message(s):`,
-        "",
-        ...rows.map((row) => `  [${row.ts}] ${row.from}: ${row.body}`),
-        "",
-      ].join("\n"));
+      // --quiet: an empty inbox must read back as EMPTY. The human-facing
+      // "No new messages." line is non-blank, passed tryStartTurn's emptiness
+      // check, and became the entire prompt of an injected turn.
+      const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, "inbox.sh"), pair.team, pair.name, "--quiet"], { cwd: this.opts.project, encoding: "utf8" });
+      if (result.error || result.status !== 0) { console.error(`codex-bridge: inbox.sh failed for ${pair.team}/${pair.name}`); continue; }
+      if ((result.stdout || "").trim()) sections.push(result.stdout.trim());
     }
     if (!sections.length) {
       // A kept record occupies nextEpoch. Advance so the next unread cannot
