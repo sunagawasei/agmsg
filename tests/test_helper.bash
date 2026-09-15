@@ -1,8 +1,53 @@
 # Shared setup/teardown for agmsg BATS tests.
 # Each test gets an isolated skill directory with its own DB and teams.
 
+# #1095: a test that exercises join.sh/actas-claim.sh/spawn.sh/watch.sh/
+# session-start.sh/check-inbox.sh (or the two libraries under them) is, as far
+# as the self-naming primitive can tell, a seat acting -- so it names the pane
+# it is running in, with its own fixture team/agent. On a real machine that is
+# the developer's own terminal, inherited because bats runs inside it. This is
+# TOP-LEVEL, not inside setup_test_env(): `load test_helper` runs it before
+# ANY test's own setup(), so it reaches every file that loads this one,
+# including one (test_install.bats) whose own setup() never calls
+# setup_test_env. A file that deliberately exercises the switch itself
+# (test_self_name.bats, test_self_rename.bats) unsets this right after
+# loading -- that is a local, visible override, not a gap in this default.
+# Hard safety boundary: a test that opts back into self-naming must first install
+# a fake terminal. Clear every ambient terminal marker while this helper loads,
+# before any suite-level setup or test body can unset AGMSG_SELF_NAME. Tests that
+# deliberately model a real terminal restore these variables explicitly, using
+# a fake driver or a documented fixture socket.
+unset TMUX TMUX_PANE TMUX_TMPDIR
+unset HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_SESSION HERDR_BIN_PATH HERDR_STARTUP_CWD
+# #1229: the claude-code transcript-path resolver (agmsg_transcript_path)
+# prefers CLAUDE_CONFIG_DIR over $HOME/.claude when set -- a developer or
+# agent running under a multi-account profile carries this in their real
+# shell, and every fixture in this suite that creates a transcript under the
+# sandboxed HOME assumes that IS the resolved root. Left ambient, those tests
+# would silently resolve against the real profile dir instead of the fixture.
+unset CLAUDE_CONFIG_DIR
+# #1229: poke.sh's plain-no-pane fallback resolves ITS OWN caller identity
+# from AGMSG_SESSION_ID/CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID (the same
+# chain fix.sh uses). Left ambient, a suite run from inside a real
+# claude-code session (this repo's own dev loop very much included) would
+# make that resolution succeed using the DEVELOPER's real session id instead
+# of whatever the fixture set up, silently changing which branch a test
+# exercises. Tests that deliberately model a caller set these explicitly.
+unset AGMSG_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
+export AGMSG_SELF_NAME=off
+
 setup_test_env() {
-  local source_test_dir="${AGMSG_TEST_SOURCE_TEST_DIR:-$BATS_TEST_DIRNAME}"
+  # A test never inherits the developer's terminal. The terminal drivers
+  # identify "this pane" from the environment (tmux: $TMUX/$TMUX_PANE; herdr:
+  # HERDR_PANE_ID, measured 2026-09-08), and join/send/inbox/history name the
+  # caller's pane through it -- so a suite run from inside a real tmux or herdr
+  # pane would otherwise write the fixture's team:agent onto the developer's
+  # own pane. Tests that want a terminal set these AFTER this call, against a
+  # fake on PATH. CI runners carry none of these, so nothing changes there.
+  unset TMUX TMUX_PANE TMUX_TMPDIR
+  unset HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_SESSION HERDR_BIN_PATH HERDR_STARTUP_CWD
+  unset CLAUDE_CONFIG_DIR
+  unset AGMSG_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
   export TEST_SKILL_DIR="$(mktemp -d)"
   mkdir -p "$TEST_SKILL_DIR"/{scripts,db,teams}
   test_fixture_registry_init "$TEST_SKILL_DIR"
