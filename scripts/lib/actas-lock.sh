@@ -26,6 +26,9 @@
 
 : "${SKILL_DIR:?actas-lock.sh requires SKILL_DIR}"
 
+# shellcheck disable=SC1091
+. "$SKILL_DIR/scripts/lib/name-encode.sh"
+
 # Owner tokens are per-process instance ids (see instance-id.sh), not bare
 # session_ids — this is what keeps parallel --continue/--resume sessions that
 # share a session_id from each appearing to own the other's locks (#93). The
@@ -85,41 +88,23 @@ _agmsg_wait_epoch_seconds() {
   printf '%s\n' "$now"
 }
 
-# Encode a team or agent name into a filesystem-safe form. Anything outside
-# [A-Za-z0-9._-] is percent-encoded byte-by-byte (UTF-8 safe, reversible).
-# An earlier underscore-replacement scheme was lossy: "foo bar" and "foo_bar"
-# collided on the same lock file, as did every Japanese team name (every
-# non-ASCII byte mapped to "_"). #65 review, finding 2.
-_actas_lock_encode() {
-  printf '%s' "$1" | LC_ALL=C awk '
-    BEGIN { for (n = 0; n < 256; n++) ord[sprintf("%c", n)] = n }
-    {
-      for (i = 1; i <= length($0); i++) {
-        c = substr($0, i, 1)
-        if (c ~ /[A-Za-z0-9._\-]/) printf "%s", c
-        else printf "%%%02X", ord[c]
-      }
-    }
-  '
-}
-
-# Decode a value produced by _actas_lock_encode. Percent-encoded bytes are
-# restored under the C locale so UTF-8 worker names remain byte-for-byte
-# reversible before the caller's locale interprets them.
-_actas_lock_decode() {
-  printf '%s' "$1" | LC_ALL=C awk '
-    BEGIN { for (n = 0; n < 256; n++) byte[sprintf("%02X", n)] = sprintf("%c", n) }
-    {
-      for (i = 1; i <= length($0); i++) {
-        c = substr($0, i, 1)
-        if (c == "%") {
-          hex = substr($0, i + 1, 2)
-          printf "%s", byte[hex]
-          i += 2
-        } else printf "%s", c
-      }
-    }
-  '
+# Bridge _agmsg_id_key_for's 3-way rc (0 resolved / 1 no id / 2 undetermined)
+# into what a path function does next, in ONE place so the distinction is not
+# re-decided three times. Prints the key and returns 0 when one resolved.
+# Returns 1 with nothing printed when there is genuinely no id -- the caller
+# must use <legacy> outright, its existing contract. Returns 2, with a
+# reason on stderr, when resolution could not even be attempted -- the
+# caller MUST NOT fall back (an id-keyed lock could already exist on disk;
+# see the rc-2 note on _agmsg_id_key_for above) (#1241 review).
+_agmsg_id_key_or_legacy() {   # <team> <agent>
+  local key krc=0
+  key="$(_agmsg_id_key_for "$1" "$2")" || krc=$?
+  case "$krc" in
+    0) printf '%s\n' "$key"; return 0 ;;
+    1) return 1 ;;
+    *) printf 'agmsg: ERROR: cannot tell whether %s/%s has an id-keyed lock (SKILL_DIR unresolved) -- refusing rather than risk missing one and creating a second lock at the legacy path\n' "$1" "$2" >&2
+       return 2 ;;
+  esac
 }
 
 # Compute the lock file path for (team, agent).
