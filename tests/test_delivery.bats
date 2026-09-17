@@ -2455,9 +2455,61 @@ JSON
 # match what the template actually offers (turn/off only, like cursor/gemini).
 @test "antigravity rejects monitor mode" {
   run bash "$SCRIPTS/delivery.sh" set monitor antigravity "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [[ "$output" =~ "not supported" ]]
-  [ ! -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
+  [ "$status" -eq 0 ]
+  grep -qF '<!-- agmsg:antigravity:monitor -->' "$TEST_PROJECT/.agent/rules/agmsg.md"
+}
+
+@test "antigravity migrates turn's own generated rule file to the monitor marker, never refusing it as foreign" {
+  # The migration path compares the existing file byte-for-byte against a
+  # hardcoded copy of what turn mode generates, to tell "our own file, safe to
+  # overwrite" from "someone's hand-written rules, must not clobber". The two
+  # copies (rulefile_apply's actual output and this driver's own hardcoded
+  # expectation) have to stay in lockstep by hand — this pins that they do.
+  bash "$SCRIPTS/delivery.sh" set turn antigravity "$TEST_PROJECT"
+  [ -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
+  run bash "$SCRIPTS/delivery.sh" set monitor antigravity "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  refute grep -qF 'existing rule file is not in agmsg format' <<<"$output"
+  grep -qF '<!-- agmsg:antigravity:monitor -->' "$TEST_PROJECT/.agent/rules/agmsg.md"
+
+  # Pre-#1248 agmsg (1.3.0 and earlier) wrote this exact text but named the
+  # per-driver notes file SKILL.md, renamed to README.md in #1248. Every
+  # upgraded user's untouched rule file has that one older byte, and must
+  # migrate the same way rather than being refused as a foreign file.
+  local rule_file="$TEST_PROJECT/.agent/rules/agmsg.md"
+  rm -f "$rule_file"
+  mkdir -p "$(dirname "$rule_file")"
+  # Sourced, not written out literally here, for the same #1249 reason
+  # _delivery.sh's own migration check sources it: this stays the only
+  # tracked place holding the pre-#1248 path, so a new stray SKILL.md
+  # reference anywhere else -- including elsewhere in this file -- still
+  # fails the #1249 check.
+  local LEGACY_PRE1248_NOTES_PATH
+  source "$SCRIPTS/drivers/types/antigravity/legacy-pre1248-notes-path.sh"
+  cat > "$rule_file" <<EOF
+# agmsg Integration Rule
+
+## PostToolUse
+After each tool call, automatically check the agmsg inbox for unread messages.
+- Command: '$SCRIPTS/check-inbox.sh' 'antigravity' '$TEST_PROJECT'
+
+## Terminal/pane self-awareness
+Asked about your own terminal, pane, or driver — or before using arrange/peek/poke
+— run '$SCRIPTS/where.sh' first and answer from its terminal=/capabilities=
+fields. Never guess from environment variables or a grep/ps command; a driver
+that IS present can be wrongly reported absent that way. Per-driver detail:
+'$SCRIPTS/$LEGACY_PRE1248_NOTES_PATH' (terminal= names which).
+
+## Teammates: placement, status, and reaching them
+Placement and status for a teammate: '$SCRIPTS/team.sh' <team> — never a
+stale memory of their last known pane. Act on one with '$SCRIPTS/peek.sh'
+/ 'poke.sh' / 'arrange.sh' <team> <name> directly, not a guess: its exit code
+says whether it worked and, if not, why.
+EOF
+  run bash "$SCRIPTS/delivery.sh" set monitor antigravity "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  refute grep -qF 'existing rule file is not in agmsg format' <<<"$output"
+  grep -qF '<!-- agmsg:antigravity:monitor -->' "$rule_file"
 }
 
 @test "antigravity rejects both mode" {
