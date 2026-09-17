@@ -15,9 +15,45 @@ setup() {
   # its pidfile on the raw session_id it passes — deterministic in CI and when
   # the suite runs under an agent process.
   export AGMSG_AGENT_PID=""
+  # Newline-separated "pid<TAB>expected cmdline substring" records. Only the
+  # tests below that intentionally leave a background process running past
+  # their next assertion populate this; harmless (stays empty) elsewhere.
+  WATCHED_PIDS=""
+}
+
+# Register <pid> for teardown, together with a substring that MUST appear in
+# its cmdline (read fresh from the real ps, below) before teardown may signal
+# it. Call this immediately after the pid becomes known -- before any
+# assertion that could end the test, not after (#963 review): `run` cannot
+# fail a test, but the check that follows it can, and a pid recorded only
+# after that point never reaches teardown if the test ends there. Two engines
+# leaked exactly that way and were found still running, days later, on a
+# shared machine.
+_agmsg_watch_pid() {
+  local pid="$1" expect="$2"
+  [ -n "$pid" ] || return 0
+  WATCHED_PIDS="${WATCHED_PIDS}${WATCHED_PIDS:+$'\n'}${pid}"$'\t'"${expect}"
 }
 
 teardown() {
+  local pid expect cmd
+  while IFS=$'\t' read -r pid expect; do
+    [ -n "$pid" ] || continue
+    # A pid recorded from a pidfile only says where the number came from, not
+    # which process holds it now -- the engine may have already exited and
+    # the number been reused by an unrelated process. /bin/ps by absolute
+    # path, never through $PATH: a test above may have prepended a fixture
+    # directory whose fake ps claims every pid matches, and by teardown that
+    # override is normally out of scope again (it was only ever exported for
+    # one `run env PATH=... ...` child), but naming the real binary directly
+    # costs nothing and removes the dependency on that being true.
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    cmd="$(/bin/ps -p "$pid" -o args= 2>/dev/null)"
+    case "$cmd" in
+      *"$expect"*) kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true ;;
+    esac
+  done <<< "$WATCHED_PIDS"
   rm -rf "$FAKE_HOME"
 }
 
@@ -258,6 +294,91 @@ teardown() {
   [[ "$output" =~ "#133" ]]
 }
 
+# #963: a running sync engine either keeps executing the code it already
+# loaded (the write below never touches an in-memory process) or crashes
+# reading a half-written driver file mid-write -- either way it does not come
+# back on its own. Drives this through the real installer, not a unit-level
+# call, since the bug is specifically about what --update does around the
+# write. AGMSG_NODE + the ps fixture below stand in for a real Node/server so
+# the engine reaches readiness deterministically and in-process, the same
+# technique test_remote_status_liveness.bats uses; entirely within
+# FAKE_HOME, so this never touches a real installed engine.
+@test "install --update: replaces a running sync engine with one on the new code (#963)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  bash "$SK/scripts/join.sh" testteam alice claude-code /tmp/install-963-proj
+
+  local cfg="$SK/teams/testteam/config.json" escaped updated
+  escaped="$(sed "s/'/''/g" "$cfg")"
+  updated="$(sqlite_mem "
+    SELECT json_set('$escaped', '\$.remote_binding', json_object(
+      'endpoint', 'https://remote.example',
+      'server_instance_id', '018f0000-0000-7000-8000-000000000001',
+      'remote_team_id', '018f0000-0000-7000-8000-000000000002',
+      'protocol_version', 1,
+      'capabilities', json_object('write_allowed_ciphers', json_array('none')),
+      'connected_at', '2026-07-30T00:00:00Z',
+      'disconnected_at', null
+    ));")"
+  printf '%s\n' "$updated" > "$cfg"
+  mkdir -p "$SK/run"
+
+  local fake_node="$SK/fake-node" fake_bin="$SK/fake-node-bin"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'if [ "${1:-}" = "--version" ]; then echo v23.0.0; exit 0; fi' \
+    'echo "{\"event\":\"capabilities\",\"startup_nonce\":\"${AGMSG_SYNC_START_NONCE:-}\"}"' \
+    'trap "exit 0" TERM INT' \
+    'while :; do sleep 1; done' > "$fake_node"
+  chmod +x "$fake_node"
+  mkdir -p "$fake_bin"
+  # Answers only "-p <any pid> -o args=" -- with a fixed, matching cmdline for
+  # any pid asked about, since the engine's real pid is not known until after
+  # each start. Anything else goes to the real ps.
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'args=0' \
+    'case " $* " in *" -o args= "*) args=1 ;; esac' \
+    '[ "$args" = 1 ] || exec /bin/ps "$@"' \
+    "printf '%s\\n' 'bash $SK/scripts/internal/remote-sync.mjs run --team testteam'" > "$fake_bin/ps"
+  chmod +x "$fake_bin/ps"
+
+  local engine_signature="$SK/scripts/internal/remote-sync.mjs run --team testteam"
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SK/scripts/remote.sh" sync start testteam
+  # Captured and registered with teardown BEFORE the assertion below, not
+  # after: `run` itself cannot fail the test, but the `[ ]` that reads its
+  # status can end it right here, and a pid read only after that point is
+  # never watched -- an engine this call actually started then outlives the
+  # test with nothing left to stop it (leaked on this machine, found and
+  # killed by hand; #963 review).
+  local old_pid=""
+  [ -f "$SK/run/remote-sync.testteam.pid" ] && old_pid="$(cat "$SK/run/remote-sync.testteam.pid")"
+  _agmsg_watch_pid "$old_pid" "$engine_signature"
+  [ "$status" -eq 0 ]
+  kill -0 "$old_pid"
+
+  run env HOME="$FAKE_HOME" PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" \
+    bash "$REPO_ROOT/install.sh" --cmd agmsg --update
+  # Same reason as above: whatever the pidfile names now -- the restarted
+  # engine on success, or the old one still if the restart step never ran --
+  # is registered before the status assertion that follows can end the test.
+  local new_pid=""
+  [ -f "$SK/run/remote-sync.testteam.pid" ] && new_pid="$(cat "$SK/run/remote-sync.testteam.pid")"
+  _agmsg_watch_pid "$new_pid" "$engine_signature"
+  [ "$status" -eq 0 ]
+
+  # No engine from before the update remains.
+  sleep 1
+  run kill -0 "$old_pid"
+  [ "$status" -ne 0 ]
+
+  # The engine process now running executes the new install's code: a fresh
+  # pid, alive, and reported running by the (also just-updated) status command.
+  [ "$new_pid" != "$old_pid" ]
+  kill -0 "$new_pid"
+  run env PATH="$fake_bin:$PATH" bash "$SK/scripts/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"connected (engine running, pid $new_pid)"* ]]
+}
+
 @test "install: AGMSG_STORAGE_PATH override works against the installed skill" {
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
   bash "$SK/scripts/join.sh" demo alice claude-code /tmp/install-override-projA
@@ -475,12 +596,20 @@ PS1
   bash "$SK/scripts/join.sh" demo alice claude-code /tmp/install-projA
   local sid="resue-sid-$$"
 
+  local watch_signature="$SK/scripts/watch.sh $sid"
+
   bash "$SK/scripts/watch.sh" "$sid" /tmp/install-projA claude-code 3>&- &
   local first=$!
+  # Registered right after the pid is known, before wait_for_pidfile_pid --
+  # which can time out and end the test -- gets a chance to (#963 review,
+  # same shape as the sync-engine leak above: a pid recorded only after an
+  # assertion that can end the test is never watched by teardown).
+  _agmsg_watch_pid "$first" "$watch_signature"
   wait_for_pidfile_pid "$SK/run/watch.$sid.pid" "$first"
 
   bash "$SK/scripts/watch.sh" "$sid" /tmp/install-projA claude-code 3>&- &
   local second=$!
+  _agmsg_watch_pid "$second" "$watch_signature"
   wait_for_pidfile_pid "$SK/run/watch.$sid.pid" "$second"
   # The pidfile can flip to $second a beat before $first's TERM trap has
   # actually run — poll for its exit rather than checking the instant the
