@@ -270,9 +270,8 @@ If argument starts with "despawn" (e.g. "despawn reviewer", "despawn alice --for
    - `--force`: skips the message and tears the member down from the placement recorded at spawn time — kills its tmux pane/window and drops its registration. Use when the member's watcher can't respond.
 3. Show the script's output. Do NOT TaskStop or relaunch this session's own Monitor — despawn affects the spawned member, not this session's subscription.
 
-If argument is "mode" (no further args):
-1. Run: `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh status claude-code "$(pwd)"`
-2. Show the output to the user.
+<!-- agmsg:slot mode -->
+If argument is "mode", run `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh status __AGENT_TYPE__ "$(pwd)"`. Show the output to the user, and if it says `mode: monitor` (or `both`), say explicitly that this reports project *configuration* only — it does not prove the runtime Monitor task is attached in the current session. To confirm the runtime state, run TaskList and look for a task whose description begins with `agmsg inbox stream` (after an `actas` it reads `agmsg inbox stream (acting as <name>)`) — that is the reliable check; the background-task footer is not (it does not reliably reflect whether a Monitor is really streaming for this session).
 
 If argument starts with "mode" followed by a mode name (e.g. "mode monitor"):
 1. Parse the mode (one of `monitor`, `turn`, `both`, `off`).
