@@ -167,13 +167,11 @@ put_record() {
 }
 
 write_request() {
-  local thread="$1"
-  local pair_team="${2:-}" pair_name="${3:-}"
+  local thread="$1" app_server="${2:-ws://127.0.0.1:1}"
   # #1254: the request file is keyed by AGMSG_CODEX_SEAT_KEY now, not a
   # project hash -- this file's setup() exports one fixed key for the whole
   # suite, which every launcher invocation below inherits.
-  printf 'codex\t%s\tws://127.0.0.1:1\t%s\t%s\n' "$thread" "$pair_team" "$pair_name" \
-    > "$RUN_DIR/codex-bridge-request.$AGMSG_CODEX_SEAT_KEY"
+  printf 'codex\t%s\t%s\n' "$thread" "$app_server" > "$RUN_DIR/codex-bridge-request.$AGMSG_CODEX_SEAT_KEY"
 }
 
 # Start a signal-controlled live PID without imposing a fixed-duration sleep on
@@ -327,8 +325,7 @@ run_launcher() {
 
 @test "launcher: ignores a stale request app-server URL and binds to its live server" {
   put_record team alice rec-thread-1 "$PROJ" codex
-  printf 'codex\trec-thread-1\tws://127.0.0.1:2\tteam\talice\n' \
-    > "$RUN_DIR/codex-bridge-request.$AGMSG_CODEX_SEAT_KEY"
+  write_request old-request-thread ws://127.0.0.1:2
   run_launcher
 
   [ -f "$CAPTURE" ]
