@@ -18,8 +18,8 @@ Teams that use remote sync should update every machine to 1.3.1 or later. From t
 - Codex: a stale app-server URL left in a request file no longer overrides the live endpoint (#1305)
 - `install --update` restarts a sync engine that was running, on the new code, instead of leaving it stale (#1288)
 - Receiving tolerates unknown fields in a message, so a newer sender does not get its messages rejected (#1282)
-- Claude Code Monitor directives set a 30-minute timeout and tell the agent to re-arm silently when a watch expires (#1287)
-- Antigravity monitor works on macOS (#1253); switching an existing 1.3.0 project to monitor delivery is accepted (#1289, #1303); user-facing messages are in English (#1281); a paused start says how to resume (#1291)
+- Claude Code Monitor directives set a 30-minute timeout (#1287). The instruction to re-arm silently on expiry is now opt-in, behind `AGMSG_CC_MONITOR_KEEP_ALIVE` (unset by default) — most seats do not need a watch kept alive across its own natural expiry, and `rearm.sh` covers the ones that do by poking every claude-code seat in a team whose delivery mode is monitor or both (#1315)
+- Antigravity monitor delivery, which is experimental, now also runs on macOS (#1253); switching an existing 1.3.0 project to monitor delivery is accepted (#1289, #1303); user-facing messages are in English (#1281); a refused claim names the process that holds the role and how to release it (#1301); the driver's messages and comments are all in English (#1313). See docs/antigravity-monitor-beta.md for its limitations before enabling it.
 - Sync engines supervised by systemd are detected (#1006)
 - A backtick in a SQL comment no longer runs as a command substitution (#1276)
 - herdr instance names containing a backslash survive percent-decoding (#1275)

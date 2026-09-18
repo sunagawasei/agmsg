@@ -488,18 +488,20 @@ EOF
   # (#188).
   local watch_command
   watch_command="$(printf '%q %q %q %q' "$watch" "$session_id" "$project" "$type")"
-
-  # In session-team mode, mid-session mode changes that reach this function
-  # (/agmsg mode monitor|both, restart) need the same setup as session-start.sh:
-  # join this Claude to its session team and pin the watcher to that team.
-  # Without both, watch.sh has no subscription and exits immediately.
-  if [ "$type" = "claude-code" ]; then
-    local session_team
-    session_team="$(agmsg_session_team_name_from_id "${CLAUDE_CODE_SESSION_ID:-}")"
-    if [ -n "$session_team" ]; then
-      AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$session_team" claude "$type" "$project" >/dev/null 2>&1 || true
-      watch_command="$watch_command $(printf '%q %q %q' claude --team "$session_team")"
-    fi
+  # AGMSG_CC_MONITOR_KEEP_ALIVE, default OFF: timeout_ms: 1800000 always
+  # stays (the Monitor tool caps every watch there regardless), but the
+  # prose explaining the expiry and asking the agent to re-arm on it is
+  # opt-in. Off by default because most Claude Code seats do not need a
+  # standing watch kept alive across its own natural expiry; #1313 added
+  # rearm.sh for the seats that do.
+  local rearm_note=""
+  if [ -n "${AGMSG_CC_MONITOR_KEEP_ALIVE:-}" ]; then
+    rearm_note=" This watch expires after at most 30 minutes; when the expiry
+notice arrives, immediately re-arm it by invoking Monitor again with this
+exact command and description — delivery depends on it, since nothing else
+keeps the stream running. Re-arm it silently: no message to the user, no
+\"re-armed\", no acknowledgement, no summary — just invoke Monitor again and
+continue, since announcing it every 30 minutes wastes tokens for no benefit."
   fi
   cat <<EOF
 
@@ -517,7 +519,7 @@ description begins with "agmsg inbox stream" (after actas it reads
 transcript event named to match. The background-task footer is not a
 reliable check either way; use TaskList. If ToolSearch cannot find the
 generic Monitor tool, use turn/manual inbox as a fallback; that is not
-real-time monitor delivery.
+real-time monitor delivery.${rearm_note}
 EOF
 }
 

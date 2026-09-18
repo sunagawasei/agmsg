@@ -7,104 +7,11 @@ Agent messaging command. **IMPORTANT: Always use the provided scripts. NEVER dir
 
 **Shell requirement:** All agmsg scripts are Bash scripts. Always execute them via `bash`, never via PowerShell or cmd directly. If your default shell is not Bash (e.g. PowerShell on Windows), wrap every command with `bash -lc '...'`. Example: `bash -lc '~/.agents/skills/__SKILL_NAME__/scripts/send.sh myteam alice bob "hello"'`. Do NOT construct DB paths manually — the scripts handle path resolution internally. If you need to redirect storage, use `AGMSG_STORAGE_PATH` (the supported override).
 
-## Identity
+If asked, in ordinary language and in either English or Japanese, to re-arm this session's own agmsg monitor (no fixed trigger word — read the request as it is phrased): invoke Monitor with the standard command and description for this seat, and say nothing else.
 
-If you already know your AGENT and TEAMS from a previous `/__SKILL_NAME__` call in this session, skip to **Execute** below.
+If asked to re-arm the team's Claude Code monitors (not just this session's own): run `~/.agents/skills/__SKILL_NAME__/scripts/rearm.sh` and report what it prints.
 
-Otherwise, run: `~/.agents/skills/__SKILL_NAME__/scripts/whoami.sh "$(pwd)" claude-code`
-
-Four possible outputs:
-
-**A) Single identity:**
-`agent=<name> teams=<t1,t2,...> type=claude-code project=<path>`
-→ Remember AGENT and TEAMS, then go to **Execute**.
-
-**B) Multiple identities:**
-`multiple=true agents=<n1,n2,...> teams=<t1,t2,...> type=claude-code project=<path>`
-→ Ask the user which agent name to use for this session, then go to **Execute**.
-
-**C) Not in a team:**
-`not_joined=true available_teams=<t1,t2,...>` (or `available_teams=none`)
-→ Show the user the available teams from the output, then:
-
-  > **First-time setup required.**
-  > Joining a team so this agent can send and receive messages.
-  > - **Team name**: a group of agents that can message each other (available: <list from output>)
-  > - **Agent name**: this agent's identity within the team
-
-  1. Ask: "Enter a team name (joins existing or creates new)"
-  2. If the team name given already appears in `available_teams`, run `~/.agents/skills/__SKILL_NAME__/scripts/team.sh <team>` to see the current roster (name, type, project) and note the names already in use. Look for a naming convention already in play (e.g. a shared base name with role and number suffixes (`<base>-<role><n>`), or names derived from the team name) and, when one exists, propose 2-3 unused names that extend it; otherwise propose 2-3 short, distinctive identity names (not a bare tool-type label like `codex`/`cc`). Either way, names must not collide with the roster. Then ask: "Enter a name for this agent (suggestions: <name1>, <name2>, <name3> — or type your own)". For a brand-new team, skip the roster check and just ask: "Enter a name for this agent".
-  3. **You MUST use join.sh** — run: `~/.agents/skills/__SKILL_NAME__/scripts/join.sh <team> <agent_name> claude-code "$(pwd)"`
-  4. Show the result and explain:
-
-  > **Joined!** You can now use `/__SKILL_NAME__` to check and send messages.
-  > - `/__SKILL_NAME__` — check inbox
-  > - `/__SKILL_NAME__ send <agent> <message>` — send a message
-  > - `/__SKILL_NAME__ team` — list team members
-  > - `/__SKILL_NAME__ history` — message history
-  > - `/__SKILL_NAME__ mode <monitor|turn|both|off>` — switch delivery mode
-  > - `/__SKILL_NAME__ actas <name>` — switch to another role in this project (creates if needed)
-  > - `/__SKILL_NAME__ drop <name>` — remove a role from this project
-  > - `/__SKILL_NAME__ spawn <type> <name>` — launch a new agent in a tmux pane / terminal and have it actas <name>
-  > - `/__SKILL_NAME__ despawn <name>` — tear down a member you spawned (graceful, or `--force`)
-
-  5. **REQUIRED — Do NOT skip this step.** First check whether the user has a configured default delivery mode:
-     run `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh default-mode claude-code 2>/dev/null`
-     (the `2>/dev/null` matters — judge ONLY on stdout; the resolver may print an explanatory note to stderr).
-
-     - **If stdout is exactly one of `monitor` / `turn` / `both` / `off`**: the user has set `delivery.default_mode` — **do NOT show the prompt below.** Run
-       `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh set <that-mode> claude-code "$(pwd)"`,
-       tell the user `Delivery mode auto-set to <mode> (delivery.default_mode) — change anytime with /__SKILL_NAME__ mode <monitor|turn|both|off>`,
-       read the `AGMSG-DIRECTIVE` block printed by `delivery.sh` and follow it (invoke Monitor or TaskStop as instructed), then continue to step 6.
-     - **If stdout is empty** (no default configured, or the configured value is invalid/unsupported): ask the user to pick a delivery mode using exactly this prompt:
-
-       ```
-       Choose delivery mode for incoming messages:
-
-         1) monitor — Real-time push (~5s latency)
-                       SessionStart hook + Monitor tool streams events.
-                       Recommended.
-
-         2) turn    — Check inbox at the end of each assistant turn
-                       Stop hook pulls after each response.
-
-         3) both    — monitor primary, turn as fallback
-                       Redundant safety net.
-
-         4) off     — No automatic delivery
-                       Manual /__SKILL_NAME__ only.
-
-       [1]:
-       ```
-
-       - **Wait for the user's answer before proceeding.** Empty input means `1` (monitor).
-       - Map the chosen number to a mode and run:
-         `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh set <mode> claude-code "$(pwd)"`
-       - Read the `AGMSG-DIRECTIVE` block printed by `delivery.sh` and follow it (invoke Monitor or TaskStop as instructed).
-
-  6. Then check inbox for the newly joined team.
-
-**D) Suggestions for reuse:**
-`suggest=true agents=<n1,n2,...> teams=<t1,t2,...> type=claude-code project=<path> available_teams=<t1,t2,...>`
-→ No exact registration exists for this project, but there are same-type agent names registered elsewhere.
-
-  1. Show the suggested agent names to the user.
-  2. Ask whether to reuse one of those names or choose a new one.
-  3. Ask for the team name to join (existing or new).
-  4. Run: `~/.agents/skills/__SKILL_NAME__/scripts/join.sh <team> <agent_name> claude-code "$(pwd)"`
-  5. Then continue with the normal post-join flow above.
-
-## Execute
-
-**Only use scripts in `~/.agents/skills/__SKILL_NAME__/scripts/` — do not read or modify files under `teams/` or `db/` directly.** Treat the storage layout as internal: never construct a database path or invoke `sqlite3` directly. The scripts resolve the active store, including `AGMSG_STORAGE_PATH` overrides.
-
-**Ensure monitor is running first.** Before processing any subcommand below, check whether this session already has an `agmsg inbox stream` Monitor task in its TaskList. If not, and the project's delivery mode is `monitor` or `both` (check via `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh status claude-code "$(pwd)"`), invoke the Monitor tool now:
-
-- command: `~/.agents/skills/__SKILL_NAME__/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code`
-- description: `agmsg inbox stream`
-- persistent: true
-
-Then continue with the user's subcommand. This catches the case where the user invokes `/__SKILL_NAME__` as the first prompt before the SessionStart-hook directive has been acted on.
+Claude Code commands may need permission and sandbox allowlists for `~/.agents/skills/__SKILL_NAME__/scripts/` and its writable `db/`, `teams/`, and `run/` directories.
 
 **Permission prompts.** Every command here runs through the Bash tool, so each call is gated by the permission system until the script directory is allowlisted. Without this the user is asked to confirm essentially every `__SKILL_NAME__` call. Add to `~/.claude/settings.json` (or project-level `.claude/settings.local.json`):
 
@@ -219,7 +126,7 @@ If argument starts with "actas" followed by an agent name (e.g. "actas alice"):
         - persistent: true
         - timeout_ms: 1800000
 
-        This watch expires after at most 30 minutes; when the expiry notice arrives, immediately re-arm it by invoking Monitor again with this exact command and description — delivery depends on it, since nothing else keeps the stream running. Re-arm it silently: no message to the user, no "re-armed", no acknowledgement, no summary — just invoke Monitor again and continue, since announcing it every 30 minutes wastes tokens for no benefit.
+        Check whether the environment variable `AGMSG_CC_MONITOR_KEEP_ALIVE` is set (e.g. `printenv AGMSG_CC_MONITOR_KEEP_ALIVE`). If it IS set: this watch expires after at most 30 minutes; when the expiry notice arrives, immediately re-arm it by invoking Monitor again with this exact command and description — delivery depends on it, since nothing else keeps the stream running. Re-arm it silently: no message to the user, no "re-armed", no acknowledgement, no summary — just invoke Monitor again and continue, since announcing it every 30 minutes wastes tokens for no benefit. If it is UNSET (the default), skip this paragraph — the watch still expires after 30 minutes, but nothing here asks you to re-arm it.
       - **`mode: turn`**: leave it stopped, silently. `has_st=1` is the one case `delivery.sh` can actually confirm was a deliberate choice — someone configured turn-based delivery for this project — so `actas` starting nothing here needs no explanation.
       - **`mode: off (no agmsg delivery hooks installed for this project)`**: leave it stopped (`actas` must not start automatic delivery a project wasn't configured for), but **do not treat this as silently deliberate**. `delivery.sh` cannot tell whether someone ran `mode off` here or this project was simply never configured — both leave the exact same settings file (#687 review round 3). **Tell the user** — e.g. "agmsg delivery hooks are not installed for this project; automatic delivery remains stopped. Run `/__SKILL_NAME__ mode <choice>` if you want to configure it." Keep it matter-of-fact, not a warning. Do not report `actas` as complete without saying this.
       - **`mode: off (unrecognized: ...)`**: leave it stopped too (same rule — do not guess a mode), but this is a stronger case than the no-hooks-installed one above: `delivery.sh` could not even find or read a settings file for this project, most often because the working directory does not match how the project was actually registered. **Tell the user explicitly** — e.g. "agmsg could not find a delivery configuration for this project at `<path from the message>` — delivery is stopped, but this may mean the project isn't registered here rather than that it was deliberately turned off. Check the path, or run `/__SKILL_NAME__ mode <choice>` to configure it explicitly." Do not report `actas` as complete without saying this — a silent stop here is indistinguishable from the other off cases and is what let this go unnoticed before (#687).
@@ -242,7 +149,7 @@ If argument starts with "drop" followed by an agent name (e.g. "drop alice"):
         - persistent: true
         - timeout_ms: 1800000
 
-        This watch expires after at most 30 minutes; when the expiry notice arrives, immediately re-arm it by invoking Monitor again with this exact command and description — delivery depends on it, since nothing else keeps the stream running. Re-arm it silently: no message to the user, no "re-armed", no acknowledgement, no summary — just invoke Monitor again and continue, since announcing it every 30 minutes wastes tokens for no benefit.
+        Check whether the environment variable `AGMSG_CC_MONITOR_KEEP_ALIVE` is set (e.g. `printenv AGMSG_CC_MONITOR_KEEP_ALIVE`). If it IS set: this watch expires after at most 30 minutes; when the expiry notice arrives, immediately re-arm it by invoking Monitor again with this exact command and description — delivery depends on it, since nothing else keeps the stream running. Re-arm it silently: no message to the user, no "re-armed", no acknowledgement, no summary — just invoke Monitor again and continue, since announcing it every 30 minutes wastes tokens for no benefit. If it is UNSET (the default), skip this paragraph — the watch still expires after 30 minutes, but nothing here asks you to re-arm it.
       - **`mode: turn`**: leave it stopped, silently — the one case `delivery.sh` can confirm was deliberate.
       - **`mode: off (no agmsg delivery hooks installed for this project)`**: leave it stopped, but say so — same reasoning as the `actas` step this mirrors: this state is indistinguishable from "never configured" (#687 review round 3), so do not report it as deliberate. Do not report the drop as complete without mentioning it.
       - **`mode: off (unrecognized: ...)`**: leave it stopped, but say so with the stronger diagnostic — same reasoning as the `actas` step this mirrors (#687). Do not report the drop as complete without mentioning it.
