@@ -830,6 +830,7 @@ JSON
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
   wait_for_pid_exit "$watch_pid"
   [ ! -f "$TEST_SKILL_DIR/run/watch.stop-test.pid" ]
+  wait_for_pid_exit "$watch_pid"
   ! kill -0 "$watch_pid" 2>/dev/null
 }
 
@@ -1043,12 +1044,11 @@ JSON
 
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sigterm-test "$TEST_PROJECT" claude-code alice 3>&- &
   local pid=$!
-  test_fixture_register_owned_pid "$pid"
   wait_for_file "$TEST_SKILL_DIR/run/watch.sigterm-test.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
   wait_for_file "$TEST_SKILL_DIR/run/ready.myteam__alice"
   kill -TERM "$pid"
-  sleep 1
+  wait_for_pid_exit "$pid"
   refute kill -0 "$pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
 }
@@ -1244,7 +1244,7 @@ has_session_end() {
     || { echo "the decoy does not look like this install's watch.sh" >&2; return 1; }
   echo "$target_pid" > "$TEST_SKILL_DIR/run/watch.sess-A.pid"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
-  sleep 1
+  wait_for_pid_exit "$target_pid"
   refute kill -0 "$target_pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sess-A.pid" ]
 }
@@ -1701,9 +1701,21 @@ JSON
   # The watcher seeds its cursor from the storage tip at startup, so prior
   # messages aren't replayed. Send NEW messages through the facade (storage_send
   # writes the event log the watcher now streams) and wait for several polls.
-  sleep 1
+  #
+  # Wait for the readiness sentinel, not the pidfile: watch.sh writes its
+  # pidfile (~line 520) well before it resolves PAIRS (~line 677), and this
+  # is an ACTIVE_NAME watcher, so the sentinel is written only once PAIRS is
+  # resolved (#108) -- the pidfile alone would let `send.sh` race ahead of
+  # subscription resolution (review on #1327).
+  wait_for_file "$(_ready_path myteam bob)"
   bash "$SCRIPTS/send.sh" myteam system alice "new-for-alice" --force >/dev/null
   bash "$SCRIPTS/send.sh" myteam system bob "new-for-bob" --force >/dev/null
+  # A flat wait, deliberately: this observes that "new-for-alice" is ABSENT
+  # (checked below), and polling for the one message that IS allowed to
+  # arrive would let the watcher be killed the instant it appears -- before a
+  # buggy watcher that wrote the allowed line and was ABOUT to write the
+  # forbidden one gets the chance to (review on #1327). Nothing here is a
+  # condition to poll for.
   sleep 3
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
@@ -1802,7 +1814,14 @@ JSON
   # is resolved at launch and not re-evaluated each poll.
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-static "$TEST_PROJECT" claude-code > /tmp/agmsg-static 2>&1 3>&- &
   local pid=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.t-static.watermark"
+  # A flat wait, deliberately: watch.sh's readiness sentinel is written only
+  # for an ACTIVE_NAME (actas) watcher (#108), and this one has none -- it is
+  # exactly the "default, broad subscription" shape this test is about -- so
+  # there is no file this watcher writes AFTER resolving PAIRS (~line 677)
+  # that a plain watcher's own pidfile write (~line 520) could be swapped
+  # for. Polling the pidfile would let `join.sh bob` below race ahead of the
+  # subscription snapshot this test's premise depends on (review on #1327).
+  sleep 1
 
   # Join `bob` to the same (project, type) after the watcher is running.
   bash "$SCRIPTS/join.sh" myteam bob claude-code "$TEST_PROJECT"
@@ -1812,13 +1831,13 @@ JSON
   bash "$SCRIPTS/send.sh" myteam sys alice "for-alice-static" --force >/dev/null
   bash "$SCRIPTS/send.sh" myteam sys bob   "for-bob-static" --force >/dev/null
 
-  # A sentinel for alice inserted AFTER bob's row. Its arrival proves the
-  # watcher has already scanned past for-bob-static, which is what makes "bob
-  # never arrived" an assertion rather than a guess. Waiting on
-  # for-alice-static instead would not: it precedes bob's row, so seeing it
-  # says nothing about whether bob's had been reached yet.
-  sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'sys', 'alice', 'static-sentinel');"
-  wait_for_file_contains /tmp/agmsg-static "static-sentinel"
+  # A flat wait, deliberately: this observes that "for-bob-static" is ABSENT
+  # (checked below), and polling for the one message that IS allowed to
+  # arrive would let the watcher be killed the instant it appears -- before a
+  # buggy watcher that wrote the allowed line and was ABOUT to write the
+  # forbidden one gets the chance to (review on #1327). Nothing here is a
+  # condition to poll for.
+  sleep 3
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
 
@@ -1924,7 +1943,8 @@ JSON
 
   run bash "$SCRIPTS/delivery.sh" stop
   [[ "$output" =~ "Killed 2 watch" ]]
-  sleep 1
+  wait_for_pid_exit "$pid_a"
+  wait_for_pid_exit "$pid_b"
   refute kill -0 "$pid_a" 2>/dev/null
   refute kill -0 "$pid_b" 2>/dev/null
 
