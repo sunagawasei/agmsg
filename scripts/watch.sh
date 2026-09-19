@@ -261,6 +261,239 @@ watch_log() {
   printf '%s\n' "$record" >> "$LOGFILE" 2>/dev/null || true
 }
 
+# Close THIS member's own pane at the end of a graceful despawn, through the
+# terminal driver named by its placement record.
+#
+# It used to be `tmux kill-pane -t "$TMUX_PANE"`, which is the asymmetry the v1
+# scope named: a tmux member could fold itself away and a herdr member could
+# not, for no reason other than which multiplexer the teardown was written
+# against. The record already says which terminal placed the pane, and
+# despawn.sh already tears down through it; this is the same route for the
+# member tearing down ITSELF.
+#
+# Two things this deliberately does NOT do:
+#
+# 1. It does not fall back to $TMUX_PANE when the record is unusable. Keeping
+#    that fallback would leave tmux on a private path and reinstate the very
+#    asymmetry being removed — and it would make the failure invisible, because
+#    the one terminal that still worked is the one nobody would notice.
+#
+# 2. It does not fold a pane it cannot show is its own. `despawn.sh` tears down
+#    SOMEBODY ELSE from a record; this path tears down ITSELF, and the two need
+#    different proof. A record naming (team, name) says a pane was placed for
+#    that seat — it does not say the pane this process is running in IS that
+#    pane. Acting on the weaker fact is how a record gets used as authority it
+#    was never given. So the record's terminal+id must match what this session
+#    resolves to right now, and anything short of a match is reported, not
+#    guessed at.
+#
+# Silence is never the answer here: a pane that should have closed and did not
+# is exactly the state an operator cannot see. Every path that declines says
+# why, on stderr and in the watcher log.
+# Fold this session's own pane, and SAY WHICH of three things happened:
+#
+#   0  closed            the driver confirmed the pane is folded
+#   1  could-not-close   a pane was placed for this seat and this call did not
+#                        fold it — it may still be open
+#   2  nothing-to-close  nothing of ours was ever placed here (no record, or the
+#                        record names another session's pane)
+#
+# The channel follows the same split, and that is the rule rather than a habit:
+# 1 goes to STDOUT (`watch_report`) because an operator has a window to deal
+# with and the shipped launcher discards stderr (#691); 2 goes to stderr, because
+# there is nothing for anyone to do.
+#
+# Every branch used to `return 0`, including the one where the driver refused —
+# so the caller could not tell a folded pane from an open one, and reported
+# success either way (#1051). The failures also announced themselves only on
+# stderr, which the shipped launcher discards (#691), so they reached nobody.
+# Re-verify, at the act, that this pair is still in the state the turn read it
+# in. #983: the lock is read once per pair per turn (`pair_state=`), and the
+# irreversible acts happen ~200 lines later; a claim landing in between made this
+# watcher deliver, consume and even fold on behalf of a role it no longer held.
+#
+# The comparison is against the state we READ, not against "is it ours": the gate
+# serves a pair that is `free` as well as one that is `mine` (a broad watcher
+# holds no lock at all), so demanding `mine` here would stop the ordinary case.
+# What must not happen is the state CHANGING under us — `free`/`mine` becoming
+# `other:<sid>` — and equality catches that without needing to know which of the
+# two we started from.
+#
+# LIMIT, stated rather than left to be discovered: this NARROWS the window to the
+# distance between this re-read and the syscall after it. It does not make
+# read-and-act atomic, and it cannot see an ABA (the same instance id releasing
+# and reclaiming) — unreachable in practice because the id carries the pid, but
+# not impossible. Closing it means holding the actas lock across the turn, which
+# needs a critical-section protocol the lock does not have today; that is its own
+# issue, deliberately not smuggled in here.
+_pair_unchanged_since_read() {   # <team> <agent> <owner-as-read-this-turn>
+  # 0 unchanged | 1 changed | 2 unknown (unknown is refused, same as changed).
+  #
+  # ONE read, and the comparison is on the RAW owner. Two earlier shapes were both
+  # wrong, and the second is the subtler one:
+  #
+  #   `|| echo free`        turned an unreadable lock into "free", which COMPARED
+  #                         EQUAL to a pair read as free (review, round 1).
+  #   probe then re-derive  checked the status of one read and then used a second
+  #                         one's answer: actas_lock_state does its own read and
+  #                         collapses ITS failure to free/rc0, so for a broad
+  #                         watcher (pair_state=free) the unknown was laundered
+  #                         back into unchanged (review, round 2).
+  #
+  # Deriving `free`/`mine`/`other:` also drags in liveness, and
+  # actas_lock_sid_alive -> agmsg_instance_alive is a boolean with no "cannot
+  # tell": an unreadable run dir makes a live owner look dead, i.e. free again.
+  # None of that is needed to answer THIS question. "Did the pair move?" is
+  # answered by the owner string alone, so the guard reads it once, checks that
+  # read's own status, and compares bytes.
+  #
+  # A stale owner that dies mid-turn keeps the same string and is correctly
+  # `unchanged` — the role did not move to anyone. A lock removed mid-turn reads
+  # empty against a non-empty capture and is `changed`, which refuses; that is the
+  # conservative direction and costs one cycle.
+  #
+  # The reader is the three-valued one (#983): `absent` and `unreadable` are
+  # NOT the same answer here. Absent means there is no owner, which compares
+  # equal to an empty baseline and is correctly `unchanged` -- that is the
+  # ordinary case for a broad watcher on a free pair. Unreadable means we cannot
+  # say, and cannot say is refused. `actas_lock_owner` returned "" and rc 0 for
+  # both, so a run directory that became unsearchable mid-turn matched the free
+  # baseline exactly and the guard waved the act through (review).
+  local _r _rd _now
+  # Cached path resolution (actas_lock_read_cached): this guard runs several
+  # times per cycle for the same pair, and the path it resolves cannot change
+  # for the life of this process's PAIRS subscription -- see
+  # actas_lock_path_cached's own comment for exactly what is and is not
+  # memoized. The LOCK CONTENTS are still read fresh every call; only the
+  # path computation is skipped on a repeat.
+  _r="$(actas_lock_read_cached "$1" "$2")" || return 2
+  _rd="${_r%%$'\t'*}"
+  case "$_rd" in
+    ok)     _now="${_r#*$'\t'}" ;;
+    absent) _now="" ;;
+    *)      return 2 ;;
+  esac
+  [ "$3" = "__unreadable__" ] && return 2
+  [ "$_now" = "$3" ] && return 0
+  return 1
+}
+
+# Say why an act was refused, on the channel a reason survives on. The three
+# refusals below use watch_report (stdout), NOT watch_log: the shipped launcher
+# runs the watcher with fd2 on /dev/null (#691), so a refusal on stderr is a
+# refusal nobody can see -- and this is the moment an operator most needs to know
+# why their message did not arrive. `unknown` is reported with different words
+# from `changed`: one says the role moved, the other says we could not tell, and
+# the operator's next step differs.
+_report_pair_refusal() {   # <verdict-rc> <team> <agent> <what-was-skipped>
+  case "$1" in
+    2) watch_report "${2}/${3}: could not verify who holds this role (the actas lock could not be read), so ${4} was skipped this cycle; it will be retried." ;;
+    *) watch_report "${2}/${3} changed hands while this turn was running; ${4} skipped, and its messages stay for the session that claimed it." ;;
+  esac
+}
+
+close_own_placement() {
+  local team="$1" name="$2"
+  local rec ref rec_term rec_id mine my_term my_id
+
+  rec="$(agmsg_spawn_path "$team" "$name")"
+  if [ ! -f "$rec" ]; then
+    # A record is written when a pane is PLACED. A seat that joined by hand and
+    # never went through spawn has none — normal, not an error, and there is
+    # nothing here to close. Say so rather than exiting quietly, because the
+    # same silence would also cover "the record was lost".
+    watch_log "despawned '$name' (role dropped); no placement record for '$team/$name', so there is no pane to close from here — if a window remains it was not placed by agmsg; close it directly"
+    return 2
+  fi
+  IFS=$'\t' read -r ref _ _ _ < "$rec"
+  if [ -z "$ref" ]; then
+    watch_report "despawned '$name' (role dropped); the placement record at $rec is empty, so the pane cannot be identified — close this window manually"
+    return 1
+  fi
+
+  if ! declare -F agmsg_terminal_ref_terminal >/dev/null 2>&1; then
+    watch_report "despawned '$name' (role dropped); the terminal registry is not available in this install, so the recorded pane cannot be closed — close this window manually"
+    return 1
+  fi
+
+  # The ref parser fails CLOSED (non-zero) on a corrupt/unknown-scheme ref. A bare
+  # assignment would leave rec_term/rec_id empty and fall through to the "belongs to
+  # someone else" branch with an empty recorded side — a misleading message, and
+  # under a caller's `set -e` it would take the watcher down with no log at all.
+  # Give the unresolvable ref its OWN contract, in the sibling guards' shape.
+  rec_term=""; rec_id=""
+  rec_term="$(agmsg_terminal_ref_terminal "$ref")" || rec_term=""
+  rec_id="$(agmsg_terminal_ref_id "$ref")" || rec_id=""
+  if [ -z "$rec_term" ] || [ -z "$rec_id" ]; then
+    watch_report "despawned '$name' (role dropped); the placement record's pane ref ($ref) did not resolve to a terminal and pane id, so the pane cannot be identified — close this window manually"
+    return 1
+  fi
+
+  # Which pane is THIS process in, right now. resolve-for-name is the strict
+  # resolver: it answers only with a self-id it could actually establish, and
+  # says why when it cannot. That is the property wanted here — an unidentified
+  # pane must not be matched against a record by default.
+  #
+  # The BARE session id, not $SESSION_ID. watch.sh normalises its argument into
+  # an instance id (watch.sh:99), which for claude-code is the composite
+  # "<sid>.<pid>" — that composite exists only inside agmsg. What a terminal
+  # knows is what the CLI told it at SessionStart, which is the bare sid; herdr
+  # stores exactly that in agent_session.value. Handing it the composite asks a
+  # question no terminal can answer, and the answer comes back as "this session
+  # cannot identify its own pane" — a fail-closed that looks like a resolution
+  # problem and is really an identifier mismatch. Caught by the herdr test,
+  # which is the whole reason it stubs a session id rather than trusting one.
+  mine=""
+  if declare -F agmsg_terminal_resolve_name >/dev/null 2>&1; then
+    local bare_sid="$SESSION_ID"
+    if declare -F agmsg_instance_bare_sid >/dev/null 2>&1; then
+      bare_sid="$(agmsg_instance_bare_sid "$SESSION_ID")"
+    fi
+    mine="$(agmsg_terminal_resolve_name "$bare_sid" 2>/dev/null || true)"
+  fi
+  if [ -z "$mine" ]; then
+    watch_report "despawned '$name' (role dropped); this session cannot identify its own pane, so the recorded placement ($ref) is not provably ours and was left alone — close this window manually"
+    return 1
+  fi
+  my_term="${mine%%	*}"
+  my_id="${mine#*	}"
+
+  # Compare at the precision BOTH sides have. A record written before refs
+  # carried the tmux socket says `%9`; this session now resolves itself as
+  # `<socket>:%9`, and a literal comparison calls its own pane someone else's —
+  # measured: the member stopped being able to fold itself. So when either side
+  # is missing the socket, compare the bare ids.
+  #
+  # That is the legacy ambiguity, not a new one: a bare `%9` cannot name a server
+  # (two servers can both hold it), and this is the same assumption the record
+  # has always carried. New records carry the socket and compare at full
+  # precision.
+  local _my_cmp="$my_id" _rec_cmp="$rec_id"
+  case "$my_id:$rec_id" in
+    *:*)
+      if [ "${my_id#*:}" = "$my_id" ] || [ "${rec_id#*:}" = "$rec_id" ]; then
+        _my_cmp="${my_id##*:}"; _rec_cmp="${rec_id##*:}"
+      fi ;;
+  esac
+  if [ "$my_term" != "$rec_term" ] || [ "$_my_cmp" != "$_rec_cmp" ]; then
+    watch_log "despawned '$name' (role dropped); the placement record names $rec_term:$rec_id but this session is in $my_term:$my_id, so that pane belongs to someone else and was left alone — close this window manually"
+    return 2
+  fi
+
+  if ! agmsg_terminal_load "$rec_term" 2>/dev/null; then
+    watch_report "despawned '$name' (role dropped); the '$rec_term' terminal driver would not load, so the pane could not be closed — close this window manually"
+    return 1
+  fi
+  if ! terminal_despawn "$rec_id" >/dev/null 2>&1; then
+    # 13 is the drivers' "unsupported" — plain has no addressable pane, so there
+    # is genuinely nothing to close and the member must be told, not left with a
+    # window it thinks was folded.
+    watch_report "despawned '$name' (role dropped); the '$rec_term' terminal did not close pane $rec_id — close this window manually"
+    return 1
+  fi
+  return 0
+}
+
 # Resolve poll interval. Env var wins over config, default 5s.
 INTERVAL="${AGMSG_WATCH_INTERVAL:-}"
 if [ -z "$INTERVAL" ]; then
@@ -956,6 +1189,19 @@ while true; do
   fi
   while IFS=$'\t' read -r pair_team pair_agent; do
     [ -z "$pair_team" ] && continue
+    # Warm the actas-lock path cache as a PLAIN STATEMENT, never via $(...): a
+    # command substitution forks a subshell, and a cache array populated
+    # inside one is discarded the instant that subshell exits (the exact
+    # hazard role-session.sh's own _agmsg_role_session_path_into documents,
+    # #466). Both consumers below (actas_lock_observe_cached and
+    # _pair_unchanged_since_read's actas_lock_read_cached) reach this cache
+    # through a $(...) of their own, so warming it here, in this loop's own
+    # top-level (non-subshell) frame, is what makes the warmth actually
+    # survive to the NEXT cycle instead of being rebuilt from scratch every
+    # single call (#1321 first-stage follow-up). Storage's own partition
+    # driver is deliberately NOT cached this way — see
+    # _agmsg_partition_load's comment in lib/storage.sh (#1329 round 2).
+    _actas_lock_primitives_into "$pair_team" "$pair_agent"
     # Ownership is re-read every cycle, because it can change under a running
     # watcher and nothing else notices. The subscription set and the startup
     # lock check both happen once, above; a session that claims this role
@@ -972,14 +1218,48 @@ while true; do
     # Only the lock file is read here, not the whole subscription set: losing a
     # pair is the half a running process can detect for the price of a file
     # read. Gaining one is the caller's job, at the point it creates the team.
-    pair_state="$(actas_lock_state "$pair_team" "$pair_agent" "$SESSION_ID" 2>/dev/null || echo free)"
-    case "$pair_state" in
-      other:*)
-        if [ -n "$ACTIVE_NAME" ]; then
-          # This watcher exists to serve exactly this role and no longer owns
-          # it. Stop -- and say so: stderr is the only place a reason survives,
-          # and a watcher that ends without one is indistinguishable from one
-          # that crashed.
+    # ONE read, in the lock library, returning BOTH the classification and the raw
+    # owner (actas_lock_observe). Reading state and owner separately left a window
+    # between the two calls: a claim landing there produced a stale `free` state
+    # (so the gate chose serve) paired with a FRESH owner baseline (so the guard
+    # compared new-to-new and said unchanged), and the pair was served for a role
+    # someone else held. Found in review; the fix belongs in the library, so every
+    # caller that needs both gets them from one observation. (#983)
+    # actas_lock_observe_cached: same read-and-verdict rule as
+    # actas_lock_observe, only the path resolution behind it is memoized
+    # per (team, agent) for the life of this process (#1321 first-stage
+    # follow-up) -- see actas_lock_path_cached's comment in actas-lock.sh.
+    IFS="$(printf '\t')" read -r pair_state pair_owner <<EOF
+$(actas_lock_observe_cached "$pair_team" "$pair_agent" "$SESSION_ID")
+EOF
+    # Test seam: a two-file barrier that parks the watcher immediately AFTER the
+    # lock read, so the race regression test can land a claim inside the window
+    # deterministically instead of guessing a sleep wide enough to hit it. Same
+    # shape as inbox.sh's AGMSG_TEST_MARK_BARRIER; no-op unless set.
+    if [ -n "${AGMSG_TEST_CLAIM_BARRIER:-}" ]; then
+      : > "$AGMSG_TEST_CLAIM_BARRIER.reached"
+      _agmsg_claim_barrier_waited=0
+      while [ ! -e "$AGMSG_TEST_CLAIM_BARRIER.release" ]; do
+        sleep 0.05
+        _agmsg_claim_barrier_waited=$((_agmsg_claim_barrier_waited + 1))
+        # 60s cap. Deliberately much longer than the time a test waits to NOTICE
+        # `.reached`: the two are a race, and if the cap is the same order as the
+        # test's wait, a loaded machine releases the watcher before the test has
+        # acted and the window the barrier exists to hold is simply gone. Measured
+        # — four of these back to back under load never saw `.reached` at a 10s
+        # cap, and each passed alone. The cap only bounds a wedged test; it costs
+        # nothing in production, where the variable is unset and none of this runs.
+        [ "$_agmsg_claim_barrier_waited" -ge 1200 ] && break
+      done
+    fi
+    # actas-fatal: a watcher that exists to serve exactly this one role, and no
+    # longer owns it, stops -- and says so on stderr (the only place a reason
+    # survives; a watcher that ends without one is indistinguishable from a
+    # crash). This is decided here, before the gate, because it EXITS rather than
+    # skips; the gate only decides serve-vs-skip for a watcher that keeps running.
+    if [ -n "$ACTIVE_NAME" ]; then
+      case "$pair_state" in
+        other:*)
           watch_log "${pair_team}/${pair_agent} is now held by session ${pair_state#other:}."
           watch_log "this watcher no longer owns that role and is stopping."
           watch_log "messages for it stay unread and reach the session that claimed it."
@@ -1006,6 +1286,103 @@ while true; do
         fi
         continue
         ;;
+      unverified:*)
+        # We could not establish who holds this pair. Neither serve nor stop:
+        # skip it this cycle and say why on the channel that survives (#691) —
+        # the next poll asks again and nothing is lost. Decided in _pair_gate
+        # rather than before it, so there is ONE place that turns a state into a
+        # verdict; a second decision here would be the arm that never runs.
+        watch_report "${pair_team}/${pair_agent}: ${PAIR_VERDICT#unverified:} — skipping this pair this cycle; it will be retried."
+        continue
+        ;;
+      nostore)
+        # Per team: with a store per team, "one team has no store yet" is a
+        # normal state, and a single check outside this loop would silence
+        # delivery for every OTHER team as well. Said once per pair per process
+        # (#692) -- a line every poll interval would bury the log it exists to
+        # make readable.
+        case " $NO_STORE_REPORTED " in
+          *" $pair_team:$pair_agent "*) ;;
+          *) NO_STORE_REPORTED="$NO_STORE_REPORTED $pair_team:$pair_agent"
+             watch_log "${pair_team}/${pair_agent}: no store yet; skipping this pair until one exists." ;;
+        esac
+        continue
+        ;;
+    esac
+    # serve: free or ours, store present. If we had stepped aside for it, say we
+    # are taking it back -- otherwise the log shows a role leaving and never
+    # returning, which reads as a permanent drop.
+    if _held_elsewhere_has "${pair_team}/${pair_agent}"; then
+      HELD_ELSEWHERE="$(_held_elsewhere_without "${pair_team}/${pair_agent}")"
+      echo "agmsg watch: ${pair_team}/${pair_agent} is unheld again; serving it here." >&2
+    fi
+    # Read this pair's delivery state -- its read frontier, then the messages
+    # past it -- and KEEP THE STATUS separate from the output. A failed read must
+    # not collapse to "" and fall into the caught-up arm below: that arm drops the
+    # tracker and continues in silence, which is the exact outage #1045 exists to
+    # catch, one level earlier. The stuck guard cannot see this one -- a failed
+    # scan returns no message_sent row to count, so the pair looks caught up
+    # forever. So on a failed observation, say why on stdout (a plain
+    # "agmsg watch:" line, not the delivery shape) and exit: a bounded, visible
+    # stop, never silent continuation. This is the same failure-is-not-empty
+    # collapse the cursor-only fix above closed, at the read itself.
+    #
+    # The two OTHER reads in this cycle that also fall back to empty are the
+    # DIFFERENT case the stuck guard already covers, so they are left as-is: the
+    # mktemp and the ':memory:' delivery query (below) can fail to "", but OUT
+    # still holds the message_sent rows, so a frozen cursor climbs to the
+    # threshold and fires. actas_lock_state's fall back to "free" (above) is a
+    # deliberate fail-open (a stale/unreadable lock is free, #595), not this
+    # class. Reverting either read here to `|| true` reopens the silent hole --
+    # a mutation test asserts it.
+    if READ_CURSOR="$(storage_read_cursor_get "$pair_team" "$pair_agent" 2>/dev/null)" \
+       && OUT="$(storage_watch_after "$READ_CURSOR" "$pair_team:$pair_agent" 2>/dev/null)"; then
+      [ -n "$READ_CURSOR" ] || READ_CURSOR=0
+    else
+      printf 'agmsg watch: cannot read delivery state for %s — the store read failed, so whether messages are waiting is unknown. Treating "unknown" as "no messages" would leave this watcher alive and silent, so it is exiting instead; restart this session (or run /%s actas <name>) to resume delivery (#1045/#777).\n' \
+        "$pair_team:$pair_agent" "$(basename "$SKILL_DIR")"
+      cleanup
+      exit "$_AGMSG_EXIT_DELIVERY_UNHEALTHY"
+    fi
+    # fix 2 (#1045): update this pair's stuck-cursor tracker (see the block comment
+    # before the loop). "Pending" here means real undelivered MESSAGE rows -- not a
+    # non-empty OUT. storage_watch_after also emits a trailing "cursor" high-water
+    # line, and that line is present for a CAUGHT-UP pair too, because the team's
+    # sequence advances whenever ANY pair in the team receives a message. Keying the
+    # tracker on [ -n "$OUT" ] would therefore treat every idle pair as perpetually
+    # pending, and on any cycle its cursor could not advance (e.g. a delivery stall
+    # that is not this pair's fault) the count would climb and fire the guard on a
+    # perfectly healthy watcher. So track a pair only while a message_sent row is
+    # actually waiting for it; a glob avoids forking grep in the poll loop. When
+    # READ_CURSOR is UNCHANGED from the previous cycle delivery did not advance it --
+    # count that; at the threshold say why on stdout and exit. With no message row
+    # waiting the pair is caught up, so drop its tracker and a future backlog starts
+    # a fresh count.
+    _agmsg_pair_key="$pair_team:$pair_agent"
+    # _agmsg_has_new_message, set here alongside the stuck-tracker's own read
+    # of the same fact, gates the formatting pass below (#1321 first-stage
+    # follow-up: watch.sh process-count reduction) -- one case statement,
+    # reused, rather than testing the same glob against $OUT twice.
+    _agmsg_has_new_message=0
+    case "$OUT" in
+      *'"type":"message_sent"'*)
+        _agmsg_has_new_message=1
+        IFS=$'\x1f' read -r _agmsg_prev_c _agmsg_prev_n <<< "$(_stuck_get "$_agmsg_pair_key")"
+        [ -n "$_agmsg_prev_n" ] || _agmsg_prev_n=0
+        if [ "$_agmsg_prev_c" = "$READ_CURSOR" ]; then
+          _agmsg_n=$((_agmsg_prev_n + 1))
+        else
+          _agmsg_n=1
+        fi
+        if [ "$_agmsg_n" -ge "$STUCK_THRESHOLD" ]; then
+          _agmsg_bytes="$(printf '%s' "$OUT" | wc -c | tr -d ' ')"
+          printf 'agmsg watch: delivery for %s is STUCK — its read cursor (%s) has not advanced for %s poll cycles while %s bytes of messages wait behind it, so nothing is being delivered and nothing is being marked read. This watcher is exiting rather than looping in silence; restart this session (or run /%s actas <name>) to resume delivery. If it recurs, the pending batch may be hitting a system limit (#1045/#777).\n' \
+            "$_agmsg_pair_key" "$READ_CURSOR" "$_agmsg_n" "$_agmsg_bytes" "$(basename "$SKILL_DIR")"
+          cleanup
+          exit "$_AGMSG_EXIT_DELIVERY_UNHEALTHY"
+        fi
+        _stuck_set "$_agmsg_pair_key" "$READ_CURSOR" "$_agmsg_n"
+        ;;
       *)
         # Free or ours. If we had stepped aside for it, say that we are taking
         # it back -- otherwise the log shows a role leaving and never returning,
@@ -1016,20 +1393,71 @@ while true; do
         fi
         ;;
     esac
-    # Per team: with a store per team, "one team has no store yet" is a
-    # normal state, and a single check outside this loop would silence
-    # delivery for every OTHER team as well.
-    # Skipped, and said once. The same "stop quietly" shape as the guard above
-    # (#692): a team with no store yet is a normal state, but a team that
-    # silently stops being delivered every cycle is not distinguishable from
-    # one that is fine. Once per pair per process -- a line every poll interval
-    # would bury the log this exists to make readable.
-    if ! storage_store_exists "$pair_team"; then
-      case " $NO_STORE_REPORTED " in
-        *" $pair_team:$pair_agent "*) ;;
-        *) NO_STORE_REPORTED="$NO_STORE_REPORTED $pair_team:$pair_agent"
-           watch_log "${pair_team}/${pair_agent}: no store yet; skipping this pair until one exists." ;;
-      esac
+    if [ "$_agmsg_has_new_message" -eq 1 ]; then
+    # The quote is held in a variable, never written as \' in the pattern: bash 3.2
+    # (macOS /bin/bash) keeps the backslash of a \' REPLACEMENT, so the inline form
+    # doubles a quote into \'\' there while producing '' on bash 4+. Same shape as
+    # _sqlite_sync_lit_into in sqlite-sync.sh, which documents the same hazard.
+    _AGMSG_SQ="'"
+    _arr="[$(printf '%s' "$OUT" | paste -sd, -)]"
+    # #777/#1045: this pair's undelivered backlog grows independently of
+    # anything this loop bounds, so interpolating it into ONE argv element
+    # eventually exceeds the OS's per-argument ceiling (Linux
+    # MAX_ARG_STRLEN=131,072 bytes; smaller still on Windows/macOS) and
+    # `agmsg_sqlite` fails with "Argument list too long" -- every single
+    # poll, since a single long body can carry it past the ceiling on its
+    # own too, and because the failure below was already swallowed by
+    # `|| true` and the read cursor is only advanced from
+    # FINAL_CURSOR/DELIVERED_IDS further down, a silently empty ROWS here
+    # left the cursor stuck forever, repeating the same failure on every
+    # future poll -- a silent, self-locking outage. Pass the statement on
+    # stdin instead, mirroring drivers/storage/sqlite-sync.sh:1301
+    # (`_sqlite_data_stdin`, #882) and history.sh/inbox.sh: printf is a bash
+    # builtin, so writing a large value to a temp file never execs and can
+    # hit neither that ceiling nor argv's at all.
+    #
+    # No trap here: this script installs `trap cleanup EXIT` and
+    # `trap 'exit 0' INT TERM HUP` once, near the top (bash traps do not
+    # stack -- the last one set wins), and this runs inside that same
+    # process's long-lived polling loop, once per pair per interval. Adding a
+    # loop-local trap here would silently replace those for the rest of the
+    # process's life. The temp file is removed explicitly on every path
+    # instead; the one path that leaks it (a signal landing between mktemp
+    # and the following rm) is caught by the pre-existing INT/TERM/HUP
+    # handler tearing down the whole process. The stuck-cursor guard below is
+    # a separate backstop, for any OTHER cause that leaves the cursor stuck.
+    _agmsg_watch_sql="$(mktemp "${TMPDIR:-/tmp}/agmsg-watch-rows.XXXXXX" 2>/dev/null || true)"
+    if [ -n "$_agmsg_watch_sql" ]; then
+      {
+        printf "%s\n" "SELECT COALESCE(json_extract(value,'\$.type'),'') || char(31) ||"
+        printf "%s\n" "       COALESCE(json_extract(value,'\$.id'),'') || char(31) ||"
+        printf "%s\n" "       COALESCE(json_extract(value,'\$.at'),'') || char(31) ||"
+        printf "%s\n" "       COALESCE(json_extract(value,'\$.team'),'') || char(31) ||"
+        printf "%s\n" "       COALESCE(json_extract(value,'\$.from'),'') || char(31) ||"
+        printf "%s\n" "       COALESCE(json_extract(value,'\$.to'),'') || char(31) ||"
+        printf "%s\n" "       replace(replace(replace(COALESCE(json_extract(value,'\$.body'),''), char(13), ''), char(10), '\\n'), char(9), '\t') || char(31) ||"
+        printf "%s\n" "       COALESCE(json_extract(value,'\$.cursor'),'')"
+        printf "FROM json_each('"
+        printf '%s' "${_arr//$_AGMSG_SQ/$_AGMSG_SQ$_AGMSG_SQ}"
+        printf "');\n"
+      } > "$_agmsg_watch_sql"
+      ROWS="$(agmsg_sqlite ':memory:' < "$_agmsg_watch_sql" 2>/dev/null || true)"
+      rm -f "$_agmsg_watch_sql"
+    else
+      ROWS=""
+    fi
+
+    # Deliver (#983): re-verify at the act, like the two below. Checked ONCE here
+    # rather than per row, and that is a deliberate trade rather than an oversight:
+    # the loop's harm is a stranger's message appearing on this session's stdout,
+    # which is visible and leaves the row unread — recoverable, unlike consuming it
+    # or folding on it. A lock read per row would buy a narrower window at a file
+    # read per message; the two acts whose damage is permanent get their own check
+    # immediately before them.
+    _pair_verdict=0
+    _pair_unchanged_since_read "$pair_team" "$pair_agent" "$pair_owner" || _pair_verdict=$?
+    if [ "$_pair_verdict" -ne 0 ]; then
+      _report_pair_refusal "$_pair_verdict" "$pair_team" "$pair_agent" "delivery"
       continue
     fi
     READ_CURSOR="$(storage_read_cursor_get "$pair_team" "$pair_agent" 2>/dev/null || true)"
@@ -1126,6 +1554,44 @@ while true; do
       fi
       exit 0
     fi
+    elif [ -n "$OUT" ]; then
+      # No new message for THIS pair, but storage_watch_after's trailing
+      # "cursor" line (present on every call, caught-up pair or not, because
+      # the team's sequence advances whenever ANY pair receives a message)
+      # moved. Advance our own frontier to it without the mktemp + `sqlite3
+      # :memory:` json_each/json_extract pass above: that pass exists to turn
+      # message ROWS into shell-safe delimited text (escaping newlines in a
+      # body, etc.), and a cursor-only page carries no message body needing
+      # that treatment -- so paying for it here forked sqlite3+mktemp on
+      # EVERY poll cycle a pair was simply idle, which is most of them
+      # (#1321 first-stage follow-up: watch.sh process-count reduction).
+      #
+      # The cursor line's own shape is controlled (storage_watch_after's own
+      # `json_object('type','cursor','cursor', CAST(... AS TEXT))`, always
+      # emitted last in the batch), so parameter-expansion pattern removal in
+      # pure bash is exactly equivalent to the sqlite3 json_extract this
+      # replaces for this one field, with no forks at all.
+      _agmsg_cursor_line="${OUT##*$'\n'}"
+      FINAL_CURSOR=""
+      case "$_agmsg_cursor_line" in
+        *'"cursor":"'*)
+          FINAL_CURSOR="${_agmsg_cursor_line#*'"cursor":"'}"
+          FINAL_CURSOR="${FINAL_CURSOR%%'"'*}"
+          ;;
+      esac
+      if [ -n "$FINAL_CURSOR" ]; then
+        # Consume (#983): the same re-verification the heavy path above does
+        # immediately before advancing the read frontier — a pair that
+        # changed hands is left entirely alone, cursor included, so the
+        # session that now owns it still sees everything from where it was.
+        _pair_verdict=0
+        _pair_unchanged_since_read "$pair_team" "$pair_agent" "$pair_owner" || _pair_verdict=$?
+        if [ "$_pair_verdict" -ne 0 ]; then
+          _report_pair_refusal "$_pair_verdict" "$pair_team" "$pair_agent" "marking them read"
+        else
+          storage_read_cursor_consume "$pair_team" "$pair_agent" "$FINAL_CURSOR" >/dev/null 2>&1 || true
+        fi
+      fi
     fi
   done <<< "$PAIRS"
 

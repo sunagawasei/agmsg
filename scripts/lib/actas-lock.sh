@@ -107,7 +107,107 @@ _agmsg_id_key_or_legacy() {   # <team> <agent>
   esac
 }
 
-# Compute the lock file path for (team, agent).
+# _agmsg_id_key_or_legacy's rc-2 refusal (above) is one level too deep to be
+# the FIRST thing any of the three path functions below does: each builds
+# <legacy> before calling it, and that build calls _actas_lock_dir, which
+# reads SKILL_DIR bare. Under `set -u` -- every real entry point's shell --
+# an unset SKILL_DIR aborts right there with "unbound variable", never
+# reaching the rc-2 refusal at all (#1241 review, round 2: the first pass at
+# this fix protected the resolver but not its own callers' earlier reads).
+# This is the guard that actually runs first, called before any of the
+# three touches SKILL_DIR in any way.
+_agmsg_lock_paths_require_skill_dir() {   # <caller-name, for the message>
+  [ -n "${SKILL_DIR:-}" ] && return 0
+  printf 'agmsg: ERROR: %s: SKILL_DIR is not set -- refusing rather than guess a path\n' "$1" >&2
+  return 1
+}
+
+# --- process-lifetime memoization of actas_lock_path's PRIMITIVES ------------
+#
+# team_id (config.json), member_id (the roster journal) and the two
+# name-encodings are each a pure function of on-disk config that cannot
+# change for the life of a long-running poller (watch.sh) without an
+# external event this process has no way of observing anyway -- so
+# recomputing them every poll cycle only forks sqlite3/tr/sed for the same
+# answer every time. What CAN change on every call -- whether a lock file
+# already exists under the id-keyed or legacy candidate path -- is NOT
+# cached here: _actas_lock_path_cached still asks _agmsg_id_or_legacy_path
+# fresh every time, exactly like actas_lock_path itself, so the #1023
+# double-lock avoidance keeps seeing live filesystem state.
+#
+# Same shape as role-session.sh's _agmsg_role_session_path_into (#466):
+# parallel arrays (bash 3.2 has no associative arrays), set in the CALLER's
+# shell rather than via $(...) (a command-substitution write is lost with
+# the subshell it runs in), capped growth.
+_AGMSG_ALP_KEYS=()
+_AGMSG_ALP_ENC_T=()
+_AGMSG_ALP_ENC_A=()
+_AGMSG_ALP_IDKEY=()
+_AGMSG_ALP_IDKEY_RC=()
+_AGMSG_ALP_MAX=64
+
+# Sets _AGMSG_ALP_ENC_TEAM / _AGMSG_ALP_ENC_AGENT / _AGMSG_ALP_ID_KEY /
+# _AGMSG_ALP_ID_KEY_RC in the CALLER's shell.
+_actas_lock_primitives_into() {
+  local team="$1" agent="$2" cachekey i n
+  cachekey="${SKILL_DIR:-}"$'\x1f'"${team}"$'\x1f'"${agent}"
+  n=${#_AGMSG_ALP_KEYS[@]}
+  for ((i = 0; i < n; i++)); do
+    if [ "${_AGMSG_ALP_KEYS[$i]}" = "$cachekey" ]; then
+      _AGMSG_ALP_ENC_TEAM="${_AGMSG_ALP_ENC_T[$i]}"
+      _AGMSG_ALP_ENC_AGENT="${_AGMSG_ALP_ENC_A[$i]}"
+      _AGMSG_ALP_ID_KEY="${_AGMSG_ALP_IDKEY[$i]}"
+      _AGMSG_ALP_ID_KEY_RC="${_AGMSG_ALP_IDKEY_RC[$i]}"
+      return 0
+    fi
+  done
+  _AGMSG_ALP_ENC_TEAM="$(_actas_lock_encode "$team")"
+  _AGMSG_ALP_ENC_AGENT="$(_actas_lock_encode "$agent")"
+  _AGMSG_ALP_ID_KEY_RC=0
+  _AGMSG_ALP_ID_KEY="$(_agmsg_id_key_or_legacy "$team" "$agent")" || _AGMSG_ALP_ID_KEY_RC=$?
+  # Cache a SUCCESSFUL resolution only (review, #1329 round 2). rc 1 ("no id")
+  # and rc 2 ("could not even try") both cover a config.json or roster read
+  # that did not go through -- which can be transient (the file mid-rewrite,
+  # a momentary permission issue) as easily as a genuine decided absence, and
+  # this function cannot tell the two apart. Caching either would make a
+  # watcher that warmed at the wrong instant repeat the same failure for the
+  # rest of its life even after the read would plainly succeed again; retrying
+  # every call until one actually succeeds is what makes that self-correcting.
+  if [ "$_AGMSG_ALP_ID_KEY_RC" -eq 0 ] && [ "$n" -lt "$_AGMSG_ALP_MAX" ]; then
+    _AGMSG_ALP_KEYS[$n]="$cachekey"
+    _AGMSG_ALP_ENC_T[$n]="$_AGMSG_ALP_ENC_TEAM"
+    _AGMSG_ALP_ENC_A[$n]="$_AGMSG_ALP_ENC_AGENT"
+    _AGMSG_ALP_IDKEY[$n]="$_AGMSG_ALP_ID_KEY"
+    _AGMSG_ALP_IDKEY_RC[$n]="$_AGMSG_ALP_ID_KEY_RC"
+  fi
+  return 0
+}
+
+# Cached counterpart of actas_lock_path below: identical resolution rule,
+# using the memoized primitives above in place of recomputing them on every
+# call. Callers that need a fresh read on every call (most of the tree —
+# spawn/despawn/actas-claim/etc., each a one-shot process where memoization
+# buys nothing) keep using actas_lock_path unchanged; this is for a caller
+# that resolves the SAME pairs over and over in one long-lived process.
+actas_lock_path_cached() {
+  local team="$1" agent="$2" legacy
+  _agmsg_lock_paths_require_skill_dir actas_lock_path_cached || return 1
+  _actas_lock_primitives_into "$team" "$agent"
+  legacy="$(printf '%s/actas.%s__%s.session' "$(_actas_lock_dir)" "$_AGMSG_ALP_ENC_TEAM" "$_AGMSG_ALP_ENC_AGENT")"
+  case "$_AGMSG_ALP_ID_KEY_RC" in
+    0) _agmsg_id_or_legacy_path "$(printf '%s/actas.%s.session' "$(_actas_lock_dir)" "$_AGMSG_ALP_ID_KEY")" "$legacy" ;;
+    1) printf '%s\n' "$legacy" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Compute the lock file path for (team, agent). #1023: id-keyed when both ids
+# resolve and a file already exists at either candidate path, or nothing does
+# yet; the legacy name-keyed path otherwise -- see _agmsg_id_key_for above.
+# Fails (empty stdout, rc 1) if BOTH candidates exist for the pair, or if id
+# resolution itself was undetermined rather than genuinely absent -- see
+# _agmsg_id_or_legacy_path and _agmsg_id_key_or_legacy. Every caller must
+# check this.
 actas_lock_path() {
   local team="$1" agent="$2"
   local t a; t="$(_actas_lock_encode "$team")"; a="$(_actas_lock_encode "$agent")"
@@ -204,6 +304,14 @@ actas_lock_owner() {
   local lock; lock="$(actas_lock_path "$1" "$2")"
   [ -f "$lock" ] || { printf ''; return 0; }
   head -1 "$lock" 2>/dev/null
+}
+
+# Cached counterpart of actas_lock_read, via actas_lock_path_cached. See that
+# function's comment for what is and is not memoized.
+actas_lock_read_cached() {   # <team> <agent>
+  local p
+  p="$(actas_lock_path_cached "$1" "$2")" || { printf 'ambiguous\t\n'; return 0; }
+  _actas_lock_read_path "$p"
 }
 
 # Return 0 if the given owner token is alive. The token is a per-process
@@ -362,7 +470,35 @@ actas_lock_gc_stale() {
 }
 
 # Classify a (team, agent) pair relative to the calling session.
-# Echoes one of: free | mine | other:<sid>
+# Prints "<state>\t<owner>"; the owner is empty when there is none to report.
+# The states are _actas_lock_verdict's, documented there -- this function is the
+# read plus that verdict, and nothing else, so that `observe` and `try_claim`
+# cannot drift apart again (they did: review axis 5).
+#
+# Returning the owner alongside the state matters as much as the values: callers
+# that need a baseline to compare against later were reading the state and then
+# reading the owner in a SECOND call, and a claim landing between the two
+# produced a stale state paired with a fresh owner. One read, both facts, no
+# window. (#983, found in review.)
+actas_lock_observe() {
+  local _r
+  _r="$(actas_lock_read "$1" "$2")"
+  _actas_lock_verdict "$3" "${_r%%$'\t'*}" "${_r#*$'\t'}"
+}
+
+# Cached counterpart of actas_lock_observe, via actas_lock_read_cached. Same
+# verdict rule, same owner read every call — only the path resolution behind
+# it is memoized. See actas_lock_path_cached's comment for scope.
+actas_lock_observe_cached() {
+  local _r
+  _r="$(actas_lock_read_cached "$1" "$2")"
+  _actas_lock_verdict "$3" "${_r%%$'\t'*}" "${_r#*$'\t'}"
+}
+
+# Classify a (team, agent) pair relative to the calling session. Thin wrapper over
+# actas_lock_observe so there is exactly one place that reads and one set of rules;
+# callers needing the owner as well should use actas_lock_observe and split, rather
+# than calling both (that pairing is what created the window described above).
 actas_lock_state() {
   local team="$1" agent="$2" sid="$3"
   local owner

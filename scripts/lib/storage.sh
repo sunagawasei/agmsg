@@ -38,7 +38,99 @@ agmsg_storage_dir() {
   printf '%s\n' "$skill_dir/db"
 }
 
-# Echo the full path to messages.db, in a form the sqlite3 binary can open.
+# Echo the full path to a team's message store, in a form sqlite3 can open.
+#
+# Echo the full path to a team's message store, in a form sqlite3 can open.
+#
+# WHICH store depends on the team's partition driver, and teams choose separately:
+# `shared` (the default) puts every team in one file, `per-team` gives the team
+# its own. A team only leaves the default when connecting requires it, because
+# external programs read the shared store directly and lose sight of any team
+# that moves out. See scripts/drivers/partition/.
+#
+# The argument is required rather than optional on purpose. An optional one
+# leaves two ways to reach the store, and a caller that forgot the selector
+# would silently read a different team's messages instead of failing.
+#
+# The selector reaches the filesystem as a path segment under per-team, so it is
+# validated here rather than in the driver: this is the last point that can
+# refuse to build a path it cannot vouch for.
+agmsg_db_path() {
+  local team="${1-}"
+  if [ -z "$team" ]; then
+    echo "Error: agmsg_db_path requires a team selector" >&2
+    return 1
+  fi
+  agmsg_validate_team_name "$team" || return 1
+  _agmsg_partition_load "$team" || return 1
+  _agmsg_db_file "$(partition_store_relpath "$team")"
+}
+
+# Source the partition driver this team uses, memoized so repeated resolution in
+# one process costs nothing. Re-sources when a caller moves between teams on
+# different partitions — watch.sh loops over a subscription that can contain both.
+#
+# Deliberately NOT caching agmsg_driver_for_team's own answer (which driver a
+# team uses) per team, on top of this: a team's partition CAN change under a
+# running watcher, via an ordinary operation (internal/migrate-team-store.sh,
+# reached mid remote-connect) that flips a team from shared to per-team and
+# then removes its row from the shared store. A watcher that had cached
+# "shared" would keep reading the now-stale shared store forever, silently
+# never delivering anything the migrated store receives. The un-cached read
+# below is what notices the switch, exactly as it always has (review, #1329
+# round 2: a first attempt at this cache shipped the exact regression this
+# comment describes).
+_AGMSG_PARTITION_LOADED=""
+_agmsg_partition_load() {
+  # The registry may not be sourced yet — agmsg_db_path is reachable without
+  # going through agmsg_storage_load. Same guarded pull-in that uses.
+  if ! command -v agmsg_driver_for_team >/dev/null 2>&1; then
+    local _lib
+    _lib="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    # shellcheck disable=SC1091
+    [ -n "$_lib" ] && . "$_lib/driver-registry.sh"
+  fi
+  local name
+  name="$(agmsg_driver_for_team partition "$1" shared)"
+  [ "$name" = "$_AGMSG_PARTITION_LOADED" ] && return 0
+  local base kind file found=""
+  while IFS="$(printf '\t')" read -r kind base; do
+    [ -n "$base" ] || continue
+    file="$base/partition/$name.sh"
+    [ -f "$file" ] || continue
+    # Externals stay gated by the same opt-in every other axis uses.
+    if [ "$kind" = external ] && ! agmsg_driver_is_trusted partition "$name" "$file"; then
+      continue
+    fi
+    found="$file"
+  done <<EOF
+$(agmsg_driver_bases)
+EOF
+  if [ -z "$found" ]; then
+    # Loud rather than falling back to shared: a team recorded a partition, and
+    # quietly reading a different store than the one it names is the exact
+    # failure this axis exists to make impossible.
+    echo "Error: no partition driver '$name' for team '$1'" >&2
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  . "$found" || return 1
+  _AGMSG_PARTITION_LOADED="$name"
+}
+
+# The store that is NOT team-scoped, and the only resolver allowed to take no
+# selector. Two things live here that are not message data: the runtime `locks`
+# table (its resources are project-scoped — there is no team to pass), and the
+# pre-split store that migration reads from.
+#
+# Runtime state deliberately did not follow the messages when they split: a lock
+# on a project is not a fact about any one team, and per-team lock files would
+# let two teams in the same project take the same lock.
+_agmsg_runtime_db_path() { _agmsg_db_file; }
+
+# Join a store-relative path onto the storage directory. Defaults to the
+# pre-split shared file, which is what the runtime store still is.
+#
 # On Windows, sqlite3.exe is a native binary that cannot open a Git Bash path
 # like /c/Users/.../db/messages.db: open() fails, so inbox/send/watch all fail
 # to reach the store and the team goes silent (#197, reported by vhsvhafmwf).
