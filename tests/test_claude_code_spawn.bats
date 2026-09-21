@@ -2081,3 +2081,249 @@ STUB
   [ "$(claude_probe_cache_count)" -eq 0 ]
   [ ! -e "$CAPTURE/bridge.args.glob-proj" ]
 }
+
+@test "probe failure while cache is off, TTL invalid, or scratch-bypassed forgets a prior record" {
+  run spawn_claude gate-seed
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_cache_count)" -eq 1 ]
+
+  bash "$SCRIPTS/config.sh" set spawn.claude_probe_cache false
+  export FAKE_PROBE_MODE=missing
+  reset_probe_capture
+  run spawn_claude gate-off
+  [ "$status" -ne 0 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  bash "$SCRIPTS/config.sh" set spawn.claude_probe_cache true
+  export FAKE_PROBE_MODE=complete
+  reset_probe_capture
+  run spawn_claude gate-off-restored
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  [[ "$output" != *"reusing cached Claude"* ]]
+
+  bash "$SCRIPTS/config.sh" set spawn.claude_probe_cache_ttl nope
+  export FAKE_PROBE_MODE=missing
+  reset_probe_capture
+  run spawn_claude gate-ttl
+  [ "$status" -ne 0 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  bash "$SCRIPTS/config.sh" set spawn.claude_probe_cache_ttl 86400
+  export FAKE_PROBE_MODE=complete
+  reset_probe_capture
+  run spawn_claude gate-ttl-restored
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  [[ "$output" != *"reusing cached Claude"* ]]
+
+  local scratch="$TEST_SKILL_DIR/run/claude-code-team-gate-byp-cwd"
+  mkdir -p "$scratch/.claude"
+  export FAKE_PROBE_MODE=missing
+  reset_probe_capture
+  run spawn_claude gate-byp
+  [ "$status" -ne 0 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  rm -rf "$scratch/.claude"
+  export FAKE_PROBE_MODE=complete
+  reset_probe_capture
+  run spawn_claude gate-byp-restored
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  [[ "$output" != *"reusing cached Claude"* ]]
+}
+
+@test "OS identity command failures stay uncacheable across consecutive spawns" {
+  cat > "$FAKE_BIN/uname" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = -r ] && [ "${FAKE_UNAME_FAIL:-}" = 1 ]; then
+  echo "uname failed" >&2
+  exit 1
+fi
+exec /usr/bin/uname "$@"
+STUB
+  cat > "$FAKE_BIN/sw_vers" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = -productVersion ] && [ "${FAKE_SW_VERS_FAIL:-}" = 1 ]; then
+  echo "sw_vers failed" >&2
+  exit 1
+fi
+exec /usr/bin/sw_vers "$@"
+STUB
+  chmod +x "$FAKE_BIN/uname" "$FAKE_BIN/sw_vers"
+
+  export FAKE_UNAME_FAIL=1
+  run spawn_claude os-uname-a
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  run spawn_claude os-uname-b
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  unset FAKE_UNAME_FAIL
+
+  export FAKE_SW_VERS_FAIL=1
+  reset_probe_capture
+  run spawn_claude os-sw-a
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  run spawn_claude os-sw-b
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+}
+
+@test "managed-settings.d file symlink target changes miss the probe cache" {
+  local realdir="$TEST_SKILL_DIR/real-managed-d"
+  mkdir -p "$realdir" "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d"
+  printf '{}\n' > "$realdir/one.json"
+  ln -s "$realdir/one.json" "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d/one.json"
+
+  source_claude_spawn
+  local h1 h2
+  h1="$(agmsg_claude_probe_cache_layer_dir_value \
+    "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d")"
+  [ -n "$h1" ]
+  [ "$h1" != absent ]
+
+  run spawn_claude symlink-d-seed
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+
+  printf '{"changed":true}\n' > "$realdir/one.json"
+  h2="$(agmsg_claude_probe_cache_layer_dir_value \
+    "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d")"
+  [ "$h1" != "$h2" ]
+  run spawn_claude symlink-d-changed
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+  [[ "$output" != *"reusing cached Claude"* ]]
+}
+
+@test "key-generation failure plus probe failure forgets a prior record" {
+  cat > "$FAKE_BIN/uname" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = -r ] && [ "${FAKE_UNAME_FAIL:-}" = 1 ]; then
+  echo "uname failed" >&2
+  exit 1
+fi
+exec /usr/bin/uname "$@"
+STUB
+  chmod +x "$FAKE_BIN/uname"
+
+  run spawn_claude keyfail-seed
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_cache_count)" -eq 1 ]
+
+  export FAKE_UNAME_FAIL=1
+  export FAKE_PROBE_MODE=missing
+  reset_probe_capture
+  run spawn_claude keyfail-miss
+  [ "$status" -ne 0 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  unset FAKE_UNAME_FAIL
+  export FAKE_PROBE_MODE=complete
+  reset_probe_capture
+  run spawn_claude keyfail-restored
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  [[ "$output" != *"reusing cached Claude"* ]]
+
+  mkdir -p "$TEST_SKILL_DIR/db/claude-worker-home"
+  printf '{}\n' > "$TEST_SKILL_DIR/db/claude-worker-home/settings.json"
+  run spawn_claude keyfail-unreadable-seed
+  [ "$status" -eq 0 ]
+  chmod 000 "$TEST_SKILL_DIR/db/claude-worker-home/settings.json"
+  export FAKE_PROBE_MODE=missing
+  reset_probe_capture
+  run spawn_claude keyfail-unreadable-miss
+  local fail_status="$status"
+  chmod 644 "$TEST_SKILL_DIR/db/claude-worker-home/settings.json"
+  rm -f "$TEST_SKILL_DIR/db/claude-worker-home/settings.json"
+  [ "$fail_status" -ne 0 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  export FAKE_PROBE_MODE=complete
+  reset_probe_capture
+  run spawn_claude keyfail-unreadable-restored
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  [[ "$output" != *"reusing cached Claude"* ]]
+}
+
+@test "managed-settings.d directory symlink root and nested dir follow target changes" {
+  local realroot="$TEST_SKILL_DIR/real-managed-root"
+  local nested="$TEST_SKILL_DIR/real-managed-nested"
+  mkdir -p "$realroot" "$nested"
+  printf '{}\n' > "$realroot/root.json"
+  printf '{}\n' > "$nested/nested.json"
+  ln -s "$realroot" "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d"
+
+  source_claude_spawn
+  local h1 h2 h3
+  h1="$(agmsg_claude_probe_cache_layer_dir_value \
+    "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d")"
+  [ -n "$h1" ]
+  [ "$h1" != absent ]
+
+  run spawn_claude dirlink-seed
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+
+  printf '{"changed":true}\n' > "$realroot/root.json"
+  h2="$(agmsg_claude_probe_cache_layer_dir_value \
+    "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d")"
+  [ "$h1" != "$h2" ]
+  run spawn_claude dirlink-root-changed
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+  [[ "$output" != *"reusing cached Claude"* ]]
+
+  rm -rf "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d"
+  mkdir -p "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d"
+  ln -s "$nested" "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d/sub"
+  reset_probe_capture
+  run spawn_claude dirlink-nested-seed
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  printf '{"changed":true}\n' > "$nested/nested.json"
+  h3="$(agmsg_claude_probe_cache_layer_dir_value \
+    "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d")"
+  [ -n "$h3" ]
+  run spawn_claude dirlink-nested-changed
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+  [[ "$output" != *"reusing cached Claude"* ]]
+}
+
+@test "keyless probe failure replaces an unlistable cache dir so the old record cannot hit" {
+  cat > "$FAKE_BIN/uname" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = -r ] && [ "${FAKE_UNAME_FAIL:-}" = 1 ]; then
+  echo "uname failed" >&2
+  exit 1
+fi
+exec /usr/bin/uname "$@"
+STUB
+  chmod +x "$FAKE_BIN/uname"
+
+  run spawn_claude unlist-seed
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_cache_count)" -eq 1 ]
+
+  chmod 100 "$TEST_SKILL_DIR/run/claude-probe-ok"
+  export FAKE_UNAME_FAIL=1
+  export FAKE_PROBE_MODE=missing
+  reset_probe_capture
+  run spawn_claude unlist-miss
+  local fail_status="$status"
+  chmod -R u+rwx "$TEST_SKILL_DIR/run/claude-probe-ok" 2>/dev/null || true
+  chmod -R u+rwx "$TEST_SKILL_DIR/run"/claude-probe-ok.forgotten.* 2>/dev/null || true
+  [ "$fail_status" -ne 0 ]
+  unset FAKE_UNAME_FAIL
+  export FAKE_PROBE_MODE=complete
+  reset_probe_capture
+  run spawn_claude unlist-restored
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  [[ "$output" != *"reusing cached Claude"* ]]
+}

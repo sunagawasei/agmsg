@@ -499,13 +499,17 @@ agmsg_claude_probe_cache_bin_stat() {
 }
 
 # OS identity (key item 4). sw_vers is Darwin-only; a box without it still
-# gets a deterministic string from uname -r alone.
+# gets a deterministic string from uname -r alone. If sw_vers is on PATH but
+# fails, or uname -r fails, this is uncacheable (ENOENT-other read failure),
+# not an empty cacheable placeholder.
 agmsg_claude_probe_cache_os_string() {
   local sw="" kr=""
   if command -v sw_vers >/dev/null 2>&1; then
-    sw="$(sw_vers -productVersion 2>/dev/null || true)"
+    sw="$(sw_vers -productVersion 2>/dev/null)" || return 1
+    [ -n "$sw" ] || return 1
   fi
-  kr="$(uname -r 2>/dev/null || true)"
+  kr="$(uname -r 2>/dev/null)" || return 1
+  [ -n "$kr" ] || return 1
   printf '%s %s' "$sw" "$kr"
 }
 
@@ -513,11 +517,17 @@ agmsg_claude_probe_cache_os_string() {
 # tuples. Returns 1 (uncacheable) the moment any file cannot be read; a
 # missing directory is quietly empty rather than an error (only used on
 # directories this driver itself ships, see agmsg_claude_probe_cache_logic_hash).
+# follow-symlinks: traverse directory/file symlinks (managed-settings.d).
+# A find -L loop or unreadable referent is uncacheable, not a silent miss.
 agmsg_claude_probe_cache_tree_lines() {
-  local base="$1" file rel len digest files
+  local base="$1" follow="${2:-}" file rel len digest files
   [ -d "$base" ] || return 0
   [ -r "$base" ] && [ -x "$base" ] || return 1
-  files="$(find "$base" -type f -print 2>/dev/null)" || return 1
+  if [ "$follow" = follow-symlinks ]; then
+    files="$(find -L "$base" -type f -print 2>/dev/null)" || return 1
+  else
+    files="$(find "$base" -type f -print 2>/dev/null)" || return 1
+  fi
   [ -n "$files" ] || return 0
   while IFS= read -r file; do
     [ -n "$file" ] || continue
@@ -574,7 +584,10 @@ agmsg_claude_probe_cache_layer_dir_value() {
     return 0
   fi
   [ -d "$base" ] || return 1
-  lines="$(agmsg_claude_probe_cache_tree_lines "$base")" || return 1
+  # Follow file and directory symlinks: a fixed managed-settings.d tree whose
+  # referents change is ordinary config drift, not the out-of-scope
+  # "malicious symlink swap" case.
+  lines="$(agmsg_claude_probe_cache_tree_lines "$base" follow-symlinks)" || return 1
   printf '%s' "$lines" | LC_ALL=C sort | agmsg_claude_sha256
 }
 
@@ -620,7 +633,7 @@ agmsg_claude_probe_cache_key() {
   [ -n "$bin_realpath" ] || return 1
 
   bin_stat="$(agmsg_claude_probe_cache_bin_stat "$bin_realpath")" || return 1
-  os_string="$(agmsg_claude_probe_cache_os_string)"
+  os_string="$(agmsg_claude_probe_cache_os_string)" || return 1
   logic_hash="$(agmsg_claude_probe_cache_logic_hash)" || return 1
 
   settings_hash="$(agmsg_claude_probe_cache_normalized_settings \
@@ -696,6 +709,27 @@ agmsg_claude_probe_cache_forget() {
   rm -f "$record" 2>/dev/null && return 0
   : > "$record" 2>/dev/null && return 0
   echo "spawn: could not remove or truncate stale Claude probe cache record $record" >&2
+  return 1
+}
+
+# When the cache key itself cannot be computed, a failed live probe still
+# must not leave a recoverable success record (the same environment may
+# become keyable again once the transient read failure clears). Extra misses
+# across other keys in this dir are accepted; a false hit is not.
+#
+# Do not enumerate children: an execute-only directory is traversable by a
+# known name (so check_hit can still read $dir/$key) but `"$dir"/*` does not
+# expand. Replace the directory instead.
+agmsg_claude_probe_cache_forget_all() {
+  local dir="$SKILL_DIR/run/claude-probe-ok" stale
+  [ -e "$dir" ] || [ -L "$dir" ] || return 0
+  stale="$dir.forgotten.$$"
+  if mv "$dir" "$stale" 2>/dev/null; then
+    mkdir -p "$dir" 2>/dev/null || true
+    rm -rf "$stale" 2>/dev/null || true
+    return 0
+  fi
+  echo "spawn: could not replace Claude probe cache directory $dir" >&2
   return 1
 }
 
@@ -1095,6 +1129,7 @@ agmsg_spawn_headless() {
   case "$probe_timeout" in ''|*[!0-9]*|0) probe_timeout=30 ;; esac
   local probe_cache_enabled=1 probe_cache_ttl="" probe_cache_ttl_valid=0
   local probe_cache_bypass=0 probe_cache_key="" probe_cache_hit=0
+  local probe_cache_recordable=0
 
   _agmsg_claude_cleanup_probe_targets() {
     if [ "$sentinel_created" = 1 ]; then
@@ -1211,8 +1246,8 @@ agmsg_spawn_headless() {
   fi
 
   # Probe cache decision (spawn.claude_probe_cache*, see [task:probe-cache]).
-  # Computed even when a bypass/invalid-TTL path will end up ignoring the key,
-  # so a probe failure below can still forget a stale record for it.
+  # The key is computed even when a disabled/bypass/invalid-TTL path will not
+  # hit or write, so a later live-probe failure can still forget a stale record.
   if ! agmsg_claude_config_true \
     "$("$SCRIPT_DIR/config.sh" get spawn.claude_probe_cache true 2>/dev/null || true)"; then
     probe_cache_enabled=0
@@ -1227,17 +1262,19 @@ agmsg_spawn_headless() {
   fi
   if [ "$probe_cache_enabled" = 1 ] && [ "$probe_cache_ttl_valid" = 1 ] \
     && [ "$probe_cache_bypass" != 1 ]; then
-    if probe_cache_key="$(agmsg_claude_probe_cache_key "$layout" "$PROJECT" \
-      "$storage_dir" "$worker_home" "$CLAUDE_CODE_MODEL" "$CLAUDE_CODE_EFFORT" \
-      "$CLAUDE_CODE_VERSION_OUTPUT" "$CLAUDE_CODE_BIN" \
-      ${inherited_dirs[@]+"${inherited_dirs[@]}"})"; then
-      if [ "${AGMSG_CLAUDE_PROBE_FORCE:-0}" != 1 ] \
-        && agmsg_claude_probe_cache_check_hit "$probe_cache_key" "$probe_cache_ttl"; then
-        probe_cache_hit=1
-      fi
-    else
-      probe_cache_key=""
+    probe_cache_recordable=1
+  fi
+  if probe_cache_key="$(agmsg_claude_probe_cache_key "$layout" "$PROJECT" \
+    "$storage_dir" "$worker_home" "$CLAUDE_CODE_MODEL" "$CLAUDE_CODE_EFFORT" \
+    "$CLAUDE_CODE_VERSION_OUTPUT" "$CLAUDE_CODE_BIN" \
+    ${inherited_dirs[@]+"${inherited_dirs[@]}"})"; then
+    if [ "$probe_cache_recordable" = 1 ] \
+      && [ "${AGMSG_CLAUDE_PROBE_FORCE:-0}" != 1 ] \
+      && agmsg_claude_probe_cache_check_hit "$probe_cache_key" "$probe_cache_ttl"; then
+      probe_cache_hit=1
     fi
+  else
+    probe_cache_key=""
   fi
 
   if [ "$probe_cache_hit" != 1 ]; then
@@ -1341,7 +1378,7 @@ agmsg_spawn_headless() {
       if [ "$probe_rc" -eq 0 ] \
         && agmsg_claude_probe_complete "$probe_trace" "$layout" "$probe_token" \
           "$PROJECT" "$scratch" "$sentinel" "$run_write"; then
-        if [ -n "$probe_cache_key" ]; then
+        if [ -n "$probe_cache_key" ] && [ "$probe_cache_recordable" = 1 ]; then
           agmsg_claude_probe_cache_write "$probe_cache_key" "$layout" \
             "$CLAUDE_CODE_VERSION_OUTPUT" \
             || echo "spawn: could not record Claude sandbox probe cache entry (non-fatal)" >&2
@@ -1355,6 +1392,8 @@ agmsg_spawn_headless() {
           "$PROJECT" "$scratch" "$sentinel" "$run_write"; }; then
       if [ -n "$probe_cache_key" ]; then
         agmsg_claude_probe_cache_forget "$probe_cache_key" || true
+      else
+        agmsg_claude_probe_cache_forget_all || true
       fi
       if [ "${AGMSG_CLAUDE_KEEP_PROBE:-0}" = 1 ]; then
         diagnostics_preserved=1
