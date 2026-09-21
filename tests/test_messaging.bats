@@ -252,9 +252,13 @@ line"
 }
 
 @test "inbox: --mark-read-ids marks only the listed ids" {
-  bash "$SCRIPTS/send.sh" testteam alice bob "keep-unread"   # id 1
-  bash "$SCRIPTS/send.sh" testteam alice bob "ack-this"      # id 2
-  bash "$SCRIPTS/inbox.sh" testteam bob --mark-read-ids 2
+  bash "$SCRIPTS/send.sh" testteam alice bob "keep-unread"
+  bash "$SCRIPTS/send.sh" testteam alice bob "ack-this"
+  run bash "$SCRIPTS/inbox.sh" testteam bob --format ids
+  local ack_id
+  ack_id="$(printf '%s\n' "$output" | awk -F$'\x1f' '$3 ~ /ack-this/ { print $1; exit }')"
+  [ -n "$ack_id" ]
+  bash "$SCRIPTS/inbox.sh" testteam bob --mark-read-ids "$ack_id"
   run bash "$SCRIPTS/inbox.sh" testteam bob --format ids
   [[ "$output" == *"keep-unread"* ]]
   [[ "$output" != *"ack-this"* ]]

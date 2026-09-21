@@ -249,7 +249,7 @@ SHIM
   [[ "$output" == *"stay unread"* ]]
   # testteam delivered-and-read; zteam untouched, so its message re-surfaces.
   [ "$(unread_count alice)" -eq 0 ]
-  [ "$(sqlite3 "$DBPATH" "SELECT COUNT(*) FROM messages WHERE team='zteam' AND to_agent='alice' AND read_at IS NULL;" | tr -d '\r')" -eq 1 ]
+  [ "$(pair_unread_count zteam alice)" -eq 1 ]
 }
 
 @test "check-inbox: multiple identities poll only the first agent's exact team rows" {

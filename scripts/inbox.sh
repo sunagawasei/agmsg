@@ -12,7 +12,7 @@ set -euo pipefail
 #       failed/timed-out turn never silently consumes a message.
 #   inbox.sh <team> <agent_id> --mark-read-ids <id[,id...]>
 #       Mark ONLY the listed message ids read (no display). The ack half of the
-#       machine path; ids are validated to digits/commas before the UPDATE.
+#       machine path; ids are validated (UUIDv7 / legacy decimal) before mark.
 
 TEAM="${1:?Usage: inbox.sh <team> <agent_id> [--quiet | --format ids | --mark-read-ids <ids>]}"
 AGENT="${2:?Missing agent_id}"
@@ -39,8 +39,22 @@ DB="$(agmsg_db_path)"
 # Preserve the read-only "not initialized yet" behaviour: an inbox check must not
 # create the store, so guard on the file before touching the facade.
 if [ ! -f "$DB" ]; then
-  if [ "$QUIET" = true ] || [ "$FORMAT" = ids ]; then exit 0; fi
+  if [ "$QUIET" = true ] || [ "$FORMAT" = ids ] || [ -n "$MARK_IDS" ]; then exit 0; fi
   echo "No messages (DB not initialized)"
+  exit 0
+fi
+
+# --- ack mode: mark only the listed ids read, then exit -----------------------
+# IDs are UUIDv7 (hex + hyphens) or legacy decimal; reject anything else so a
+# crafted list cannot reach storage_mark_read_batch as SQL.
+if [ -n "$MARK_IDS" ]; then
+  case "$MARK_IDS" in
+    *[!0-9a-fA-F,-]* | ,* | *, | *,,*)
+      echo "inbox: --mark-read-ids must be a comma-separated list of message ids" >&2
+      exit 1 ;;
+  esac
+  IFS=',' read -r -a _mark_arr <<< "$MARK_IDS"
+  storage_mark_read_batch "$TEAM" "$AGENT" "${_mark_arr[@]}" >/dev/null 2>&1 || true
   exit 0
 fi
 
@@ -51,8 +65,21 @@ fi
 UNREAD_JSONL=$(storage_list_unread "$TEAM" "$AGENT")
 
 if [ -z "$UNREAD_JSONL" ]; then
-  if [ "$QUIET" = true ]; then exit 0; fi
+  if [ "$QUIET" = true ] || [ "$FORMAT" = ids ]; then exit 0; fi
   echo "No new messages."
+  exit 0
+fi
+
+# --- machine mode: id-tagged unread, never marked read ------------------------
+if [ "$FORMAT" = ids ]; then
+  _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
+  agmsg_sqlite ':memory:' "
+    SELECT json_extract(value,'\$.id') || char(31) ||
+           json_extract(value,'\$.from') || char(31) ||
+           replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
+           json_extract(value,'\$.at')
+    FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
+  "
   exit 0
 fi
 

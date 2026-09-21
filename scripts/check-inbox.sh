@@ -354,7 +354,7 @@ done
 # "no new messages" and then exiting non-zero states something untrue on a
 # channel that is about to be discarded anyway.
 if [ -z "$OUTPUT" ]; then
-  [ "$CLAIM_RC" -eq 0 ] || exit "$CLAIM_RC"
+  [ "$LOOP_RC" -eq 0 ] || exit "$LOOP_RC"
   emit_status_json "agmsg: no new messages"
   exit 0
 fi
@@ -384,8 +384,8 @@ fi
 # upstream mistakes a partial poll for a complete one, because the text says
 # which team stopped it and that the rest are still unread.
 if [ -n "$OUTPUT" ]; then
-  if [ "$CLAIM_RC" -ne 0 ]; then
-    OUTPUT+="agmsg: this poll stopped early — team '$CLAIM_FAILED_TEAM' could not be read (status $CLAIM_RC)."$'\n'
+  if [ "$LOOP_RC" -ne 0 ]; then
+    OUTPUT+="agmsg: this poll stopped early — team '$LOOP_FAILED_TEAM' could not be read (status $LOOP_RC)."$'\n'
     OUTPUT+="agmsg: teams after it were not checked; their messages stay unread and will be offered again."$'\n'
   fi
   # Escape for JSON: backslash, double-quote, newlines, tabs (macOS/Linux compatible)

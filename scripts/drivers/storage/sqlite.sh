@@ -83,6 +83,14 @@ storage_describe() {
   printf 'db=%s\n' "$(_sqlite_db)"
 }
 
+# Predicate for check-inbox / watch-once: skip polling until the store file
+# exists. Prints nothing — callers use the exit status as a boolean, and
+# check-inbox's stdout is hook JSON. The optional team argument is ignored;
+# this driver is one shared file, not a per-team store.
+storage_store_exists() {
+  [ -f "$(_sqlite_db)" ]
+}
+
 storage_init() {
   local db; db="$(_sqlite_db)"
   mkdir -p "$(dirname "$db")" 2>/dev/null || true
