@@ -406,7 +406,7 @@ agmsg_delivery_status() { agmsg_delivery_status_default "$@"; }
 
 agmsg_delivery_runtime_status_default() {
   if [ -d "$RUN_DIR" ]; then
-    local verified=0 fallback=0 unverified=0 dead=0
+    local alive=0 dead=0
     for f in "$RUN_DIR"/watch.*.pid; do
       [ -f "$f" ] || continue
       local pid
@@ -417,7 +417,7 @@ agmsg_delivery_runtime_status_default() {
         dead=$((dead + 1))
       fi
     done
-    echo "watch processes: $verified verified, $fallback legacy/degraded, $unverified unverified, $dead stale pidfiles"
+    echo "watch processes: $alive alive, $dead stale pidfiles"
   fi
 }
 agmsg_delivery_runtime_status() { agmsg_delivery_runtime_status_default "$@"; }
