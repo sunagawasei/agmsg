@@ -18,7 +18,9 @@ setup() {
   # A host tmux/herdr session would otherwise bypass the terminal fixture.
   unset TMUX HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID
   unset BASH_ENV ENV PROMPT_COMMAND CDPATH ZDOTDIR CLAUDE_ENV_FILE
-  unset AGMSG_CLAUDE_KEEP_PROBE FAKE_WRONG_RUN_PATH
+  unset AGMSG_CLAUDE_KEEP_PROBE FAKE_WRONG_RUN_PATH AGMSG_CLAUDE_PROBE_FORCE
+  export AGMSG_CLAUDE_MANAGED_SETTINGS_DIR="$TEST_SKILL_DIR/managed-claude"
+  mkdir -p "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR"
   hash -r 2>/dev/null || true
 
   cat > "$FAKE_CLAUDE" <<'STUB'
@@ -342,10 +344,46 @@ teardown() {
 spawn_claude() {
   local name="$1"
   shift
+  spawn_claude_at team "$name" "$PROJ" "$@"
+}
+
+spawn_claude_at() {
+  local team="$1" name="$2" project="$3"
+  shift 3
   env CLAUDE_CODE_SESSION_ID=parent-sid CLAUDECODE=parent CLAUDE_CODE_CHILD_SESSION=parent-child \
     PATH="$FAKE_BIN:$PATH" \
     bash "$SCRIPTS/spawn.sh" claude-code "$name" \
-      --project "$PROJ" --team team --headless "$@"
+      --project "$project" --team "$team" --headless "$@"
+}
+
+claude_probe_count() {
+  cat "$CAPTURE/probe-count" 2>/dev/null || echo 0
+}
+
+clear_claude_probe_cache() {
+  rm -rf "$TEST_SKILL_DIR/run/claude-probe-ok"
+}
+
+claude_probe_cache_count() {
+  local dir="$TEST_SKILL_DIR/run/claude-probe-ok"
+  [ -d "$dir" ] || { echo 0; return 0; }
+  find "$dir" \( -type f -o -type l \) | wc -l | tr -d ' '
+}
+
+source_claude_spawn() {
+  export SCRIPT_DIR="$SCRIPTS"
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  . "$SCRIPTS/lib/resolve-project.sh"
+  # shellcheck disable=SC1091
+  . "$SCRIPTS/drivers/types/claude-code/_spawn.sh"
+}
+
+reset_probe_capture() {
+  printf '0\n' > "$CAPTURE/probe-count"
+  rm -f "$CAPTURE"/probe.args.* "$CAPTURE"/probe.env.* \
+    "$CAPTURE"/probe.prompt.* "$CAPTURE"/probe.events.* \
+    "$CAPTURE"/probe.settings.* "$CAPTURE"/probe.effects.*
 }
 
 spawn_claude_configured() {
@@ -1011,6 +1049,7 @@ policy_shape() {
   for model in "${malformed[@]}"; do
     probe_number=$((probe_number + 1))
     name="bad-model-$probe_number"
+    clear_claude_probe_cache
     run spawn_claude "$name" --model "$model"
     [ "$status" -eq 0 ]
     [[ "$output" == *"ignoring unsafe Claude model"* ]]
@@ -1062,6 +1101,7 @@ policy_shape() {
   [ "$(grep -Fxc 'ARG=--verbose' "$CAPTURE/probe.args.1")" -eq 1 ]
 
   printf '0\n' > "$CAPTURE/probe-count"
+  clear_claude_probe_cache
   export FAKE_PROBE_MODE=missing
   run spawn_claude verbose-missing --reviewer
   [ "$status" -ne 0 ]
@@ -1071,6 +1111,7 @@ policy_shape() {
   [ ! -e "$CAPTURE/bridge.args.verbose-missing" ]
 
   printf '0\n' > "$CAPTURE/probe-count"
+  clear_claude_probe_cache
   export FAKE_PROBE_MODE=uncorrelated
   run spawn_claude verbose-uncorrelated --reviewer
   [ "$status" -ne 0 ]
@@ -1085,6 +1126,7 @@ policy_shape() {
   [ "$(cat "$CAPTURE/probe-count")" -eq 2 ]
 
   printf '0\n' > "$CAPTURE/probe-count"
+  clear_claude_probe_cache
   export FAKE_PROBE_MODE=missing
   run spawn_claude missing --reviewer
   [ "$status" -ne 0 ]
@@ -1093,6 +1135,7 @@ policy_shape() {
   [ ! -e "$CAPTURE/bridge.args.missing" ]
 
   printf '0\n' > "$CAPTURE/probe-count"
+  clear_claude_probe_cache
   export FAKE_PROBE_MODE=uncorrelated
   run spawn_claude unrelated --reviewer
   [ "$status" -ne 0 ]
@@ -1204,6 +1247,7 @@ HOSTILE
     "$CAPTURE/probe.effects.1"
 
   printf '0\n' > "$CAPTURE/probe-count"
+  clear_claude_probe_cache
   export FAKE_PROBE_MODE=wrong-run-path
   export FAKE_WRONG_RUN_PATH="$hostile_tmp/wrong-run"
   run spawn_claude wrong-run --reviewer
@@ -1575,4 +1619,465 @@ SYMLINKS
   [ ! -e "$TEST_SKILL_DIR/run/claude-code-team-fail-cwd" ]
   run bash "$SCRIPTS/identities.sh" "$TEST_SKILL_DIR/run/claude-code-team-fail-cwd" claude-code
   [[ "$output" != *$'team\tfail'* ]]
+}
+
+@test "normalized settings are identical across TEAM/NAME/PID and change with add-dir, PROJECT, layout" {
+  source_claude_spawn
+  local storage="$TEST_SKILL_DIR/db"
+  local home="$TEST_SKILL_DIR/db/claude-worker-home"
+  local extra_a="$TEST_SKILL_DIR/add-a"
+  local extra_b="$TEST_SKILL_DIR/add-b"
+  local other_project="$TEST_SKILL_DIR/other-project"
+  mkdir -p "$home" "$extra_a" "$extra_b" "$other_project"
+  local out1 out2 out_add out_order out_rev_order out_project out_layout
+  out1="$(agmsg_claude_probe_cache_normalized_settings \
+    consultant "$PROJ" "$storage" "$home")"
+  out2="$(agmsg_claude_probe_cache_normalized_settings \
+    consultant "$PROJ" "$storage" "$home")"
+  [ -n "$out1" ]
+  [ "$out1" = "$out2" ]
+
+  out_add="$(agmsg_claude_probe_cache_normalized_settings \
+    reviewer "$PROJ" "$storage" "$home" "$extra_a")"
+  out_layout="$(agmsg_claude_probe_cache_normalized_settings \
+    reviewer "$PROJ" "$storage" "$home")"
+  [ "$out_layout" != "$out_add" ]
+  out_order="$(agmsg_claude_probe_cache_normalized_settings \
+    reviewer "$PROJ" "$storage" "$home" "$extra_b" "$extra_a")"
+  out_rev_order="$(agmsg_claude_probe_cache_normalized_settings \
+    reviewer "$PROJ" "$storage" "$home" "$extra_a" "$extra_b")"
+  [ "$out_order" = "$out_rev_order" ]
+
+  out_project="$(agmsg_claude_probe_cache_normalized_settings \
+    consultant "$other_project" "$storage" "$home")"
+  [ "$out1" != "$out_project" ]
+  [ "$out1" != "$out_layout" ]
+}
+
+@test "probe cache misses then hits and skips live probe for the same PROJECT and layout" {
+  run spawn_claude cache-miss
+  [ "$status" -eq 0 ]
+  wait_bridge_capture cache-miss
+  [ "$(claude_probe_count)" -eq 1 ]
+  [ "$(claude_probe_cache_count)" -eq 1 ]
+  [[ "$output" != *"reusing cached Claude"* ]]
+
+  run spawn_claude cache-hit
+  [ "$status" -eq 0 ]
+  wait_bridge_capture cache-hit
+  [ "$(claude_probe_count)" -eq 1 ]
+  [ "$(claude_probe_cache_count)" -eq 1 ]
+  [[ "$output" == *"reusing cached Claude consultant sandbox probe result; skipping live probe"* ]]
+  [ -z "$(find "$PROJ" -maxdepth 1 -name '.agmsg-probe-*' -print -quit)" ]
+}
+
+@test "probe cache hits across TEAM and worker name when PROJECT and layout match" {
+  bash "$SCRIPTS/join.sh" other leader claude-code "$PROJ" >/dev/null
+  run spawn_claude cache-home
+  [ "$status" -eq 0 ]
+  wait_bridge_capture cache-home
+  [ "$(claude_probe_count)" -eq 1 ]
+
+  run spawn_claude_at other cache-away "$PROJ"
+  [ "$status" -eq 0 ]
+  wait_bridge_capture cache-away
+  [ "$(claude_probe_count)" -eq 1 ]
+  [[ "$output" == *"reusing cached Claude consultant"* ]]
+}
+
+@test "probe cache misses when binary version, realpath, mtime, or size change" {
+  run spawn_claude bin-base
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+
+  export FAKE_VERSION="2.2.0 (Claude Code)"
+  run spawn_claude bin-version
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+
+  export FAKE_VERSION="2.1.226 (Claude Code)"
+  run spawn_claude bin-version-restored
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+
+  touch -t 202001010101 "$FAKE_CLAUDE"
+  run spawn_claude bin-mtime
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 3 ]
+
+  local preserved="$FAKE_BIN/claude.mtime-ref"
+  cp -p "$FAKE_CLAUDE" "$preserved"
+  printf '#\n' >> "$FAKE_CLAUDE"
+  touch -r "$preserved" "$FAKE_CLAUDE"
+  run spawn_claude bin-size
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 4 ]
+
+  local alt="$FAKE_BIN/claude-alt"
+  cp -p "$FAKE_CLAUDE" "$alt"
+  chmod +x "$alt"
+  export AGMSG_CLAUDE_CMD="$alt"
+  run spawn_claude bin-realpath
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 5 ]
+}
+
+@test "probe cache misses when OS string, generator files, settings layers, layout, model, or effort change" {
+  cat > "$FAKE_BIN/uname" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = -s ]; then exec /usr/bin/uname -s; fi
+if [ "${1:-}" = -r ] && [ -n "${FAKE_UNAME_R:-}" ]; then
+  printf '%s\n' "$FAKE_UNAME_R"
+  exit 0
+fi
+exec /usr/bin/uname "$@"
+STUB
+  cat > "$FAKE_BIN/sw_vers" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = -productVersion ] && [ -n "${FAKE_SW_VERS:-}" ]; then
+  printf '%s\n' "$FAKE_SW_VERS"
+  exit 0
+fi
+exec /usr/bin/sw_vers "$@"
+STUB
+  chmod +x "$FAKE_BIN/uname" "$FAKE_BIN/sw_vers"
+
+  run spawn_claude layer-base
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+
+  export FAKE_UNAME_R=fake-kernel-release
+  run spawn_claude layer-os
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+  unset FAKE_UNAME_R
+
+  printf '\n# probe-cache invalidation marker\n' >> \
+    "$SCRIPTS/drivers/types/claude-code/type.conf"
+  run spawn_claude layer-logic-edit
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 3 ]
+
+  mkdir -p "$SCRIPTS/lib/probe-cache-split"
+  cp "$SCRIPTS/lib/hash.sh" "$SCRIPTS/lib/probe-cache-split/hash.sh"
+  run spawn_claude layer-logic-split
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 4 ]
+
+  mv "$SCRIPTS/lib/probe-cache-split/hash.sh" "$SCRIPTS/lib/probe-cache-split/hash-renamed.sh"
+  run spawn_claude layer-logic-rename
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 5 ]
+
+  printf '{}\n' > "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.json"
+  run spawn_claude layer-managed-json
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 6 ]
+  printf '{"changed":true}\n' > "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.json"
+  run spawn_claude layer-managed-json-edit
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 7 ]
+  clear_claude_probe_cache
+  reset_probe_capture
+  run spawn_claude layer-managed-json-present
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  rm -f "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.json"
+  run spawn_claude layer-managed-json-del
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+
+  mkdir -p "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d"
+  printf '{}\n' > "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d/one.json"
+  run spawn_claude layer-managed-d
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 3 ]
+  printf '{"changed":true}\n' > "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d/one.json"
+  run spawn_claude layer-managed-d-edit
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 4 ]
+  clear_claude_probe_cache
+  reset_probe_capture
+  run spawn_claude layer-managed-d-present
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  rm -rf "$AGMSG_CLAUDE_MANAGED_SETTINGS_DIR/managed-settings.d"
+  run spawn_claude layer-managed-d-del
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+
+  local worker_home="$TEST_SKILL_DIR/db/claude-worker-home"
+  mkdir -p "$worker_home"
+  printf '{}\n' > "$worker_home/settings.json"
+  run spawn_claude layer-worker-settings
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 3 ]
+  printf '{}\n' > "$worker_home/remote-settings.json"
+  run spawn_claude layer-worker-remote
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 4 ]
+  printf '{}\n' > "$worker_home/policy-limits.json"
+  run spawn_claude layer-worker-policy
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 5 ]
+  clear_claude_probe_cache
+  reset_probe_capture
+  run spawn_claude layer-worker-present
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  rm -f "$worker_home/settings.json" "$worker_home/remote-settings.json" \
+    "$worker_home/policy-limits.json"
+  run spawn_claude layer-worker-del
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+
+  run spawn_claude layer-reviewer --reviewer
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 3 ]
+  run spawn_claude layer-reviewer-hit --reviewer
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 3 ]
+
+  bash "$SCRIPTS/config.sh" set spawn.claude_model.layer-model opus
+  run spawn_claude layer-model --reviewer
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 4 ]
+  bash "$SCRIPTS/config.sh" set spawn.claude_effort.layer-effort high
+  run spawn_claude layer-effort --reviewer
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 5 ]
+}
+
+@test "probe cache misses on TTL expiry and invalid probed_at values" {
+  run spawn_claude ttl-base
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  local rec
+  rec="$(find "$TEST_SKILL_DIR/run/claude-probe-ok" -type f ! -type l | head -1)"
+  [ -f "$rec" ]
+
+  bash "$SCRIPTS/config.sh" set spawn.claude_probe_cache_ttl 1
+  printf 'version=stale\nlayout=consultant\nprobed_at=%s\n' \
+    "$(( $(date +%s) - 10 ))" > "$rec"
+  reset_probe_capture
+  run spawn_claude ttl-expired
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+
+  rec="$(find "$TEST_SKILL_DIR/run/claude-probe-ok" -type f ! -type l | head -1)"
+  printf 'version=x\nlayout=consultant\nprobed_at=%s\n' \
+    "$(( $(date +%s) + 864000 ))" > "$rec"
+  reset_probe_capture
+  run spawn_claude ttl-future
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+
+  rec="$(find "$TEST_SKILL_DIR/run/claude-probe-ok" -type f ! -type l | head -1)"
+  printf 'version=x\nlayout=consultant\nprobed_at=not-a-number\n' > "$rec"
+  reset_probe_capture
+  run spawn_claude ttl-nan
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+
+  rec="$(find "$TEST_SKILL_DIR/run/claude-probe-ok" -type f ! -type l | head -1)"
+  printf 'version=x\nlayout=consultant\nprobed_at=-1\n' > "$rec"
+  reset_probe_capture
+  run spawn_claude ttl-negative
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+
+  rec="$(find "$TEST_SKILL_DIR/run/claude-probe-ok" -type f ! -type l | head -1)"
+  printf 'version=x\nlayout=consultant\nprobed_at=12345678901234567890\n' > "$rec"
+  reset_probe_capture
+  run spawn_claude ttl-huge
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+}
+
+@test "scratch .claude directory or symlink bypasses probe cache without writing" {
+  run spawn_claude bypass-seed
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  local rec_before
+  rec_before="$(claude_probe_cache_count)"
+
+  local scratch="$TEST_SKILL_DIR/run/claude-code-team-bypass-dir-cwd"
+  mkdir -p "$scratch/.claude"
+  reset_probe_capture
+  run spawn_claude bypass-dir
+  [ "$status" -eq 0 ]
+  wait_bridge_capture bypass-dir
+  [ "$(claude_probe_count)" -eq 1 ]
+  [ "$(claude_probe_cache_count)" -eq "$rec_before" ]
+  [[ "$output" != *"reusing cached Claude"* ]]
+
+  local scratch_link="$TEST_SKILL_DIR/run/claude-code-team-bypass-link-cwd"
+  mkdir -p "$scratch_link"
+  ln -s "$TEST_SKILL_DIR/managed-claude" "$scratch_link/.claude"
+  reset_probe_capture
+  run spawn_claude bypass-link
+  [ "$status" -eq 0 ]
+  wait_bridge_capture bypass-link
+  [ "$(claude_probe_count)" -eq 1 ]
+  [ "$(claude_probe_cache_count)" -eq "$rec_before" ]
+}
+
+@test "unreadable cache-key inputs and invalid TTL stay uncacheable across consecutive spawns" {
+  mkdir -p "$TEST_SKILL_DIR/db/claude-worker-home"
+  printf '{}\n' > "$TEST_SKILL_DIR/db/claude-worker-home/settings.json"
+  chmod 000 "$TEST_SKILL_DIR/db/claude-worker-home/settings.json"
+
+  run spawn_claude unreadable-a
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  run spawn_claude unreadable-b
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  chmod 644 "$TEST_SKILL_DIR/db/claude-worker-home/settings.json"
+  rm -f "$TEST_SKILL_DIR/db/claude-worker-home/settings.json"
+
+  bash "$SCRIPTS/config.sh" set spawn.claude_probe_cache_ttl nope
+  reset_probe_capture
+  run spawn_claude ttl-bad-a
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  run spawn_claude ttl-bad-b
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+
+  bash "$SCRIPTS/config.sh" set spawn.claude_probe_cache_ttl 0
+  reset_probe_capture
+  run spawn_claude ttl-zero-a
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  run spawn_claude ttl-zero-b
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+
+  bash "$SCRIPTS/config.sh" set spawn.claude_probe_cache_ttl -3
+  reset_probe_capture
+  run spawn_claude ttl-neg-a
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  run spawn_claude ttl-neg-b
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+}
+
+@test "failed probe forgets a record and truncate fallback prevents a later hit" {
+  run spawn_claude forget-seed
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_cache_count)" -eq 1 ]
+  local rec
+  rec="$(find "$TEST_SKILL_DIR/run/claude-probe-ok" -type f ! -type l | head -1)"
+  [ -f "$rec" ]
+
+  export AGMSG_CLAUDE_PROBE_FORCE=1
+  export FAKE_PROBE_MODE=missing
+  reset_probe_capture
+  run spawn_claude forget-fail
+  [ "$status" -ne 0 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  unset AGMSG_CLAUDE_PROBE_FORCE
+  export FAKE_PROBE_MODE=complete
+
+  run spawn_claude forget-seed2
+  [ "$status" -eq 0 ]
+  rec="$(find "$TEST_SKILL_DIR/run/claude-probe-ok" -type f ! -type l | head -1)"
+  [ -f "$rec" ]
+  chmod a-w "$TEST_SKILL_DIR/run/claude-probe-ok"
+  source_claude_spawn
+  agmsg_claude_probe_cache_forget "$(basename "$rec")"
+  chmod u+w "$TEST_SKILL_DIR/run/claude-probe-ok"
+  [ -e "$rec" ]
+  [ ! -s "$rec" ]
+  reset_probe_capture
+  run spawn_claude forget-truncated
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+}
+
+@test "symlink cache records miss and an unwritable cache dir does not fail spawn" {
+  run spawn_claude symlink-seed
+  [ "$status" -eq 0 ]
+  local rec
+  rec="$(find "$TEST_SKILL_DIR/run/claude-probe-ok" -type f ! -type l | head -1)"
+  [ -f "$rec" ]
+  mv "$rec" "$rec.real"
+  ln -s "$rec.real" "$rec"
+  reset_probe_capture
+  run spawn_claude symlink-record
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+
+  chmod a-w "$TEST_SKILL_DIR/run/claude-probe-ok"
+  reset_probe_capture
+  run spawn_claude nowrite --model opus
+  local spawn_status="$status"
+  chmod u+w "$TEST_SKILL_DIR/run/claude-probe-ok"
+  [ "$spawn_status" -eq 0 ]
+  wait_bridge_capture nowrite
+  [ "$(claude_probe_count)" -eq 1 ]
+  reset_probe_capture
+  run spawn_claude nowrite-again --model opus
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+}
+
+@test "probe cache config false and AGMSG_CLAUDE_PROBE_FORCE always run a live probe" {
+  run spawn_claude force-seed
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+
+  export AGMSG_CLAUDE_PROBE_FORCE=1
+  run spawn_claude force-run
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+  [[ "$output" != *"reusing cached Claude"* ]]
+  unset AGMSG_CLAUDE_PROBE_FORCE
+
+  bash "$SCRIPTS/config.sh" set spawn.claude_probe_cache false
+  reset_probe_capture
+  run spawn_claude cache-off-a
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 1 ]
+  run spawn_claude cache-off-b
+  [ "$status" -eq 0 ]
+  [ "$(claude_probe_count)" -eq 2 ]
+}
+
+@test "TEAM/NAME glob metacharacters appear only on the allow side of generated rules" {
+  local team='t*eam' name='n?ame'
+  bash "$SCRIPTS/join.sh" "$team" leader claude-code "$PROJ" >/dev/null
+  run spawn_claude_at "$team" "$name" "$PROJ"
+  [ "$status" -eq 0 ]
+  wait_bridge_capture "$name"
+  local settings scratch
+  settings="$TEST_SKILL_DIR/run/claude-code-bridge.$team.$name.settings.json"
+  scratch="$TEST_SKILL_DIR/run/claude-code-$team-$name-cwd"
+  [ -f "$settings" ]
+  json_array_has "$settings" '$.permissions.allow' "Read(/$scratch/**)"
+  ! json_array_has "$settings" '$.permissions.deny' "Read(/$scratch/**)"
+  ! json_array_has "$settings" '$.permissions.deny' "Edit(/$scratch/**)"
+  local deny_blob
+  deny_blob="$(sqlite_mem "SELECT group_concat(value, char(10)) FROM json_each(readfile('$(rf "$settings")'), '\$.permissions.deny');")"
+  [[ "$deny_blob" != *"$scratch"* ]]
+  [[ "$deny_blob" != *'t*eam'* ]]
+  [[ "$deny_blob" != *'n?ame'* ]]
+}
+
+@test "PROJECT glob metacharacters run a probe that fails and write no cache record" {
+  local globproj="$TEST_SKILL_DIR/proj[glob]"
+  mkdir -p "$globproj"
+  bash "$SCRIPTS/join.sh" team leader claude-code "$globproj" >/dev/null
+  run spawn_claude_at team glob-proj "$globproj" --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"did not produce every required correlated tool event"* ]]
+  [ "$(claude_probe_count)" -ge 1 ]
+  [ "$(claude_probe_cache_count)" -eq 0 ]
+  [ ! -e "$CAPTURE/bridge.args.glob-proj" ]
 }

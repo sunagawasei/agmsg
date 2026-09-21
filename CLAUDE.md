@@ -53,6 +53,14 @@ The three axes are fully orthogonal — any combination is valid.
 
 Every script must begin with `set -euo pipefail`. Drivers expose functions prefixed by axis name to avoid namespace collisions (`storage_*`, `agent_*`, `delivery_*`). Scripts source shared helpers via `source "$SCRIPT_DIR/lib/storage.sh"` (or the equivalent lib file); they never hard-code `~/.agents/`.
 
+## Claude Code sandbox probe cache
+
+Headless `claude-code` spawn reuses a successful sandbox probe while the things it depends on have not changed (binary realpath/version/mtime+size, OS, generator files under `scripts/drivers/types/claude-code/` and `scripts/lib/`, normalized settings, PROJECT realpath, Claude Code's other settings layers, layout, model, effort). Records live at `$SKILL_DIR/run/claude-probe-ok/<key>`.
+
+- `spawn.claude_probe_cache` (default `true`) — `false` runs a live probe on every spawn
+- `spawn.claude_probe_cache_ttl` (default `86400` seconds = 1 day) — a non-positive or non-integer value is a config error and makes the probe uncacheable
+- `AGMSG_CLAUDE_PROBE_FORCE=1` — ignore a fresh record and run one live probe
+
 ## AGMSG-DIRECTIVE protocol
 
 When a driver needs the host agent to take an action (install a dependency, invoke the Monitor tool, stop a task), it emits a single line on stdout:
