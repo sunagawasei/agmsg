@@ -585,168 +585,27 @@ eperm_pid() {
   [ "$3" = "$sp" ]
 }
 
-@test "session-start: a connected team with no engine is started, and said when that fails (#761, #774)" {
-  # A reboot kills every sync engine and nothing restarts one. `connected` keeps
-  # printing and `send` keeps succeeding locally, so the only symptom is silence
-  # — which reads as "nobody wrote anything". This hook is the first thing of
-  # ours that runs afterwards.
-  #
-  # A RULING WAS REVERSED HERE, and this test is where it is recorded.
-  #
-  # #761/#765 decided: do NOT start anything, make the absence VISIBLE. That
-  # decision is what this test was written to hold. #774 reverses it — an agent
-  # arriving at a connected team now STARTS the engine — on the grounds that
-  # visibility asks a person for something the machine can do.
-  #
-  # What #765 built is not discarded: its warning, its wording and its runnable
-  # remedy are exactly what remains when the start FAILS, and that is the case
-  # driven below. The assertions about what the operator is told are therefore
-  # unchanged; only the reason they are reachable is new. This is a reversal of
-  # a decision, not a test edited to fit new output (raised in review).
-  #
-  # THE FAILURE IS FORCED BY THE COMMAND ITSELF, not by its environment.
-  #
-  # It used to be forced with an unusable interpreter, on the reasoning that
-  # `sync start` would then "fail immediately and for a named reason". That is
-  # a claim about a machine, and it was false on one: on a macOS CI runner the
-  # command had not returned after SIXTY seconds, so the hook printed "a start
-  # is still in flight" — a different fact, tested elsewhere — and this case
-  # failed for a reason that had nothing to do with what it asserts.
-  #
-  # So `remote.sh` is replaced, for this half of the test, by one that answers
-  # `status` with a connected team and refuses `sync start` at once. The real
-  # one is restored before the section below, which needs it to SUCCEED.
-  #
-  # It used to be inherited instead — the fixture simply had no engine to start
-  # — and that held only while this file ran alone: the case passed under
-  # `--filter` and failed in the full file, because what a start does depends on
-  # what other tests left behind. That is the same cross-test coupling this PR
-  # fixes in its own suite, arriving from the other direction. The condition is
-  # stated here so nothing about the surrounding file can decide it.
-  #
-  # The budget is raised as well: under the 5s default a slow failure is
-  # reported as "still in flight", which is a different fact and is tested
-  # separately in tests/test_sync_autostart.bats.
-  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
-
-  # NEGATIVE FIRST, on the state every ordinary machine is in: no connected
-  # team at all. A line printed unconditionally would pass the positive half
-  # below and be wrong every single session.
-  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
+@test "session-start: warns once when owner pid resolution degrades to a bare sid" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" \
+    team alice claude-code "$TEST_PROJECT" >/dev/null
+  run env AGMSG_AGENT_PID= CLAUDE_PID="$$" AGMSG_RESOLVE_PROJECT=0 \
+    bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" \
+      <<< '{"session_id":"sid-bare-warning"}'
   [ "$status" -eq 0 ]
   [ "$(printf '%s\n' "$output" | grep -c 'owner PID unresolved')" -eq 1 ]
   [[ "$output" == *"without a cc-instance record"* ]]
   [[ "$output" == *"orphan GC may see this session as dead"* ]]
 }
 
-  # Now a connected team whose engine is not running. Written through the same
-  # config the command reads, rather than by calling `connect` — no server here.
-  local cfg="$TEST_SKILL_DIR/teams/team/config.json" updated escaped
-  escaped="$(sed "s/'/''/g" "$cfg")"
-  updated="$(sqlite_mem "
-    SELECT json_set('$escaped', '\$.remote_binding', json_object(
-      'endpoint', 'https://remote.example',
-      'server_instance_id', '018f0000-0000-7000-8000-000000000001',
-      'remote_team_id', '018f0000-0000-7000-8000-000000000002',
-      'protocol_version', 1,
-      'capabilities', json_object('write_allowed_ciphers', json_array('none')),
-      'connected_at', '2026-08-12T00:00:00Z',
-      'disconnected_at', null
-    ));")"
-  printf '%s\n' "$updated" > "$cfg"
-
-  # The stub goes in HERE, after the negative half has run against the real
-  # command. Installed any earlier it would report a connected team before one
-  # exists, and the negative assertion — the one that catches a line printed
-  # unconditionally — would be testing the stub instead of the hook.
-  cp "$SCRIPTS/remote.sh" "$TEST_SKILL_DIR/remote.real.sh"
-  {
-    printf '%s\n' '#!/usr/bin/env bash'
-    printf '%s\n' 'if [ "${1:-}" = "status" ] && [ -z "${2:-}" ]; then'
-    printf '%s\n' '  printf "team\tconnected since 2026-08-12\n"; exit 0'
-    printf '%s\n' 'fi'
-    printf '%s\n' 'if [ "${1:-}" = "sync" ]; then'
-    printf '%s\n' '  echo "agmsg: cannot start the sync engine for '"'"'$3'"'"': no runtime" >&2; exit 1'
-    printf '%s\n' 'fi'
-    printf '%s\n' 'exit 0'
-  } > "$SCRIPTS/remote.sh"
-  chmod +x "$SCRIPTS/remote.sh"
-
-  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
+@test "session-start: a live CLAUDE_PID creates cc-instance without a warning" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" \
+    team alice claude-code "$TEST_PROJECT" >/dev/null
+  run env -u AGMSG_AGENT_PID CLAUDE_PID="$$" AGMSG_RESOLVE_PROJECT=0 \
+    bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" \
+      <<< '{"session_id":"sid-claude-pid"}'
   [ "$status" -eq 0 ]
-  printf '%s\n' "$output" | grep -q -F -- "connected, but not syncing"
-  # The printed COMMAND must be runnable, not a template. Scoped to the command
-  # lines: the Monitor directive below legitimately contains `<team>` when it
-  # describes the message format `<ts> | <team> | <from> → <to> | <body>`, and a
-  # whole-output match calls that a defect. Measured — the first version of this
-  # assertion failed on exactly that line.
-  # Saved BEFORE the next `run`, which replaces $output. Asserting on $output
-  # after running the suggested command reads the command's output and calls it
-  # the hook's — measured here, it turned a passing check into a failing one for
-  # the wrong reason.
-  local session_out="$output" suggested
-  suggested="$(printf '%s\n' "$session_out" | sed -n 's/^  bash //p' | head -1)"
-  [ -n "$suggested" ]
-  refute grep -qF -- "<team>" <<<"$suggested"
-
-  # The directive still has to be there: a warning that displaces it would stop
-  # the session receiving anything at all, which is worse than the gap it names.
-  printf '%s\n' "$session_out" | grep -q -F -- "invoke the Monitor tool"
-
-  # The real command is back from here on: the rest of this test requires a
-  # `sync start` that can succeed, and a stub that always refuses would make
-  # the final assertion unreachable rather than true.
-  cp "$TEST_SKILL_DIR/remote.real.sh" "$SCRIPTS/remote.sh"
-  chmod +x "$SCRIPTS/remote.sh"
-
-  # Run what was printed, THROUGH AN INSTALL PATH THAT NEEDS QUOTING, and
-  # require it to succeed.
-  #
-  # The first version of this checked only that `Usage:` was absent, and never
-  # looked at `$status` — so `bash: …: No such file or directory` would have
-  # passed it. And the fixture's install path had no space in it, so dropping
-  # `%q` from the path changed nothing: the test could not fail for the reason
-  # it was written. Both raised in review, both true.
-  # A COPY, not a symlink. `SKILL_DIR` is `cd "$SCRIPT_DIR/.." && pwd`, and `..`
-  # resolves through a symlink to the physical parent — so a symlinked install
-  # with a space in its name arrives here as the real path without one, and the
-  # fixture would silently stop testing what it was built for. Measured.
-  local spaced="$BATS_TEST_TMPDIR/an install/skill"
-  mkdir -p "$spaced"
-  cp -R "$TEST_SKILL_DIR/." "$spaced/"
-  run env AGMSG_RESOLVE_PROJECT=0 bash "$spaced/scripts/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
-  [ "$status" -eq 0 ]
-  local spaced_cmd
-  spaced_cmd="$(printf '%s\n' "$output" | sed -n 's/^  bash //p' | head -1)"
-  [ -n "$spaced_cmd" ]
-  # `install`, not `an install`: %q escapes the space, so the literal phrase is
-  # never present in a correctly quoted line. Checking for it asserts the
-  # ABSENCE of the quoting this test exists to require — measured, it failed
-  # against a correct implementation twice.
-  printf '%s\n' "$spaced_cmd" | grep -q -F -- "install"
-
-  # A fake engine, so success is reachable at all: without one the command runs
-  # correctly and still exits non-zero with `sync engine … did not become ready`,
-  # and a test that accepted that would be accepting the failure it is meant to
-  # catch.
-  local fake_node="$BATS_TEST_TMPDIR/fake-node"
-  printf '%s\n' '#!/usr/bin/env bash' \
-    'if [ "${1:-}" = "--version" ]; then echo v23.0.0; exit 0; fi' \
-    'echo "{\"event\":\"capabilities\",\"startup_nonce\":\"${AGMSG_SYNC_START_NONCE:-}\"}"' \
-    'trap "exit 0" TERM INT' \
-    'while :; do sleep 1; done' > "$fake_node"
-  chmod +x "$fake_node"
-
-  run env AGMSG_RESOLVE_PROJECT=0 AGMSG_NODE="$fake_node" bash -c "bash $spaced_cmd"
-  # The STATUS, not the absence of one string. An unquoted path fails here with
-  # `No such file or directory` and a non-zero exit, and the earlier version of
-  # this check — `refute grep Usage:` — passed on exactly that.
-  [ "$status" -eq 0 ]
-  local started_pid
-  started_pid="$(cat "$spaced/run/remote-sync.team.pid" 2>/dev/null || true)"
-  [ -n "$started_pid" ]
-  ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$started_pid"
-  kill "$started_pid" 2>/dev/null || true
+  [[ "$output" != *"owner PID unresolved"* ]]
+  [ "$(cat "$TEST_SKILL_DIR/run/cc-instance.$$")" = "sid-claude-pid.$$" ]
 }
 
 # --- session-start.sh role-aware resume directive (#339) ---

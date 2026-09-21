@@ -196,6 +196,13 @@ delivered_to_operator() {
   printf '%s' "$parsed"
 }
 
+@test "check-inbox: a later team's query failure does not lose earlier teams' messages (#637)" {
+  # alice is in two teams; glob order enumerates testteam before zteam.
+  bash "$SCRIPTS/join.sh" zteam alice claude-code /tmp/project-a
+  bash "$SCRIPTS/join.sh" zteam bob claude-code /tmp/project-a
+  bash "$SCRIPTS/send.sh" testteam bob alice "early"
+  bash "$SCRIPTS/send.sh" zteam bob alice "in-zteam"
+
   # PATH shim: fail (SQLITE_BUSY-style rc=5) exactly the unread SELECT for the
   # second team; everything else passes through to the real sqlite3. testteam's
   # messages are read_at-stamped inside the loop before zteam is queried, so
