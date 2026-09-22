@@ -4,7 +4,9 @@ set -euo pipefail
 # The launcher is detached from codex-monitor.sh and may outlive the shell that
 # invoked it. Never retain test-harness result/trace descriptors through the
 # dispatcher -> role child -> bridge process chain.
-exec 3>&- 4>&-
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "$0")" && pwd)/../../../lib/close-fds.sh"
+agmsg_close_inherited_fds
 
 # Runs outside Codex's tool sandbox and owns the app-server connections. The
 # dispatcher starts bridges only for roles recorded as belonging to this seat.
