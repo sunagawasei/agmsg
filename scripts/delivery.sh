@@ -906,24 +906,39 @@ kill_all_watchers() {
       [ -f "$f" ] || continue
       local pid cmd instance expected_scope signal_rc
       pid=$(cat "$f" 2>/dev/null || echo "")
-      if [ -n "$pid" ] && _agmsg_pid_alive_local "$pid"; then
-        # Defensive: only kill if the pid's command line still looks like
-        # our watch.sh. Defends against pid recycling — a stale pidfile
-        # could point at an unrelated process that reused the pid.
+      instance=${f##*/watch.}; instance=${instance%.pid}
+      expected_scope=""
+      [ -n "$type" ] && expected_scope="watch|$instance|$watch_project|$type"
+      agmsg_process_identity_state watch "$f" "$expected_scope" \
+        "$SKILL_DIR/scripts/watch.sh" "$instance" "$project" "$type"
+      if [ "$AGMSG_PROCESS_STATE" = owned ]; then
+        if [ -n "$project" ] && [ -z "$type" ]; then
+          cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
+          case " $cmd " in *"$needle"*) ;; *) continue ;; esac
+        fi
+        [ -n "$expected_scope" ] || expected_scope="@hash:$AGMSG_PROCESS_SCOPE_HASH"
+        if agmsg_process_signal_owned watch "$f" "$expected_scope" TERM \
+            --wait-release 5 \
+            "$SKILL_DIR/scripts/watch.sh" "$instance" "$project" "$type"; then
+          killed=$((killed + 1))
+        else
+          signal_rc=$?
+          if [ "$signal_rc" -eq 75 ]; then
+            echo "watch $instance: TERM sent, lease release not confirmed within 5s" >&2
+          fi
+        fi
+      elif [ "$AGMSG_PROCESS_STATE" = legacy-unverified-live ] \
+          || [ "$AGMSG_PROCESS_STATE" = legacy-exact-live ]; then
+        # Compatibility for watchers started before process-owner sidecars.
+        # Authorize only the exact shipped watch path and requested argv scope.
         cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
         case "$cmd" in
           *"$SKILL_DIR/scripts/watch.sh"*)
-            # When scoped, skip (and preserve the pidfile of) watchers that don't
-            # match this (project, type) — i.e. other projects, and other types
-            # in the same project.
             if [ -n "$needle" ]; then
-              case " $cmd " in
-                *"$needle"*) ;;
-                *) continue ;;
-              esac
+              case " $cmd " in *"$needle"*) ;; *) continue ;; esac
             fi
-            kill "$pid" 2>/dev/null && killed=$((killed + 1)) ;;
-          *) ;;  # not our watcher; leave it
+            kill "$pid" 2>/dev/null && killed=$((killed + 1))
+            ;;
         esac
       fi
       case "$AGMSG_PROCESS_STATE" in
