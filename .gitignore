@@ -4,6 +4,7 @@ teams/
 .DS_Store
 .codex/
 .claude/
+.cursor/
 .opencode/
 .playwright-mcp/
 
