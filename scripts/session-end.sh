@@ -57,6 +57,7 @@ source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 INSTANCE_ID="$(agmsg_instance_id "$SESSION_ID" "$TYPE")"
+STEAM="s-${SESSION_ID%%.*}"
 
 PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
 if [ -f "$PIDFILE" ]; then
