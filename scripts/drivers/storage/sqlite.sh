@@ -94,6 +94,10 @@ storage_store_exists() {
 storage_init() {
   local db; db="$(_sqlite_db)"
   mkdir -p "$(dirname "$db")" 2>/dev/null || true
+  if [ -f "$db" ]; then
+    agmsg_sqlite "$db" "ALTER TABLE events ADD COLUMN legacy_id INTEGER;" \
+      >/dev/null 2>&1 || true
+  fi
   agmsg_sqlite "$db" "
     PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS events (
@@ -106,10 +110,17 @@ storage_init() {
       body       TEXT,
       msg_id     TEXT,
       agent      TEXT,
-      at         TEXT NOT NULL
+      at         TEXT NOT NULL,
+      legacy_id  INTEGER
     );
     CREATE INDEX IF NOT EXISTS events_sent ON events(type, team, to_agent, seq);
     CREATE INDEX IF NOT EXISTS events_read ON events(type, team, agent, msg_id);
+    CREATE TABLE IF NOT EXISTS read_cursors (
+      team TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      local_position INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(team,agent)
+    );
     -- Legacy store (read-only here). Created so the UNION queries always parse
     -- even on a brand-new install with no pre-event-log data.
     CREATE TABLE IF NOT EXISTS messages (
@@ -127,29 +138,78 @@ storage_init() {
 
 # --- contract: messages ----------------------------------------------------
 
+_sqlite_message_sent_sql() {
+  local team="$1" from="$2" to="$3" body="$4" id="$5" at="$6"
+  local tl fl ol bl il al
+  tl="$(_sqlite_lit "$team")"; fl="$(_sqlite_lit "$from")"; ol="$(_sqlite_lit "$to")"
+  bl="$(_sqlite_lit "$body")"; il="$(_sqlite_lit "$id")"; al="$(_sqlite_lit "$at")"
+  printf '%s\n' "
+    BEGIN IMMEDIATE;
+    INSERT INTO messages (team,from_agent,to_agent,body,created_at)
+    VALUES ('$tl','$fl','$ol','$bl','$al');
+    INSERT INTO events (type,id,team,from_agent,to_agent,body,at,legacy_id)
+    VALUES ('message_sent','$il','$tl','$fl','$ol','$bl','$al',last_insert_rowid());
+    COMMIT;
+  "
+}
+
 storage_send() {
   local team="$1" from="$2" to="$3" body="$4"
   local id at db; id="$(_sqlite_uuid7)"; at="$(_sqlite_now)"; db="$(_sqlite_db)"
-  local insert="
-    INSERT INTO events (type,id,team,from_agent,to_agent,body,at)
-    VALUES ('message_sent','$(_sqlite_lit "$id")','$(_sqlite_lit "$team")',
-            '$(_sqlite_lit "$from")','$(_sqlite_lit "$to")','$(_sqlite_lit "$body")',
-            '$(_sqlite_lit "$at")');
-  "
+  local insert; insert="$(_sqlite_message_sent_sql "$team" "$from" "$to" "$body" "$id" "$at")"
   # Try the INSERT first and only fall back to storage_init on failure (the #114
   # pattern). Running storage_init — which issues PRAGMA journal_mode=WAL and the
   # CREATE TABLE/INDEX statements — on EVERY send serializes badly under a
   # concurrent first-write fan-out and lost rows past the busy_timeout. The common
   # path is now a single INSERT; only a missing table pays the init + retry.
-  if ! agmsg_sqlite "$db" "$insert" >/dev/null 2>&1; then
+  if ! printf '%s\n' "$insert" | agmsg_sqlite -bail "$db" >/dev/null 2>&1; then
     storage_init >/dev/null
-    agmsg_sqlite "$db" "$insert" >/dev/null 2>&1 || return 1
+    printf '%s\n' "$insert" | agmsg_sqlite -bail "$db" >/dev/null 2>&1 || return 1
   fi
   printf '%s\n' "$id"
 }
 
 # storage_list_unread <team> <agent> [--limit N]
 # events-unread ∪ legacy-unread (read_at IS NULL, not superseded by a read event).
+storage_read_cursor_get() {
+  local team="$1" agent="$2"
+  storage_init >/dev/null || return 13
+  _sqlite_data "SELECT COALESCE((SELECT local_position FROM read_cursors
+    WHERE team='$(_sqlite_lit "$team")' AND agent='$(_sqlite_lit "$agent")'),0);"
+}
+
+storage_read_cursor_consume() {
+  local team="$1" agent="$2" target="$3"; shift 3
+  case "$target" in ''|*[!0-9]*) echo runtime_error; return 13 ;; esac
+  local db tl al at id sql=""
+  db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
+  at="$(_sqlite_now)"
+  for id in "$@"; do
+    sql="$sql
+      INSERT INTO events(type,id,team,agent,msg_id,at)
+      SELECT 'message_read','$(_sqlite_lit "$(_sqlite_uuid7)")','$tl','$al',
+             '$(_sqlite_lit "$id")','$(_sqlite_lit "$at")'
+       WHERE NOT EXISTS(SELECT 1 FROM events r WHERE r.type='message_read'
+         AND r.team='$tl' AND r.agent='$al' AND r.msg_id='$(_sqlite_lit "$id")');
+      UPDATE messages SET read_at='$(_sqlite_lit "$at")'
+       WHERE read_at IS NULL
+         AND id=(SELECT e.legacy_id FROM events e
+                 WHERE e.type='message_sent' AND e.team='$tl'
+                   AND e.id='$(_sqlite_lit "$id")' AND e.legacy_id IS NOT NULL);"
+  done
+  if ! agmsg_sqlite "$db" "BEGIN IMMEDIATE;
+    $sql
+    INSERT OR IGNORE INTO read_cursors(team,agent,local_position)
+      VALUES('$tl','$al',0);
+    UPDATE read_cursors SET local_position=MAX(local_position,MIN($target,$(_sqlite_highwater)))
+      WHERE team='$tl' AND agent='$al';
+    COMMIT;" >/dev/null 2>&1; then
+    echo runtime_error
+    return 13
+  fi
+  echo ok
+}
+
 storage_list_unread() {
   local team="$1" agent="$2" limit=""
   shift 2
@@ -164,6 +224,8 @@ storage_list_unread() {
              e.at AS ts, 1 AS src, e.seq AS ord
       FROM events e
       WHERE e.type='message_sent' AND e.team='$tl' AND e.to_agent='$al'
+        AND e.seq>COALESCE((SELECT local_position FROM read_cursors
+                            WHERE team='$tl' AND agent='$al'),0)
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
                         AND r.team=e.team AND r.agent='$al' AND r.msg_id=e.id)
       UNION ALL
@@ -174,6 +236,7 @@ storage_list_unread() {
       WHERE m.team='$tl' AND m.to_agent='$al' AND m.read_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
                         AND r.team=m.team AND r.agent='$al' AND r.msg_id=CAST(m.id AS TEXT))
+        AND NOT EXISTS (SELECT 1 FROM events e2 WHERE e2.legacy_id=m.id)
     )
     ORDER BY ts, src, ord ${limit:+LIMIT $limit};
   "
@@ -193,7 +256,12 @@ storage_mark_read_batch() {
     INSERT INTO events (type,id,team,agent,msg_id,at)
     SELECT 'message_read','$(_sqlite_lit "$rid")','$tl','$al','$idl','$(_sqlite_lit "$at")'
     WHERE NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
-                      AND r.team='$tl' AND r.agent='$al' AND r.msg_id='$idl');"
+                      AND r.team='$tl' AND r.agent='$al' AND r.msg_id='$idl');
+    UPDATE messages SET read_at='$(_sqlite_lit "$at")'
+     WHERE read_at IS NULL
+       AND id=(SELECT e.legacy_id FROM events e
+               WHERE e.type='message_sent' AND e.team='$tl'
+                 AND e.id='$idl' AND e.legacy_id IS NOT NULL);"
   done
   agmsg_sqlite "$db" "$sql" >/dev/null 2>&1 || { echo runtime_error; return 13; }
   echo ok
@@ -271,6 +339,7 @@ storage_history() {
                created_at AS ts, 0 AS src, id AS ord
         FROM messages
         WHERE team='$tl' $afilter
+          AND NOT EXISTS (SELECT 1 FROM events e2 WHERE e2.legacy_id=messages.id)
       )
       ORDER BY ts DESC, src DESC, ord DESC ${limit:+LIMIT $limit}
     )
@@ -310,15 +379,18 @@ storage_import() {
     t=$(j type); id=$(j id); team=$(j team); at=$(j at)
     if [ "$t" = message_sent ]; then
       frm=$(j from); to=$(j to); body=$(j body)
-      agmsg_sqlite "$db" "INSERT INTO events (type,id,team,from_agent,to_agent,body,at)
-        VALUES ('message_sent','$(_sqlite_lit "$id")','$(_sqlite_lit "$team")',
-                '$(_sqlite_lit "$frm")','$(_sqlite_lit "$to")','$(_sqlite_lit "$body")',
-                '$(_sqlite_lit "$at")');" >/dev/null 2>&1
+      printf '%s\n' "$(_sqlite_message_sent_sql "$team" "$frm" "$to" "$body" "$id" "$at")" \
+        | agmsg_sqlite -bail "$db" >/dev/null 2>&1
     elif [ "$t" = message_read ]; then
       agent=$(j agent); msg_id=$(j msg_id)
       agmsg_sqlite "$db" "INSERT INTO events (type,id,team,agent,msg_id,at)
         VALUES ('message_read','$(_sqlite_lit "$id")','$(_sqlite_lit "$team")',
-                '$(_sqlite_lit "$agent")','$(_sqlite_lit "$msg_id")','$(_sqlite_lit "$at")');" \
+                '$(_sqlite_lit "$agent")','$(_sqlite_lit "$msg_id")','$(_sqlite_lit "$at")');
+        UPDATE messages SET read_at='$(_sqlite_lit "$at")'
+         WHERE read_at IS NULL
+           AND id=(SELECT e.legacy_id FROM events e
+                   WHERE e.type='message_sent' AND e.team='$(_sqlite_lit "$team")'
+                     AND e.id='$(_sqlite_lit "$msg_id")' AND e.legacy_id IS NOT NULL);" \
         >/dev/null 2>&1
     fi
   done < "$file"

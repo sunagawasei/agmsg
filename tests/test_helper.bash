@@ -622,6 +622,39 @@ assert_no_test_fixture_survivors() {
   echo "fixture-survivors=0 run_id=$run_id"
 }
 
+agmsg_install_fake_tmux() {
+  export FAKE_TMUX_STATE="${FAKE_TMUX_STATE:-$FAKEBIN/tmux.labels}"
+  : >"$FAKE_TMUX_STATE"
+  cat >"$FAKEBIN/tmux" <<EOF
+#!/usr/bin/env bash
+{ printf 'tmux'; for a in "\$@"; do printf ' [%s]' "\$a"; done; printf '\n'; } >> "$ARGV_LOG"
+state='$FAKE_TMUX_STATE'
+args=("\$@")
+if [ "\${args[0]}" = -S ]; then args=("\${args[@]:2}"); fi
+case "\${args[0]}" in
+  new-window) echo '@7' ;;
+  split-window) echo '%9' ;;
+  capture-pane) printf 'line one\nline two\n' ;;
+  set-option)
+    if [ "\${args[4]}" = '@agmsg_agent' ]; then
+      pane="\${args[3]}"; label="\${args[5]}"
+      [ -f "\$state" ] && grep -v "^\$pane	" "\$state" >"\$state.new" 2>/dev/null || : >"\$state.new"
+      printf '%s\t%s\n' "\$pane" "\$label" >>"\$state.new"
+      mv "\$state.new" "\$state"
+    fi ;;
+  display-message)
+    if [ "\${args[4]}" = '#{pane_id}|#{@agmsg_agent}' ]; then
+      pane="\${args[3]}"
+      label="\$(awk -F'\t' -v p="\$pane" '\$1 == p { print \$2 }' "\$state" 2>/dev/null)"
+      printf '%s|%s\n' "\$pane" "\$label"
+    fi ;;
+esac
+exit 0
+EOF
+  chmod +x "$FAKEBIN/tmux"
+  export PATH="$FAKEBIN:$PATH"
+}
+
 # Skip a test on native Windows / Git Bash (MSYS/MINGW/Cygwin). Use ONLY for
 # behaviour that depends on POSIX process semantics agmsg does not yet support
 # there — watcher discovery/kill via ps/pgrep, and session liveness via kill -0
@@ -643,6 +676,12 @@ skip_unless_windows() {
     MINGW*|MSYS*|CYGWIN*) ;;
     *) skip "${1:-only meaningful under Git Bash}" ;;
   esac
+}
+
+# Antigravity's TUI monitor is intentionally Linux-only. Installation tests
+# which execute its shim use this guard; file-handling tests remain portable.
+skip_unless_linux() {
+  [ "$(uname -s)" = Linux ] || skip "${1:-Antigravity TUI monitor is Linux-only}"
 }
 
 # In-memory sqlite for test ASSERTIONS, stripping CR. sqlite3.exe writes stdout

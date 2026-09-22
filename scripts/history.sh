@@ -16,6 +16,14 @@ case "$LIMIT" in ''|*[!0-9]*) LIMIT=20 ;; esac
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 agmsg_storage_load
+
+if [ -n "$AGENT" ]; then
+  # A team-wide history read has no acting seat; an agent-scoped read does.
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/lib/self-name.sh"
+  agmsg_self_name_on_action "$TEAM" "$AGENT" || true
+fi
+
 DB="$(agmsg_db_path)"
 
 if [ ! -f "$DB" ]; then

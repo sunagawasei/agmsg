@@ -282,6 +282,12 @@ STUB
 #!/usr/bin/env bash
 requested="${*: -1}"
 printf 'requested=%s argv=%s\n' "$requested" "$*" >> "$PS_STUB_LOG"
+# The production liveness helper cross-checks an unsignalable/dead PID with
+# `ps -o stat=`. Keep that query truthful; the fixture below only virtualizes
+# command-line discovery for bridges.
+case " $* " in
+  *" -o stat= "*) exec /bin/ps "$@" ;;
+esac
 for args_file in "$FAKE_CAPTURE"/bridge.args.*; do
   [ -f "$args_file" ] || continue
   name="${args_file#"$FAKE_CAPTURE/bridge.args."}"

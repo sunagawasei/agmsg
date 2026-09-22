@@ -59,6 +59,24 @@ source "$SCRIPT_DIR/lib/resolve-project.sh"
 INSTANCE_ID="$(agmsg_instance_id "$SESSION_ID" "$TYPE")"
 STEAM="s-${SESSION_ID%%.*}"
 
+# Snapshot every session-team spawn record before detaching cleanup. The worker
+# uses this immutable view to avoid tearing down a replacement spawned after
+# SessionEnd fired.
+mkdir -p "$RUN_DIR" 2>/dev/null || true
+SNAPSHOT_PATH="$(mktemp "$RUN_DIR/.session-end-snapshot.XXXXXX" 2>/dev/null || true)"
+if [ -n "$SNAPSHOT_PATH" ]; then
+  ENCODED_STEAM="$(_actas_lock_encode "$STEAM")"
+  SPAWN_PREFIX="$RUN_DIR/spawn.${ENCODED_STEAM}__"
+  for SPAWN_FILE in "${SPAWN_PREFIX}"*; do
+    [ -f "$SPAWN_FILE" ] || continue
+    ENCODED_NAME="${SPAWN_FILE#"$SPAWN_PREFIX"}"
+    [ "$ENCODED_NAME" != "$SPAWN_FILE" ] || continue
+    NAME="$(_actas_lock_decode "$ENCODED_NAME")"
+    RECORD="$(cat "$SPAWN_FILE" 2>/dev/null || true)"
+    printf '%s\t%s\n' "$NAME" "$RECORD" >>"$SNAPSHOT_PATH" 2>/dev/null || true
+  done
+fi
+
 PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
 if [ -f "$PIDFILE" ]; then
   pid=$(cat "$PIDFILE" 2>/dev/null || true)

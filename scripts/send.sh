@@ -83,8 +83,32 @@ source "$SCRIPT_DIR/lib/validate.sh"
 # never bypass team-name path safety.
 agmsg_validate_team_name "$TEAM" || exit 1
 
+# A seat that sends names its own pane if it is not named. Best-effort: terminal
+# discovery/naming must never make message delivery fail.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/self-name.sh"
+agmsg_self_name_on_action "$TEAM" "$FROM" || true
+
 agmsg_storage_load
 DB="$(agmsg_db_path)"
+
+# A Claude session must not accidentally address another session's private
+# team. Project teams remain unrestricted; explicit cross-team work has an
+# opt-in escape hatch.
+if [ "${AGMSG_ALLOW_CROSS_TEAM:-0}" != 1 ] \
+    && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  case "$TEAM" in
+    s-*)
+      # shellcheck disable=SC1091
+      source "$SCRIPT_DIR/lib/session-team.sh"
+      EXPECT_TEAM="$(agmsg_session_team_name 2>/dev/null || true)"
+      if [ -n "$EXPECT_TEAM" ] && [ "$TEAM" != "$EXPECT_TEAM" ]; then
+        echo "send: refusing cross-session send — '$TEAM' is another session's private team; this session's own team is '$EXPECT_TEAM'. Use \$TEAM from whoami.sh; set AGMSG_ALLOW_CROSS_TEAM=1 to override." >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
 
 # Keep the full-schema bootstrap (registry + storage tables) for a first-ever
 # command; the message write itself goes through the storage facade below.
@@ -136,8 +160,8 @@ fi
 # the message log (an append-only message_sent event), not a direct INSERT.
 # storage_send re-inits its schema idempotently before writing, which subsumes the
 # #114 concurrent first-write race the old path retried around (a process seeing
-# the DB file before the table exists just creates it). The new id is not surfaced.
-storage_send "$TEAM" "$FROM" "$TO" "$BODY" >/dev/null
+# the DB file before the table exists just creates it).
+SENT_EVENT_ID="$(storage_send "$TEAM" "$FROM" "$TO" "$BODY")"
 
 echo "Sent to $TO in team $TEAM"
 
@@ -147,6 +171,14 @@ echo "Sent to $TO in team $TEAM"
 # Block until <to> replies to <from> with a message newer than the one we sent.
 # Newlines in the body are flattened to a literal "\n" so the printed reply
 # stays a single line — same convention as watch.sh's stream.
+T_ESC="$(printf '%s' "$TEAM" | sed "s/'/''/g")"
+F_ESC="$(printf '%s' "$FROM" | sed "s/'/''/g")"
+O_ESC="$(printf '%s' "$TO" | sed "s/'/''/g")"
+E_ESC="$(printf '%s' "$SENT_EVENT_ID" | sed "s/'/''/g")"
+SENT_ID="$(agmsg_sqlite "$DB" \
+  "SELECT legacy_id FROM events WHERE type='message_sent' AND id='$E_ESC' LIMIT 1;" \
+  2>/dev/null | tr -d '\r')"
+case "$SENT_ID" in ''|*[!0-9]*) echo "send: could not resolve sent message id" >&2; exit 1 ;; esac
 REPLY_WHERE="id > $SENT_ID AND team='$T_ESC' AND from_agent='$O_ESC' AND to_agent='$F_ESC'"
 deadline=$(( $(date +%s) + TIMEOUT ))
 

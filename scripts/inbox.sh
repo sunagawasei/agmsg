@@ -34,6 +34,13 @@ case "$FORMAT" in human|ids) ;; *) echo "inbox: --format must be 'human' or 'ids
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 agmsg_storage_load
+
+# Name this seat on action when terminal identity is available. Naming is
+# advisory and must not turn an inbox read into a failure.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/self-name.sh"
+agmsg_self_name_on_action "$TEAM" "$AGENT" || true
+
 DB="$(agmsg_db_path)"
 
 # Preserve the read-only "not initialized yet" behaviour: an inbox check must not

@@ -488,6 +488,17 @@ EOF
   # (#188).
   local watch_command
   watch_command="$(printf '%q %q %q %q' "$watch" "$session_id" "$project" "$type")"
+  # A mid-session switch to monitor mode needs the same dedicated-team setup as
+  # SessionStart; otherwise watch.sh has no session-scoped subscription.
+  if [ "$type" = "claude-code" ]; then
+    local session_team
+    session_team="$(agmsg_session_team_name_from_id "${CLAUDE_CODE_SESSION_ID:-}")"
+    if [ -n "$session_team" ]; then
+      AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" \
+        "$session_team" claude "$type" "$project" >/dev/null 2>&1 || true
+      watch_command="$watch_command $(printf '%q %q %q' claude --team "$session_team")"
+    fi
+  fi
   # AGMSG_CC_MONITOR_KEEP_ALIVE, default OFF: timeout_ms: 1800000 always
   # stays (the Monitor tool caps every watch there regardless). What differs
   # is whether re-arming on expiry is UNCONDITIONAL or read off the expiry

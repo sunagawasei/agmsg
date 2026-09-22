@@ -157,6 +157,58 @@ _agmsg_pid_alive() {
   _agmsg_pid_alive_local "$pid"
 }
 
+# Print a process-generation token that changes when a PID is reused. Linux's
+# procfs starttime is preferred because it is a kernel tick counter and does not
+# depend on wall-clock formatting. Other POSIX hosts use ps(1)'s full start
+# timestamp. Git Bash may need PowerShell to inspect a native Windows process.
+# Failure is deliberately distinct from "dead": callers that authorize
+# teardown must fail closed when no generation token can be obtained.
+agmsg_pid_start_token() {
+  local pid="$1" line rest value=""
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pid" -gt 0 ] 2>/dev/null || return 1
+
+  if [ -r "/proc/$pid/stat" ]; then
+    line="$(LC_ALL=C sed -n '1p' "/proc/$pid/stat" 2>/dev/null)" || return 1
+    # comm is parenthesized and may contain spaces or ')'. Strip through the
+    # final ") "; the remaining field 20 is proc stat field 22 (starttime).
+    rest="${line##*) }"
+    value="$(printf '%s\n' "$rest" | LC_ALL=C awk '{print $20}')"
+    case "$value" in ''|*[!0-9]*) return 1 ;; esac
+    printf 'proc:%s\n' "$value"
+    return 0
+  fi
+
+  case "${MSYSTEM:-}" in
+    MINGW*|MSYS*|CLANGARM*)
+      if command -v powershell.exe >/dev/null 2>&1; then
+        value="$(powershell.exe -NoProfile -NonInteractive -Command \
+          '$p = Get-Process -Id ([int]$args[0]) -ErrorAction Stop; $p.StartTime.ToUniversalTime().Ticks' \
+          "$pid" 2>/dev/null | tr -d '\r[:space:]')" || return 1
+        case "$value" in ''|*[!0-9]*) return 1 ;; esac
+        printf 'windows:%s\n' "$value"
+        return 0
+      fi
+      ;;
+  esac
+
+  value="$(TZ=UTC LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null \
+    | LC_ALL=C sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}')" || return 1
+  [ -n "$value" ] || return 1
+  printf 'ps:%s\n' "$value"
+}
+
+# Print the acquisition method encoded in a process-generation token. Callers
+# must never interpret a change of method as evidence that the process changed.
+agmsg_pid_start_token_method() {
+  case "${1:-}" in
+    proc:*) printf 'proc\n' ;;
+    windows:*) printf 'windows\n' ;;
+    ps:*) printf 'ps\n' ;;
+    *) return 1 ;;
+  esac
+}
+
 # Compose from an explicit pid. Bare sid when pid is empty/non-numeric.
 agmsg_instance_id_from_pid() {
   local sid="$1" pid="$2"

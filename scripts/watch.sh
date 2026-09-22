@@ -55,7 +55,30 @@ SESSION_ID="${1:-}"
 [ "$SESSION_ID" = "-" ] && SESSION_ID="" # #477: caller sentinel for empty session id
 PROJECT_PATH="${2:?Missing project_path}"
 AGENT_TYPE="${3:?Missing agent_type}"
-ACTIVE_NAME="${4:-}"
+shift 3
+ACTIVE_NAME=""
+TEAM_PIN=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --team)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || {
+        echo "ERROR: watch.sh --team needs a value"
+        exit 1
+      }
+      TEAM_PIN="$2"
+      shift 2
+      ;;
+    *)
+      if [ -z "$ACTIVE_NAME" ]; then
+        ACTIVE_NAME="$1"
+        shift
+      else
+        echo "ERROR: watch.sh unexpected argument: $1"
+        exit 1
+      fi
+      ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -67,6 +90,8 @@ source "$SCRIPT_DIR/lib/actas-lock.sh"
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/process-identity.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/watch-stuck-map.sh"
 
 # Fail loudly on an unknown agent_type instead of running with zero
 # subscriptions. The dominant real-world cause is a shifted argument list: a
@@ -225,6 +250,8 @@ esac
 
 # Pairs already reported as storeless, so the notice is once per process.
 NO_STORE_REPORTED=""
+STUCK_MAP=""
+STUCK_THRESHOLD=3
 
 watch_log() {
   local msg="$*" record size=0 bytes
@@ -259,6 +286,10 @@ watch_log() {
   fi
   # Never fatal: a sandbox that cannot write here must not take delivery down.
   printf '%s\n' "$record" >> "$LOGFILE" 2>/dev/null || true
+}
+
+watch_report() {
+  printf 'agmsg watch: %s\n' "$*"
 }
 
 # Close THIS member's own pane at the end of a graceful despawn, through the
@@ -1264,7 +1295,12 @@ EOF
           watch_log "this watcher no longer owns that role and is stopping."
           watch_log "messages for it stay unread and reach the session that claimed it."
           exit 0
-        fi
+          ;;
+      esac
+    fi
+    _pair_gate "$pair_team" "$pair_agent" "$pair_state"
+    case "$PAIR_VERDICT" in
+      held:*)
         # Broad subscription: this watcher serves other roles too, so skip the
         # pair rather than ending the process -- exiting here would take down a
         # whole session's delivery because one of its roles moved elsewhere.
@@ -1282,7 +1318,7 @@ EOF
         if ! _held_elsewhere_has "${pair_team}/${pair_agent}"; then
           HELD_ELSEWHERE="${HELD_ELSEWHERE:+$HELD_ELSEWHERE
 }${pair_team}/${pair_agent}"
-          echo "agmsg watch: ${pair_team}/${pair_agent} was claimed by session ${pair_state#other:}; not serving it while they hold it." >&2
+          echo "agmsg watch: ${pair_team}/${pair_agent} was claimed by session ${PAIR_VERDICT#held:}; not serving it while they hold it." >&2
         fi
         continue
         ;;

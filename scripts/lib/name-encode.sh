@@ -18,3 +18,21 @@ if ! declare -F _actas_lock_encode >/dev/null 2>&1; then
     '
   }
 fi
+
+if ! declare -F _actas_lock_decode >/dev/null 2>&1; then
+  _actas_lock_decode() {
+    printf '%s' "$1" | LC_ALL=C awk '
+      BEGIN { for (n = 0; n < 256; n++) byte[sprintf("%02X", n)] = sprintf("%c", n) }
+      {
+        for (i = 1; i <= length($0); i++) {
+          c = substr($0, i, 1)
+          if (c == "%") {
+            hex = substr($0, i + 1, 2)
+            printf "%s", byte[hex]
+            i += 2
+          } else printf "%s", c
+        }
+      }
+    '
+  }
+fi

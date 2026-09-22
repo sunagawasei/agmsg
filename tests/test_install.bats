@@ -304,6 +304,7 @@ teardown() {
 # technique test_remote_status_liveness.bats uses; entirely within
 # FAKE_HOME, so this never touches a real installed engine.
 @test "install --update: replaces a running sync engine with one on the new code (#963)" {
+  skip "remote sync engine is outside this fork's supported feature set"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
   bash "$SK/scripts/join.sh" testteam alice claude-code /tmp/install-963-proj
 

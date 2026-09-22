@@ -87,6 +87,15 @@ Do NOT manually edit config files. Always use join.sh. If the name was recently 
 # List team members
 ~/.agents/skills/agmsg/scripts/team.sh <team>
 
+# Terminal and pane questions
+# run `where.sh` before answering terminal/pane questions or invoking
+# arrange/peek/poke. Never infer the driver from environment variables or a
+# remembered terminal layout. Its output includes `capabilities=<list>`; consult
+# `scripts/drivers/terminals/<terminal>/README.md` for that driver's semantics.
+# Use `team.sh <team>` to answer who the teammates are. To inspect or act on a
+# teammate, use `peek.sh`/`poke.sh`/`arrange.sh <team> <name>` after where.sh.
+~/.agents/skills/agmsg/scripts/where.sh
+
 # List every locally known team (read-only, secret-free — "agmsg team list").
 # Distinct from `team.sh <team>` above: check for "team list" FIRST so
 # "list" is never mistaken for a team name. --json emits a strict,

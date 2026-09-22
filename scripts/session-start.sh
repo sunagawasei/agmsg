@@ -50,6 +50,12 @@ source "$SCRIPT_DIR/lib/type-registry.sh"
 source "$SCRIPT_DIR/lib/session-team.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/role-session.sh"  # role->session reverse lookup (#339)
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/process-identity.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/pending-teardown.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/inflight.sh"
 # Only DEFINES agmsg_close_inherited_fds; nothing is closed here. The type
 # plug calls it inside a subshell around its own long-lived spawn, so this
 # shell's descriptors are untouched. See lib/close-fds.sh.
@@ -282,6 +288,15 @@ fi
 # UNLESS session-team mode will create one.
 PAIRS=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null || true)
 if [ -z "$PAIRS" ] && [ -z "$SESSION_TEAM" ]; then exit 0; fi
+
+# In session-team mode the validated hook session owns a dedicated team and a
+# single `claude` identity. Register it before type-specific startup and refresh
+# the pair list so every later narrowing/delivery decision sees the new seat.
+if [ -n "$SESSION_TEAM" ]; then
+  AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" \
+    "$SESSION_TEAM" claude "$TYPE" "$PROJECT" >/dev/null 2>&1 || true
+  PAIRS=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null || true)
+fi
 
 # Type-specific SessionStart behaviour (Template Method). A type may ship
 # scripts/drivers/types/<type>/_session-start.sh defining agmsg_session_start to override the
@@ -837,8 +852,11 @@ fi
 # messages arriving"), naming `/agmsg actas <name>` so the seat can be set
 # explicitly — which re-fires this hook down the role-filtered path above.
 _pair_count="$(printf '%s\n' "$PAIRS" | grep -c '.' || true)"
-if [ "${_pair_count:-0}" -le 1 ]; then
+if [ -n "$SESSION_TEAM" ] || [ "${_pair_count:-0}" -le 1 ]; then
   WATCH_COMMAND="$(printf '%q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE")"
+  if [ -n "$SESSION_TEAM" ]; then
+    WATCH_COMMAND="$WATCH_COMMAND $(printf '%q %q %q' claude --team "$SESSION_TEAM")"
+  fi
   cat <<EOF
 AGMSG monitor mode: invoke the Monitor tool now with the following parameters,
 before any other action in this session.
