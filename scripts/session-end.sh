@@ -3,6 +3,16 @@ set -uo pipefail
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 
+# The headless cursor worker's own turns set this so this SessionEnd hook never
+# treats a worker turn's --resume-triggered sessionEnd as the interactive
+# session ending (cursor fires sessionEnd on --resume even for the worker's own
+# read-only turns; misreading that here would publish a tombstone and snapshot
+# teardown for a session that never ended). Same guard, same reasoning, as
+# check-inbox.sh's. See _spawn.sh / cursor-bridge.sh.
+if [ -n "${AGMSG_CURSOR_BRIDGE:-}" ]; then
+  exit 0
+fi
+
 # SessionEnd hook — symmetric counterpart of session-start.sh.
 #
 # Usage: session-end.sh <type> <project_path>
@@ -56,7 +66,38 @@ fi
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/process-identity.sh"
 INSTANCE_ID="$(agmsg_instance_id "$SESSION_ID" "$TYPE")"
+
+# Stop this session's cursor inject watcher (inject-watch.sh), keyed on the
+# same INSTANCE_ID as watch.sh's pidfile but under its own name — it does not
+# share watch.*.pid, so it is not reached by that pidfile's owner-stop path
+# (which can sit waiting on a re-verification round-trip; a watcher whose pipe
+# closes during that wait would go unnoticed, leaving it running and still
+# injecting into a pane for a session that has already ended). A bare TERM is
+# enough: inject-watch.sh's own trap removes its pidfile on receipt.
+#
+# Verify ownership from the sidecar file before signalling, using only plain
+# reads (process-identity.sh's own field parser, no fork) — a PID this
+# session's own inject-watch.sh already released could otherwise have been
+# recycled by an unrelated process by the time this hook runs. This stops
+# short of process-identity.sh's full lease-probing verification
+# (agmsg_process_signal_owned): that forks a python/lockf helper and this
+# section must stay non-blocking (see this file's header on why teardown that
+# can stall is detached to session-end-worker.sh instead) — a pid+kind match
+# on the owner sidecar is enough to rule out the PID-reuse case review flagged,
+# and this script already declares itself best-effort throughout.
+INJECT_PIDFILE="$RUN_DIR/inject-watch.$INSTANCE_ID.pid"
+INJECT_PID="$(_agmsg_process_read_pid "$INJECT_PIDFILE" 2>/dev/null || true)"
+if [ -n "$INJECT_PID" ]; then
+  INJECT_OWNER="$(agmsg_process_owner_path "$INJECT_PIDFILE")"
+  INJECT_OWNER_PID="$(_agmsg_process_owner_field "$INJECT_OWNER" pid 2>/dev/null || true)"
+  INJECT_OWNER_KIND="$(_agmsg_process_owner_field "$INJECT_OWNER" kind 2>/dev/null || true)"
+  if [ "$INJECT_PID" = "$INJECT_OWNER_PID" ] && [ "$INJECT_OWNER_KIND" = "inject-watch" ]; then
+    kill -TERM "$INJECT_PID" 2>/dev/null || true
+  fi
+fi
 
 # Snapshot every session-team spawn record. Use the exact encoded-team prefix
 # that agmsg_spawn_path writes, strip only that known prefix, then decode the

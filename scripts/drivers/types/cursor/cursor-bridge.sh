@@ -6,6 +6,16 @@
 set -uo pipefail
 CURSOR_BRIDGE_ORIGINAL_ARGS=("$@")
 
+# Every cursor-agent turn this bridge runs -- including its own self-reexec
+# below and any AGMSG_CURSOR_AGENT_CMD/AGMSG_CURSOR_BRIDGE_CMD stand-in -- must
+# see this so check-inbox.sh's `stop` hook exits immediately instead of firing
+# INSIDE this worker's own turns. Hooks resolve by --workspace, not cwd, so a
+# turn run with --workspace "$PROJECT" would otherwise trigger the project's
+# own .cursor/hooks.json (misdelivery, plus injection into a pane that doesn't
+# exist). Exported here too (not just by _spawn.sh) so a bridge started
+# directly -- bypassing _spawn.sh, e.g. in tests -- is still covered.
+export AGMSG_CURSOR_BRIDGE=1
+
 # cursor-bridge.sh — headless, read-only Cursor reviewer worker for agmsg.
 #
 # The cursor-side analogue of codex-bridge.js, but far smaller: cursor-agent's

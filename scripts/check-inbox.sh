@@ -3,6 +3,15 @@ set -euo pipefail
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 
+# The headless cursor worker's own turns set this so this `stop` hook never
+# fires INSIDE those turns -- .cursor/hooks.json resolves by --workspace, not
+# cwd, so a worker turn run with --workspace <project> would otherwise trigger
+# the project's own hook on every reviewer turn (misdelivery, plus injection
+# into a pane that doesn't exist). See _spawn.sh / cursor-bridge.sh.
+if [ -n "${AGMSG_CURSOR_BRIDGE:-}" ]; then
+  exit 0
+fi
+
 # Check inbox across all teams with cooldown. Skips if last check was < 60 seconds ago.
 # Usage: check-inbox.sh <type> <project_path>
 
@@ -20,14 +29,39 @@ source "$SCRIPT_DIR/lib/resolve-project.sh"  # agmsg_agent_pid, for instance-id 
 source "$SCRIPT_DIR/lib/type-registry.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/process-identity.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/inbox-target.sh"
 
 # Some Stop-hook runtimes (codex, copilot) want an explicit JSON status object
-# even when there is nothing to deliver; others (claude-code) stay silent. This
-# is the type's manifest `stop_output=` (data), not a hardcoded type list.
+# even when there is nothing to deliver; cursor wants a `followup_message`
+# instead; others (claude-code) stay silent. This is the type's manifest
+# `stop_output=` (data), not a hardcoded type list.
 STOP_OUTPUT="$(agmsg_type_get "$TYPE" stop_output 2>/dev/null || true)"
 emit_status_json() {
   [ "$STOP_OUTPUT" = "json" ] || return 0
   printf '{\n  "continue": true,\n  "systemMessage": "%s"\n}\n' "$1"
+}
+
+# Shared JSON-string escaping for both output shapes below (decision/block and
+# followup_message). sqlite3's json_quote covers every character JSON requires
+# escaping -- including CR and the rest of U+0000..U+001F, which the previous
+# sed/awk pipeline passed through raw and so could emit invalid JSON for a
+# message body carrying them (the runtime then drops the payload, after the rows
+# were already marked read). Emits the string body WITHOUT the surrounding
+# quotes: callers supply those. Falls back to the old pipeline when sqlite3 is
+# unavailable, which is no worse than before.
+_agmsg_json_escape() {
+  local tmp out
+  if command -v sqlite3 >/dev/null 2>&1; then
+    tmp=$(mktemp "${TMPDIR:-/tmp}/agmsg-esc.XXXXXX")
+    printf '%s' "$1" > "$tmp"
+    out=$(sqlite3 :memory: \
+      "SELECT substr(q, 2, length(q) - 2) FROM (SELECT json_quote(CAST(readfile('$(printf %s "$tmp" | sed "s/'/''/g")') AS TEXT)) AS q);" 2>/dev/null || true)
+    rm -f "$tmp"
+    if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
+    # Empty body (or a sqlite failure) falls through to the pipeline below.
+  fi
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | awk '{if(NR>1) printf "\\n"; printf "%s",$0}'
 }
 
 # Hook runtimes that pass JSON do so on stdin. Interactive invocations such as
@@ -58,9 +92,11 @@ fi
 
 # Defer to the monitor watcher when one is alive for this session.
 # Avoids double-delivery when delivery.mode = both. The session id field name
-# differs by vendor: Claude Code emits snake_case "session_id"; Grok Build (and
-# Cursor) emit camelCase "sessionId". Try snake first (claude-code unaffected),
-# then camel, then the GROK_SESSION_ID env Grok injects into every hook.
+# differs by vendor: Claude Code AND Cursor both emit top-level snake_case
+# "session_id" (measured on cursor-agent 2026.09.10-fd3934a); Grok Build is the
+# one that emits camelCase "sessionId". Try snake first (claude-code/cursor
+# unaffected), then camel, then the GROK_SESSION_ID env Grok injects into every
+# hook.
 SESSION_ID=$(printf '%s' "$INPUT" \
   | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
   | head -1)
@@ -68,6 +104,11 @@ SESSION_ID=$(printf '%s' "$INPUT" \
   | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
   | head -1)
 [ -z "$SESSION_ID" ] && SESSION_ID="${GROK_SESSION_ID:-}"
+# Preserve the raw (pre-normalization) id for agmsg_inbox_target below -- it
+# must never see the composite "<sid>.<pid>" form the watcher dedup check
+# derives just below (agmsg_session_team_name_from_id / role-session records
+# both key on the bare id).
+SESSION_ID_RAW="$SESSION_ID"
 if [ -n "$SESSION_ID" ]; then
   # The monitor watcher keys its pidfile (and its actas owner, below) on the
   # per-process instance id (#93), not the bare session_id. Normalize to the
@@ -85,10 +126,27 @@ if [ -n "$SESSION_ID" ]; then
       exit 0
     fi
   fi
+  # Same deference for the cursor inject watcher, which owns its own pidfile
+  # instead of watch.<iid>.pid (see cursor/inject-watch.sh). Without this, both
+  # paths deliver the same message: the inject watcher holds an unread id while
+  # waiting for an idle pane, this Stop hook consumes it in the meantime, and
+  # the pane gets it twice -- its own pre-injection read_at recheck only closes
+  # the opposite ordering.
+  INJECT_PIDFILE="$SKILL_DIR/run/inject-watch.$SESSION_ID.pid"
+  if [ -f "$INJECT_PIDFILE" ]; then
+    INJECT_PID=$(cat "$INJECT_PIDFILE" 2>/dev/null || true)
+    case "$INJECT_PID" in
+      ''|*[!0-9]*) ;;
+      *) if _agmsg_pid_alive "$INJECT_PID"; then exit 0; fi ;;
+    esac
+  fi
 fi
 
-# Identify agent and teams
-WHOAMI=$("$SCRIPT_DIR/whoami.sh" "$PROJECT" "$TYPE")
+# Identify agent and teams via the shared resolver (session-team / role /
+# project-team routing) instead of calling whoami.sh directly -- see
+# lib/inbox-target.sh for why a bare whoami.sh call here mis-delivers to a
+# same-project headless worker's identity when `multiple=true`.
+WHOAMI=$(agmsg_inbox_target "$TYPE" "$PROJECT" "$SESSION_ID_RAW")
 # suggest=true means this identity is registered only under a DIFFERENT
 # project, so it is not joined here -> deliver nothing (mirror not_joined).
 # Without this the else-branch extracts "agents=" as the agent name.
@@ -203,8 +261,11 @@ fi
 
 # New messages found
 if [ -n "$OUTPUT" ]; then
-  # Escape for JSON: backslash, double-quote, newlines, tabs (macOS/Linux compatible)
-  ESCAPED=$(printf '%s' "$OUTPUT" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | awk '{if(NR>1) printf "\\n"; printf "%s",$0}')
+  ESCAPED=$(_agmsg_json_escape "$OUTPUT")
+  if [ "$STOP_OUTPUT" = "followup" ]; then
+    printf '{"followup_message":"%s"}\n' "$ESCAPED"
+    exit 0
+  fi
   cat <<ENDJSON
 {
   "decision": "block",

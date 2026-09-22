@@ -194,6 +194,12 @@ agmsg_delivery_on_disable() { kill_all_watchers "$2" "$1" >/dev/null 2>&1 || tru
 # and TaskStop its watcher. Types whose runtime launches the watcher a different
 # way (e.g. grok-build's `monitor` tool) override this with their own wording.
 agmsg_delivery_stop_directive() { emit_stop_directive; }
+# Default preflight: no side effects to check, so nothing to fail on. A type
+# whose monitor/both mode depends on external runtime state it cannot recover
+# from later (e.g. cursor needing a herdr pane to inject into) overrides this
+# to reject the mode BEFORE apply_settings below writes anything. Args:
+# <type> <project> <mode>.
+agmsg_delivery_preflight() { :; }
 
 # Default delivery status (json-hooks types: claude-code, codex). Derives the mode
 # from the settings hooks file's agmsg-owned SessionStart/Stop entries, then prints
@@ -277,6 +283,13 @@ agmsg_delivery_load_plug() {
 apply_settings() {
   local type="$1" project="$2" mode="$3"
   agmsg_delivery_load_plug "$type"
+  # Preflight before apply: a failure here must leave the hooks file
+  # untouched. Checking after apply (the previous order) would have already
+  # written+enabled the hooks by the time a missing runtime dependency turned
+  # up, so `set monitor` could exit non-zero yet still leave monitor mode
+  # live. Under `set -e` this return propagates out of do_set, matching a
+  # normal validation failure.
+  agmsg_delivery_preflight "$type" "$project" "$mode" || return 1
   agmsg_delivery_apply "$type" "$project" "$mode"
 }
 
@@ -484,6 +497,10 @@ do_set() {
       # watcher in the project — so any type's `set turn` tore down the
       # project's claude-code monitor, the only type that runs one.)
       kill_all_watchers "$PROJECT" "$TYPE" >/dev/null 2>&1 || true
+      # Same (project, type) scoping for cursor's inject watcher — turn mode
+      # has no use for it either, and it doesn't share watch.*.pid so the
+      # call above never reaches it.
+      kill_inject_watchers "$PROJECT" "$TYPE" >/dev/null 2>&1 || true
       agmsg_delivery_stop_directive
       ;;
     off)
@@ -491,6 +508,11 @@ do_set() {
       # Type-specific teardown via the plug (default: stop this project's
       # watchers; codex stops its bridge instead).
       agmsg_delivery_on_disable "$TYPE" "$PROJECT"
+      # Belt-and-suspenders alongside the plug teardown above: cursor's inject
+      # watcher isn't a watch.sh pidfile (agmsg_delivery_on_disable's default
+      # only reaches those), so it needs the same explicit sweep turn mode
+      # uses. A no-op for types that never launch one.
+      kill_inject_watchers "$PROJECT" "$TYPE" >/dev/null 2>&1 || true
       # Only emit the in-session watcher-stop directive for types that actually
       # have an automatic delivery mode to stop. A manual-only type
       # (delivery_modes=off, e.g. hermes) has no Monitor/watcher, so the
@@ -620,23 +642,74 @@ kill_all_watchers() {
   echo "$killed"
 }
 
+# Teardown for cursor's per-turn inject watcher (inject-watch.sh): it keeps
+# its own pidfile rather than sharing watch.*.pid (see its header), so
+# kill_all_watchers above never reaches it — this is its counterpart.
+#
+# Verified via process-identity.sh's owner/lease sidecar (inject-watch.sh
+# bootstraps through process-owner-launch.sh with kind=inject-watch), not the
+# cmdline-substring check this used before: review found that check needs
+# `ps` (compat_get_cmdline), which is unavailable in some sandboxes — 2
+# `delivery set off|turn` tests timed out there waiting for a pidfile that
+# was never touched. inject-watch has no legacy pidfile format to be
+# compatible with (a brand new kind, unlike watch's), so unlike
+# kill_all_watchers there is no project-only (no-type) compatibility form
+# here — every real caller supplies both. Args: <project> <type>.
+kill_inject_watchers() {
+  local project="${1:-}" type="${2:-}"
+  local killed=0
+  if [ -d "$RUN_DIR" ]; then
+    for f in "$RUN_DIR"/inject-watch.*.pid; do
+      [ -f "$f" ] || continue
+      local instance expected_scope signal_rc
+      instance=${f##*/inject-watch.}; instance=${instance%.pid}
+      expected_scope=""
+      [ -n "$project" ] && [ -n "$type" ] && expected_scope="inject-watch|$instance|$project|$type"
+      agmsg_process_identity_state inject-watch "$f" "$expected_scope"
+      if [ "$AGMSG_PROCESS_STATE" = owned ]; then
+        [ -n "$expected_scope" ] \
+          || expected_scope="@hash:$AGMSG_PROCESS_SCOPE_HASH"
+        if agmsg_process_signal_owned inject-watch "$f" "$expected_scope" TERM \
+            --wait-release 5; then
+          killed=$((killed + 1))
+        else
+          signal_rc=$?
+          if [ "$signal_rc" -eq 75 ]; then
+            echo "inject-watch $instance: TERM sent, lease release not confirmed within 5s" >&2
+          fi
+        fi
+      fi
+      case "$AGMSG_PROCESS_STATE" in
+        stale|legacy-dead|legacy-foreign-live|legacy-unverified-live|degraded-dead|unverified-dead)
+          agmsg_process_cleanup_observed "$f" || true ;;
+      esac
+    done
+  fi
+  echo "$killed"
+}
+
 do_stop() {
-  local killed
+  local killed inject_killed
   killed=$(kill_all_watchers)
-  echo "Killed $killed watch process(es)."
+  # Review found `stop` never reached cursor's inject watcher at all (it
+  # isn't a watch.*.pid) -- same bare-args (kill everything) form as
+  # kill_all_watchers just above.
+  inject_killed=$(kill_inject_watchers)
+  echo "Killed $killed watch process(es), $inject_killed inject watcher(s)."
   emit_stop_directive
 }
 
 do_restart() {
   local TYPE="${1:-}"
   local PROJECT="${2:-}"
-  local killed
+  local killed inject_killed
   # Restart only the targeted (project, type)'s watcher when args are given; a
   # bare `restart` (no args) still tears down every watcher. Same (project,
   # type) scoping as `set`, so restarting one type's delivery doesn't kill an
   # unrelated project's or type's watcher.
   killed=$(kill_all_watchers "$PROJECT" "$TYPE")
-  echo "Killed $killed watch process(es)."
+  inject_killed=$(kill_inject_watchers "$PROJECT" "$TYPE")
+  echo "Killed $killed watch process(es), $inject_killed inject watcher(s)."
   if [ -n "$TYPE" ] && [ -n "$PROJECT" ]; then
     emit_stop_directive
     emit_monitor_directive "$TYPE" "$PROJECT"

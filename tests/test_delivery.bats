@@ -723,14 +723,16 @@ JSON
   [ ! -f "$TEST_SKILL_DIR/run/cc-instance.$dead_pid" ]
 }
 
-# --- session-id resolution: vendor field-name differences (grok/cursor) ---
+# --- session-id resolution: vendor field-name differences (grok) ---
 # Grok Build emits the session id on stdin as camelCase "sessionId" and injects
-# GROK_SESSION_ID into every hook; Claude uses snake_case "session_id". The
-# shared resolver tries snake -> camel -> $GROK_SESSION_ID. The Monitor
-# directive echoes the resolved id as the watch.sh command's session arg, so we
-# assert through that. (Exercised via claude-code since the resolver is shared.)
+# GROK_SESSION_ID into every hook; Claude uses snake_case "session_id" (and so
+# does Cursor -- measured on cursor-agent 2026.09.10-fd3934a, top-level and
+# snake_case there too, unlike this camelCase field). The shared resolver
+# tries snake -> camel -> $GROK_SESSION_ID. The Monitor directive echoes the
+# resolved id as the watch.sh command's session arg, so we assert through
+# that. (Exercised via claude-code since the resolver is shared.)
 
-@test "session-start: resolves camelCase sessionId from stdin (grok/cursor field)" {
+@test "session-start: resolves camelCase sessionId from stdin (grok field)" {
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
   run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<<'{"sessionId":"grokCamelSID"}'
@@ -1731,63 +1733,12 @@ JSON
   [ "$count" -eq 1 ]
 }
 
-# --- cursor agent tests (#131) ---
-
-@test "cursor is accepted as an agent type (turn mode)" {
-  run bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "Delivery mode set to 'turn'" ]]
-  [ -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
-  grep -q "check-inbox.sh" "$TEST_PROJECT/.cursor/rules/agmsg.mdc"
-}
-
-@test "cursor rule file is an always-apply .mdc (Cursor CLI auto-load)" {
-  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT" >/dev/null
-  # First non-empty line opens the frontmatter; alwaysApply must be declared so
-  # the Cursor CLI applies the rule on every turn.
-  [ "$(head -1 "$TEST_PROJECT/.cursor/rules/agmsg.mdc")" = "---" ]
-  grep -q "alwaysApply: true" "$TEST_PROJECT/.cursor/rules/agmsg.mdc"
-}
-
-@test "cursor supports off mode: removes rule file" {
-  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT"
-  [ -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
-  run bash "$SCRIPTS/delivery.sh" set off cursor "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [ ! -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
-}
-
-@test "cursor rejects monitor mode" {
-  run bash "$SCRIPTS/delivery.sh" set monitor cursor "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [[ "$output" =~ "not supported" ]]
-  [ ! -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
-}
-
-@test "cursor rejects both mode" {
-  run bash "$SCRIPTS/delivery.sh" set both cursor "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [[ "$output" =~ "not supported" ]]
-  [ ! -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
-}
-
-@test "cursor rejects monitor: does NOT delete an existing turn rule" {
-  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT" >/dev/null
-  [ -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
-  run bash "$SCRIPTS/delivery.sh" set monitor cursor "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [ -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
-}
-
-@test "cursor set turn: idempotent across repeats" {
-  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT"
-  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT"
-  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT"
-  [ -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
-  local count
-  count=$(grep -c "check-inbox.sh" "$TEST_PROJECT/.cursor/rules/agmsg.mdc")
-  [ "$count" -eq 1 ]
-}
+# cursor's delivery tests (#131) live in tests/test_cursor_delivery.bats now --
+# the old .cursor/rules/agmsg.mdc rule-file mechanics these covered (always-
+# apply frontmatter, monitor/both rejection) are gone: cursor moved to
+# .cursor/hooks.json, which now also accepts monitor and both (see that file's
+# "cursor set monitor/both" tests). The turn-mode idempotency case that is
+# still meaningful is re-asserted there against the new hooks.json shape.
 
 @test "antigravity supports off mode: removes rule file" {
   bash "$SCRIPTS/delivery.sh" set turn antigravity "$TEST_PROJECT"

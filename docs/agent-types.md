@@ -29,8 +29,9 @@ a manifest cannot execute code. Multi-value keys are whitespace-separated.
 | `hooks_file` | yes | project-relative delivery hooks file (e.g. `.codex/hooks.json`) |
 | `monitor` | — | `yes` if the type exposes a native Monitor tool; `spawn` skips the readiness wait when `no` |
 | `delivery_modes` | — | space-separated delivery modes the type's CLI accepts (e.g. `monitor turn off`); `delivery.sh`'s gate rejects anything else. Defaults to `monitor turn both off` when omitted |
-| `stop_output` | — | output protocol for the Stop/turn inbox check — `json` (codex, copilot) vs. plain text (default) |
+| `stop_output` | — | output protocol for the Stop/turn inbox check — `json` (codex, copilot), `followup` (cursor: a stdout `{"followup_message":...}` re-injects the reply as the next turn) vs. plain text (default) |
 | `hook_windows_wrap` | — | `yes` if JSON hook entries also need a Windows-native `commandWindows` variant (codex) |
+| `session_team` | — | `yes` if the type can host its own per-session team (cursor) |
 
 > The reader does not fail-fast: an omitted key reads as the empty string, so
 > "required" above means "needed for the type to actually work", not "validated at

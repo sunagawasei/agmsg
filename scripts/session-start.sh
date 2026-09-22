@@ -26,6 +26,15 @@ source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 # settings.local.json — that fact alone is the source of truth for "should
 # we emit the directive?". No separate global mode value to consult.
 
+# The headless cursor worker's own turns set this so the session hooks never
+# fire INSIDE those turns -- .cursor/hooks.json resolves by --workspace, not
+# cwd, so a worker turn run with --workspace <project> would otherwise join the
+# session team, publish a cc-instance record, run the GC and start an inject
+# watcher on every reviewer turn. See _spawn.sh / cursor-bridge.sh.
+if [ -n "${AGMSG_CURSOR_BRIDGE:-}" ]; then
+  exit 0
+fi
+
 TYPE="${1:?Usage: session-start.sh <type> <project_path>}"
 PROJECT="${2:?Missing project_path}"
 
@@ -57,6 +66,14 @@ source "$SCRIPT_DIR/lib/pending-teardown.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/inflight.sh"
 
+# Session-team code paths are gated on type CAPABILITY (type.conf declares
+# session_team=yes) AND runtime opt-in (delivery.session_team) — capability
+# alone must not be enough, or delivery.session_team=false would still route
+# a session_team=yes type into reading a team that was never created.
+_agmsg_session_team_active() {
+  agmsg_type_has "$TYPE" session_team yes && agmsg_session_team_enabled
+}
+
 # Read the hook input JSON (stdin) up-front. The hook's session_id is the
 # authoritative source for the session team, and stdin can be read only once —
 # the type plug and the claude-code path below both rely on this single read.
@@ -67,15 +84,16 @@ source "$SCRIPT_DIR/lib/inflight.sh"
 # branch below needs RUN_DIR to exist before mktemp can place a file in it.
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 #
-# Only the claude-code + session-team-mode-on gate below needs stdin captured
-# byte-for-byte on disk (to check for a raw NUL that $(...) would otherwise
-# drop silently, splicing the surrounding bytes together — verified
-# empirically 2026-08-23). Every other type/mode keeps the plain read: writing
-# every SessionStart's hook payload (which can include cwd/session_id) to
-# disk as a side effect of a check that only fires in one mode is not a cost
-# to impose on codex/cursor/gemini/grok/copilot and the (default) mode-off
-# path. $TYPE and agmsg_session_team_enabled are both already resolvable here.
-if [ "$TYPE" = "claude-code" ] && agmsg_session_team_enabled; then
+# Only the session-team-capable-type + session-team-mode-on gate below needs
+# stdin captured byte-for-byte on disk (to check for a raw NUL that $(...)
+# would otherwise drop silently, splicing the surrounding bytes together —
+# verified empirically 2026-08-23). Every other type/mode keeps the plain
+# read: writing every SessionStart's hook payload (which can include
+# cwd/session_id) to disk as a side effect of a check that only fires for
+# session-team-capable types is not a cost to impose on codex/gemini/grok/
+# copilot and the (default) mode-off path. TYPE and
+# agmsg_session_team_enabled are both already resolvable here.
+if _agmsg_session_team_active; then
   # Template + $RUN_DIR (not bare mktemp in $TMPDIR) match this repo's other
   # temp-file conventions (delivery.sh, hooks-json.sh, driver-registry.sh) so
   # a leftover is identifiable as agmsg's. Nothing currently sweeps
@@ -140,7 +158,7 @@ fi
 # Keep the generic SESSION_ID resolver above for watcher compatibility, but in
 # Claude Code session-team mode replace its fallback result with the validated
 # stdin value below, never with its camelCase/env fallbacks.
-if [ "$TYPE" = "claude-code" ] && agmsg_session_team_enabled; then
+if _agmsg_session_team_active; then
   # If the temp-file capture above didn't fully succeed (mktemp failed, or
   # the write into it failed), there is no way to check stdin for a raw NUL
   # byte, and a partial write could register a truncated payload as if it
@@ -258,15 +276,15 @@ if [ "$TYPE" = "claude-code" ] && agmsg_session_team_enabled; then
   SESSION_ID="$_claude_stdin_session_id"
 fi
 
-# Session-team mode: a claude-code session belongs to its own team s-<uuid>,
-# resolved from the REAL session id in the validated stdin payload above — NOT
-# the generic env or synthetic fallback below. This applies only when the
-# gate above ran (claude-code AND session-team mode on): invalid input has
-# already exited in that case. Mode-off and non-Claude paths never reach the
-# gate and keep their legacy rules below.
-# Gated to claude-code (codex never gets a session team here).
+# Session-team mode: a session-team-capable session belongs to its own team
+# s-<uuid>, resolved from the REAL session id in the validated stdin payload
+# above — NOT the generic env or synthetic fallback below. This applies only
+# when the gate above ran (session-team-capable type AND session-team mode
+# on): invalid input has already exited in that case. Mode-off and
+# non-capable-type paths never reach the gate and keep their legacy rules
+# below.
 SESSION_TEAM=""
-[ "$TYPE" = "claude-code" ] && SESSION_TEAM="$(agmsg_session_team_name_from_id "$SESSION_ID")"
+_agmsg_session_team_active && SESSION_TEAM="$(agmsg_session_team_name_from_id "$SESSION_ID")"
 
 # SessionEnd publishes an intentional-teardown tombstone before detaching its
 # worker. Clear only this session's marker on its next start; other session
@@ -285,62 +303,105 @@ fi
 PAIRS=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null || true)
 if [ -z "$PAIRS" ] && [ -z "$SESSION_TEAM" ]; then exit 0; fi
 
-# Type-specific SessionStart behaviour (Template Method). A type may ship
-# scripts/drivers/types/<type>/_session-start.sh defining agmsg_session_start to override the
-# default no-op — codex uses it to hand the session off to the bridge. The plug
-# is sourced in this script's context so it sees PROJECT / RUN_DIR / SKILL_DIR /
-# PAIRS and the helpers sourced above; it may exit 0 (codex does, having no
-# Monitor tool) to skip the Monitor-directive path below.
-agmsg_session_start_default() { :; }
+# --- Common session-start initialization (idempotent). ---
+# Wraps the cc-instance/session-team bookkeeping below so a future per-prompt
+# caller (a driver whose delivery hook fires every turn, not just once per
+# session) can reuse it without duplicating this file. claude-code's own call
+# below always resolves fast_path_ok=0 (no type here defines
+# agmsg_session_start_fast_path_ok), so it takes exactly the path HEAD did
+# for every fixture the golden test covers.
+#
+# Defined here, before the type-plug sourcing below, so an early plug's own
+# agmsg_session_start can call this directly instead of only reaching it
+# through the fixed call site further down -- sourcing the plug before this
+# function existed made that call fail with "command not found" (exit 127).
+#
+# Usage: agmsg_session_start_common_init <fast_path_ok:0|1>
+# Reads (already set by the caller): TYPE PROJECT SESSION_ID SESSION_TEAM
+# PAIRS RUN_DIR SCRIPT_DIR SKILL_DIR.
+# Sets (plain globals, matching this script's existing style): CC_PID
+# INSTANCE_ID WATCH_PROJECT WATCH ROLE_NAME ROLE_TEAM.
+# Extracted verbatim from the pre-refactor script body without reindenting, so
+# its one remaining literal heredoc (the dedup-skip directive) stays
+# byte-identical -- indenting a `<<EOF` block would leak into its own stdout.
+# May exit the whole process directly instead of returning: the dedup-skip
+# branch already terminated the script at this point before this extraction,
+# and that must not change. The role-aware-resume branch used to exit here
+# too; it no longer does, so its directive can go through the same
+# agmsg_session_start_emit_directive extension point as the generic one
+# (built in the tail, after this function returns).
 
-_tdir="$(agmsg_type_dir "$TYPE" 2>/dev/null || true)"
-if [ -n "$_tdir" ] && [ -f "$_tdir/_session-start.sh" ]; then
-  # shellcheck disable=SC1090
-  . "$_tdir/_session-start.sh"
-  agmsg_session_start
-else
-  agmsg_session_start_default
-fi
+# Type-overridable liveness check for the fast path's "is the watcher this
+# process would reuse actually alive" gate. Default matches watch.sh's own
+# pidfile convention; a type with a different watcher mechanism (e.g. no
+# separate watch.sh process) defines agmsg_session_start_watcher_alive to
+# replace it.
+agmsg_session_start_watcher_alive_default() {
+  local iid="$1" project="$2" type="$3" wpf="$RUN_DIR/watch.$iid.pid"
+  agmsg_process_dedup_should_suppress watch "$wpf" \
+    "watch|$iid|$project|$type" \
+    "$SCRIPT_DIR/watch.sh" "$iid" "$project" "$type" >/dev/null 2>&1
+}
 
-# (INPUT / SESSION_ID were parsed at the top — stdin is read only once.)
+# Fast-path membership alternative for a role-aware resume. The full path
+# deliberately does NOT join "claude" to the session team once a role record
+# matched, so requiring that pair would keep every per-prompt call on the full
+# path (and its GC) for the whole life of a role session. A matching role record
+# whose (team, agent) is one of this project's pairs is the same evidence of "this
+# session is already registered".
+_agmsg_session_start_role_registered() {
+  local sid="$1" bare rec r_agent r_team
+  bare="$(agmsg_instance_bare_sid "$sid" 2>/dev/null || printf '%s' "$sid")"
+  rec="$(agmsg_role_session_lookup_by_sid "$bare" 2>/dev/null || true)"
+  [ -n "$rec" ] || return 1
+  r_agent="$(printf '%s\n' "$rec" | sed -n 's/^agent=//p' | head -1)"
+  r_team="$(printf '%s\n' "$rec" | sed -n 's/^team=//p' | head -1)"
+  [ -n "$r_agent" ] && [ -n "$r_team" ] || return 1
+  printf '%s\n' "$PAIRS" | grep -Fxq "$(printf '%s\t%s' "$r_team" "$r_agent")"
+}
 
-# --- Skip spawned worktree sub-sessions (.claude/worktrees checkouts). ---
-# Claude Code's background-task feature runs a short-lived sub-session in an
-# isolated worktree under .claude/worktrees/<name>. SessionStart still fires
-# there (#92's resolve-project normalizes its cwd back to the registered
-# project, so identities resolve fine), so a persistent inbox watcher was
-# getting launched for it too — but that watcher keeps the sub-session's
-# Monitor alive past the point its task finishes, so the parent session never
-# receives the sub-session's completion notification (#367). The sub-session
-# is also not normally an agmsg team member in its own right, so a watcher
-# has little value there anyway. cwd may arrive as forward slashes or
-# JSON-escaped backslashes depending on platform (a single escaped backslash
-# decodes to two raw '\' bytes in the captured substring), so normalize both
-# to '/' and squeeze doubled separators before matching. Match the exact
-# ".claude/worktrees" PATH SEGMENT sequence, not a loose substring — a naive
-# `*.claude*worktrees*` glob would also skip an unrelated project merely
-# named e.g. ".claude-tools/my-worktrees-app".
-HOOK_CWD=""
-if [ -n "$INPUT" ]; then
-  # Same failure mode as the SESSION_ID extraction above and the same fix:
-  # a bare assignment would let a sed failure (malformed UTF-8 in the
-  # payload, bad locale) kill the whole script via errexit. This one runs
-  # unconditionally for every type/mode, so it's reachable even more often.
-  HOOK_CWD=$(printf '%s' "$INPUT" \
-    | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -1) || HOOK_CWD=""
-fi
-[ -z "$HOOK_CWD" ] && HOOK_CWD="${PWD:-}"
-# Same reasoning, but falling back to the un-normalized value (not "") if
-# this sed fails: an empty HOOK_CWD_NORM would never match the worktree
-# case below, silently skipping the worktree guard instead of just losing
-# path normalization for this one hook invocation.
-HOOK_CWD_NORM=$(printf '%s' "$HOOK_CWD" | tr '\\' '/' | sed 's#//*#/#g') || HOOK_CWD_NORM="$HOOK_CWD"
-case "$HOOK_CWD_NORM" in
-  */.claude/worktrees|*/.claude/worktrees/*|.claude/worktrees|.claude/worktrees/*) exit 0 ;;
-esac
+_agmsg_session_start_watcher_alive() {
+  if command -v agmsg_session_start_watcher_alive >/dev/null 2>&1; then
+    agmsg_session_start_watcher_alive "$@"
+  else
+    agmsg_session_start_watcher_alive_default "$@"
+  fi
+}
 
-mkdir -p "$RUN_DIR" 2>/dev/null || true
+agmsg_session_start_common_init() {
+  local _fast_path_ok="${1:-0}"
+  # Always initialized so a fast-path return below (which skips the
+  # role-lookup section entirely) still leaves these safe to read in the
+  # tail, under this script's `set -u`.
+  ROLE_NAME=""; ROLE_TEAM=""
+
+  # --- fast path (opt-in; claude-code's SessionStart never sets it) ---
+  # Skips straight to reusing the current watcher/registration when nothing
+  # changed since the last full pass, so a per-prompt caller doesn't pay for
+  # the GC below on every turn. Two gates, both required: the watcher this
+  # process would reuse is confirmed alive and owned (not just a stale
+  # pidfile), and -- when session-team mode applies -- this session is
+  # already a member of its team. Anything else falls through to the full
+  # path below, which is what (re)derives and republishes those facts.
+  if [ "$_fast_path_ok" = "1" ]; then
+    local _fp_cc_pid _fp_iid _fp_project
+    _fp_cc_pid="$(agmsg_agent_pid "$TYPE" 2>/dev/null || true)"
+    _fp_iid="$(agmsg_instance_id_from_pid "$SESSION_ID" "$_fp_cc_pid")"
+    _fp_project="$(agmsg_resolve_project "$PROJECT" "$TYPE")"
+    if [ -n "$_fp_cc_pid" ] \
+        && [ -f "$RUN_DIR/cc-instance.$_fp_cc_pid" ] \
+        && [ "$(cat "$RUN_DIR/cc-instance.$_fp_cc_pid" 2>/dev/null || true)" = "$_fp_iid" ] \
+        && _agmsg_session_start_watcher_alive "$_fp_iid" "$_fp_project" "$TYPE" \
+        && { [ -z "$SESSION_TEAM" ] \
+             || printf '%s\n' "$PAIRS" | grep -Fxq "$(printf '%s\t%s' "$SESSION_TEAM" claude)" \
+             || _agmsg_session_start_role_registered "$SESSION_ID"; }; then
+      CC_PID="$_fp_cc_pid"
+      INSTANCE_ID="$_fp_iid"
+      WATCH_PROJECT="$_fp_project"
+      WATCH="$SKILL_DIR/scripts/watch.sh"
+      return 0
+    fi
+  fi
 
 # --- Identify the enclosing Claude Code process. ---
 # Reuse the shared agent-process resolver (#92) instead of a local ps-walk: it
@@ -702,13 +763,120 @@ if [ -n "$_rec" ]; then
 fi
 
 WATCH="$SKILL_DIR/scripts/watch.sh"
+
+  # --- Session-team join. ---
+  # Moved here (was the tail's job pre-refactor) so a fast-path caller that
+  # falls through to this full path still ends up joined, same as before.
+  # Skipped when a role-aware resume matched: joining "claude" to the
+  # session team would be wrong once this session is re-armed as a specific
+  # role instead -- mirrors the pre-refactor role branch's exit before ever
+  # reaching this join call.
+  if [ -z "$ROLE_NAME" ] && [ -n "$SESSION_TEAM" ]; then
+    # session-team mode: register this Claude as `claude` in its own per-session
+    # team, so the monitor stream carries only this session's traffic — no
+    # cross-session crosstalk. Idempotent; opt out of #92 pwd-rewrite so the
+    # registration pins exactly this project.
+    AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$SESSION_TEAM" claude "$TYPE" "$PROJECT" >/dev/null 2>&1 || true
+  fi
+}
+
+# Type-specific SessionStart behaviour (Template Method). A type may ship
+# scripts/drivers/types/<type>/_session-start.sh defining agmsg_session_start to override the
+# default no-op — codex uses it to hand the session off to the bridge. The plug
+# is sourced in this script's context so it sees PROJECT / RUN_DIR / SKILL_DIR /
+# PAIRS and the helpers sourced above; it may exit 0 (codex does, having no
+# Monitor tool) to skip the Monitor-directive path below.
+agmsg_session_start_default() { :; }
+
+_tdir="$(agmsg_type_dir "$TYPE" 2>/dev/null || true)"
+if [ -n "$_tdir" ] && [ -f "$_tdir/_session-start.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$_tdir/_session-start.sh"
+  agmsg_session_start
+else
+  agmsg_session_start_default
+fi
+
+# (INPUT / SESSION_ID were parsed at the top — stdin is read only once.)
+
+# --- Skip spawned worktree sub-sessions (.claude/worktrees checkouts). ---
+# Claude Code's background-task feature runs a short-lived sub-session in an
+# isolated worktree under .claude/worktrees/<name>. SessionStart still fires
+# there (#92's resolve-project normalizes its cwd back to the registered
+# project, so identities resolve fine), so a persistent inbox watcher was
+# getting launched for it too — but that watcher keeps the sub-session's
+# Monitor alive past the point its task finishes, so the parent session never
+# receives the sub-session's completion notification (#367). The sub-session
+# is also not normally an agmsg team member in its own right, so a watcher
+# has little value there anyway. cwd may arrive as forward slashes or
+# JSON-escaped backslashes depending on platform (a single escaped backslash
+# decodes to two raw '\' bytes in the captured substring), so normalize both
+# to '/' and squeeze doubled separators before matching. Match the exact
+# ".claude/worktrees" PATH SEGMENT sequence, not a loose substring — a naive
+# `*.claude*worktrees*` glob would also skip an unrelated project merely
+# named e.g. ".claude-tools/my-worktrees-app".
+HOOK_CWD=""
+if [ -n "$INPUT" ]; then
+  # Same failure mode as the SESSION_ID extraction above and the same fix:
+  # a bare assignment would let a sed failure (malformed UTF-8 in the
+  # payload, bad locale) kill the whole script via errexit. This one runs
+  # unconditionally for every type/mode, so it's reachable even more often.
+  HOOK_CWD=$(printf '%s' "$INPUT" \
+    | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -1) || HOOK_CWD=""
+fi
+[ -z "$HOOK_CWD" ] && HOOK_CWD="${PWD:-}"
+# Same reasoning, but falling back to the un-normalized value (not "") if
+# this sed fails: an empty HOOK_CWD_NORM would never match the worktree
+# case below, silently skipping the worktree guard instead of just losing
+# path normalization for this one hook invocation.
+HOOK_CWD_NORM=$(printf '%s' "$HOOK_CWD" | tr '\\' '/' | sed 's#//*#/#g') || HOOK_CWD_NORM="$HOOK_CWD"
+case "$HOOK_CWD_NORM" in
+  */.claude/worktrees|*/.claude/worktrees/*|.claude/worktrees|.claude/worktrees/*) exit 0 ;;
+esac
+
+mkdir -p "$RUN_DIR" 2>/dev/null || true
+
+# claude-code's SessionStart fires at most a few times per session (fresh,
+# /clear, /compact, --continue/--resume) -- never once per prompt -- and no
+# type here defines agmsg_session_start_fast_path_ok, so this always
+# resolves to 0.
+_fast_path_ok=0
+if command -v agmsg_session_start_fast_path_ok >/dev/null 2>&1 \
+    && agmsg_session_start_fast_path_ok; then
+  _fast_path_ok=1
+fi
+agmsg_session_start_common_init "$_fast_path_ok"
+
 # Shell-quote each argv so the host can paste the command into Monitor and run
 # it verbatim. A plain '...' wrap breaks on paths with an apostrophe
 # (/Users/o'brien/...); printf %q escapes spaces, quotes and other metacharacters
-# safely for shell re-execution (#188). A resumed role adds the 4th <agent> arg.
+# safely for shell re-execution (#188). A resumed role uses the 4th <agent>
+# arg instead of the --team suffix below.
 if [ -n "$ROLE_NAME" ]; then
   WATCH_COMMAND="$(printf '%q %q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE" "$ROLE_NAME")"
-  cat <<EOF
+else
+  WATCH_COMMAND="$(printf '%q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE")"
+  if [ -n "$SESSION_TEAM" ]; then
+    # The extra argv are %q-quoted too so they paste into Monitor verbatim
+    # (#188). The join itself already happened inside
+    # agmsg_session_start_common_init above.
+    WATCH_COMMAND="$WATCH_COMMAND $(printf '%q %q %q' claude --team "$SESSION_TEAM")"
+  fi
+fi
+
+# --- Type-specific directive emission (Template Method, 2nd extension point). ---
+# A type may ship scripts/drivers/types/<type>/_session-start.sh defining
+# agmsg_session_start_emit_directive to replace the generic "invoke Monitor"
+# text below (both the plain and the resumed-role variant) -- e.g. a type
+# with no Monitor tool. Distinct from the agmsg_session_start plug above:
+# that one runs before the common init (and codex's exit 0 there skips
+# join/dedup/GC/role-resume entirely), so it is not reused here -- a type
+# that needs join/dedup/GC to run must not exit there.
+# Default (this script's own behavior) when a type has no override.
+agmsg_session_start_emit_directive_default() {
+  if [ -n "$ROLE_NAME" ]; then
+    cat <<EOF
 AGMSG monitor mode (resumed role \`$ROLE_NAME\` in team \`$ROLE_TEAM\`): this
 session was recorded as that role's seat, so invoke the Monitor tool now with the
 following parameters, before any other action in this session.
@@ -728,21 +896,8 @@ Note: On a /clear or --continue/--resume re-fire, you may shortly see a
 task. That is the previous watcher being cleaned up — expected. Do NOT
 relaunch it; the Monitor you invoke from this directive replaces it.
 EOF
-  exit 0
-fi
-
-WATCH_COMMAND="$(printf '%q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE")"
-if [ -n "$SESSION_TEAM" ]; then
-  # session-team mode: register this Claude as `claude` in its own per-session
-  # team and pin the watcher to it, so the monitor stream carries only this
-  # session's traffic — no cross-session crosstalk. Idempotent; opt out of #92
-  # pwd-rewrite so the registration pins exactly this project. The extra argv are
-  # %q-quoted too so they paste into Monitor verbatim (#188).
-  AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$SESSION_TEAM" claude "$TYPE" "$PROJECT" >/dev/null 2>&1 || true
-  WATCH_COMMAND="$WATCH_COMMAND $(printf '%q %q %q' claude --team "$SESSION_TEAM")"
-fi
-
-cat <<EOF
+  else
+    cat <<EOF
 AGMSG monitor mode: invoke the Monitor tool now with the following parameters,
 before any other action in this session.
 
@@ -760,3 +915,11 @@ task. That is the previous watcher being cleaned up to avoid duplicates
 — it is expected. Do NOT relaunch it; the Monitor you invoke from this
 directive replaces it.
 EOF
+  fi
+}
+
+if command -v agmsg_session_start_emit_directive >/dev/null 2>&1; then
+  agmsg_session_start_emit_directive
+else
+  agmsg_session_start_emit_directive_default
+fi
