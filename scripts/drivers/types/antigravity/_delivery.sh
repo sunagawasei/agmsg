@@ -30,28 +30,10 @@ agmsg_delivery_apply() {
 ## PostToolUse
 After each tool call, automatically check the agmsg inbox for unread messages.
 - Command: '$SKILL_DIR/scripts/check-inbox.sh' '$type' '$project'
-
-## Terminal/pane self-awareness
-Asked about your own terminal, pane, or driver — or before using arrange/peek/poke
-— run '$SKILL_DIR/scripts/where.sh' first and answer from its terminal=/capabilities=
-fields. Never guess from environment variables or a grep/ps command; a driver
-that IS present can be wrongly reported absent that way. Per-driver detail:
-'$SKILL_DIR/scripts/drivers/terminals/<terminal>/README.md' (terminal= names which).
-
-## Teammates: placement, status, and reaching them
-Placement and status for a teammate: '$SKILL_DIR/scripts/team.sh' <team> — never a
-stale memory of their last known pane. Act on one with '$SKILL_DIR/scripts/peek.sh'
-/ 'poke.sh' / 'arrange.sh' <team> <name> directly, not a guess: its exit code
-says whether it worked and, if not, why.
 EOF
 )"
-    # Pre-#1248 agmsg (1.3.0 and earlier) wrote this same text but named the
-    # per-driver notes file SKILL.md instead of README.md (renamed in #1248,
-    # commit a54c9e23) -- that is the only byte that ever differed. Accept
-    # either form as agmsg's own generated content so an upgraded user's
-    # untouched rule file still migrates instead of being refused. The old
-    # path lives in its own file (see legacy-pre1248-notes-path.sh), not
-    # written out literally here, so a #1249 regression elsewhere still fails.
+    # Pre-#1248 agmsg (1.3.0 and earlier) wrote a longer turn template (terminal/
+    # teammate sections) with SKILL.md instead of README.md — still accepted.
     local LEGACY_PRE1248_NOTES_PATH
     # shellcheck disable=SC1091
     source "$(dirname "${BASH_SOURCE[0]}")/legacy-pre1248-notes-path.sh"
@@ -60,7 +42,28 @@ EOF
     # would silently become a copy of expected -- matching nothing it should
     # not, but also proving nothing about the actual pre-#1248 text.
     [ -n "${LEGACY_PRE1248_NOTES_PATH:-}" ] || return 1
-    local expected_pre1248="${expected/drivers\/terminals\/<terminal>\/README.md/$LEGACY_PRE1248_NOTES_PATH}"
+    local expected_pre1248
+    expected_pre1248="$(cat <<EOF
+# agmsg Integration Rule
+
+## PostToolUse
+After each tool call, automatically check the agmsg inbox for unread messages.
+- Command: '$SKILL_DIR/scripts/check-inbox.sh' '$type' '$project'
+
+## Terminal/pane self-awareness
+Asked about your own terminal, pane, or driver — or before using arrange/peek/poke
+— run '$SKILL_DIR/scripts/where.sh' first and answer from its terminal=/capabilities=
+fields. Never guess from environment variables or a grep/ps command; a driver
+that IS present can be wrongly reported absent that way. Per-driver detail:
+'$SKILL_DIR/scripts/$LEGACY_PRE1248_NOTES_PATH' (terminal= names which).
+
+## Teammates: placement, status, and reaching them
+Placement and status for a teammate: '$SKILL_DIR/scripts/team.sh' <team> — never a
+stale memory of their last known pane. Act on one with '$SKILL_DIR/scripts/peek.sh'
+/ 'poke.sh' / 'arrange.sh' <team> <name> directly, not a guess: its exit code
+says whether it worked and, if not, why.
+EOF
+)"
     actual="$(cat "$file")"
     if [ "$actual" != "$expected" ] && [ "$actual" != "$expected_pre1248" ]; then
       echo 'existing rule file is not in agmsg format' >&2; return 1
