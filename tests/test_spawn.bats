@@ -6,6 +6,28 @@ _capture_nonempty() {
   [ -s "$CAPTURE" ]
 }
 
+# Parse CODEX_HOME from the fake-bridge launch capture (sets REVIEWER_HOME).
+_reviewer_home_from_capture() {
+  run cat "$CAPTURE"
+  [[ "$output" =~ CODEX_HOME=\'([^\']+)\' ]]
+  REVIEWER_HOME="${BASH_REMATCH[1]}"
+}
+
+_reviewer_newest_launch_home() {
+  find "$TEST_SKILL_DIR/reviewer-codex-home/${1:-myteam}/${2:-rv}" \
+    -maxdepth 1 -type d -name 'launch.*' 2>/dev/null | sort | tail -1
+}
+
+_reviewer_source_codex_spawn_plug() {
+  TEAM="${1:-myteam}"
+  NAME="${2:-rv}"
+  SKILL_DIR="$TEST_SKILL_DIR"
+  SCRIPT_DIR="$SCRIPTS"
+  die() { echo "spawn: $*" >&2; exit 1; }
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/drivers/types/codex/_spawn.sh"
+}
+
 setup() {
   setup_test_env
 
@@ -27,6 +49,7 @@ setup() {
 if [ "$1" = sandbox ]; then
   case "$*" in
     *"rm -f"*) exit 0 ;;                                                   # positive probe (run/ write) — allowed
+    *planted.rules*|*agmsg-not-auth*|*/marker*) echo "Operation not permitted" >&2; exit 1 ;;
     *touch*)   echo "touch: probe: Operation not permitted" >&2; exit 1 ;; # repo write — denied (enforcing)
     *)         exit 0 ;;                                                   # preflight (true) / other — ok
   esac
@@ -954,6 +977,7 @@ EOF
   [[ "$output" == *"permissions.agmsg-consultant.filesystem="* ]]
   [[ "$output" == *"permissions.agmsg-consultant.network={ enabled=false }"* ]]
   [[ "$output" != *"--enable network_proxy"* ]]
+  [[ "$output" != *"CODEX_HOME="* ]]
   # No model/effort override was requested: appcmd must end EXACTLY at
   # approval_policy=never (end-of-string anchor, not just a substring match) —
   # a substring check alone would miss a regression that appends a stray/empty
@@ -1301,16 +1325,16 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"spawned headless reviewer codex 'rv'"* ]]
 
-  local i
+  local i home
   wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" == *$'--pair myteam\trv'* ]]
-  [[ "$output" == *"--project $PROJ"* ]]                  # cwd = the real repo
-  [[ "$output" != *"codex-myteam-cwd"* ]]                 # NOT the scratch dir
+  [[ "$output" == *"--project $PROJ"* ]]
+  [[ "$output" != *"codex-myteam-cwd"* ]]
   [[ "$output" == *"default_permissions=agmsg-reviewer"* ]]
   [[ "$output" == *"permissions.agmsg-reviewer.filesystem="* ]]
   [[ "$output" == *":workspace_roots"* ]]
-  [[ "$output" != *"sandbox_mode=workspace-write"* ]]     # profile supersedes sandbox_mode
+  [[ "$output" != *"sandbox_mode=workspace-write"* ]]
   [[ "$output" == *"--enable network_proxy"* ]]
   codex_bin="$(type -P codex)"
   [[ "$codex_bin" == /* ]]
@@ -1324,6 +1348,12 @@ EOF
   [[ "$output" == *'"raw.githubusercontent.com"="allow"'* ]]
   [[ "$output" != *'"example.com"="allow"'* ]]
   [ "$(printf '%s\n' "$output" | grep -o '="allow"' | wc -l | tr -d ' ')" -eq 7 ]
+  [[ "$output" =~ CODEX_HOME=\'([^\']+)\' ]]
+  home="${BASH_REMATCH[1]}"
+  [[ "$output" == *"\"$TEST_SKILL_DIR/reviewer-codex-home\"=\"none\""* ]]
+  [ "$(printf '%s\n' "$output" | grep -o "$home" | wc -l | tr -d ' ')" -eq 1 ]
+  [ -d "$home/rules" ]
+  [ -z "$(ls -A "$home/rules")" ]
   [[ "$output" == *"web_search=live"* ]]
   [[ "$output" == *"approval_policy=never"* ]]
   # No model/effort override was requested: appcmd must end EXACTLY at
@@ -1437,6 +1467,10 @@ args="\$*"
 if [[ "\$args" == *'&& rm'* ]]; then
   exit 0
 fi
+if [[ "\$args" == *planted.rules* || "\$args" == *agmsg-not-auth* || "\$args" == */marker* ]]; then
+  echo "Operation not permitted"
+  exit 1
+fi
 if [[ "\$args" == *touch* ]]; then
   echo "Operation not permitted"
   exit 1
@@ -1500,6 +1534,443 @@ EOF
   ! printf '%s' "$rest" | grep -Eq '(^|[^[:alnum:]_./-])curl([^[:alnum:]_./-]|$)'
 }
 
+@test "spawn: reviewer keeps the user's execpolicy rules file and does not load it" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  # PROJ lives under TEST_SKILL_DIR, so this .codex is an ancestor project
+  # layer and also the user's CODEX_HOME. The user layer is isolated by the
+  # private home and must not be treated as a project rule.
+  local fake="$TEST_SKILL_DIR/.codex"
+  mkdir -p "$fake/rules"
+  printf 'prefix_rule(pattern=["echo"], decision="allow")\n' > "$fake/rules/default.rules"
+  printf '{}\n' > "$fake/auth.json"
+  local before
+  before=$(cksum "$fake/rules/default.rules")
+  run env CODEX_HOME="$fake" AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [ "$(cksum "$fake/rules/default.rules")" = "$before" ]
+  wait_until 10 _capture_nonempty
+  _reviewer_home_from_capture
+  local home="$REVIEWER_HOME"
+  [ -z "$(ls -A "$home/rules")" ]
+  [ -L "$home/auth.json" ]
+  [ ! -e "$home/config.toml" ]
+  run cat "$CAPTURE"
+  [[ "$output" == *"CODEX_HOME='$home'"* ]]
+  [[ "$output" != *"CODEX_HOME='$fake'"* ]]
+}
+
+@test "spawn: reviewer leaves project rules in place and does not trust the repo" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  mkdir -p "$PROJ/.codex/rules"
+  printf 'prefix_rule(pattern=["echo"], decision="allow")\n' > "$PROJ/.codex/rules/p.rules"
+  local before
+  before=$(cksum "$PROJ/.codex/rules/p.rules")
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [ "$(cksum "$PROJ/.codex/rules/p.rules")" = "$before" ]
+  wait_until 10 _capture_nonempty
+  _reviewer_home_from_capture
+  local home="$REVIEWER_HOME"
+  [ ! -e "$home/config.toml" ]
+  [ -z "$(ls -A "$home/rules")" ]
+}
+
+@test "spawn: reviewer refuses a symlinked execpolicy home" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  local victim="$TEST_SKILL_DIR/victim-home"
+  mkdir -p "$victim/rules"
+  printf 'keep-me\n' > "$victim/rules/keep.rules"
+  mkdir -p "$TEST_SKILL_DIR/reviewer-codex-home/myteam"
+  ln -s "$victim" "$TEST_SKILL_DIR/reviewer-codex-home/myteam/rv"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"symlink"* ]]
+  [ "$(cat "$victim/rules/keep.rules")" = "keep-me" ]
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: reviewer drops an auth link when the source home has none" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  local with_auth="$TEST_SKILL_DIR/home-a" without_auth="$TEST_SKILL_DIR/home-b"
+  mkdir -p "$with_auth" "$without_auth"
+  printf '{}\n' > "$with_auth/auth.json"
+  run bash -c '
+    set -euo pipefail
+    TEAM=myteam NAME=rv SKILL_DIR="'"$TEST_SKILL_DIR"'" SCRIPT_DIR="'"$SCRIPTS"'"
+    die() { echo "spawn: $*" >&2; exit 1; }
+    source "$SCRIPT_DIR/drivers/types/codex/_spawn.sh"
+    AGMSG_REVIEWER_EXEC_HOME="'"$TEST_SKILL_DIR"'/reviewer-codex-home/myteam/rv/launch.auth-probe"
+    CODEX_HOME="'"$with_auth"'"
+    agmsg_codex_reviewer_prepare_execpolicy_home
+    [ -L "$AGMSG_REVIEWER_EXEC_HOME/auth.json" ]
+    CODEX_HOME="'"$without_auth"'"
+    agmsg_codex_reviewer_prepare_execpolicy_home
+    [ ! -e "$AGMSG_REVIEWER_EXEC_HOME/auth.json" ]
+    [ ! -L "$AGMSG_REVIEWER_EXEC_HOME/auth.json" ]
+  '
+  [ "$status" -eq 0 ]
+}
+
+@test "spawn: reviewer execpolicy home probe refuses an unexpected sandbox error" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  cat > "$STUB_BIN/codex" <<'CODEX_STUB'
+#!/usr/bin/env bash
+if [ "$1" = sandbox ]; then
+  case "$*" in
+    *"rm -f"*) exit 0 ;;
+    *planted.rules*|*agmsg-not-auth*|*/marker*) echo "command not found" >&2; exit 2 ;;
+    *touch*) echo "touch: probe: Operation not permitted" >&2; exit 1 ;;
+    *) exit 0 ;;
+  esac
+fi
+exit 0
+CODEX_STUB
+  chmod +x "$STUB_BIN/codex"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"failed unexpectedly"* ]]
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: reviewer execpolicy home probe refuses when the marker is readable" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  cat > "$STUB_BIN/codex" <<'CODEX_STUB'
+#!/usr/bin/env bash
+if [ "$1" = sandbox ]; then
+  case "$*" in
+    *"rm -f"*) exit 0 ;;
+    */marker*) exit 0 ;;
+    *planted.rules*|*agmsg-not-auth*) echo "Operation not permitted" >&2; exit 1 ;;
+    *touch*) echo "touch: probe: Operation not permitted" >&2; exit 1 ;;
+    *) exit 0 ;;
+  esac
+fi
+exit 0
+CODEX_STUB
+  chmod +x "$STUB_BIN/codex"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"read marker succeeded"* ]]
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: reviewer execpolicy home probe refuses when a rule file can be written" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  cat > "$STUB_BIN/codex" <<'CODEX_STUB'
+#!/usr/bin/env bash
+if [ "$1" = sandbox ]; then
+  case "$*" in
+    *"rm -f"*) exit 0 ;;
+    *planted.rules*) exit 0 ;;
+    */marker*|*agmsg-not-auth*) echo "Operation not permitted" >&2; exit 1 ;;
+    *touch*) echo "touch: probe: Operation not permitted" >&2; exit 1 ;;
+    *) exit 0 ;;
+  esac
+fi
+exit 0
+CODEX_STUB
+  chmod +x "$STUB_BIN/codex"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"write rules succeeded"* ]]
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: reviewer execpolicy home probe refuses when the auth link can be replaced" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  cat > "$STUB_BIN/codex" <<'CODEX_STUB'
+#!/usr/bin/env bash
+if [ "$1" = sandbox ]; then
+  case "$*" in
+    *"rm -f"*) exit 0 ;;
+    *agmsg-not-auth*) exit 0 ;;
+    */marker*|*planted.rules*) echo "Operation not permitted" >&2; exit 1 ;;
+    *touch*) echo "touch: probe: Operation not permitted" >&2; exit 1 ;;
+    *) exit 0 ;;
+  esac
+fi
+exit 0
+CODEX_STUB
+  chmod +x "$STUB_BIN/codex"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"replace auth link succeeded"* ]]
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: a refused reviewer execpolicy probe does not keep the placement lock" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  cat > "$STUB_BIN/codex" <<'CODEX_STUB'
+#!/usr/bin/env bash
+if [ "$1" = sandbox ]; then
+  case "$*" in
+    *"rm -f"*) exit 0 ;;
+    *planted.rules*|*agmsg-not-auth*|*/marker*) echo "command not found" >&2; exit 2 ;;
+    *touch*) echo "touch: probe: Operation not permitted" >&2; exit 1 ;;
+    *) exit 0 ;;
+  esac
+fi
+exit 0
+CODEX_STUB
+  chmod +x "$STUB_BIN/codex"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [ ! -d "$TEST_SKILL_DIR/run/placement.myteam__rv.lock" ]
+  cat > "$STUB_BIN/codex" <<'CODEX_STUB'
+#!/usr/bin/env bash
+if [ "$1" = sandbox ]; then
+  case "$*" in
+    *"rm -f"*) exit 0 ;;
+    *planted.rules*|*agmsg-not-auth*|*/marker*) echo "Operation not permitted" >&2; exit 1 ;;
+    *touch*) echo "touch: probe: Operation not permitted" >&2; exit 1 ;;
+    *) exit 0 ;;
+  esac
+fi
+exit 0
+CODEX_STUB
+  chmod +x "$STUB_BIN/codex"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless reviewer codex 'rv'"* ]]
+}
+
+@test "spawn: a second reviewer spawn does not rewrite a live worker's execpolicy home" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  local home="$TEST_SKILL_DIR/reviewer-codex-home/myteam/rv"
+  local idkey
+  idkey="$(agmsg_identity_key myteam rv)"
+  mkdir -p "$home/rules"
+  printf 'original-marker\n' > "$home/marker"
+  printf 'original-rule\n' > "$home/rules/keep.rules"
+  ln -s /tmp/original-auth "$home/auth.json"
+  printf 'trusted\n' > "$home/config.toml"
+  cat > "$STUB_BIN/pgrep" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"codex-bridge\\.js"*) printf '%s\n' 424242 ;;
+esac
+STUB
+  cat > "$STUB_BIN/ps" <<'STUB'
+#!/usr/bin/env bash
+if [ "$*" = "-ww -o args= -p 424242" ]; then
+  printf 'node /x/codex-bridge.js --identity-key %s\n' "$LIVE_IDENTITY_KEY"
+  exit 0
+fi
+exit 1
+STUB
+  chmod +x "$STUB_BIN/pgrep" "$STUB_BIN/ps"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" LIVE_IDENTITY_KEY="$idkey" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already running"* ]]
+  [ "$(cat "$home/marker")" = "original-marker" ]
+  [ "$(cat "$home/rules/keep.rules")" = "original-rule" ]
+  [ "$(readlink "$home/auth.json")" = "/tmp/original-auth" ]
+  [ "$(cat "$home/config.toml")" = "trusted" ]
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: reviewer duplicate detection falls back when the pidfile disappears" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  local idkey home
+  idkey="$(agmsg_identity_key myteam rv)"
+  home="$TEST_SKILL_DIR/reviewer-codex-home/myteam/rv/launch.stale-pid"
+  mkdir -p "$home/rules"
+  printf 'leave-me\n' > "$home/marker"
+  local pidfile="$TEST_SKILL_DIR/run/codex-bridge.myteam.rv.pid"
+  : > "$pidfile"
+  cat > "$STUB_BIN/pgrep" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"codex-bridge\\.js"*) printf '%s\n' 424242 ;;
+esac
+STUB
+  cat > "$STUB_BIN/ps" <<'STUB'
+#!/usr/bin/env bash
+if [ "$*" = "-ww -o args= -p 424242" ]; then
+  printf 'node /x/codex-bridge.js --identity-key %s\n' "$LIVE_IDENTITY_KEY"
+  exit 0
+fi
+exit 1
+STUB
+  chmod +x "$STUB_BIN/pgrep" "$STUB_BIN/ps"
+  run env LIVE_IDENTITY_KEY="$idkey" \
+    AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already running"* ]]
+  [ "$(cat "$home/marker")" = "leave-me" ]
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: reviewer dedup falls through to pgrep when suppress is true but pidfile is empty" {
+  local idkey pidfile scope
+  idkey="$(agmsg_identity_key myteam rv)"
+  pidfile="$TEST_SKILL_DIR/run/test-bridge.pid"
+  scope='codex-bridge|myteam.rv'
+  mkdir -p "$TEST_SKILL_DIR/run"
+  : > "$pidfile"
+  cat > "$STUB_BIN/pgrep" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"codex-bridge\\.js"*) printf '%s\n' 515151 ;;
+esac
+STUB
+  cat > "$STUB_BIN/ps" <<'STUB'
+#!/usr/bin/env bash
+if [ "$*" = "-ww -o args= -p 515151" ]; then
+  printf 'node /x/codex-bridge.js --identity-key %s\n' "$LIVE_IDENTITY_KEY"
+  exit 0
+fi
+exit 1
+STUB
+  chmod +x "$STUB_BIN/pgrep" "$STUB_BIN/ps"
+  run env LIVE_IDENTITY_KEY="$idkey" PATH="$STUB_BIN:$PATH" bash -c '
+    set -euo pipefail
+    TEAM=myteam NAME=rv SKILL_DIR="'"$TEST_SKILL_DIR"'" SCRIPT_DIR="'"$SCRIPTS"'"
+    die() { echo "spawn: $*" >&2; exit 1; }
+    source "$SCRIPT_DIR/lib/process-identity.sh"
+    agmsg_process_dedup_should_suppress() { return 0; }
+    source "$SCRIPT_DIR/drivers/types/codex/_spawn.sh"
+    out="$(agmsg_codex_bridge_running_pid "'"$pidfile"'" "'"$scope"'" "'"$idkey"'")"
+    [ "$out" = "515151" ]
+  '
+  [ "$status" -eq 0 ]
+}
+
+@test "spawn: reviewer refuses a symlinked execpolicy home marker" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  local victim="$TEST_SKILL_DIR/marker-victim"
+  printf 'keep-me\n' > "$victim"
+  run bash -c '
+    set -euo pipefail
+    TEAM=myteam NAME=rv SKILL_DIR="'"$TEST_SKILL_DIR"'" SCRIPT_DIR="'"$SCRIPTS"'"
+    die() { echo "spawn: $*" >&2; exit 1; }
+    source "$SCRIPT_DIR/drivers/types/codex/_spawn.sh"
+    AGMSG_REVIEWER_EXEC_HOME="'"$TEST_SKILL_DIR"'/reviewer-codex-home/myteam/rv/launch.markerprobe"
+    mkdir -p "$AGMSG_REVIEWER_EXEC_HOME"
+    ln -s "'"$victim"'" "$AGMSG_REVIEWER_EXEC_HOME/marker"
+    CODEX_HOME=/dev/null
+    if agmsg_codex_reviewer_prepare_execpolicy_home 2>&1; then exit 99; else exit 1; fi
+  '
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"marker is a symlink"* ]]
+  [ "$(cat "$victim")" = "keep-me" ]
+}
+
+@test "spawn: app-server does not load project rules from an untrusted home" {
+  local real
+  real=$(PATH="${PATH#"$STUB_BIN:"}" type -P codex 2>/dev/null || true)
+  if [ -z "$real" ] || [ ! -x "$real" ]; then
+    skip "real codex binary is not on PATH"
+  fi
+  command -v node >/dev/null 2>&1 || skip "node is not on PATH"
+  local base="$TEST_SKILL_DIR/app-server-policy"
+  local repo="$base/repo" home_u="$base/home-u" home_t="$base/home-t"
+  mkdir -p "$repo/.codex/rules" "$home_u/rules" "$home_t/rules"
+  printf '%s\n' 'prefix_rule(pattern=["echo", "AGMSG_RULE_MARKER"], decision="allow")' > "$repo/.codex/rules/marker.rules"
+  printf '%s\n' "[projects.\"$repo\"]" 'trust_level = "trusted"' > "$home_t/config.toml"
+  cat > "$base/probe.js" <<'JS'
+const {spawn} = require("child_process");
+const fs = require("fs");
+const [base, repo, home, label, codex] = process.argv.slice(2);
+const logPath = `${base}/${label}.log`;
+const log = fs.createWriteStream(logPath);
+const child = spawn(codex, ["app-server", "--listen", "stdio://"], {
+  cwd: repo,
+  env: {...process.env, CODEX_HOME: home, RUST_LOG: "codex_core::exec_policy=trace"},
+  stdio: ["pipe", "pipe", "pipe"],
+});
+child.stderr.pipe(log);
+let buf = "";
+let id = 0;
+const pending = new Map();
+child.stdout.on("data", (chunk) => {
+  buf += chunk.toString();
+  let nl;
+  while ((nl = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, nl);
+    buf = buf.slice(nl + 1);
+    if (!line.trim()) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.id && pending.has(msg.id)) {
+      pending.get(msg.id)(msg);
+      pending.delete(msg.id);
+    }
+  }
+});
+const send = (method, params) => new Promise((resolve, reject) => {
+  const my = ++id;
+  const timer = setTimeout(() => reject(new Error("timeout " + method)), 8000);
+  pending.set(my, (msg) => { clearTimeout(timer); resolve(msg); });
+  child.stdin.write(JSON.stringify({jsonrpc:"2.0", id: my, method, params}) + "\n");
+});
+(async () => {
+  await send("initialize", {clientInfo:{name:"agmsg-probe", version:"0"}, capabilities:{experimentalApi:true}});
+  child.stdin.write(JSON.stringify({jsonrpc:"2.0", method:"initialized", params:{}}) + "\n");
+  await send("thread/start", {cwd: repo, ephemeral: true});
+})().catch((err) => fs.appendFileSync(logPath, "\nPROBE_ERR " + err + "\n"))
+  .finally(() => {
+    const finish = () => log.end(() => process.exit(0));
+    child.once("exit", finish);
+    child.kill("SIGTERM");
+    setTimeout(() => child.kill("SIGKILL"), 2000);
+  });
+JS
+  node "$base/probe.js" "$base" "$repo" "$home_u" untrusted "$real"
+  node "$base/probe.js" "$base" "$repo" "$home_t" trusted "$real"
+  ! grep -q 'marker.rules' "$base/untrusted.log"
+  grep -q 'marker.rules' "$base/trusted.log"
+  ! grep -q 'PROBE_ERR' "$base/untrusted.log"
+  ! grep -q 'PROBE_ERR' "$base/trusted.log"
+}
+
+@test "spawn: an untrusted codex home does not load project execpolicy rules" {
+  local real
+  real=$(PATH="${PATH#"$STUB_BIN:"}" type -P codex 2>/dev/null || true)
+  if [ -z "$real" ] || [ ! -x "$real" ]; then
+    skip "real codex binary is not on PATH"
+  fi
+  local base="$TEST_SKILL_DIR/policy-probe"
+  local repo="$base/repo" home_u="$base/home-u" home_t="$base/home-t"
+  mkdir -p "$repo/.codex/rules" "$home_u/rules" "$home_t/rules"
+  printf '%s\n' 'prefix_rule(pattern=["echo", "AGMSG_RULE_MARKER"], decision="allow")' > "$repo/.codex/rules/marker.rules"
+  printf '%s\n' "[projects.\"$repo\"]" 'trust_level = "trusted"' > "$home_t/config.toml"
+  _policy_log() {
+    local chome="$1" log="$2" pid
+    RUST_LOG=codex_core::exec_policy=trace CODEX_HOME="$chome" \
+      "$real" exec --skip-git-repo-check -C "$repo" 'say hi' </dev/null >"$log" 2>&1 &
+    pid=$!
+    sleep 2
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  }
+  _policy_log "$home_u" "$base/untrusted.log"
+  _policy_log "$home_t" "$base/trusted.log"
+  ! grep -q 'marker.rules' "$base/untrusted.log"
+  grep -q 'marker.rules' "$base/trusted.log"
+}
+
 @test "spawn: reviewer ignores a codex shell function and uses the absolute executable" {
   bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
   _make_fake_bridge
@@ -1550,6 +2021,7 @@ EOF
   [[ "$output" == *"permissions.agmsg-implementer.filesystem="* ]]
   [[ "$output" == *"permissions.agmsg-implementer.network={ enabled=false }"* ]]
   [[ "$output" != *"--enable network_proxy"* ]]
+  [[ "$output" != *"CODEX_HOME="* ]]
   [[ "$output" != *"default_permissions=agmsg-reviewer"* ]]
   [[ "$output" == *"web_search=live"* ]]
   [[ "$output" == *"approval_policy=never"* ]]
@@ -1716,6 +2188,7 @@ EOF
 if [ "$1" = sandbox ]; then
   case "$*" in
     *"rm -f"*) exit 0 ;;
+    *planted.rules*|*agmsg-not-auth*|*/marker*) echo "Operation not permitted" >&2; exit 1 ;;
     *touch*)   echo "touch: probe: Operation not permitted" >&2; exit 1 ;;
     *)         exit 0 ;;
   esac
@@ -1822,6 +2295,25 @@ CODEX_STUB
   [[ "$output" != *"\"$PROJ\"=\"read\""* ]]   # already :workspace_roots — not re-granted
 }
 
+@test "spawn: codex reviewer skips /add-dir paths under reviewer-codex-home" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_inherit_add_dirs true
+  local sibling="$TEST_SKILL_DIR/reviewer-codex-home/other-team/w/launch.1"
+  mkdir -p "$sibling/rules"
+  printf 'secret-rule\n' > "$sibling/rules/leak.rules"
+  mkdir -p "$PROJ/.claude"
+  printf '{"permissions":{"additionalDirectories":["%s"]}}' "$sibling" > "$PROJ/.claude/settings.local.json"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" != *"\"$sibling\"=\"read\""* ]]
+  [[ "$output" == *"\"$TEST_SKILL_DIR/reviewer-codex-home\"=\"none\""* ]]
+}
+
 # --- reviewer gh CLI config (spawn.codex_gh_config_dir.<name>) ---
 
 @test "spawn: codex reviewer does not inject GH_CONFIG_DIR when the per-worker key is unset" {
@@ -1853,6 +2345,59 @@ CODEX_STUB
   run cat "$CAPTURE"
   [[ "$output" == *"\"$ghdir\"=\"read\""* ]]
   [[ "$output" == *"shell_environment_policy.set.GH_CONFIG_DIR=\"$ghdir\""* ]]
+}
+
+@test "spawn: codex reviewer ignores GH config dir under reviewer-codex-home" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  local sibling="$TEST_SKILL_DIR/reviewer-codex-home/other-team/w/launch.1"
+  mkdir -p "$sibling"
+  printf '{}\n' > "$sibling/auth.json"
+  bash "$SCRIPTS/config.sh" set spawn.codex_gh_config_dir.rv "$sibling"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ignoring codex GH config dir under execpolicy home tree"* ]]
+
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" != *"\"$sibling\"=\"read\""* ]]
+  [[ "$output" != *"GH_CONFIG_DIR"* ]]
+}
+
+@test "spawn: codex reviewer skips extra fs roots under reviewer-codex-home" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  local sibling="$TEST_SKILL_DIR/reviewer-codex-home/other-team/w/launch.1"
+  mkdir -p "$sibling/rules"
+  bash "$SCRIPTS/config.sh" set spawn.codex_extra_fs_roots "$sibling=read"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" != *"\"$sibling\"=\"read\""* ]]
+  [[ "$output" == *"\"$TEST_SKILL_DIR/reviewer-codex-home\"=\"none\""* ]]
+}
+
+@test "spawn: codex reviewer skips extra fs roots aliasing reviewer-codex-home" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  local private_alias="$TEST_SKILL_DIR/private-alias" future="$TEST_SKILL_DIR/private-alias/not-yet/child"
+  ln -sfn "$TEST_SKILL_DIR/reviewer-codex-home" "$private_alias"
+  bash "$SCRIPTS/config.sh" set spawn.codex_extra_fs_roots "$future=read"
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -eq 0 ]
+
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" != *"\"$future\"=\"read\""* ]]
+  [[ "$output" != *"not-yet"* ]]
 }
 
 @test "spawn: codex reviewer ignores a relative per-worker GH config directory with a warning" {
@@ -1938,6 +2483,7 @@ if [ "$1" = sandbox ]; then
   case "$*" in
     *"$GH_TEST_REJECT_DIR"*) exit 1 ;;
     *"rm -f"*) exit 0 ;;
+    *planted.rules*|*agmsg-not-auth*|*/marker*) echo "Operation not permitted" >&2; exit 1 ;;
     *touch*) echo "touch: probe: Operation not permitted" >&2; exit 1 ;;
     *) exit 0 ;;
   esac

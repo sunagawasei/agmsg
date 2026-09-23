@@ -143,6 +143,56 @@ preflight_seatbelt_nesting() {
 . "$SCRIPT_DIR/lib/identity-key.sh"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/process-identity.sh"
+
+# Canonical root of per-launch reviewer CODEX_HOME directories under SKILL_DIR.
+agmsg_reviewer_execpolicy_home_root() {
+  local private_home="$SKILL_DIR/reviewer-codex-home"
+  if [ -d "$private_home" ]; then
+    (cd "$private_home" && pwd -P)
+  else
+    printf '%s/reviewer-codex-home' "$(cd "$SKILL_DIR" && pwd -P)"
+  fi
+}
+
+# True when a filesystem grant for $1 would expose any launch home (existing path,
+# not-yet-created path under the tree, or a literal path under SKILL_DIR/...).
+agmsg_reviewer_path_conflicts_execpolicy_home() {
+  local d="$1" real_ph cand="" prefix suffix="" literal_root="$SKILL_DIR/reviewer-codex-home"
+  case "$d" in
+    "~") d="$HOME" ;;
+    "~/"*) d="$HOME/${d#\~/}" ;;
+  esac
+  real_ph="$(agmsg_reviewer_execpolicy_home_root)"
+  case "$d" in
+    "$literal_root"|"$literal_root"/*) return 0 ;;
+  esac
+  if [ -d "$d" ] || [ -L "$d" ]; then
+    cand="$(cd "$d" 2>/dev/null && pwd -P)" || return 1
+  else
+    prefix="$d"
+    while [ "$prefix" != "/" ] && [ ! -e "$prefix" ] && [ ! -L "$prefix" ]; do
+      suffix="/$(basename "$prefix")$suffix"
+      prefix="$(dirname "$prefix")"
+    done
+    if [ -e "$prefix" ] || [ -L "$prefix" ]; then
+      if [ -d "$prefix" ] || [ -L "$prefix" ]; then
+        cand="$(cd "$prefix" && pwd -P)$suffix"
+      else
+        cand="$(cd "$(dirname "$prefix")" && pwd -P)/$(basename "$prefix")$suffix"
+      fi
+    else
+      case "$d" in
+        "$real_ph"|"$real_ph"/*) return 0 ;;
+      esac
+      return 1
+    fi
+  fi
+  case "$cand" in
+    "$real_ph"|"$real_ph"/*) return 0 ;;
+  esac
+  return 1
+}
+
 agmsg_reviewer_add_dir_roots() {
   # Wrap the shared harvest: format each collected dir as a codex filesystem-table
   # read entry (`, "<dir>"="read"`) to splice into the reviewer profile body. The
@@ -150,6 +200,10 @@ agmsg_reviewer_add_dir_roots() {
   local d out=""
   while IFS= read -r d; do
     [ -n "$d" ] || continue
+    if agmsg_reviewer_path_conflicts_execpolicy_home "$d"; then
+      echo "spawn: reviewer add-dir path skipped (execpolicy home tree): $d" >&2
+      continue
+    fi
     out="$out, \"$d\"=\"read\""
   done < <(agmsg_collect_add_dir_roots "$1" "spawn.codex_inherit_add_dirs")
   printf '%s' "$out"
@@ -170,7 +224,7 @@ agmsg_reviewer_add_dir_roots() {
 # Because the result is spliced through both a single-quoted -c clause and a
 # TOML string, any quote or backslash is fatal rather than emitted unsafely.
 agmsg_codex_extra_fs_roots() {
-  local _name="$1" mode="${2:-profile}" value="" remaining="" token="" perm="" path_="" out=""
+  local _name="$1" mode="${2:-profile}" reviewer_filter="${3:-0}" value="" remaining="" token="" perm="" path_="" out=""
   case "$mode" in
     profile|runtime-write-roots) ;;
     *) die "spawn: internal error: unknown codex extra filesystem root output mode '$mode'" ;;
@@ -200,6 +254,16 @@ agmsg_codex_extra_fs_roots() {
       read|write) ;;
       *) die "spawn: invalid codex extra filesystem root permission (expected read or write)" ;;
     esac
+    if [ "$reviewer_filter" = reviewer ]; then
+      if [ ! -d "$path_" ]; then
+        echo "spawn: reviewer extra filesystem root skipped (not an existing directory): $path_" >&2
+        continue
+      fi
+      if agmsg_reviewer_path_conflicts_execpolicy_home "$path_"; then
+        echo "spawn: reviewer extra filesystem root skipped (execpolicy home tree): $path_" >&2
+        continue
+      fi
+    fi
     if [ "$mode" = "runtime-write-roots" ]; then
       [ "$perm" = "write" ] && printf '%s\n' "$path_"
     else
@@ -402,6 +466,9 @@ agmsg_codex_gh_config_dir() {
   if [ "$valid" != 1 ] || [ ! -d "$dir" ]; then
     echo "spawn: ignoring invalid codex GH config dir for '$name' (spawn.codex_gh_config_dir.<name> must be an existing absolute directory without whitespace, quotes, backslashes, or control characters)" >&2
     dir=""
+  elif agmsg_reviewer_path_conflicts_execpolicy_home "$dir"; then
+    echo "spawn: ignoring codex GH config dir under execpolicy home tree for '$name': $dir" >&2
+    dir=""
   fi
   printf '%s' "$dir"
 }
@@ -439,6 +506,145 @@ agmsg_codex_reviewer_assert_network() {
   if [ "$rc" -ne 0 ]; then
     die "reviewer network proxy is not enforced (example.com and a direct IP must fail, api.github.com must succeed); refusing to launch (rc=$rc got: ${out:-<empty>})."
   fi
+}
+
+# User execpolicy allow-rules are not part of the reviewer profile.
+# codex 0.147.0's app-server has no --ignore-rules (that flag is only on
+# `codex exec`). The reviewer process gets its own CODEX_HOME: rules is an
+# empty real directory, config.toml is absent, and auth.json is a symlink
+# only when the source home has one. Measured with `codex exec` on 0.147.0:
+# a home with no trust_level does not load the repo's .codex/rules, including
+# when .codex is a symlink; the same repo is loaded once config.toml marks it
+# trusted. Leaving config.toml out is what keeps project rules unloaded for
+# the life of the process. A build that loads project rules without trust is
+# outside this fix.
+# Sets AGMSG_REVIEWER_EXEC_HOME. Does not create or modify the directory:
+# that happens only after the duplicate-worker check, so a rejected second
+# spawn cannot replace a live worker's auth link or rules.
+# Sets AGMSG_REVIEWER_EXEC_HOME to a per-spawn directory so concurrent spawns
+# for the same team/name do not race on rules, auth links, or config.
+agmsg_codex_reviewer_execpolicy_home_path() {
+  local dest launch_id="$$.$RANDOM"
+  case "$TEAM" in
+    *[!A-Za-z0-9._-]*)
+      die "spawn: reviewer team name cannot be used in the execpolicy home: $TEAM" ;;
+  esac
+  case "$NAME" in
+    *[!A-Za-z0-9._-]*)
+      die "spawn: reviewer name cannot be used in the execpolicy home: $NAME" ;;
+  esac
+  case "$launch_id" in
+    *[!A-Za-z0-9._-]*)
+      die "spawn: reviewer execpolicy launch id is not path-safe: $launch_id" ;;
+  esac
+  dest="$SKILL_DIR/reviewer-codex-home/$TEAM/$NAME/launch.$launch_id"
+  case "$dest" in
+    *[!A-Za-z0-9._/+-]*)
+      die "spawn: reviewer execpolicy home path cannot be spliced safely: $dest" ;;
+  esac
+  case "$dest" in
+    "$SKILL_DIR/run"|"$SKILL_DIR/run"/*|"$SKILL_DIR/teams"|"$SKILL_DIR/teams"/*)
+      die "spawn: reviewer execpolicy home is inside a write grant: $dest" ;;
+  esac
+  AGMSG_REVIEWER_EXEC_HOME="$dest"
+}
+
+agmsg_codex_reviewer_discard_execpolicy_home() {
+  [ -n "${AGMSG_REVIEWER_EXEC_HOME:-}" ] && rm -rf "$AGMSG_REVIEWER_EXEC_HOME" 2>/dev/null || true
+}
+
+# Not called from a command substitution: bash disables errexit there, so a
+# failed rm would still look like success.
+agmsg_codex_reviewer_prepare_execpolicy_home() {
+  local source_home dest parent
+  source_home="${CODEX_HOME:-$HOME/.codex}"
+  dest="$AGMSG_REVIEWER_EXEC_HOME"
+  parent="$SKILL_DIR/reviewer-codex-home"
+  if [ -L "$parent" ] || [ -L "$parent/$TEAM" ] || [ -L "$parent/$TEAM/$NAME" ] || [ -L "$dest" ]; then
+    die "spawn: reviewer execpolicy home is a symlink; refusing to launch ($dest)"
+  fi
+  if [ -e "$dest" ] && [ ! -d "$dest" ]; then
+    die "spawn: reviewer execpolicy home exists and is not a directory: $dest"
+  fi
+  mkdir -p "$dest" || die "spawn: failed to create reviewer execpolicy home: $dest"
+  if [ -L "$dest/rules" ]; then
+    die "spawn: reviewer execpolicy rules path is a symlink; refusing to launch ($dest/rules)"
+  fi
+  rm -rf "$dest/rules" || die "spawn: failed to clear reviewer execpolicy rules: $dest/rules"
+  mkdir -p "$dest/rules" || die "spawn: failed to create reviewer execpolicy rules: $dest/rules"
+  if [ -L "$dest/marker" ]; then
+    die "spawn: reviewer execpolicy home marker is a symlink; refusing to launch ($dest/marker)"
+  fi
+  printf 'agmsg-reviewer-home\n' > "$dest/marker" || die "spawn: failed to write reviewer execpolicy home marker: $dest/marker"
+  # Drop a link left by an earlier source home. A spawn with no auth.json
+  # must not keep the previous worker's credential.
+  rm -f "$dest/auth.json" || die "spawn: failed to clear reviewer execpolicy auth link: $dest/auth.json"
+  if [ -e "$source_home/auth.json" ]; then
+    ln -sfn "$source_home/auth.json" "$dest/auth.json" || die "spawn: failed to link reviewer execpolicy auth: $dest/auth.json"
+  fi
+  # A leftover config.toml could mark this repo trusted and load project rules.
+  if [ -L "$dest/config.toml" ] || [ -e "$dest/config.toml" ]; then
+    rm -f "$dest/config.toml" || die "spawn: failed to remove reviewer execpolicy config: $dest/config.toml"
+  fi
+}
+
+# A sandboxed command must not read the marker, plant a rule, or replace the
+# auth symlink. Any other failure (missing binary, syntax, a proxy that does
+# not apply "none") also refuses the launch. Absolute binaries so a curl-style
+# PATH stand-in cannot choose the result.
+agmsg_codex_reviewer_assert_exec_denied() {
+  local label="$1"; shift
+  local out rc=0
+  out="$("$@" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    agmsg_codex_reviewer_discard_execpolicy_home
+    die "reviewer execpolicy home is not enforced ($label succeeded); refusing to launch (got: ${out:-<empty>})."
+  fi
+  case "$out" in
+    *"Operation not permitted"*|*"Permission denied"*) ;;
+    *)
+      agmsg_codex_reviewer_discard_execpolicy_home
+      die "reviewer execpolicy home probe failed unexpectedly ($label); refusing to launch (rc=$rc got: ${out:-<empty>})." ;;
+  esac
+}
+
+# Pid of a live codex-bridge for this team and name, or empty. Used before the
+# placement lock so a reviewer home is not rebuilt for a worker that is already
+# up, and so a failing home probe never holds that lock.
+agmsg_codex_bridge_running_pid() {
+  local pidfile="$1" bridge_scope="$2" idkey="$3" recorded_pid="" _p
+  if [ -f "$pidfile" ] \
+      && agmsg_process_dedup_should_suppress codex-bridge "$pidfile" "$bridge_scope" \
+        codex-bridge "$idkey"; then
+    recorded_pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [ -n "$recorded_pid" ]; then
+      printf '%s\n' "$recorded_pid"
+      return 0
+    fi
+  fi
+  for _p in $(pgrep -f "codex-bridge\.js" 2>/dev/null || true); do
+    if ps -ww -o args= -p "$_p" 2>/dev/null | grep -qF -- "--identity-key $idkey"; then
+      printf '%s\n' "$_p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+agmsg_codex_reviewer_assert_execpolicy_home() {
+  local codex_bin="$1" cwd="$2" fs="$3" net_c="$4" home="$5"
+  local -a sandbox=(
+    "$codex_bin" sandbox --enable network_proxy -P agmsg-reviewer -C "$cwd"
+    -c "permissions.agmsg-reviewer.filesystem=$fs"
+    -c "$net_c"
+    -- /bin/sh -c
+  )
+  agmsg_codex_reviewer_assert_exec_denied "read marker" \
+    "${sandbox[@]}" "/bin/cat -- '$home/marker'"
+  agmsg_codex_reviewer_assert_exec_denied "write rules" \
+    "${sandbox[@]}" "/usr/bin/touch -- '$home/rules/planted.rules'"
+  agmsg_codex_reviewer_assert_exec_denied "replace auth link" \
+    "${sandbox[@]}" "/bin/ln -sfn -- /tmp/agmsg-not-auth '$home/auth.json'"
 }
 
 # approval_policy=never in every mode because a headless worker cannot answer approvals.
@@ -510,13 +716,21 @@ agmsg_spawn_headless() {
       *[!A-Za-z0-9._/+-]*)
         die "spawn: codex path cannot be spliced into the app-server command safely: $codex_bin" ;;
     esac
+    # Research workers use this same reviewer path. Implementer and consultant
+    # keep the user's CODEX_HOME, including its execpolicy rules.
+    agmsg_codex_reviewer_execpolicy_home_path
+    local execpolicy_home="$AGMSG_REVIEWER_EXEC_HOME"
     # Read-only repo + tmp/toolchain reads + writes confined to agmsg. The toolchain
     # roots let codex run git/rg/etc. installed outside the repo; extend this list if
     # a review needs another global read root (e.g. a language's module cache). The
     # -c values that contain spaces are single-quoted: the bridge runs the command
     # via `sh -lc`, which re-parses the string (see codex-bridge.js).
     local fs_base="\":minimal\"=\"read\", \":tmpdir\"=\"write\", \":workspace_roots\"={ \".\"=\"read\" }, \"/nix\"=\"read\", \"/opt/homebrew\"=\"read\", \"/usr/local\"=\"read\", \"$SKILL_DIR/scripts\"=\"read\", \"$storage_dir\"=\"write\", \"$SKILL_DIR/teams\"=\"write\", \"$run_dir\"=\"write\""
-    fs_base="$fs_base$extra_fs"
+    fs_base="$fs_base$(agmsg_codex_extra_fs_roots "$NAME" profile reviewer)"
+    # Hide every per-launch CODEX_HOME from the reviewer sandbox, not only this
+    # spawn's directory. Unlisted paths are writable; without this, one worker
+    # could read or rewrite another launch's auth link or rules.
+    fs_base="$fs_base, \"$SKILL_DIR/reviewer-codex-home\"=\"none\""
     # Additively grant READ on the Claude session's /add-dir directories (gated;
     # see agmsg_reviewer_add_dir_roots). Purely additive and fail-open: pre-flight
     # the augmented profile with a trivial sandboxed command, and if it fails to
@@ -553,7 +767,7 @@ agmsg_spawn_headless() {
       fi
     fi
     local fs="{ $fs_base$add_dir_roots$gh_config_root }"
-    appcmd="${codex_bin} app-server --listen stdio:// --enable network_proxy -c default_permissions=agmsg-reviewer -c 'permissions.agmsg-reviewer.filesystem=$fs' -c '${net_c}' -c web_search=live -c approval_policy=never$model_effort_args$gh_config_arg"
+    appcmd="CODEX_HOME='$execpolicy_home' ${codex_bin} app-server --listen stdio:// --enable network_proxy -c default_permissions=agmsg-reviewer -c 'permissions.agmsg-reviewer.filesystem=$fs' -c '${net_c}' -c web_search=live -c approval_policy=never$model_effort_args$gh_config_arg"
   else
     cwd="$run_dir/codex-$TEAM-cwd"
     mkdir -p "$cwd"
@@ -615,6 +829,20 @@ agmsg_spawn_headless() {
       die "reviewer sandbox can't write to run_dir ($run_dir); the worker would be unable to reply via send.sh. Check the filesystem profile's write grants for \$SKILL_DIR/run."
     fi
     agmsg_codex_reviewer_assert_network "$codex_bin" "$cwd" "$fs" "$net_c"
+    # Home rebuild and its sandbox probes stay outside the placement lock.
+    # die/exit does not run the lock's RETURN trap, and the probes are slower
+    # than the lock timeout. A live worker is left untouched.
+    local running_early=""
+    running_early="$(agmsg_codex_bridge_running_pid \
+      "$run_dir/codex-bridge.$TEAM.$NAME.pid" \
+      "codex-bridge|$TEAM.$NAME" \
+      "$(agmsg_identity_key "$TEAM" "$NAME")" || true)"
+    if [ -n "$running_early" ]; then
+      echo "spawn: headless codex '$NAME' already running in '$TEAM' (pid $running_early)"
+      return 0
+    fi
+    agmsg_codex_reviewer_prepare_execpolicy_home
+    agmsg_codex_reviewer_assert_execpolicy_home "$codex_bin" "$cwd" "$fs" "$net_c" "$execpolicy_home"
   fi
 
   # Serialize the register→spawn→record-write critical section against a
@@ -652,23 +880,8 @@ agmsg_spawn_headless() {
 
   local pidfile="$run_dir/codex-bridge.$TEAM.$NAME.pid"
   local bridge_scope="codex-bridge|$TEAM.$NAME"
-  local running="" recorded_pid=""
-  [ -f "$pidfile" ] && recorded_pid="$(cat "$pidfile" 2>/dev/null || true)"
-  if [ -f "$pidfile" ] \
-      && agmsg_process_dedup_should_suppress codex-bridge "$pidfile" "$bridge_scope" \
-        codex-bridge "$_idkey"; then
-    running="$recorded_pid"
-  else
-    # Fallback: list codex-bridge candidates, then confirm identity by the opaque
-    # --identity-key via grep -F (-- guards the leading dashes). ps -ww avoids argv
-    # truncation. No regex escaping / argv-boundary trick needed.
-    local _p
-    for _p in $(pgrep -f "codex-bridge\.js" 2>/dev/null || true); do
-      if ps -ww -o args= -p "$_p" 2>/dev/null | grep -qF -- "--identity-key $_idkey"; then
-        running="$_p"; break
-      fi
-    done
-  fi
+  local running=""
+  running="$(agmsg_codex_bridge_running_pid "$pidfile" "$bridge_scope" "$_idkey" || true)"
   if [ -n "$running" ]; then
     echo "spawn: headless codex '$NAME' already running in '$TEAM' (pid $running)"
     return 0
