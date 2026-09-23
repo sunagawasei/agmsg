@@ -2367,10 +2367,9 @@ JSON
   [ ! -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
 }
 
-# #399: type.conf previously advertised delivery_modes=monitor turn both off,
-# but antigravity has no Monitor tool or bridge equivalent — the manifest must
-# match what the template actually offers (turn/off only, like cursor/gemini).
-@test "antigravity rejects monitor mode" {
+# #1289 / #399 follow-up: monitor is supported via the antigravity bridge marker;
+# `both` remains unsupported (no Monitor-tool equivalent).
+@test "antigravity accepts monitor mode" {
   run bash "$SCRIPTS/delivery.sh" set monitor antigravity "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   grep -qF '<!-- agmsg:antigravity:monitor -->' "$TEST_PROJECT/.agent/rules/agmsg.md"

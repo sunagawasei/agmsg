@@ -38,6 +38,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 agmsg_storage_load
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/validate.sh"
 
 _agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
 

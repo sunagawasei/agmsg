@@ -487,6 +487,20 @@ actas_lock_read() {   # <team> <agent>
   _actas_lock_read_path "$p"
 }
 
+# Narrow read helper for legacy call sites (despawn, doctor, tests). Unreadable or
+# ambiguous locks read as empty — callers that need the full read outcome must
+# use actas_lock_read instead (#983).
+actas_lock_owner() {
+  local line read owner
+  line="$(actas_lock_read "$1" "$2")"
+  read="${line%%$'\t'*}"
+  owner="${line#*$'\t'}"
+  case "$read" in
+    ok) printf '%s\n' "$owner" ;;
+    *) printf '' ;;
+  esac
+}
+
 # Cached counterpart of actas_lock_read, via actas_lock_path_cached. See that
 # function's comment for what is and is not memoized.
 actas_lock_read_cached() {   # <team> <agent>
