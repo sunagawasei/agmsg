@@ -263,10 +263,9 @@ storage_mark_read_batch() {
                       AND r.team='$tl' AND r.agent='$al' AND r.msg_id=$resolved);
     UPDATE messages SET read_at='$(_sqlite_lit "$at")'
      WHERE read_at IS NULL
-       AND (CAST(id AS TEXT)='$idl'
-         OR id=(SELECT e.legacy_id FROM events e
-                WHERE e.type='message_sent' AND e.team='$tl'
-                  AND e.id='$idl' AND e.legacy_id IS NOT NULL));"
+       AND id=(SELECT e.legacy_id FROM events e
+               WHERE e.type='message_sent' AND e.team='$tl'
+                 AND e.id='$idl' AND e.legacy_id IS NOT NULL);"
   done
   agmsg_sqlite "$db" "$sql" >/dev/null 2>&1 || { echo runtime_error; return 13; }
   echo ok
