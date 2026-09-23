@@ -406,16 +406,12 @@ for f in "$RUN_DIR"/cc-instance.*; do
       && ! printf '%s\n' "$live_sids" | tr '|' '\n' | grep -Fxq "$dead_sid"; then
     orphan_pidfile="$RUN_DIR/watch.$dead_sid.pid"
     if [ -f "$orphan_pidfile" ]; then
-      orphan_pid=$(cat "$orphan_pidfile" 2>/dev/null || true)
-      if [ -n "$orphan_pid" ] && _agmsg_pid_alive_local "$orphan_pid"; then
-        # Defensive: only kill if the pid's command line actually matches
-        # our watch.sh. Defends against pid recycling — a stale pidfile
-        # could point at an unrelated process that took the same pid.
-        cmd=$(compat_get_cmdline "$orphan_pid" 2>/dev/null || true)
-        case "$cmd" in
-          *"$SKILL_DIR/scripts/watch.sh"*) kill "$orphan_pid" 2>/dev/null || true ;;
-          *) ;;  # not our watcher anymore; leave it alone
-        esac
+      agmsg_process_identity_state watch "$orphan_pidfile" "" \
+        "$SKILL_DIR/scripts/watch.sh" "$dead_sid"
+      if [ "$AGMSG_PROCESS_STATE" = owned ]; then
+        agmsg_process_signal_owned watch "$orphan_pidfile" \
+          "@hash:$AGMSG_PROCESS_SCOPE_HASH" TERM \
+          "$SKILL_DIR/scripts/watch.sh" "$dead_sid" >/dev/null || true
       fi
       case "$AGMSG_PROCESS_STATE" in
         stale|legacy-dead|legacy-foreign-live|legacy-unverified-live|degraded-dead|unverified-dead)
@@ -430,12 +426,11 @@ done
 # lease for its whole life, so an unheld lease means the recorded pid was reused.
 for f in "$RUN_DIR"/watch.*.pid; do
   [ -f "$f" ] || continue
-  pid=$(cat "$f" 2>/dev/null || true)
-  if [ -z "$pid" ]; then
-    rm -f "$f"
-    continue
-  fi
-  _agmsg_pid_alive_local "$pid" || rm -f "$f"
+  agmsg_process_identity_state watch "$f" ""
+  case "$AGMSG_PROCESS_STATE" in
+    stale|legacy-dead|legacy-foreign-live|degraded-dead|unverified-dead)
+      agmsg_process_cleanup_observed "$f" || true ;;
+  esac
 done
 
 # Garbage-collect actas exclusivity locks whose owner session_id no longer
