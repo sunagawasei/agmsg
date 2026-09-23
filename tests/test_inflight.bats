@@ -141,7 +141,6 @@ alice_notices() {
   printf 'pid:%s\t%s\tcodex\n' "$BRIDGE_PID" "$PROJ" > "$RUN/spawn.team__worker"
   printf 'pid=%s\n' "$BRIDGE_PID" > "$RUN/codex-bridge.team.worker.meta"
   run bash "$SCRIPTS/despawn.sh" team leader worker --force
-  echo "DBG force status=$status output=<$output>" >&3
   [ "$status" -eq 0 ]
   [[ "$output" == *"status=forced"* ]]
   [ ! -f "$(ipath 1)" ]
@@ -159,7 +158,6 @@ alice_notices() {
   method="${BRIDGE_START%%:*}"
   run bash "$SCRIPTS/despawn.sh" team leader worker --force \
     --expect-record "$rec" --expect-bridge-start "$method:not-this-generation"
-  echo "DBG mismatch status=$status output=<$output>" >&3
   [ "$status" -eq 5 ]
   [[ "$output" == *"reason=bridge-generation-changed"* ]]
   kill -0 "$BRIDGE_PID"
