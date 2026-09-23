@@ -261,6 +261,8 @@ function parseArgs(argv) {
       opts.team = argv[++i];
     } else if (arg === "--name") {
       opts.name = argv[++i];
+    } else if (arg === "--owner") {
+      opts.owner = argv[++i];
     } else if (arg === "--pair") {
       const [team, name] = (argv[++i] || "").split("\t");
       if (!team || !name) die("--pair must be team<TAB>agent");

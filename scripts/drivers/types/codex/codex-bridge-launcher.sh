@@ -922,6 +922,12 @@ EOF
   # the new ones, so no gate can bail out between the wipe and the rewrite.
   rm -f "$pidfile" "$appserver_file" "$thread_file"
 
+  bridge_owner_args=()
+  _actas_owner="$(actas_lock_owner "$team" "$name" 2>/dev/null || true)"
+  if [ -n "$_actas_owner" ]; then
+    bridge_owner_args=(--owner "$(agmsg_instance_bare_sid "$_actas_owner")")
+  fi
+
   nohup "${bridge_run[@]}" \
     --project "$PROJECT" \
     --workspace-root "$STORAGE_DIR" \
@@ -932,6 +938,7 @@ EOF
     --thread "$thread_id" \
     --app-server "$req_app_server" \
     --inline-inbox \
+    "${bridge_owner_args[@]}" \
     >>"$log" 2>&1 3>&- 4>&- &
   launched_pid=$!
   if [ -n "${AGMSG_CODEX_BRIDGE_CMD:-}" ]; then
