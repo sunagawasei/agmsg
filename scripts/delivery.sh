@@ -937,13 +937,31 @@ kill_all_watchers() {
             if [ -n "$needle" ]; then
               case " $cmd " in *"$needle"*) ;; *) continue ;; esac
             fi
-            kill "$pid" 2>/dev/null && killed=$((killed + 1))
+            kill "$pid" 2>/dev/null && { killed=$((killed + 1)); rm -f "$f"; }
             ;;
         esac
       fi
       case "$AGMSG_PROCESS_STATE" in
-        stale|legacy-dead|legacy-foreign-live|legacy-unverified-live|degraded-dead|unverified-dead)
+        stale|legacy-dead|degraded-dead|unverified-dead)
           agmsg_process_cleanup_observed "$f" || true ;;
+        legacy-foreign-live)
+          # Scoped (project,type) sweeps pass argv needles for the TARGET type.
+          # A live claude-code watcher is legacy-foreign to copilot needles — not
+          # stale, and must keep its pidfile (#218).
+          if [ -z "$type" ]; then
+            agmsg_process_cleanup_observed "$f" || true
+          fi
+          ;;
+        legacy-unverified-live)
+          if [ -n "$type" ] && [ -n "$needle" ]; then
+            cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
+            case " $cmd " in
+              *"$needle"*) agmsg_process_cleanup_observed "$f" || true ;;
+            esac
+          else
+            agmsg_process_cleanup_observed "$f" || true
+          fi
+          ;;
       esac
     done
   fi
