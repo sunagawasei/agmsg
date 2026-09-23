@@ -483,10 +483,15 @@ assert_json_path_alias() {
 
 permission_rule_for_path() {
   local tool="$1" path="$2"
-  while [ -n "$path" ] && [ "${path%/}" != "$path" ]; do
-    path="${path%/}"
-  done
-  printf '%s(/%s/**)' "$tool" "$path"
+  bash -c "
+    set -euo pipefail
+    SCRIPT_DIR='$SCRIPTS'
+    SKILL_DIR='${SCRIPTS%/scripts}'
+    # shellcheck disable=SC1091
+    . \"\$SCRIPT_DIR/lib/resolve-project.sh\"
+    . \"\$SCRIPT_DIR/drivers/types/claude-code/_spawn.sh\"
+    agmsg_claude_tool_rule '$tool' '$path'
+  "
 }
 
 assert_worker_home_denials() {
@@ -614,6 +619,16 @@ policy_shape() {
   "
   [ "$status" -eq 0 ]
   [ "$output" = "$(printf 'Read(//tmp/**)\nRead(//tmp/**)\nRead(//**)\nRead(//**)')" ]
+
+  run bash -c "
+    SCRIPT_DIR='$SCRIPTS'
+    SKILL_DIR='${SCRIPTS%/scripts}'
+    . \"\$SCRIPT_DIR/lib/resolve-project.sh\"
+    . \"\$SCRIPT_DIR/drivers/types/claude-code/_spawn.sh\"
+    agmsg_claude_tool_rule Edit '/tmp/foo[1]'
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'Edit(//tmp/foo\[1\]/**)'* ]]
 
   for settings in "$consultant" "$implementer" "$reviewer"; do
     [ "$(sqlite_mem "SELECT json_valid(readfile('$(rf "$settings")'));")" = 1 ]
@@ -2060,9 +2075,12 @@ STUB
   settings="$TEST_SKILL_DIR/run/claude-code-bridge.$team.$name.settings.json"
   scratch="$TEST_SKILL_DIR/run/claude-code-$team-$name-cwd"
   [ -f "$settings" ]
-  json_array_has "$settings" '$.permissions.allow' "Read(/$scratch/**)"
-  ! json_array_has "$settings" '$.permissions.deny' "Read(/$scratch/**)"
-  ! json_array_has "$settings" '$.permissions.deny' "Edit(/$scratch/**)"
+  local rule
+  rule="$(permission_rule_for_path Read "$scratch")"
+  json_array_has "$settings" '$.permissions.allow' "$rule"
+  ! json_array_has "$settings" '$.permissions.deny' "$rule"
+  rule="$(permission_rule_for_path Edit "$scratch")"
+  ! json_array_has "$settings" '$.permissions.deny' "$rule"
   local deny_blob
   deny_blob="$(sqlite_mem "SELECT group_concat(value, char(10)) FROM json_each(readfile('$(rf "$settings")'), '\$.permissions.deny');")"
   [[ "$deny_blob" != *"$scratch"* ]]
@@ -2070,16 +2088,21 @@ STUB
   [[ "$deny_blob" != *'n?ame'* ]]
 }
 
-@test "PROJECT glob metacharacters run a probe that fails and write no cache record" {
+@test "PROJECT glob metacharacters produce escaped permission rules" {
   local globproj="$TEST_SKILL_DIR/proj[glob]"
   mkdir -p "$globproj"
   bash "$SCRIPTS/join.sh" team leader claude-code "$globproj" >/dev/null
   run spawn_claude_at team glob-proj "$globproj" --reviewer
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"did not produce every required correlated tool event"* ]]
-  [ "$(claude_probe_count)" -ge 1 ]
-  [ "$(claude_probe_cache_count)" -eq 0 ]
-  [ ! -e "$CAPTURE/bridge.args.glob-proj" ]
+  [ "$status" -eq 0 ]
+  wait_bridge_capture glob-proj
+  local settings rule
+  settings="$TEST_SKILL_DIR/run/claude-code-bridge.team.glob-proj.settings.json"
+  [ -f "$settings" ]
+  rule="$(permission_rule_for_path Edit "$globproj")"
+  json_array_has "$settings" '$.permissions.deny' "$rule"
+  rule="$(permission_rule_for_path Read "$globproj")"
+  json_array_has "$settings" '$.permissions.allow' "$rule"
+  [[ "$rule" == *'\[glob\]'* ]]
 }
 
 @test "probe failure while cache is off, TTL invalid, or scratch-bypassed forgets a prior record" {
