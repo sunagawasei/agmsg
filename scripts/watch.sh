@@ -167,26 +167,6 @@ PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
 # monitor/actas/drop steps pass a bare session_id and we self-derive here.
 SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$AGENT_TYPE")"
 
-# A resumed session may replay an old Monitor directive whose composite id
-# still embeds the previous agent pid. Rebind every downstream artifact and
-# liveness check to the live agent ancestor before claiming the watcher slot.
-if agmsg_instance_is_composite "$SESSION_ID" && ! agmsg_instance_alive "$SESSION_ID"; then
-  stale_pid="${SESSION_ID##*.}"
-  live_pid="$(agmsg_agent_pid "$AGENT_TYPE" || true)"
-  case "$live_pid" in
-    ''|*[!0-9]*)
-      echo "agmsg watch: composite instance pid $stale_pid is dead and no live $AGENT_TYPE agent found in ancestry; exiting (stale directive?)" >&2
-      exit 0
-      ;;
-  esac
-  if ! _agmsg_pid_alive "$live_pid"; then
-    echo "agmsg watch: composite instance pid $stale_pid is dead and no live $AGENT_TYPE agent found in ancestry; exiting (stale directive?)" >&2
-    exit 0
-  fi
-  SESSION_ID="$(agmsg_instance_id_from_pid "${SESSION_ID%.*}" "$live_pid")"
-  echo "agmsg watch: instance pid $stale_pid is gone; adopted live agent pid $live_pid (stale directive, e.g. resumed session)" >&2
-fi
-
 DB="$(agmsg_db_path)"
 RUN_DIR="$SKILL_DIR/run"
 PIDFILE="$RUN_DIR/watch.$SESSION_ID.pid"
@@ -287,6 +267,29 @@ watch_log() {
   # Never fatal: a sandbox that cannot write here must not take delivery down.
   printf '%s\n' "$record" >> "$LOGFILE" 2>/dev/null || true
 }
+
+# A resumed session may replay an old Monitor directive whose composite id
+# still embeds the previous agent pid. Rebind every downstream artifact and
+# liveness check to the live agent ancestor before claiming the watcher slot.
+# Uses watch_log (#691): stderr is often discarded in production launchers.
+if agmsg_instance_is_composite "$SESSION_ID" && ! agmsg_instance_alive "$SESSION_ID"; then
+  stale_pid="${SESSION_ID##*.}"
+  live_pid="$(agmsg_agent_pid "$AGENT_TYPE" || true)"
+  case "$live_pid" in
+    ''|*[!0-9]*)
+      watch_log "session $SESSION_ID is no longer alive; stopping."
+      exit 0
+      ;;
+  esac
+  if ! _agmsg_pid_alive "$live_pid"; then
+    watch_log "session $SESSION_ID is no longer alive; stopping."
+    exit 0
+  fi
+  SESSION_ID="$(agmsg_instance_id_from_pid "${SESSION_ID%.*}" "$live_pid")"
+  PIDFILE="$RUN_DIR/watch.$SESSION_ID.pid"
+  LOGFILE="$RUN_DIR/watch.$SESSION_ID.log"
+  watch_log "instance pid $stale_pid is gone; adopted live agent pid $live_pid (stale directive, e.g. resumed session)"
+fi
 
 watch_report() {
   printf 'agmsg watch: %s\n' "$*"
