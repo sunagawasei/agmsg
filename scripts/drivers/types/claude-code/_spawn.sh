@@ -209,6 +209,23 @@ agmsg_claude_emit_json_array() {
   printf ']'
 }
 
+agmsg_claude_escape_permission_glob() {
+  local path="$1" out="" rest="$path" char
+  while [ -n "$rest" ]; do
+    char="${rest:0:1}"
+    rest="${rest#?}"
+    case "$char" in
+      \\) out="${out}\\\\" ;;
+      '[') out="${out}\\[" ;;
+      ']') out="${out}\\]" ;;
+      '*') out="${out}\\*" ;;
+      '?') out="${out}\\?" ;;
+      *) out="${out}${char}" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 agmsg_claude_permission_path() {
   local path="$1"
   case "$path" in
@@ -217,18 +234,13 @@ agmsg_claude_permission_path() {
       while [ -n "$path" ] && [ "${path%/}" != "$path" ]; do
         path="${path%/}"
       done
+      path="$(agmsg_claude_escape_permission_glob "$path")"
       printf '//%s' "$path"
       ;;
-    *) printf '%s' "$path" ;;
+    *)
+      printf '%s' "$(agmsg_claude_escape_permission_glob "$path")"
+      ;;
   esac
-}
-
-# Unescaped glob metacharacters in a permission path make deny rules inert
-# (escaping is out of scope; see [task:probe-cache]). A PROJECT that contains
-# them must not produce a successful probe-cache record.
-agmsg_claude_path_has_glob_meta() {
-  local path="$1"
-  [[ "$path" == *'['* || "$path" == *']'* || "$path" == *'?'* || "$path" == *'*'* ]]
 }
 
 agmsg_claude_tool_rule() {
@@ -833,7 +845,6 @@ agmsg_claude_probe_complete() {
   local scratch_write="$scratch/.${token}-consultant-scratch"
   local specs=""
   [ -f "$trace" ] && [ ! -L "$trace" ] || return 1
-  agmsg_claude_path_has_glob_meta "$project" && return 1
   case "$layout" in
     consultant)
       specs=$'Bash\tconsultant-scratch\tsuccess\tscratch\nBash\trepo-bash\tdenied-error\trepo-bash\nBash\trun-write\tsuccess\trun-write' ;;
