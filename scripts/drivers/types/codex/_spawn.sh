@@ -107,6 +107,9 @@ preflight_seatbelt_nesting() {
 #   reviewer — cwd IS the target repo so codex can autonomously explore it, under
 #     a permission profile (default_permissions) that grants the repo READ-only
 #     and confines writes to agmsg's db/teams/run (replies via send.sh still work).
+#     Command network is on, but only for the gh HTTPS hosts below. web_search
+#     is a separate tool and is not covered by that allowlist. A credential that
+#     can write to those hosts can still send data there.
 #     Reads are scoped to the repo + toolchain dirs + agmsg (+ the Claude
 #     session's /add-dir directories when spawn.codex_inherit_add_dirs is on),
 #     so the repo cannot be modified and unrelated secrets (e.g. ~/.ssh) stay
@@ -403,6 +406,41 @@ agmsg_codex_gh_config_dir() {
   printf '%s' "$dir"
 }
 
+# Command-egress allowlist for the reviewer profile. Research workers use this
+# same profile; there is no second network policy. The hosts are the ones the
+# gh CLI reaches over HTTPS. Measured with codex 0.147.0 and network_proxy:
+# each name returns an origin status (200/301/302/404), while https://example.com
+# is a proxy 403. Direct HTTPS to 1.1.1.1 with --noproxy '*' is refused.
+agmsg_codex_reviewer_network_config() {
+  printf '%s' 'permissions.agmsg-reviewer.network={ enabled=true, domains={ "github.com"="allow", "api.github.com"="allow", "codeload.github.com"="allow", "uploads.github.com"="allow", "gist.github.com"="allow", "objects.githubusercontent.com"="allow", "raw.githubusercontent.com"="allow" } }'
+}
+
+# Fail closed unless this codex build enforces the allowlist. A build that
+# ignores network_proxy must not launch a reviewer with unrestricted egress.
+# Headless review then uses another reviewer, such as grok-review.
+agmsg_codex_reviewer_assert_network() {
+  local codex_bin="$1" cwd="$2" fs="$3" net_c="$4" out rc=0
+  out="$("$codex_bin" sandbox --enable network_proxy -P agmsg-reviewer -C "$cwd" \
+       -c "permissions.agmsg-reviewer.filesystem=$fs" \
+       -c "$net_c" \
+       -- /bin/sh -c '
+         # Absolute path on purpose. A curl earlier on PATH, including one
+         # planted in the repo, must not be able to fake this result.
+         if /usr/bin/curl -sS -o /dev/null --max-time 20 https://example.com; then
+           echo "disallowed-host-reachable"
+           exit 10
+         fi
+         if /usr/bin/curl -sS -o /dev/null --max-time 20 --noproxy "*" -k https://1.1.1.1/; then
+           echo "direct-ip-bypassed-proxy"
+           exit 11
+         fi
+         /usr/bin/curl -sS -o /dev/null --max-time 20 https://api.github.com
+       ' 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    die "reviewer network proxy is not enforced (example.com and a direct IP must fail, api.github.com must succeed); refusing to launch (rc=$rc got: ${out:-<empty>})."
+  fi
+}
+
 # approval_policy=never in every mode because a headless worker cannot answer approvals.
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run"
@@ -457,6 +495,21 @@ agmsg_spawn_headless() {
     appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-implementer -c 'permissions.agmsg-implementer.filesystem=$fs' -c 'permissions.agmsg-implementer.network={ enabled=false }' -c web_search=live -c approval_policy=never$model_effort_args"
   elif [ "$REVIEWER" = 1 ]; then
     cwd="$PROJECT"
+    local net_c; net_c="$(agmsg_codex_reviewer_network_config)"
+    # Resolve once to an absolute executable. `command -v` returns the bare
+    # name when codex is a shell function, and a relative PATH entry stays
+    # relative; `sh -lc` would then search PATH again. `type -P` skips
+    # functions. Anything that is not an absolute executable is refused.
+    local codex_bin; codex_bin="$(type -P codex 2>/dev/null || true)"
+    case "$codex_bin" in
+      /*) ;;
+      *) die "spawn: codex must resolve to an absolute executable (got: ${codex_bin:-<empty>}); refusing to launch a reviewer" ;;
+    esac
+    [ -x "$codex_bin" ] || die "spawn: codex path is not executable: $codex_bin"
+    case "$codex_bin" in
+      *[!A-Za-z0-9._/+-]*)
+        die "spawn: codex path cannot be spliced into the app-server command safely: $codex_bin" ;;
+    esac
     # Read-only repo + tmp/toolchain reads + writes confined to agmsg. The toolchain
     # roots let codex run git/rg/etc. installed outside the repo; extend this list if
     # a review needs another global read root (e.g. a language's module cache). The
@@ -472,9 +525,9 @@ agmsg_spawn_headless() {
     # base reviewer guarantee (repo read-only, secrets unreadable) is still proved
     # fail-closed by the negative/positive probes below.
     local add_dir_roots; add_dir_roots="$(agmsg_reviewer_add_dir_roots "$cwd")"
-    if [ -n "$add_dir_roots" ] && ! codex sandbox -P agmsg-reviewer -C "$cwd" \
+    if [ -n "$add_dir_roots" ] && ! "$codex_bin" sandbox --enable network_proxy -P agmsg-reviewer -C "$cwd" \
          -c "permissions.agmsg-reviewer.filesystem={ $fs_base$add_dir_roots }" \
-         -c 'permissions.agmsg-reviewer.network={ enabled=true }' \
+         -c "$net_c" \
          -- /usr/bin/true >/dev/null 2>&1; then
       echo "spawn: reviewer add-dir inheritance disabled (augmented sandbox profile failed to apply); using base profile" >&2
       add_dir_roots=""
@@ -488,9 +541,9 @@ agmsg_spawn_headless() {
     local gh_config_root="" gh_config_arg=""
     if [ -n "$gh_config_dir" ]; then
       gh_config_root=", \"$gh_config_dir\"=\"read\""
-      if ! codex sandbox -P agmsg-reviewer -C "$cwd" \
+      if ! "$codex_bin" sandbox --enable network_proxy -P agmsg-reviewer -C "$cwd" \
            -c "permissions.agmsg-reviewer.filesystem={ $fs_base$add_dir_roots$gh_config_root }" \
-           -c 'permissions.agmsg-reviewer.network={ enabled=true }' \
+           -c "$net_c" \
            -- /usr/bin/true >/dev/null 2>&1; then
         echo "spawn: reviewer codex GH config injection disabled (augmented sandbox profile failed to apply); using the existing reviewer profile" >&2
         gh_config_dir=""
@@ -500,7 +553,7 @@ agmsg_spawn_headless() {
       fi
     fi
     local fs="{ $fs_base$add_dir_roots$gh_config_root }"
-    appcmd="codex app-server --listen stdio:// -c default_permissions=agmsg-reviewer -c 'permissions.agmsg-reviewer.filesystem=$fs' -c 'permissions.agmsg-reviewer.network={ enabled=true }' -c web_search=live -c approval_policy=never$model_effort_args$gh_config_arg"
+    appcmd="${codex_bin} app-server --listen stdio:// --enable network_proxy -c default_permissions=agmsg-reviewer -c 'permissions.agmsg-reviewer.filesystem=$fs' -c '${net_c}' -c web_search=live -c approval_policy=never$model_effort_args$gh_config_arg"
   else
     cwd="$run_dir/codex-$TEAM-cwd"
     mkdir -p "$cwd"
@@ -532,9 +585,9 @@ agmsg_spawn_headless() {
   # no pre-existing repo file of the same name is accidentally removed.
   if [ "$REVIEWER" = 1 ]; then
     local probe="$cwd/.agmsg_reviewer_probe.$$" probe_out
-    if probe_out="$(codex sandbox -P agmsg-reviewer -C "$cwd" \
+    if probe_out="$("$codex_bin" sandbox --enable network_proxy -P agmsg-reviewer -C "$cwd" \
          -c "permissions.agmsg-reviewer.filesystem=$fs" \
-         -c 'permissions.agmsg-reviewer.network={ enabled=true }' \
+         -c "$net_c" \
          -- /bin/sh -c "touch -- \"$probe\"" 2>&1)"; then
       rm -f "$probe" 2>/dev/null || true
       die "reviewer sandbox is not enforced by this codex build (the repo would be writable); refusing to launch. Upgrade codex, or spawn with --no-reviewer for the scratch consultant."
@@ -554,13 +607,14 @@ agmsg_spawn_headless() {
     # Positive probe: verify the worker can actually write to run_dir (replies via
     # send.sh need db/teams/run writes). If this fails the profile is misconfigured.
     local pos_probe="$run_dir/.agmsg_reviewer_probe.$$"
-    if ! codex sandbox -P agmsg-reviewer -C "$cwd" \
+    if ! "$codex_bin" sandbox --enable network_proxy -P agmsg-reviewer -C "$cwd" \
          -c "permissions.agmsg-reviewer.filesystem=$fs" \
-         -c 'permissions.agmsg-reviewer.network={ enabled=true }' \
+         -c "$net_c" \
          -- /bin/sh -c "touch -- \"$pos_probe\" && rm -f -- \"$pos_probe\"" \
          >/dev/null 2>&1; then
       die "reviewer sandbox can't write to run_dir ($run_dir); the worker would be unable to reply via send.sh. Check the filesystem profile's write grants for \$SKILL_DIR/run."
     fi
+    agmsg_codex_reviewer_assert_network "$codex_bin" "$cwd" "$fs" "$net_c"
   fi
 
   # Serialize the register→spawn→record-write critical section against a

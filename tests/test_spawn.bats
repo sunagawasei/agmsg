@@ -952,6 +952,8 @@ EOF
   [[ "$output" == *"approval_policy=never"* ]]
   [[ "$output" == *"web_search=live"* ]]
   [[ "$output" == *"permissions.agmsg-consultant.filesystem="* ]]
+  [[ "$output" == *"permissions.agmsg-consultant.network={ enabled=false }"* ]]
+  [[ "$output" != *"--enable network_proxy"* ]]
   # No model/effort override was requested: appcmd must end EXACTLY at
   # approval_policy=never (end-of-string anchor, not just a substring match) —
   # a substring check alone would miss a regression that appends a stray/empty
@@ -1309,6 +1311,19 @@ EOF
   [[ "$output" == *"permissions.agmsg-reviewer.filesystem="* ]]
   [[ "$output" == *":workspace_roots"* ]]
   [[ "$output" != *"sandbox_mode=workspace-write"* ]]     # profile supersedes sandbox_mode
+  [[ "$output" == *"--enable network_proxy"* ]]
+  codex_bin="$(type -P codex)"
+  [[ "$codex_bin" == /* ]]
+  [[ "$output" == *"$codex_bin app-server"* ]]
+  [[ "$output" == *'"github.com"="allow"'* ]]
+  [[ "$output" == *'"api.github.com"="allow"'* ]]
+  [[ "$output" == *'"codeload.github.com"="allow"'* ]]
+  [[ "$output" == *'"uploads.github.com"="allow"'* ]]
+  [[ "$output" == *'"gist.github.com"="allow"'* ]]
+  [[ "$output" == *'"objects.githubusercontent.com"="allow"'* ]]
+  [[ "$output" == *'"raw.githubusercontent.com"="allow"'* ]]
+  [[ "$output" != *'"example.com"="allow"'* ]]
+  [ "$(printf '%s\n' "$output" | grep -o '="allow"' | wc -l | tr -d ' ')" -eq 7 ]
   [[ "$output" == *"web_search=live"* ]]
   [[ "$output" == *"approval_policy=never"* ]]
   # No model/effort override was requested: appcmd must end EXACTLY at
@@ -1364,6 +1379,155 @@ EOF
   [ ! -s "$CAPTURE" ]
 }
 
+# The codex stub executes the network probe's inner shell. A fake curl on PATH
+# decides each branch, so inverting or deleting a check in that shell fails
+# the test. Write probes stay classified as they are for a real enforcing build.
+_install_reviewer_network_stub() {
+  local curldir="$TEST_SKILL_DIR/fake-curl"
+  mkdir -p "$curldir"
+  cat > "$curldir/curl" <<'EOF'
+#!/usr/bin/env bash
+joined="$*"
+if [[ "$joined" == *example.com* ]]; then
+  [ "${AGMSG_FAKE_CURL_MODE:-}" = allow-example ] && exit 0
+  exit 56
+fi
+if [[ "$joined" == *1.1.1.1* ]]; then
+  [ "${AGMSG_FAKE_CURL_MODE:-}" = allow-ip ] && exit 0
+  exit 7
+fi
+if [[ "$joined" == *api.github.com* ]]; then
+  if [ "${AGMSG_FAKE_CURL_MODE:-}" = deny-api ]; then
+    echo "api-unreachable" >&2
+    exit 28
+  fi
+  exit 0
+fi
+echo "unexpected curl: $joined" >&2
+exit 99
+EOF
+  chmod +x "$curldir/curl"
+  cat > "$STUB_BIN/codex" <<EOF
+#!/usr/bin/env bash
+prev=""
+for a in "\$@"; do
+  if [ "\$prev" = "-c" ] && [[ "\$a" == *disallowed-host-reachable* ]]; then
+    script="\$a"
+    printf '%s\n' "\$script" > "$TEST_SKILL_DIR/network-probe-script.txt"
+    # Branch tests substitute the absolute curl so they can force each exit.
+    if [ "\${AGMSG_REWRITE_CURL:-}" = 1 ]; then
+      script="\${script//\\/usr\\/bin\\/curl/$curldir/curl}"
+      PATH="$curldir:\$PATH" exec /bin/sh -c "\$script"
+    fi
+    # PATH-bypass test stays offline. Three absolute curl commands, and no
+    # other curl token once comments are removed, is the production contract.
+    # A bare curl falls through and is satisfied by the fake on PATH.
+    body=\$(printf '%s\n' "\$script" | sed 's/^[[:space:]]*#.*//')
+    abs=\$(printf '%s' "\$body" | grep -o '/usr/bin/curl' | wc -l | tr -d ' ')
+    rest=\$(printf '%s' "\$body" | sed 's|/usr/bin/curl||g')
+    if [ "\$abs" = 3 ] && ! printf '%s' "\$rest" | grep -Eq '(^|[^[:alnum:]_./-])curl([^[:alnum:]_./-]|$)'; then
+      echo disallowed-host-reachable
+      exit 10
+    fi
+    PATH="$curldir:\$PATH" exec /bin/sh -c "\$script"
+  fi
+  prev="\$a"
+done
+args="\$*"
+if [[ "\$args" == *'&& rm'* ]]; then
+  exit 0
+fi
+if [[ "\$args" == *touch* ]]; then
+  echo "Operation not permitted"
+  exit 1
+fi
+exit 0
+EOF
+  chmod +x "$STUB_BIN/codex"
+}
+
+@test "spawn: reviewer network probe fails when a disallowed host is reachable" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  _install_reviewer_network_stub
+  run env AGMSG_REWRITE_CURL=1 AGMSG_FAKE_CURL_MODE=allow-example AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"disallowed-host-reachable"* ]]
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: reviewer network probe fails when a direct IP bypasses the proxy" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  _install_reviewer_network_stub
+  run env AGMSG_REWRITE_CURL=1 AGMSG_FAKE_CURL_MODE=allow-ip AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"direct-ip-bypassed-proxy"* ]]
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: reviewer network probe fails when the allowed host is unreachable" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  _install_reviewer_network_stub
+  run env AGMSG_REWRITE_CURL=1 AGMSG_FAKE_CURL_MODE=deny-api AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"api-unreachable"* ]]
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: reviewer network probe ignores a curl planted on PATH" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  _install_reviewer_network_stub
+  # The stub does not run curl. It refuses only when the probe script names
+  # /usr/bin/curl three times. A bare curl is run via the fake on PATH, which
+  # reports the proxy-success statuses, and the spawn would launch.
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"disallowed-host-reachable"* ]]
+  [ ! -s "$CAPTURE" ]
+  local probe="$TEST_SKILL_DIR/network-probe-script.txt"
+  [ -s "$probe" ]
+  local abs rest
+  abs=$(grep -o '/usr/bin/curl' "$probe" | wc -l | tr -d ' ')
+  [ "$abs" -eq 3 ]
+  rest=$(sed 's/^[[:space:]]*#.*//; s|/usr/bin/curl||g' "$probe")
+  ! printf '%s' "$rest" | grep -Eq '(^|[^[:alnum:]_./-])curl([^[:alnum:]_./-]|$)'
+}
+
+@test "spawn: reviewer ignores a codex shell function and uses the absolute executable" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  _make_fake_bridge
+  codex() { echo FUNCTION_CODEX_USED; exit 86; }
+  export -f codex
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/codex"
+  chmod +x "$STUB_BIN/codex"
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" != *FUNCTION_CODEX_USED* ]]
+  [[ "$output" == *"not enforced"* ]]
+  [ ! -s "$CAPTURE" ]
+}
+
+@test "spawn: reviewer refuses a relative codex path" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  local work="$TEST_SKILL_DIR/relwork"
+  mkdir -p "$work/relbin"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$work/relbin/codex"
+  chmod +x "$work/relbin/codex"
+  run env PATH="relbin:$PATH" \
+    bash -c "cd '$work' && exec bash '$SCRIPTS/spawn.sh' codex rv --project '$PROJ' --headless --reviewer"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"absolute executable"* ]]
+  [[ "$output" == *"relbin/codex"* ]]
+}
+
 # --- headless codex implementer (cwd=repo + workspace-write) ---
 
 @test "spawn: codex --implementer launches in the repo with workspace-write" {
@@ -1384,6 +1548,8 @@ EOF
   [[ "$output" == *"default_permissions=agmsg-implementer"* ]]
   [[ "$output" != *"sandbox_mode=workspace-write"* ]]
   [[ "$output" == *"permissions.agmsg-implementer.filesystem="* ]]
+  [[ "$output" == *"permissions.agmsg-implementer.network={ enabled=false }"* ]]
+  [[ "$output" != *"--enable network_proxy"* ]]
   [[ "$output" != *"default_permissions=agmsg-reviewer"* ]]
   [[ "$output" == *"web_search=live"* ]]
   [[ "$output" == *"approval_policy=never"* ]]
