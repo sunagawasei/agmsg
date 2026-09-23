@@ -38,6 +38,52 @@
 
 _actas_lock_dir() { printf '%s/run' "$SKILL_DIR"; }
 
+# Resolve a bounded wait knob without exposing malformed input to shell
+# arithmetic or sleep. The five arguments are:
+#
+#   raw default minimum maximum kind
+#
+# kind is "decimal" for a polling interval or "integer" for a count. Bounds
+# are inclusive and caller-owned, which lets despawn reuse this unchanged for
+# both its kill-poll interval and maximum poll count. Defaults and bounds are
+# trusted constants; an unset or malformed raw value always prints default.
+agmsg_wait_knob_resolve() {
+  local raw="${1-}" default="${2-}" minimum="${3-}" maximum="${4-}" kind="${5-}"
+
+  if LC_ALL=C awk \
+      -v value="$raw" -v minimum="$minimum" -v maximum="$maximum" -v kind="$kind" '
+        BEGIN {
+          if (kind == "decimal")
+            valid = value ~ /^[0-9]+([.][0-9]+)?$/
+          else if (kind == "integer")
+            valid = value ~ /^[0-9]+$/
+          else
+            valid = 0
+
+          if (!valid || value + 0 < minimum + 0 || value + 0 > maximum + 0)
+            exit 1
+        }
+      ' </dev/null
+  then
+    if [ "$kind" = "integer" ]; then
+      while [ "$raw" != "0" ] && [ "${raw#0}" != "$raw" ]; do
+        raw="${raw#0}"
+      done
+    fi
+    printf '%s\n' "$raw"
+  else
+    printf '%s\n' "$default"
+  fi
+}
+
+# Portable integer wall-clock sample used by bounded polling.
+_agmsg_wait_epoch_seconds() {
+  local now
+  now="$(date +%s 2>/dev/null)" || return 1
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$now"
+}
+
 # --- #1023: run files are keyed by name, and two names can collide ------------
 #
 # `_actas_lock_encode` percent-encodes what a name is made of, but the `__`
@@ -325,6 +371,56 @@ agmsg_spawn_path() {
     1) printf '%s\n' "$legacy" ;;
     *) return 1 ;;
   esac
+}
+
+# Placement lock path for a spawned (team, agent). Distinct prefix from the spawn
+# record so session-team TTL GC's `spawn.<team>__*` glob never touches it.
+_agmsg_placement_lock_path() {
+  local t a
+  t="$(_actas_lock_encode "$1")"; a="$(_actas_lock_encode "$2")"
+  printf '%s/placement.%s__%s.lock' "$(_actas_lock_dir)" "$t" "$a"
+}
+
+# Serializes spawn-record write against despawn --force teardown for one member.
+agmsg_placement_lock_acquire() {
+  local team="$1" agent="$2" timeout="${3:-10}" lock stale_match=""
+  local poll_interval now="" started="" last="" elapsed=0
+  case "$timeout" in ''|*[!0-9]*) return 1 ;; esac
+  poll_interval="$(agmsg_wait_knob_resolve \
+    "${AGMSG_PLACEMENT_LOCK_POLL_INTERVAL-}" 1 0.01 60 decimal)"
+  lock="$(_agmsg_placement_lock_path "$team" "$agent")"
+  mkdir -p "$(_actas_lock_dir)" 2>/dev/null || true
+  while :; do
+    stale_match=""
+    if [ -d "$lock" ]; then
+      stale_match="$(find "$lock" -maxdepth 0 -mmin +2 -print -quit 2>/dev/null || true)"
+    fi
+    if [ -n "$stale_match" ]; then
+      rmdir "$lock" 2>/dev/null || true
+    fi
+    mkdir "$lock" 2>/dev/null && return 0
+
+    now="$(_agmsg_wait_epoch_seconds)" || return 1
+    if [ -z "$started" ]; then
+      started="$now"
+      last="$now"
+      elapsed=0
+    elif [ "$now" -lt "$last" ]; then
+      started="$now"
+      last="$now"
+      elapsed=0
+    else
+      last="$now"
+      elapsed=$((now - started))
+    fi
+    [ "$elapsed" -ge "$timeout" ] && return 1
+    sleep "$poll_interval"
+  done
+}
+
+agmsg_placement_lock_release() {
+  local lock; lock="$(_agmsg_placement_lock_path "$1" "$2")"
+  rmdir "$lock" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
