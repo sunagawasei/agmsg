@@ -161,6 +161,7 @@ get_messages() {
       UNION ALL
       SELECT CAST(id AS TEXT) AS id, team, from_agent, to_agent, body, created_at, id AS ord
       FROM messages
+      WHERE NOT EXISTS (SELECT 1 FROM events e2 WHERE e2.legacy_id=messages.id)
     )
     SELECT json_object(
       'type', 'message_sent',

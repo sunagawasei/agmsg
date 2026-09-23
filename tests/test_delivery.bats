@@ -3110,14 +3110,14 @@ JSON
 }
 
 @test "default-mode: mode unsupported for the type -> empty (falls back to prompt)" {
-  # monitor is not in opencode's delivery_modes (turn off).
+  # monitor is not in copilot's delivery_modes (turn off).
   bash "$SCRIPTS/config.sh" set delivery.default_mode monitor >/dev/null
-  run bash -c "bash '$SCRIPTS/delivery.sh' default-mode opencode 2>/dev/null"
+  run bash -c "bash '$SCRIPTS/delivery.sh' default-mode copilot 2>/dev/null"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
   # ...and the stderr note explains why (visible without the 2>/dev/null).
-  run bash "$SCRIPTS/delivery.sh" default-mode opencode
-  [[ "$output" =~ "not supported for opencode" ]]
+  run bash "$SCRIPTS/delivery.sh" default-mode copilot
+  [[ "$output" =~ "not supported for copilot" ]]
 }
 
 @test "default-mode: junk value -> empty + does not break (would-be-rejected by set)" {
