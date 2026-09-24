@@ -393,6 +393,8 @@ reclassify_candidate() {
   fi
 }
 
+
+
 unescape_body() {
   printf '%s' "$1" | awk '{ gsub(/\\t/, "\t"); gsub(/\\n/, "\n"); print }'
 }
@@ -408,15 +410,19 @@ build_prompt_from_rows() {
     "$TEAM" "$NAME" >> "$out"
   printf 'Unread agmsg messages are grouped by sender below.\n' >> "$out"
 
-  senders="$(awk -F"$US" 'NF >= 2 && !seen[$2]++ { print $2 }' "$rows" 2>/dev/null || true)"
+  senders="$(awk -F"$US" 'NF >= 4 && !seen[$2]++ { print $2 }' "$rows" 2>/dev/null || true)"
   while IFS= read -r sender; do
     [ -n "$sender" ] || continue
     printf "\nMessages from '%s':\n" "$sender" >> "$out"
-    while IFS="$US" read -r id from body ts; do
-      [ "$from" = "$sender" ] || continue
-      ubody="$(unescape_body "$body")"
-      printf '  [%s] %s: %s\n' "$ts" "$from" "$ubody" >> "$out"
-    done < "$rows"
+    awk -v FS="$US" -v sender="$sender" '
+      function unesc(s) { gsub(/\\t/, "\t", s); gsub(/\\n/, "\n", s); return s }
+      NF >= 4 && $2 == sender {
+        ts = $NF
+        body = $3
+        for (i = 4; i < NF; i++) body = body FS $i
+        printf "  [%s] %s: %s\n", ts, sender, unesc(body)
+      }
+    ' "$rows" >> "$out"
   done <<< "$senders"
 
   printf '\nReply to every sender that needs a response. You may send to any recipient represented by the work using:\n' >> "$out"
@@ -427,7 +433,7 @@ build_prompt_from_rows() {
 make_consumed_snapshot() {
   local rows="$1" out="$2"
   awk -F"$US" -v OFS="$US" '
-    NF >= 2 {
+    NF >= 4 {
       if (!seen[$2]++) order[++n] = $2
       ids[$2] = ids[$2] (ids[$2] ? "," : "") $1
     }
@@ -438,7 +444,7 @@ make_consumed_snapshot() {
 }
 
 selected_ids() {
-  awk -F"$US" 'NF >= 1 { ids = ids (ids ? "," : "") $1 } END { print ids }' "$1"
+  awk -F"$US" 'NF >= 4 { ids = ids (ids ? "," : "") $1 } END { print ids }' "$1"
 }
 
 publish_inflight() {
@@ -477,8 +483,9 @@ compensate_inflight() {
 
 reject_poison_row() {
   local line="$1" rendered_bytes="$2" id sender _body _ts notice mark_rc=0
-  IFS="$US" read -r id sender _body _ts <<< "$line"
-  case "$id" in ''|*[!0-9]*) return 1 ;; esac
+  id="${line%%$US*}"
+  sender="$(printf '%s' "$line" | awk -v FS="\x1f" 'NF>=4{print $2; exit}')"
+  agmsg_validate_message_id "$id" || return 1
   [ -n "$sender" ] || return 1
 
   # This row cannot become deliverable on a later wake: it exceeds the hard
@@ -531,7 +538,8 @@ prepare_batch_admitted() {
 
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    case "${line%%$US*}" in ''|*[!0-9]*) continue ;; esac
+    id="${line%%$US*}"
+    agmsg_validate_message_id "$id" || continue
     selected_before=0
     [ -s "$SELECTED_FILE" ] && selected_before=1
     cp "$SELECTED_FILE" "$SELECTED_FILE.next" || return 1

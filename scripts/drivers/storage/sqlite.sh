@@ -242,6 +242,41 @@ storage_list_unread() {
   "
 }
 
+# Bridge/cursor machine path: id<US>from<US>body<US>at rows without stuffing the
+# full unread set into sqlite3 argv (json_each on :memory: hits ARG_MAX for ~MiB
+# bodies — cf. test_claude_code_bridge poison batch).
+storage_list_unread_machine() {
+  local team="$1" agent="$2" limit=""
+  shift 2
+  while [ $# -gt 0 ]; do case "$1" in --limit) limit="$2"; shift 2 ;; *) shift ;; esac; done
+  case "$limit" in ''|*[!0-9]*) limit="" ;; esac
+  storage_init >/dev/null
+  local tl al; tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
+  _sqlite_data "
+    SELECT id || char(31) || from_agent || char(31) ||
+           replace(replace(body, char(10), char(92)||char(110)), char(9), char(92)||char(116)) || char(31) || at
+    FROM (
+      SELECT e.id AS id, e.from_agent AS from_agent, e.body AS body, e.at AS at,
+             e.at AS ts, 1 AS src, e.seq AS ord
+      FROM events e
+      WHERE e.type='message_sent' AND e.team='$tl' AND e.to_agent='$al'
+        AND e.seq>COALESCE((SELECT local_position FROM read_cursors
+                            WHERE team='$tl' AND agent='$al'),0)
+        AND NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
+                        AND r.team=e.team AND r.agent='$al' AND r.msg_id=e.id)
+      UNION ALL
+      SELECT CAST(m.id AS TEXT), m.from_agent, m.body, m.created_at,
+             m.created_at AS ts, 0 AS src, m.id AS ord
+      FROM messages m
+      WHERE m.team='$tl' AND m.to_agent='$al' AND m.read_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
+                        AND r.team=m.team AND r.agent='$al' AND r.msg_id=CAST(m.id AS TEXT))
+        AND NOT EXISTS (SELECT 1 FROM events e2 WHERE e2.legacy_id=m.id)
+    )
+    ORDER BY ts, src, ord ${limit:+LIMIT $limit};
+  "
+}
+
 # storage_mark_read_batch <team> <agent> <id> [<id> ...]  (control op)
 storage_mark_read_batch() {
   local team="$1" agent="$2"; shift 2

@@ -4,6 +4,7 @@ load test_helper
 
 setup() {
   setup_test_env
+  unset AGMSG_CLAUDE_BRIDGE_BATCH_BYTES
   export SKILL_DIR="$TEST_SKILL_DIR"
   export RUN="$TEST_SKILL_DIR/run"
   export PROJ="$TEST_SKILL_DIR/project"
@@ -158,6 +159,13 @@ STUB
   export FAKE_CREATE_TRANSCRIPT=0
   export FAKE_HANG_REJECTION=0
   export FAKE_TO=alice
+  unset AGMSG_CLAUDE_BRIDGE_BATCH_BYTES
+}
+
+_inflight_record_exists() {
+  shopt -s nullglob
+  local hits=("$RUN"/inflight-record.*)
+  [ "${#hits[@]}" -gt 0 ]
 }
 
 teardown() {
@@ -179,6 +187,14 @@ send_to_worker() {
 
 db_scalar() {
   sqlite3 "$FAKE_DB" "$1" | tr -d '\r'
+}
+
+event_id_for_body() {
+  db_scalar "SELECT id FROM events WHERE type='message_sent' AND body LIKE '$1' LIMIT 1;"
+}
+
+legacy_id_for_body() {
+  db_scalar "SELECT id FROM messages WHERE body LIKE '$1' LIMIT 1;"
 }
 
 worker_unread_is_zero() {
@@ -560,17 +576,18 @@ WRAPPER
     printf 'POISON:'
     head -c 1099993 /dev/zero | tr '\0' P
   } | bash "$SCRIPTS/send.sh" team bob worker --stdin >/dev/null
-  poison_id="$(db_scalar "SELECT id FROM messages WHERE body LIKE 'POISON:%';")"
+  poison_id="$(legacy_id_for_body 'POISON:%')"
+  poison_eid="$(event_id_for_body 'POISON:%')"
   {
     printf 'FITS:'
     head -c 549995 /dev/zero | tr '\0' F
   } | bash "$SCRIPTS/send.sh" team alice worker --stdin >/dev/null
-  fits_id="$(db_scalar "SELECT id FROM messages WHERE body LIKE 'FITS:%';")"
+  fits_id="$(legacy_id_for_body 'FITS:%')"
   {
     printf 'DEFER:'
     head -c 549994 /dev/zero | tr '\0' D
   } | bash "$SCRIPTS/send.sh" team bob worker --stdin >/dev/null
-  defer_id="$(db_scalar "SELECT id FROM messages WHERE body LIKE 'DEFER:%';")"
+  defer_id="$(legacy_id_for_body 'DEFER:%')"
   export FAKE_CHECK_DB=1
 
   run bridge
@@ -584,7 +601,7 @@ WRAPPER
   [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE id=$poison_id AND read_at IS NOT NULL;")" -eq 1 ]
   [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE id=$fits_id AND read_at IS NOT NULL;")" -eq 1 ]
   [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE id=$defer_id AND read_at IS NULL;")" -eq 1 ]
-  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE from_agent='worker' AND to_agent='bob' AND body LIKE '[bridge-error]%message id $poison_id%rendered prompt%1048576 bytes%';")" -eq 1 ]
+  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE from_agent='worker' AND to_agent='bob' AND body LIKE '[bridge-error]%message id $poison_eid%rendered prompt%1048576 bytes%';")" -eq 1 ]
   [ "$(printf '%s\n' "$output" | grep -c 'wakeup 1 for team/worker')" -eq 1 ]
   [ "$(printf '%s\n' "$output" | grep -c 'wakeup 2 for team/worker')" -eq 0 ]
 }
@@ -593,15 +610,17 @@ WRAPPER
   head -c 2048 /dev/zero | tr '\0' R \
     > "$RUN/claude-code-bridge.team.worker.role"
   send_to_worker alice "small body"
-  message_id="$(db_scalar "SELECT id FROM messages WHERE body='small body';")"
+  local message_legacy message_eid
+  message_legacy="$(legacy_id_for_body 'small body')"
+  message_eid="$(event_id_for_body 'small body')"
   export AGMSG_CLAUDE_BRIDGE_BATCH_BYTES=1024
 
   run bridge
   [ "$status" -eq 0 ]
 
   [ ! -e "$CAPTURE/call-count" ]
-  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE id=$message_id AND read_at IS NOT NULL;")" -eq 1 ]
-  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE from_agent='worker' AND to_agent='alice' AND body LIKE '[bridge-error]%message id $message_id%stdin batch cap of 1024 bytes%';")" -eq 1 ]
+  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE id=$message_legacy AND read_at IS NOT NULL;")" -eq 1 ]
+  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE from_agent='worker' AND to_agent='alice' AND body LIKE '[bridge-error]%message id $message_eid%stdin batch cap of 1024 bytes%';")" -eq 1 ]
   [ "$(printf '%s\n' "$output" | grep -c 'wakeup 1 for team/worker')" -eq 1 ]
   [ "$(printf '%s\n' "$output" | grep -c 'started turn')" -eq 0 ]
 }
@@ -730,13 +749,18 @@ STUB
   [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE to_agent='alice' AND body LIKE '%bridge-error%';")" -eq 0 ]
 }
 
+_inflight_or_turn_started() {
+  [ -f "$CAPTURE/hang-pids" ] && return 0
+  _inflight_record_exists
+}
+
 @test "SIGKILL after mark-read is compensated by inflight reap without restoring unread" {
   send_to_worker alice doomed
   export FAKE_MODE=hang
   bridge > "$TEST_SKILL_DIR/hang-inflight.out" 2>&1 3>&- &
   local bpid=$!
   test_fixture_register_owned_pid "$bpid"
-  wait_until 15 bash -c "compgen -G '$RUN/inflight-record.*' >/dev/null"
+  wait_until 15 _inflight_or_turn_started
   wait_until 15 worker_unread_is_zero
   wait_for_file "$RUN/claude-code-bridge.team.worker.pid"
   local bridge_pid

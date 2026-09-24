@@ -5,6 +5,10 @@
 # are sourced by claude-code-bridge.sh and watch-once.sh after storage.sh,
 # actas-lock.sh, and subscription.sh have been loaded.
 
+_agmsg_claude_delivery_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../lib" && pwd)"
+# shellcheck source=../../../lib/validate.sh
+. "$_agmsg_claude_delivery_lib/validate.sh"
+
 agmsg_delivery_on_enable() {
   echo "Future sessions: SessionStart hook will auto-launch the watcher."
   emit_monitor_directive "$2" "$3"
@@ -83,22 +87,32 @@ agmsg_claude_code_has_outbound_after() {
 # unread. inbox.sh's ack path is intentionally best-effort and returns zero on a
 # sqlite failure, so the verification query is required before launching a turn.
 agmsg_claude_code_mark_exact() {
-  local team="$1" name="$2" ids="$3" db count t_esc n_esc
-  case "$ids" in
-    ''|*[!0-9,]*|,*|*,|*,,*) return 1 ;;
-  esac
+  local team="$1" name="$2" ids="$3" db count id_sql t_esc n_esc
+  agmsg_validate_message_id_csv "$ids" || return 1
   agmsg_claude_code_db_fault mark && return 1
   "$SKILL_DIR/scripts/inbox.sh" "$team" "$name" \
     --mark-read-ids "$ids" >/dev/null 2>&1 || return 1
   agmsg_claude_code_db_fault verify && return 2
+  id_sql="$(agmsg_message_ids_sql_in_clause "$ids")" || return 2
   db="$(agmsg_db_path)" || return 2
   [ -f "$db" ] || return 2
   t_esc="$(agmsg_claude_code_sql_escape "$team")"
   n_esc="$(agmsg_claude_code_sql_escape "$name")"
   count="$(agmsg_sqlite "$db" "
-    SELECT COUNT(*) FROM messages
-    WHERE team='$t_esc' AND to_agent='$n_esc'
-      AND read_at IS NULL AND id IN ($ids);
+    SELECT COUNT(*) FROM (
+      SELECT e.id FROM events e
+      WHERE e.type='message_sent' AND e.team='$t_esc' AND e.to_agent='$n_esc'
+        AND (e.id IN ($id_sql) OR CAST(e.legacy_id AS TEXT) IN ($id_sql))
+        AND NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
+          AND r.team=e.team AND r.agent='$n_esc' AND r.msg_id=e.id)
+      UNION ALL
+      SELECT CAST(m.id AS TEXT) FROM messages m
+      WHERE m.team='$t_esc' AND m.to_agent='$n_esc' AND m.read_at IS NULL
+        AND CAST(m.id AS TEXT) IN ($id_sql)
+        AND NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
+          AND r.team=m.team AND r.agent='$n_esc' AND r.msg_id=CAST(m.id AS TEXT))
+        AND NOT EXISTS (SELECT 1 FROM events e2 WHERE e2.legacy_id=m.id)
+    );
   " 2>/dev/null)" || return 2
   count="$(printf '%s' "$count" | tr -d '\r\n')"
   case "$count" in ''|*[!0-9]*) return 2 ;; esac

@@ -15,6 +15,8 @@ _agmsg_inflight_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_agmsg_inflight_lib_dir/actas-lock.sh"
 # shellcheck disable=SC1091
 . "$_agmsg_inflight_lib_dir/type-registry.sh"
+# shellcheck disable=SC1091
+. "$_agmsg_inflight_lib_dir/validate.sh"
 if ! command -v agmsg_db_path >/dev/null 2>&1; then
   # shellcheck disable=SC1091
   . "$_agmsg_inflight_lib_dir/storage.sh"
@@ -67,10 +69,11 @@ _agmsg_inflight_log_sanitize() {
 }
 
 _agmsg_inflight_ids_ok() {
-  case "$1" in
-    ''|*[!0-9,]*|,*|*,|*,,*) return 1 ;;
-  esac
-  return 0
+  agmsg_validate_message_id_csv "$1"
+}
+
+_agmsg_inflight_sql_id_list() {
+  agmsg_message_ids_sql_in_clause "$1"
 }
 
 _agmsg_inflight_read_field() {
@@ -252,16 +255,28 @@ agmsg_inflight_settle() {
 # callers must keep the in-flight record and not start a turn. Printing 0 for
 # those cases would fail-open and let a caller settle a still-consumed request.
 agmsg_inflight_unread_count() {
-  local team="$1" name="$2" ids="$3" db t_esc n_esc count
+  local team="$1" name="$2" ids="$3" db t_esc n_esc count id_sql
   _agmsg_inflight_ids_ok "$ids" || return 2
+  id_sql="$(_agmsg_inflight_sql_id_list "$ids")" || return 2
   db="$(agmsg_db_path)" || return 2
   [ -f "$db" ] || return 2
   t_esc="$(printf '%s' "$team" | sed "s/'/''/g")"
   n_esc="$(printf '%s' "$name" | sed "s/'/''/g")"
   count="$(agmsg_sqlite "$db" "
-    SELECT COUNT(*) FROM messages
-    WHERE team='$t_esc' AND to_agent='$n_esc'
-      AND read_at IS NULL AND id IN ($ids);
+    SELECT COUNT(*) FROM (
+      SELECT e.id FROM events e
+      WHERE e.type='message_sent' AND e.team='$t_esc' AND e.to_agent='$n_esc'
+        AND (e.id IN ($id_sql) OR CAST(e.legacy_id AS TEXT) IN ($id_sql))
+        AND NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
+          AND r.team=e.team AND r.agent='$n_esc' AND r.msg_id=e.id)
+      UNION ALL
+      SELECT CAST(m.id AS TEXT) FROM messages m
+      WHERE m.team='$t_esc' AND m.to_agent='$n_esc' AND m.read_at IS NULL
+        AND CAST(m.id AS TEXT) IN ($id_sql)
+        AND NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
+          AND r.team=m.team AND r.agent='$n_esc' AND r.msg_id=CAST(m.id AS TEXT))
+        AND NOT EXISTS (SELECT 1 FROM events e2 WHERE e2.legacy_id=m.id)
+    );
   " 2>/dev/null)" || return 2
   count="$(printf '%s' "$count" | tr -d '\r\n')"
   case "$count" in ''|*[!0-9]*) return 2 ;; esac

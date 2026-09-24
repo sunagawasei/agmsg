@@ -68,3 +68,83 @@ agmsg_validate_agent_name() {
   esac
   return 0
 }
+
+# Message ids from the storage facade: legacy decimal strings or UUIDv7 (same
+# charset rules as inbox.sh --mark-read-ids).
+agmsg_validate_message_id() {
+  case "$1" in
+    ''|*,*|,* ) return 1 ;;
+    *[!0-9a-fA-F-]*) return 1 ;;
+  esac
+  return 0
+}
+
+agmsg_validate_message_id_csv() {
+  local csv="$1" part
+  case "$csv" in ''|,*|*,|*,,*) return 1 ;; esac
+  IFS=',' read -r -a _agmsg_id_parts <<< "$csv"
+  for part in "${_agmsg_id_parts[@]}"; do
+    agmsg_validate_message_id "$part" || return 1
+  done
+  return 0
+}
+
+# Build a quoted SQL IN (...) list for validated message ids.
+agmsg_message_ids_sql_in_clause() {
+  local csv="$1" out="" part esc
+  agmsg_validate_message_id_csv "$csv" || return 1
+  IFS=',' read -r -a _agmsg_id_sql_parts <<< "$csv"
+  for part in "${_agmsg_id_sql_parts[@]}"; do
+    esc="$(printf '%s' "$part" | sed "s/'/''/g")"
+    out="${out:+$out,}'$esc'"
+  done
+  printf '%s' "$out"
+}
+
+# Machine inbox row: id<US>from<US>body<US>ts (body may contain US). On success
+# prints four lines — id, from, body, ts — to stdout; exit status 1 if invalid.
+agmsg_parse_machine_inbox_row() {
+  local line="$1"
+  printf '%s' "$line" | awk -v FS="\x1f" '
+    NF >= 4 {
+      id = $1
+      from = $2
+      ts = $NF
+      body = $3
+      for (i = 4; i < NF; i++) body = body FS $i
+      print id
+      print from
+      print body
+      print ts
+      exit 0
+    }
+    { exit 1 }
+  '
+}
+
+# Populate shell variables named by the next four arguments (id from body ts).
+# Example: agmsg_parse_machine_inbox_row_assign "$line" id from body ts
+agmsg_parse_machine_inbox_row_assign() {
+  local line="$1" v_id="$2" v_from="$3" v_body="$4" v_ts="$5"
+  local tmp n
+  tmp="$(mktemp "${TMPDIR:-/tmp}/agmsg-mrow.XXXXXX")" || return 1
+  if ! agmsg_parse_machine_inbox_row "$line" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  n="$(wc -l < "$tmp" | tr -d ' ')"
+  if [ "$n" -lt 4 ]; then
+    rm -f "$tmp"
+    return 1
+  fi
+  # shellcheck disable=SC2162
+  read -r "$v_id" < <(sed -n '1p' "$tmp")
+  # shellcheck disable=SC2162
+  read -r "$v_from" < <(sed -n '2p' "$tmp")
+  # shellcheck disable=SC2162
+  read -r "$v_ts" < <(tail -n 1 "$tmp")
+  # shellcheck disable=SC2162
+  read -r "$v_body" < <(sed -n '3,$p' "$tmp" | sed '$d')
+  rm -f "$tmp"
+  return 0
+}

@@ -65,6 +65,26 @@ if [ -n "$MARK_IDS" ]; then
   exit 0
 fi
 
+# --- machine mode: id-tagged unread, never marked read ------------------------
+# Query the store directly; do not json_each the full unread JSONL into argv.
+if [ "$FORMAT" = ids ]; then
+  if declare -F storage_list_unread_machine >/dev/null 2>&1; then
+    storage_list_unread_machine "$TEAM" "$AGENT"
+  else
+    UNREAD_JSONL=$(storage_list_unread "$TEAM" "$AGENT")
+    [ -z "$UNREAD_JSONL" ] && exit 0
+    _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
+    agmsg_sqlite ':memory:' "
+      SELECT json_extract(value,'\$.id') || char(31) ||
+             json_extract(value,'\$.from') || char(31) ||
+             replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
+             json_extract(value,'\$.at')
+      FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
+    "
+  fi
+  exit 0
+fi
+
 # Unread comes from the storage facade (§2.1 storage_list_unread = the event log
 # UNION the legacy messages table), as one JSONL record per line in delivery
 # order. Parse it with sqlite's JSON funcs in a single pass — the repo idiom, no
@@ -74,19 +94,6 @@ UNREAD_JSONL=$(storage_list_unread "$TEAM" "$AGENT")
 if [ -z "$UNREAD_JSONL" ]; then
   if [ "$QUIET" = true ] || [ "$FORMAT" = ids ]; then exit 0; fi
   echo "No new messages."
-  exit 0
-fi
-
-# --- machine mode: id-tagged unread, never marked read ------------------------
-if [ "$FORMAT" = ids ]; then
-  _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
-  agmsg_sqlite ':memory:' "
-    SELECT json_extract(value,'\$.id') || char(31) ||
-           json_extract(value,'\$.from') || char(31) ||
-           replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
-           json_extract(value,'\$.at')
-    FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
-  "
   exit 0
 fi
 
