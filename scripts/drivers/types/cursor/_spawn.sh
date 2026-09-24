@@ -98,6 +98,14 @@ agmsg_spawn_resolve_modes() {
 # HEADLESS=1. cwd is the target repo (PROJECT); cursor reads it but — without
 # --force — cannot modify it.
 agmsg_spawn_headless() {
+  # Every cursor-agent invocation this worker's lifecycle touches -- create-chat
+  # just below, the bridge process launched further down, and every turn it
+  # runs -- must see this so check-inbox.sh's `stop` hook exits immediately
+  # instead of firing INSIDE the worker's own turns. Hooks resolve by
+  # --workspace, not cwd, so a headless cursor run with --workspace "$PROJECT"
+  # would otherwise trigger the project's own .cursor/hooks.json.
+  export AGMSG_CURSOR_BRIDGE=1
+
   local run_dir="$SKILL_DIR/run"
   mkdir -p "$run_dir"
 

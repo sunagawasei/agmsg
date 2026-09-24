@@ -3,6 +3,16 @@ set -uo pipefail
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 
+# The headless cursor worker's own turns set this so this SessionEnd hook never
+# treats a worker turn's --resume-triggered sessionEnd as the interactive
+# session ending (cursor fires sessionEnd on --resume even for the worker's own
+# read-only turns; misreading that here would publish a tombstone and snapshot
+# teardown for a session that never ended). Same guard, same reasoning, as
+# check-inbox.sh's. See _spawn.sh / cursor-bridge.sh.
+if [ -n "${AGMSG_CURSOR_BRIDGE:-}" ]; then
+  exit 0
+fi
+
 # SessionEnd hook — symmetric counterpart of session-start.sh.
 #
 # Usage: session-end.sh <type> <project_path>
@@ -56,12 +66,44 @@ fi
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/process-identity.sh"
 INSTANCE_ID="$(agmsg_instance_id "$SESSION_ID" "$TYPE")"
-STEAM="s-${SESSION_ID%%.*}"
 
-# Snapshot every session-team spawn record before detaching cleanup. The worker
-# uses this immutable view to avoid tearing down a replacement spawned after
-# SessionEnd fired.
+# Stop this session's cursor inject watcher (inject-watch.sh), keyed on the
+# same INSTANCE_ID as watch.sh's pidfile but under its own name — it does not
+# share watch.*.pid, so it is not reached by that pidfile's owner-stop path
+# (which can sit waiting on a re-verification round-trip; a watcher whose pipe
+# closes during that wait would go unnoticed, leaving it running and still
+# injecting into a pane for a session that has already ended). A bare TERM is
+# enough: inject-watch.sh's own trap removes its pidfile on receipt.
+#
+# Verify ownership from the sidecar file before signalling, using only plain
+# reads (process-identity.sh's own field parser, no fork) — a PID this
+# session's own inject-watch.sh already released could otherwise have been
+# recycled by an unrelated process by the time this hook runs. This stops
+# short of process-identity.sh's full lease-probing verification
+# (agmsg_process_signal_owned): that forks a python/lockf helper and this
+# section must stay non-blocking (see this file's header on why teardown that
+# can stall is detached to session-end-worker.sh instead) — a pid+kind match
+# on the owner sidecar is enough to rule out the PID-reuse case review flagged,
+# and this script already declares itself best-effort throughout.
+INJECT_PIDFILE="$RUN_DIR/inject-watch.$INSTANCE_ID.pid"
+INJECT_PID="$(_agmsg_process_read_pid "$INJECT_PIDFILE" 2>/dev/null || true)"
+if [ -n "$INJECT_PID" ]; then
+  INJECT_OWNER="$(agmsg_process_owner_path "$INJECT_PIDFILE")"
+  INJECT_OWNER_PID="$(_agmsg_process_owner_field "$INJECT_OWNER" pid 2>/dev/null || true)"
+  INJECT_OWNER_KIND="$(_agmsg_process_owner_field "$INJECT_OWNER" kind 2>/dev/null || true)"
+  if [ "$INJECT_PID" = "$INJECT_OWNER_PID" ] && [ "$INJECT_OWNER_KIND" = "inject-watch" ]; then
+    kill -TERM "$INJECT_PID" 2>/dev/null || true
+  fi
+fi
+
+# Snapshot every session-team spawn record. Use the exact encoded-team prefix
+# that agmsg_spawn_path writes, strip only that known prefix, then decode the
+# remaining worker name. One temp file keeps the detached argv small even when
+# several headless workers belong to the session.
+STEAM="s-${SESSION_ID%%.*}"
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 SNAPSHOT_PATH="$(mktemp "$RUN_DIR/.session-end-snapshot.XXXXXX" 2>/dev/null || true)"
 if [ -n "$SNAPSHOT_PATH" ]; then
@@ -75,24 +117,6 @@ if [ -n "$SNAPSHOT_PATH" ]; then
     RECORD="$(cat "$SPAWN_FILE" 2>/dev/null || true)"
     printf '%s\t%s\n' "$NAME" "$RECORD" >>"$SNAPSHOT_PATH" 2>/dev/null || true
   done
-fi
-
-PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
-if [ -f "$PIDFILE" ]; then
-  pid=$(cat "$PIDFILE" 2>/dev/null || true)
-  # _agmsg_pid_alive_local: EPERM-aware, so a live watcher still gets cleaned --
-  # and no tasklist, which cannot see the $$ watch.sh recorded (#567).
-  if [ -n "$pid" ] && _agmsg_pid_alive_local "$pid"; then
-    # Defensive: only kill if the pid's command line still looks like our
-    # watch.sh. Pids can be recycled — a stale pidfile could point at an
-    # unrelated process that took the same pid.
-    cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
-    case "$cmd" in
-      *"$SKILL_DIR/scripts/watch.sh"*) kill "$pid" 2>/dev/null || true ;;
-      *) ;;
-    esac
-  fi
-  rm -f "$PIDFILE"
 fi
 
 # Publish the intentional teardown before detaching the slow cleanup worker. A
