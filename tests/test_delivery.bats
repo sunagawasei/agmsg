@@ -1594,6 +1594,223 @@ JSON
   rm -f /tmp/agmsg-as-bob
 }
 
+# Read one pair's store-owned local read frontier (copied from
+# test_resume_seat_guard.bats, itself copied from test_watch.bats).
+_cursor_read_cursor() {
+  ( export SKILL_DIR="$TEST_SKILL_DIR"
+    # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/storage.sh"
+    agmsg_storage_load
+    storage_read_cursor_get "$1" "$2" )
+}
+
+_cursor_ready_path() {
+  ( export SKILL_DIR="$TEST_SKILL_DIR"
+    # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/actas-lock.sh"
+    agmsg_ready_path "$1" "$2" )
+}
+
+@test "watch.sh advances the pair's stored read cursor after delivering a message, instead of redelivering it every poll (#1349)" {
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  # Regression test for a watch.sh path (the busy delivery branch, kind=cursor
+  # handling) that printed a batch but never called storage_read_cursor_consume
+  # for it. With nothing ever advancing this pair's read_cursors row,
+  # storage_watch_after kept re-returning the same message every poll, and the
+  # stuck-cursor guard (STUCK_THRESHOLD=3 polls of no advance) fired and exited
+  # the watcher -- on every pair that ever received a message, independent of
+  # body size, despite the guard's own #1045/#777 wording pointing at argv size.
+  bash "$SCRIPTS/join.sh" cursorteam alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" cursorteam bob   claude-code "$TEST_PROJECT" >/dev/null
+
+  local out="$TEST_SKILL_DIR/cursor-advance.log"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" cursor-sid "$TEST_PROJECT" claude-code bob \
+    >"$out" 2>/dev/null 3>&- &
+  local pid=$!
+  wait_for_file "$(_cursor_ready_path cursorteam bob)"
+
+  bash "$SCRIPTS/send.sh" cursorteam alice bob "cursor-once" --force >/dev/null
+  wait_for_file_contains "$out" "cursor-once"
+
+  # Several more polls with nothing new to deliver. A watcher stuck on the
+  # regression re-prints "cursor-once" every cycle and self-exits via the
+  # STUCK guard well within this window; a healthy one is caught up and idle.
+  sleep 5
+
+  run kill -0 "$pid"
+  [ "$status" -eq 0 ]
+  ! grep -q "is STUCK" "$out"
+  [ "$(grep -c "cursor-once" "$out")" -eq 1 ]
+  # `run` so a failed/empty read (status!=0, output="") cannot slip past a bare
+  # `!= "0"` string comparison as a false pass (codex review finding).
+  run _cursor_read_cursor cursorteam bob
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ ^[0-9]+$ ]]
+  [ "$output" -gt 0 ]
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+@test "watch.sh preserves quotes/CR/LF/tabs and delivers a moderately large body exactly once (#1349)" {
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  # This test checks CONTENT correctness (quotes/CR/LF/tab survive the
+  # surviving safe ROWS build unmangled) at a size larger than the tiny
+  # fixtures above. It does NOT prove the safe path (mktemp+stdin) is what
+  # ran rather than the removed unsafe one (inline argv + `sed`) -- at this
+  # size and with this content, the old unsafe rebuild would produce the
+  # same output (round-3 review finding). The single-call-site test below
+  # ("...never rebuilds ROWS a second time...") is what actually guards
+  # against that rebuild's reintroduction; this test is content-only.
+  #
+  # NOT sized to cross an OS argv ceiling (round-2 review finding): the real
+  # ceiling varies by platform (Linux ~131072 bytes; this host's macOS ARG_MAX
+  # is 1048576, so even 500000 bytes goes through argv fine here). It IS sized
+  # large enough to be more than the original tiny fixtures while staying
+  # fast: the safe path's bash-native `${var//pattern/replacement}` escaping
+  # step is slow on macOS's stock bash 3.2 (round-2 review measured ~25s for a
+  # 200000-byte body there), which would make a much larger fixture a
+  # platform-dependent timeout flake rather than a meaningful check.
+  bash "$SCRIPTS/join.sh" bigteam alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" bigteam bob   claude-code "$TEST_PROJECT" >/dev/null
+
+  local out="$TEST_SKILL_DIR/big-body.log"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" big-sid "$TEST_PROJECT" claude-code bob \
+    >"$out" 2>/dev/null 3>&- &
+  local pid=$!
+  wait_for_file "$(_cursor_ready_path bigteam bob)"
+
+  local body_file="$TEST_SKILL_DIR/big-body.txt"
+  python3 -c "
+import sys
+sys.stdout.write(\"line-one-with-'quotes'\r\nline-two-with-a-tab\there\r\n\" + ('X' * 5000))
+" > "$body_file"
+
+  bash "$SCRIPTS/send.sh" bigteam alice bob --stdin < "$body_file" >/dev/null
+  wait_for_file_contains "$out" "line-one-with-'quotes'"
+  # A few more polls: a STUCK regression here would exit within them.
+  sleep 3
+
+  run kill -0 "$pid"
+  [ "$status" -eq 0 ]
+  ! grep -q "is STUCK" "$out"
+  [ "$(grep -c "line-one-with-'quotes'" "$out")" -eq 1 ]
+  grep -qF 'line-two-with-a-tab\there' "$out"   # CR stripped, LF/tab preserved as literal \n / \t
+  [ "$(grep -F "line-one-with-'quotes'" "$out" | wc -c | tr -d ' ')" -gt 5000 ]
+  run _cursor_read_cursor bigteam bob
+  [ "$status" -eq 0 ]
+  [ "$output" -gt 0 ]
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+@test "watch.sh never rebuilds ROWS a second time from a raw argv (#1349)" {
+  # Structural guard, not a behavioral one: this diff removed a call site
+  # that rebuilt ROWS a second time via `agmsg_sqlite ':memory:' "<SQL with
+  # the batch interpolated into the argv string>"`, immediately after -- and
+  # discarding -- a safe mktemp+stdin build of the same data. No fixture size
+  # or content can prove "the safe path ran, not a reintroduced unsafe
+  # twin" (round-3 review finding: at moderate sizes the two produce
+  # identical output), so this checks a narrower, count-only invariant: there
+  # is only ONE call site building ROWS from a message batch at all, which
+  # catches an exact-duplicate reintroduction. It does NOT confirm that one
+  # site is still the stdin form specifically (round-4 review finding) -- a
+  # single call site rewritten back to raw argv would still pass this count.
+  local count
+  count="$(grep -c "agmsg_sqlite ':memory:'" "$SCRIPTS/watch.sh")"
+  [ "$count" -eq 1 ]
+}
+
+@test "watch.sh's stuck-cursor exit uses the documented status, not an unbound-variable crash (#1349)" {
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  [ "$(id -u)" -eq 0 ] && skip "chmod 444 is ineffective as root (same precedent as test_watch.bats:909)"
+  # _AGMSG_EXIT_DELIVERY_UNHEALTHY was referenced by both of watch.sh's
+  # "delivery unhealthy" exit paths but never defined anywhere -- under
+  # `set -u` both crashed with "unbound variable" (status 1) instead of the
+  # distinct status this test checks for. Forces the stuck-guard path
+  # independently of whether THIS diff's Bug 2 fix is present, by making the
+  # DB read-only right after the message lands: storage_read_cursor_consume's
+  # UPDATE then fails (swallowed by its own `|| true`) while the plain SELECTs
+  # (storage_read_cursor_get / storage_watch_after) still succeed, so the
+  # cursor freezes and the guard fires the same way Bug 2 used to cause
+  # unconditionally.
+  bash "$SCRIPTS/join.sh" stuckteam alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" stuckteam bob   claude-code "$TEST_PROJECT" >/dev/null
+
+  local out="$TEST_SKILL_DIR/stuck-exit.log" err="$TEST_SKILL_DIR/stuck-exit.err"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" stuck-sid "$TEST_PROJECT" claude-code bob \
+    >"$out" 2>"$err" 3>&- &
+  local pid=$!
+  wait_for_file "$(_cursor_ready_path stuckteam bob)"
+
+  local db="$TEST_SKILL_DIR/db/messages.db"
+  # SIGSTOP the watcher across send+chmod: without this, nothing guarantees
+  # the watcher's own poll doesn't land in the gap between the two and
+  # consume the message before the DB goes read-only, racing the test into a
+  # false pass via a wait_for_file_contains timeout (review finding, round 2
+  # -- 3 successful reruns had not ruled this out, only failed to hit it).
+  # SIGSTOP makes that gap have zero wall-clock width for the watcher.
+  kill -STOP "$pid"
+  bash "$SCRIPTS/send.sh" stuckteam alice bob "wedged" --force >/dev/null
+  chmod 444 "$db"
+  kill -CONT "$pid"
+
+  wait_for_file_contains "$out" "is STUCK"
+  # Plain `wait`, not `run wait` -- `run` executes in a subshell where $pid is
+  # not a job of THAT shell, so bash's wait returns 127 ("not a child of this
+  # shell") instead of the watcher's real exit status.
+  local rc=0
+  wait "$pid" || rc=$?
+  chmod 644 "$db"
+
+  [ "$rc" -eq 3 ]
+  ! grep -q "unbound variable" "$err"
+}
+
+@test "watch.sh's storage-read-failure exit uses the documented status, not an unbound-variable crash (#1349)" {
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  # The OTHER of watch.sh's two "delivery unhealthy" exit paths (the STUCK
+  # guard above is the other). Forces it OS/permission-independently -- a
+  # regular FILE where the storage dir needs to be a directory makes
+  # storage_init's own mkdir -p and the sqlite3 open both fail structurally,
+  # unlike chmod 444/000 which root ignores (round-3 review finding, applied
+  # here pre-emptively rather than waiting for the same finding a third
+  # time). That alone hits an EARLIER, separate DB-open healthcheck (#197)
+  # that exits 1 before the per-pair loop even starts -- not what this test
+  # targets -- so the watcher is let start normally against a WORKING db
+  # first, and the file is corrupted in place afterward: storage_store_exists
+  # (a plain `-f` check) still sees a file and lets the per-pair loop reach
+  # storage_read_cursor_get, which is where THIS failure needs to happen.
+  #
+  # No STOP/CONT barrier around the corrupting write, unlike the STUCK test
+  # above: `kill -STOP`/`kill -CONT` on this watcher process, tried here,
+  # made bash's own `wait` report a bogus status (128+17, a stop-signal
+  # encoding) instead of the script's real exit code -- some interaction
+  # between the external STOP/CONT and this script's own signal handling,
+  # not a test bug. Without it, the race window is a single `>` redirect's
+  # write, not a multi-command gap like the STUCK test's send+chmod, so it is
+  # narrow enough to leave alone (confirmed reliable across reruns below).
+  bash "$SCRIPTS/join.sh" failteam alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" failteam bob   claude-code "$TEST_PROJECT" >/dev/null
+
+  local out="$TEST_SKILL_DIR/read-fail-exit.log" err="$TEST_SKILL_DIR/read-fail-exit.err"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" readfail-sid "$TEST_PROJECT" claude-code bob \
+    >"$out" 2>"$err" 3>&- &
+  local pid=$!
+  wait_for_file "$(_cursor_ready_path failteam bob)"
+
+  local db="$TEST_SKILL_DIR/db/messages.db"
+  echo "corrupted, not a real sqlite db anymore" > "$db"
+
+  wait_for_file_contains "$out" "cannot read delivery state"
+  local rc=0
+  wait "$pid" || rc=$?
+
+  [ "$rc" -eq 3 ]
+  ! grep -q "unbound variable" "$err"
+}
+
 @test "watch.sh exits when active_name is not registered" {
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON

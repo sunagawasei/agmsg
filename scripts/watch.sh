@@ -232,6 +232,11 @@ esac
 NO_STORE_REPORTED=""
 STUCK_MAP=""
 STUCK_THRESHOLD=3
+# Distinct from a bash "unbound variable" abort (status 1) so a caller that
+# greps this process's exit status can tell "delivery is unhealthy" (#1045)
+# from an ordinary crash. Referenced but never defined before this fix -- both
+# call sites hit the unbound-variable case they were meant to be distinct from.
+_AGMSG_EXIT_DELIVERY_UNHEALTHY=3
 
 watch_log() {
   local msg="$*" record size=0 bytes
@@ -1433,6 +1438,13 @@ EOF
         ;;
     esac
     if [ "$_agmsg_has_new_message" -eq 1 ]; then
+    # This ROWS build runs on the OUT already fetched above for the
+    # stuck-tracker, not a fresh re-read: a message a concurrent sender
+    # inserts in the gap between that fetch and this point is not lost (§2.2
+    # never-skip still holds -- storage_watch_after's WHERE seq > cursor makes
+    # it turn up on the NEXT poll), just delivered up to one poll interval
+    # later than the old two-read version could have.
+    #
     # The quote is held in a variable, never written as \' in the pattern: bash 3.2
     # (macOS /bin/bash) keeps the backslash of a \' REPLACEMENT, so the inline form
     # doubles a quote into \'\' there while producing '' on bash 4+. Same shape as
@@ -1486,43 +1498,47 @@ EOF
       ROWS=""
     fi
 
-    # Deliver (#983): re-verify at the act, like the two below. Checked ONCE here
-    # rather than per row, and that is a deliberate trade rather than an oversight:
-    # the loop's harm is a stranger's message appearing on this session's stdout,
-    # which is visible and leaves the row unread — recoverable, unlike consuming it
-    # or folding on it. A lock read per row would buy a narrower window at a file
-    # read per message; the two acts whose damage is permanent get their own check
-    # immediately before them.
+    # Deliver (#983): re-verify at the act, immediately before the print
+    # loop -- not before the ROWS build above, which can take real wall-clock
+    # time for a large body (a 200000-byte body took ~25s under macOS's stock
+    # bash 3.2's slow parameter-substitution escaping, review-measured). A
+    # check any earlier than this leaves a window, between "ownership
+    # confirmed" and this session actually writing to stdout, wide enough for
+    # the role to change hands mid-build -- exactly the exposure #983 exists
+    # to close. Checked ONCE here rather than per row: the loop's harm is a
+    # stranger's message appearing on this session's stdout, which is visible
+    # and leaves the row unread -- recoverable, unlike consuming it (the idle
+    # path's own consume, and this same batch's cursor-row consume below, get
+    # their own re-check immediately before them too, since consuming is not
+    # recoverable the same way).
     _pair_verdict=0
     _pair_unchanged_since_read "$pair_team" "$pair_agent" "$pair_owner" || _pair_verdict=$?
     if [ "$_pair_verdict" -ne 0 ]; then
       _report_pair_refusal "$_pair_verdict" "$pair_team" "$pair_agent" "delivery"
       continue
     fi
-    READ_CURSOR="$(storage_read_cursor_get "$pair_team" "$pair_agent" 2>/dev/null || true)"
-    [ -n "$READ_CURSOR" ] || READ_CURSOR=0
-    OUT="$(storage_watch_after "$READ_CURSOR" "$pair_team:$pair_agent" 2>/dev/null || true)"
-    if [ -n "$OUT" ]; then
-      _arr="[$(printf '%s' "$OUT" | paste -sd, -)]"
-      ROWS="$(agmsg_sqlite ':memory:' "
-        SELECT COALESCE(json_extract(value,'\$.type'),'') || char(31) ||
-               COALESCE(json_extract(value,'\$.id'),'') || char(31) ||
-               COALESCE(json_extract(value,'\$.at'),'') || char(31) ||
-               COALESCE(json_extract(value,'\$.team'),'') || char(31) ||
-               COALESCE(json_extract(value,'\$.from'),'') || char(31) ||
-               COALESCE(json_extract(value,'\$.to'),'') || char(31) ||
-               replace(replace(replace(COALESCE(json_extract(value,'\$.body'),''), char(13), ''), char(10), '\\n'), char(9), '\t') || char(31) ||
-               COALESCE(json_extract(value,'\$.cursor'),'')
-        FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
-      " 2>/dev/null || true)"
 
       while IFS=$'\x1f' read -r kind id ts team from to body cursor; do
         [ -z "$kind" ] && continue
         if [ "$kind" = "cursor" ]; then
-          # Trailing cursor = the resume point. Advance + persist only after the
-          # batch's messages were delivered above; a crash mid-batch re-delivers
-          # from the old cursor (at-least-once, never skip — §2.2).
+          # Trailing cursor = the resume point. Advance + persist the session
+          # watermark, then -- re-verified immediately before, mirroring the
+          # idle path's own consume below -- advance THIS pair's stored
+          # read_cursors frontier too. That second act used to be missing here:
+          # with nothing ever consuming it on this path, storage_read_cursor_get
+          # kept returning the same value next poll, storage_watch_after
+          # re-returned the same rows, and the stuck-cursor guard above fired
+          # and exited after STUCK_THRESHOLD polls on every pair that ever
+          # received a message -- independent of batch size, despite the
+          # #1045/#777 wording in that guard's message.
           LAST="$cursor"; persist_watermark
+          _pair_verdict=0
+          _pair_unchanged_since_read "$pair_team" "$pair_agent" "$pair_owner" || _pair_verdict=$?
+          if [ "$_pair_verdict" -ne 0 ]; then
+            _report_pair_refusal "$_pair_verdict" "$pair_team" "$pair_agent" "marking them read"
+          else
+            storage_read_cursor_consume "$pair_team" "$pair_agent" "$cursor" >/dev/null 2>&1 || true
+          fi
           continue
         fi
         [ "$kind" = "message_sent" ] || continue
@@ -1583,16 +1599,6 @@ EOF
           exit 0
         fi
       done <<< "$ROWS"
-    fi
-    if [ -n "$DESPAWN_TARGET" ]; then
-      "$SCRIPT_DIR/reset.sh" "$PROJECT_PATH" "$AGENT_TYPE" "$DESPAWN_TARGET" "$SESSION_ID" >/dev/null 2>&1 || true
-      if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
-        tmux kill-pane -t "$TMUX_PANE" 2>/dev/null || true
-      else
-        watch_log "despawned '$DESPAWN_TARGET' (role dropped); close this window manually"
-      fi
-      exit 0
-    fi
     elif [ -n "$OUT" ]; then
       # No new message for THIS pair, but storage_watch_after's trailing
       # "cursor" line (present on every call, caught-up pair or not, because
