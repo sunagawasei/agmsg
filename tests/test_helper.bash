@@ -1,7 +1,53 @@
 # Shared setup/teardown for agmsg BATS tests.
 # Each test gets an isolated skill directory with its own DB and teams.
 
+# #1095: a test that exercises join.sh/actas-claim.sh/spawn.sh/watch.sh/
+# session-start.sh/check-inbox.sh (or the two libraries under them) is, as far
+# as the self-naming primitive can tell, a seat acting -- so it names the pane
+# it is running in, with its own fixture team/agent. On a real machine that is
+# the developer's own terminal, inherited because bats runs inside it. This is
+# TOP-LEVEL, not inside setup_test_env(): `load test_helper` runs it before
+# ANY test's own setup(), so it reaches every file that loads this one,
+# including one (test_install.bats) whose own setup() never calls
+# setup_test_env. A file that deliberately exercises the switch itself
+# (test_self_name.bats, test_self_rename.bats) unsets this right after
+# loading -- that is a local, visible override, not a gap in this default.
+# Hard safety boundary: a test that opts back into self-naming must first install
+# a fake terminal. Clear every ambient terminal marker while this helper loads,
+# before any suite-level setup or test body can unset AGMSG_SELF_NAME. Tests that
+# deliberately model a real terminal restore these variables explicitly, using
+# a fake driver or a documented fixture socket.
+unset TMUX TMUX_PANE TMUX_TMPDIR
+unset HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_SESSION HERDR_BIN_PATH HERDR_STARTUP_CWD
+# #1229: the claude-code transcript-path resolver (agmsg_transcript_path)
+# prefers CLAUDE_CONFIG_DIR over $HOME/.claude when set -- a developer or
+# agent running under a multi-account profile carries this in their real
+# shell, and every fixture in this suite that creates a transcript under the
+# sandboxed HOME assumes that IS the resolved root. Left ambient, those tests
+# would silently resolve against the real profile dir instead of the fixture.
+unset CLAUDE_CONFIG_DIR
+# #1229: poke.sh's plain-no-pane fallback resolves ITS OWN caller identity
+# from AGMSG_SESSION_ID/CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID (the same
+# chain fix.sh uses). Left ambient, a suite run from inside a real
+# claude-code session (this repo's own dev loop very much included) would
+# make that resolution succeed using the DEVELOPER's real session id instead
+# of whatever the fixture set up, silently changing which branch a test
+# exercises. Tests that deliberately model a caller set these explicitly.
+unset AGMSG_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
+export AGMSG_SELF_NAME=off
+
 setup_test_env() {
+  # A test never inherits the developer's terminal. The terminal drivers
+  # identify "this pane" from the environment (tmux: $TMUX/$TMUX_PANE; herdr:
+  # HERDR_PANE_ID, measured 2026-09-08), and join/send/inbox/history name the
+  # caller's pane through it -- so a suite run from inside a real tmux or herdr
+  # pane would otherwise write the fixture's team:agent onto the developer's
+  # own pane. Tests that want a terminal set these AFTER this call, against a
+  # fake on PATH. CI runners carry none of these, so nothing changes there.
+  unset TMUX TMUX_PANE TMUX_TMPDIR
+  unset HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_SESSION HERDR_BIN_PATH HERDR_STARTUP_CWD
+  unset CLAUDE_CONFIG_DIR
+  unset AGMSG_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
   local source_test_dir="${AGMSG_TEST_SOURCE_TEST_DIR:-$BATS_TEST_DIRNAME}"
   export TEST_SKILL_DIR="$(mktemp -d)"
   mkdir -p "$TEST_SKILL_DIR"/{scripts,db,teams}
@@ -70,9 +116,99 @@ setup_test_env() {
   export AGMSG_DESPAWN_WAIT_POLL_INTERVAL=0.05
 }
 
+# PIDs (one per line, this shell excluded) whose command line references <dir>.
+# The detached codex children — codex-bridge-launcher.sh and the codex-bridge.js it
+# starts (codex-monitor.sh spawns the launcher with `… &`, "outlives this script") —
+# resolve their SKILL_DIR from their own script path, so their argv carries
+# TEST_SKILL_DIR. The launcher records no pidfile of its own, so a pidfile sweep cannot
+# reach it; the command line is what names it. Unix uses ps; on Git Bash ps enumerates
+# MSYS processes, which the launcher/bridge are, so it reaches them there too.
+#
+# LIMIT (named deliberately, not a defect): this matches only processes that carry
+# $dir IN THEIR ARGV. A process whose CWD is inside $dir but whose argv does not name
+# it would NOT be found. The two known holders are argv-visible today — the launcher
+# resolves SKILL_DIR from its own script path (argv[0]), and the bridge receives
+# --workspace-root <dir> — so they are caught; but that is a property of THOSE two, not
+# a guarantee about any future holder. A cwd/open-fd sweep (lsof) would close the gap;
+# it is deliberately NOT used because lsof is slow and this runs in EVERY test's
+# teardown — too heavy for the ~all tests that hold nothing. If a future detached child
+# holds $dir without naming it in argv, revisit (add an lsof pass gated on the rm
+# actually failing, so the cost is paid only when it is needed).
+_pids_referencing_dir() {   # <dir>
+  ps -eo pid=,args= 2>/dev/null |
+    AGMSG_REAP_DIR="$1" awk -v me="$$" 'index($0, ENVIRON["AGMSG_REAP_DIR"]) { if ($1+0 != me+0) print $1 }'
+}
+
+# Reap any process still holding $TEST_SKILL_DIR, then let handles release, BEFORE the
+# rm. Those detached children keep writing $TEST_SKILL_DIR/run after the test body
+# returns and are in no pidset the tests kill, so the bare rm below races them and fails
+# `rm: Directory not empty` (or, on Windows, `Device or resource busy` on the bridge's
+# open messages.db). #662 == #1036 == #1049.
+#
+# Scope is $TEST_SKILL_DIR ITSELF — a unique mktemp path — so matching it in process
+# args cannot reach a developer's live bridge or another test's processes; this is never
+# a blanket `pkill codex-bridge.js`. Guarded to a temp path so a mis-set variable can
+# never turn the scan loose on a short/rooty prefix. A single `ps` for the ~all tests
+# that spawn nothing.
+#
+# The SIGTERM→wait→SIGKILL sequence is EXERCISED by tests/test_teardown_reap.bats (kill,
+# scope-safety, no-op, guard); whether the wait budget is long enough on a load-3-digit
+# host, and whether killing a holder RELEASES the Windows file handle before the rm, are
+# both timing/OS facts this repo cannot measure on the author's loaded machine — CI
+# (dedicated runners, Windows leg) measures them. Written as designed-and-static-checked,
+# NOT as "measured", per the day's rule that a claim states how it was verified (#1036).
+_reap_test_skill_dir_procs() {
+  local dir="${TEST_SKILL_DIR:-}"
+  case "$dir" in
+    ""|/|/tmp|/var|/private|/usr|"$HOME") return 0 ;;
+  esac
+  case "$dir" in
+    /tmp/*|/private/*|/var/folders/*|/private/var/folders/*) : ;;
+    *)
+      # Outside the well-known temp roots, allow ONLY under a TMPDIR that is set AND a
+      # real path — never unset, "", or "/". Resolve and VALIDATE the prefix before using
+      # it as a pattern: a pattern assembled from an empty prefix ("${TMPDIR:+…}" with
+      # TMPDIR unset, or "${TMPDIR%/}" with TMPDIR="/") degenerates to match ANY non-empty
+      # dir. This guards a KILL, so the loose failure kills EXTRA processes, not nothing
+      # (co2 BLOCKING). Strip the trailing slash first, then require the result non-empty,
+      # so unset / "" / "/" all fail closed. Only then is "$_tmp" safe as a pattern prefix.
+      local _tmp="${TMPDIR:-}"; _tmp="${_tmp%/}"
+      [ -n "$_tmp" ] || return 0
+      case "$dir" in "$_tmp"/?*) : ;; *) return 0 ;; esac
+      ;;
+  esac
+  local pids tries=0 sig p
+  while :; do
+    pids="$(_pids_referencing_dir "$dir")"
+    [ -n "$pids" ] || return 0
+    # Escalate to SIGKILL quickly (after ~0.3s of SIGTERM): a detached launcher may not
+    # act on SIGTERM, and this is a teardown, not a graceful shutdown. SIGKILL is
+    # uncatchable, so once sent the process WILL die — the only remaining wait is for ps
+    # to stop listing it, which a heavily loaded host can slow. So keep re-checking up
+    # to ~6s (a bound only ever reached when something is genuinely stuck; the ~all tests
+    # that hold nothing return on the first check above), then return and let the rm
+    # surface anything still there. The 6s headroom is what covers a load-3-digit host.
+    sig=TERM; [ "$tries" -ge 3 ] && sig=KILL
+    for p in $pids; do kill "-$sig" "$p" 2>/dev/null || true; done
+    [ "$tries" -ge 60 ] && return 1
+    sleep 0.1 2>/dev/null || true
+    tries=$((tries + 1))
+  done
+}
+
 teardown_test_env() {
-  test_fixture_cleanup
-  rm -rf "$TEST_SKILL_DIR"
+  # Try the plain rm FIRST, and only reap when it actually fails. The reaper's scan is a
+  # full `ps -eo pid=,args=`; running it in EVERY teardown would add that cost to all of
+  # the (vast majority of) tests that hold nothing — across the suite's hundreds of tests
+  # that dominates the runtime and pushes CI shards over their timeout. The race it fixes
+  # is rare (only the codex tests spawn the detached launcher), and it announces itself
+  # as a non-zero rm ("Directory not empty" / "Device or resource busy"), so pay the cost
+  # exactly there: on failure, reap the TEST_SKILL_DIR-scoped holders and retry.
+  rm -rf "$TEST_SKILL_DIR" 2>/dev/null && return 0
+  local reap_status=0 rm_status=0
+  _reap_test_skill_dir_procs || reap_status=$?
+  rm -rf "$TEST_SKILL_DIR" || rm_status=$?
+  [ "$reap_status" -eq 0 ] && [ "$rm_status" -eq 0 ]
 }
 
 # Bind SessionEnd tests to a live owner PID so session-end.sh publishes a
@@ -486,6 +622,39 @@ assert_no_test_fixture_survivors() {
   echo "fixture-survivors=0 run_id=$run_id"
 }
 
+agmsg_install_fake_tmux() {
+  export FAKE_TMUX_STATE="${FAKE_TMUX_STATE:-$FAKEBIN/tmux.labels}"
+  : >"$FAKE_TMUX_STATE"
+  cat >"$FAKEBIN/tmux" <<EOF
+#!/usr/bin/env bash
+{ printf 'tmux'; for a in "\$@"; do printf ' [%s]' "\$a"; done; printf '\n'; } >> "$ARGV_LOG"
+state='$FAKE_TMUX_STATE'
+args=("\$@")
+if [ "\${args[0]}" = -S ]; then args=("\${args[@]:2}"); fi
+case "\${args[0]}" in
+  new-window) echo '@7' ;;
+  split-window) echo '%9' ;;
+  capture-pane) printf 'line one\nline two\n' ;;
+  set-option)
+    if [ "\${args[4]}" = '@agmsg_agent' ]; then
+      pane="\${args[3]}"; label="\${args[5]}"
+      [ -f "\$state" ] && grep -v "^\$pane	" "\$state" >"\$state.new" 2>/dev/null || : >"\$state.new"
+      printf '%s\t%s\n' "\$pane" "\$label" >>"\$state.new"
+      mv "\$state.new" "\$state"
+    fi ;;
+  display-message)
+    if [ "\${args[4]}" = '#{pane_id}|#{@agmsg_agent}' ]; then
+      pane="\${args[3]}"
+      label="\$(awk -F'\t' -v p="\$pane" '\$1 == p { print \$2 }' "\$state" 2>/dev/null)"
+      printf '%s|%s\n' "\$pane" "\$label"
+    fi ;;
+esac
+exit 0
+EOF
+  chmod +x "$FAKEBIN/tmux"
+  export PATH="$FAKEBIN:$PATH"
+}
+
 # Skip a test on native Windows / Git Bash (MSYS/MINGW/Cygwin). Use ONLY for
 # behaviour that depends on POSIX process semantics agmsg does not yet support
 # there — watcher discovery/kill via ps/pgrep, and session liveness via kill -0
@@ -497,6 +666,22 @@ skip_on_windows() {
   case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) skip "${1:-not yet supported on native Windows}" ;;
   esac
+}
+
+# The inverse, for the handful of tests whose whole point is native Windows: the
+# real tasklist, the real MSYS pid space, no stub in between. Everywhere else
+# they would prove nothing, so they skip rather than pass vacuously.
+skip_unless_windows() {
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) ;;
+    *) skip "${1:-only meaningful under Git Bash}" ;;
+  esac
+}
+
+# Antigravity's TUI monitor is intentionally Linux-only. Installation tests
+# which execute its shim use this guard; file-handling tests remain portable.
+skip_unless_linux() {
+  [ "$(uname -s)" = Linux ] || skip "${1:-Antigravity TUI monitor is Linux-only}"
 }
 
 # In-memory sqlite for test ASSERTIONS, stripping CR. sqlite3.exe writes stdout
@@ -741,4 +926,122 @@ setup_live_owner() {
 wait_until() {
   local timeout="$1"; shift
   _wait_poll "$timeout" "$_WAIT_INTERVAL" "condition command" "$@"
+}
+
+# Fail the test when <cmd> SUCCEEDS.
+#
+# `! cmd` cannot do this. POSIX errexit exempts a negated command, on every
+# bash, so `! grep -q needle file` is silent when the needle IS there -- the
+# one outcome it was written to catch. Measured on 3.2.57 and 5.3.15: both
+# report `ok` (#670).
+#
+# Deliberately not `run cmd` + `[ "$status" -ne 0 ]`, which also works: `run`
+# overwrites `$output` and `$status`, so converting an absence check that way
+# silently breaks any assertion after it that still reads `$output`. That is a
+# real bug, not a hypothetical -- it happened twice in #697 -- and 48 sites is
+# too many to hand that to.
+#
+# Says what failed, because a bare `false` leaves the reader to work out which
+# of several absence checks was the one that fired.
+refute() {
+  if "$@"; then
+    echo "refute: '$*' unexpectedly succeeded" >&2
+    return 1
+  fi
+}
+
+# A live process whose command line contains <path>, and nothing else.
+#
+# The kill paths in session-end.sh / session-start.sh only signal a pid whose
+# cmdline still looks like this install's watch.sh -- a deliberate defence
+# against pid recycling. Fixtures used a bare `sleep`, whose cmdline does not
+# match, so the kill never fired and the assertion checking for it was `!
+# kill -0 ...`, which is silent on every bash. The tests passed for years
+# without once exercising the branch they are named after (#670).
+#
+# It runs a script that sleeps; it does NOT exec, which would drop the argument
+# from the command line, and it does NOT start the real watcher -- a live
+# watcher inside a test is how a suite grows processes that outlive it.
+# Sets DECOY_PID rather than printing it: `pid="$(spawn_...)"` runs the `&` in
+# a command substitution's subshell, and the child dies with that subshell. The
+# first version did exactly that, and the tests using it went green because the
+# decoy was already gone -- not because anything had killed it. Returning
+# through a variable keeps the process a child of the test.
+# The same reader the product uses to decide whether a pid is one of ours, so
+# a fixture's precondition is checked the way session-end.sh checks it rather
+# than by a lookalike.
+_decoy_cmdline() {
+  # shellcheck disable=SC1090
+  . "$SCRIPTS/lib/compat.sh"
+  compat_get_cmdline "$1"
+}
+
+spawn_decoy_with_cmdline() {
+  local path="$1" decoy
+  decoy="$(mktemp -d)/decoy.sh"
+  printf '#!/usr/bin/env bash\nsleep 30\n' > "$decoy"
+  chmod +x "$decoy"
+  bash "$decoy" "$path" 3>&- &
+  DECOY_PID=$!
+}
+
+# Sends <count> messages of ~<bodylen> bytes each from <from> to <to> on
+# <team>, via storage_send directly rather than send.sh's own CLI (#777
+# argv-length regressions in inbox.sh/check-inbox.sh/watch.sh/watch-once.sh).
+#
+# A plain bash FUNCTION CALL, not a subprocess: `storage_send "$team" ...
+# "$body"` hands the body to sqlite3 through the same escaped-argv path
+# production code uses for a single INSERT (which is not itself in scope --
+# no test here builds a body anywhere near that ceiling), but building the
+# backlog this way never has to exec anything with the WHOLE backlog as one
+# argument, which is exactly the shape production code used to get wrong
+# on read. Bodies are tagged "$label-$i-<pad>" so a caller can assert both
+# ends of the run (index 0 and count-1) are actually present in what the
+# script under test displayed, not just that its exit status was 0.
+# 1.3.1 CI speedup: a 100-message backlog through the loop below used to
+# spawn one sqlite3 process PER MESSAGE (storage_send's own -bail invocation),
+# which is what made the two tests that build a real argv-ceiling-sized
+# backlog the two slowest in this file. Verified before switching: a 3-message
+# batch built the old way (storage_send in a loop, one sqlite3 call each) and
+# the new way (one sqlite3 call for all 3) were compared row-for-row across
+# both `messages` and `events` -- same team/from/to/body fields, same rowid
+# sequencing, same events.legacy_id -> messages.rowid linkage. Only
+# created_at differs, because the batched form finishes fast enough that
+# _sqlite_now's second-granularity clock barely advances between messages --
+# expected, not a correctness difference (each message's timestamp is still
+# a real, distinct call to the same clock function). Only takes this path
+# when the driver is sqlite (the only one an argv-ceiling concern applies to,
+# and the one whose private functions this depends on); any other driver
+# keeps the one-call-per-message loop unchanged.
+bulk_send_direct() {
+  local team="$1" from="$2" to="$3" count="$4" bodylen="$5" label="$6" \
+    i=0 pad
+  pad="$(head -c "$bodylen" /dev/zero | tr '\0' 'x')"
+  (
+    # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/storage.sh"
+    agmsg_storage_load
+    if declare -F _sqlite_message_sent_sql >/dev/null 2>&1 \
+      && declare -F _sqlite_db >/dev/null 2>&1 \
+      && declare -F _sqlite_now >/dev/null 2>&1; then
+      storage_init "$team" >/dev/null 2>&1 || true
+      local db batch id at
+      db="$(_sqlite_db "$team")"
+      batch=""
+      while [ "$i" -lt "$count" ]; do
+        id="$(compat_uuid7)"
+        at="$(_sqlite_now)"
+        batch="${batch}
+$(_sqlite_message_sent_sql "$team" "$from" "$to" "${label}-${i}-${pad}" "$id" "$at")"
+        i=$((i + 1))
+      done
+      agmsg_sqlite_warm
+      printf '%s\n' "$batch" | agmsg_sqlite -bail "$db" >/dev/null
+    else
+      while [ "$i" -lt "$count" ]; do
+        storage_send "$team" "$from" "$to" "${label}-${i}-${pad}" >/dev/null
+        i=$((i + 1))
+      done
+    fi
+  )
 }

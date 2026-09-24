@@ -39,6 +39,13 @@
 # shellcheck disable=SC1091
 . "$SKILL_DIR/scripts/lib/storage.sh"
 
+# _agmsg_pid_alive: the EPERM-aware liveness check both the ancestor walk and the
+# marker GC below need. Sourced here rather than left to the caller — a missing
+# definition used to mean the walk fell back to a bare `kill -0`, which reports a
+# live agent as gone under a sandbox. Double-source guarded.
+# shellcheck disable=SC1091
+. "$SKILL_DIR/scripts/lib/instance-id.sh"
+
 _agmsg_run_dir() { printf '%s/run' "$SKILL_DIR"; }
 
 # Canonicalize a directory path by resolving symlinks to its physical location.
@@ -221,6 +228,9 @@ agmsg_find_registered_project_variant() {
 }
 
 # Map an agent type to the binary basename(s) its process may carry.
+# Names must be type-distinctive. Do not list `agent`: Homebrew grok-build
+# and the Cursor CLI installer both use that basename (#856). Matching it
+# would attach the wrong pid (#93). The alias is an intentional miss.
 _agmsg_agent_binaries() {
   case "$1" in
     claude-code) echo "claude" ;;
@@ -229,6 +239,7 @@ _agmsg_agent_binaries() {
     antigravity) echo "antigravity" ;;
     copilot)     echo "copilot" ;;
     opencode)    echo "opencode" ;;
+    grok-build)  echo "grok" ;;
     *)           echo "claude codex gemini" ;;
   esac
 }
@@ -252,7 +263,7 @@ _agmsg_agent_binaries() {
 agmsg_pid_is_agent() {
   local pid="$1" type="$2"
   [ -n "$pid" ] || return 1
-  _agmsg_resolve_pid_alive "$pid" || return 1
+  _agmsg_pid_alive "$pid" || return 1
   local binaries comm cmdline first base bin
   binaries=$(_agmsg_agent_binaries "$type")
   comm=$(compat_get_comm "$pid" 2>/dev/null || true)

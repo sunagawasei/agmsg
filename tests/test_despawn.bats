@@ -84,7 +84,14 @@ _read_at_for_body() {
   # The ctrl:despawn row itself must not be left permanently unread — a
   # broad (non-actas) watcher that later scans this project's inbox must not
   # see it resurface as a "new" message (2026-07-19 review finding).
-  [ -n "$(_read_at_for_body "ctrl:despawn")" ]
+  _control_row_exists_for_alice
+  # `refute`, not a bare `!` (#715). `! cmd` is exempt from errexit on every bash,
+  # so `! _is_unread_for_alice ...` reported ok even when the row WAS unread — the
+  # assertion was written but watched nothing (#670). `refute` makes it fail when
+  # the row lingers unread. The separate, load-dependent flake this then exposes
+  # (the row not yet read right after despawn returns, under load) is NOT fixed
+  # here; it stays open as #715.
+  refute _is_unread_for_alice "ctrl:despawn"
 
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
 }

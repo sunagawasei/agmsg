@@ -282,6 +282,13 @@ if [ "$FORCE" = "1" ]; then
   if agmsg_placement_lock_acquire "$TEAM" "$NAME" 10; then
     placement_lock_held=1
   elif [ "$EXPECT_SET" = 1 ]; then
+    # A stale --expect-record snapshot is a safe no-op: compare without holding
+    # the placement lock so we never rmdir a lock directory we failed to create.
+    cur="$(cat "$SPAWN_REC" 2>/dev/null || true)"
+    if [ "$cur" != "$EXPECT_RECORD" ]; then
+      echo "status=skipped name=$NAME team=$TEAM reason=record-changed"
+      exit 0
+    fi
     echo "status=unverified name=$NAME team=$TEAM reason=placement-lock"
     exit 4
   fi

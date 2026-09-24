@@ -1,18 +1,24 @@
 name: tests
 
-# Run the full Bats suite on every PR and on pushes to main. This repo is
-# public, so GitHub-hosted runners are free — running everything every time is
-# simpler and safer than selectively running "only the changed tests", which
-# would miss regressions in shared libs (lib/*.sh) that fan out across many
-# scripts. What we do instead is run the whole suite in parallel shards.
+# Run the full Bats suite on PRs targeting main or any `integration/**` branch,
+# and on pushes to either. The push leg on integration branches is what tests
+# the MERGED shape: a PR is only ever tested as "my head against the base I was
+# opened on", so with several PRs collecting on one integration branch, the
+# state that is actually dogfooded -- all of them together at the tip -- is a
+# tree no PR run ever saw.
 #
-# Sharding: the suite has grown to ~790 tests, 11 min on ubuntu and 12-17 on
-# macOS, which is the dominant wait on every PR. `bats-shard` splits it across
-# SHARD_TOTAL runners per OS. The split is computed from the tree by
-# .github/scripts/shard-tests.sh, NOT from a list in this file: a static list
-# would put a newly added test file in no shard at all, and CI would go on
-# reporting green while silently not running it. tests/test_ci_sharding.bats
-# pins that the shards stay a partition of tests/*.bats.
+# The filter is a pattern rather than a list of branch
+# names because a list goes quiet exactly when a new integration branch
+# appears: a PR onto an unlisted base has no required checks, so GitHub reports
+# `mergeStateStatus: CLEAN` -- "nothing to check", not "everything checked" --
+# and the PR's summary status alone cannot tell those apart (measured
+# 2026-08-31). The detail views can: `gh pr checks`, `gh run list` and the
+# Checks tab all show zero runs. That is why the merge gate reads a run whose
+# headSha matches the head being merged, and never the PR's status. The suite is
+# fast (~2 min) and this repo is public, so GitHub-hosted runners are free —
+# running everything every time is simpler and safer than selectively running
+# "only the changed tests", which would miss regressions in shared libs
+# (lib/*.sh) that fan out across many scripts.
 #
 # Docs-only skip (without the paths-ignore trap):
 # the bats check is REQUIRED on main. A naive `paths-ignore` would mean it
@@ -41,24 +47,84 @@ name: tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'integration/**']
   pull_request:
-    branches: [main]
+    branches: [main, 'integration/**']
 
 permissions:
   contents: read
 
+# A PR run whose head has moved is dead weight: its verdict can be used for
+# nothing, and it keeps holding the runner slots -- four macOS shards per run,
+# and the account runs at most five macOS jobs at once (measured 2026-08-21:
+# 35 runs that day, 140 macOS jobs, queue waits of 0-50 min, one PR's shard
+# waiting 50 min behind runs whose heads had already been replaced). So a new
+# run for the same PR cancels the one before it. The same reasoning applies to
+# an integration branch, which is only ever dogfooded at its tip. A push to main
+# is the one case that is never cancelled: its group is its own run id, and that
+# run is what a release reads (#848). The block below spells out all three.
+concurrency:
+  # Three cases, and they want different things.
+  #
+  #   pull_request        -- group by PR. A head that has moved makes the run
+  #                          worthless, so cancel the one before it.
+  #   push to main        -- group by run id, i.e. never cancel. A release reads
+  #                          the run for the commit it ships (#848); a main run
+  #                          that another main run cancelled would leave that
+  #                          commit with no verdict at all.
+  #   push to integration -- group by ref, and cancel. An integration branch
+  #                          collects several PRs one after another, and it is
+  #                          only ever dogfooded at its tip. Without this the
+  #                          five merges of one release queue five full suites
+  #                          that all compete for the same five macOS slots
+  #                          (the header above measured 0-50 min queue waits at
+  #                          that contention), and four of the five verdicts are
+  #                          about a tip that no longer exists by the time they
+  #                          land.
+  group: >-
+    tests-${{ github.event_name == 'pull_request'
+    && format('pr-{0}', github.event.pull_request.number)
+    || (github.ref == 'refs/heads/main' && github.run_id
+    || format('push-{0}', github.ref)) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref != 'refs/heads/main' }}
+
 env:
-  # Number of parallel shards per OS. Kept in one place because the matrix, the
-  # job name, and the argument to shard-tests.sh must agree — if they drift, a
-  # shard silently runs the wrong slice of the suite. Raising it is safe (the
-  # split is recomputed, not hardcoded); it only changes the shard job names,
-  # which is exactly why the required check is the summary job below.
-  SHARD_TOTAL: 4
+  # Number of parallel bats shards per OS. The matrix and the shard helper must
+  # stay in lockstep; the stable summary job below verifies that they do.
+  #
+  # 4 -> 5 (#1107). Same change already on the terminal-driver integration branch;
+  # this is the main-targeted twin so main PRs stop hitting the same macOS cap.
+  # shard-tests.sh seeds each pinned file at one shard's AVERAGE share
+  # (total_tests/total), which grows with the suite while the pinned files do not,
+  # over-reserving the two pin shards and pushing the real load onto the non-pin
+  # ones. main is 1742 @tests here, so the worst-case non-pin shard
+  # (total*(N+2)/N^2) is 653 at N=4 and 488 at N=5 -- and a 4-shard macOS leg was
+  # already reaching the 30-min cap while still passing tests (a slow shard, not a
+  # hang: the workflow's own #848/#857 note). Five, not six, because the account
+  # runs at most FIVE macOS jobs at once (the concurrency header): a sixth would
+  # queue behind the other five of its own run. This does NOT fix the scaling
+  # property (pin_seed still grows, count still under-values wait-dominant files);
+  # that re-fit is #847.
+  SHARD_TOTAL: 5
+  # The Windows legs' sqlite3, pinned three ways (#824).
+  #
+  # This comment used to end "one trip to chocolatey, which is the only time
+  # the community feed is asked at all". There is no feed any more: the binary
+  # comes from one sqlite.org URL, and the hash is what makes the pin mean
+  # something rather than the version string alone.
+  #
+  # Bumping a release means changing all four together — YEAR and BUILD form
+  # the URL, VERSION is what `sqlite3 --version` will report, and SHA256 is the
+  # measured digest of that exact zip. A stale SHA256 fails the download step
+  # loudly, which is the intended way to find out one of them was missed.
+  WINDOWS_SQLITE_VERSION: '3.53.4'
 
 jobs:
-  # Cheap gate: is this PR's diff entirely documentation? Pushes to main always
-  # run the full suite (docs_only=false) — main must stay fully verified.
+  # Cheap gate: is this PR's diff entirely documentation? The gate is scoped to
+  # pull_request by event name, so EVERY push runs the full suite
+  # (docs_only=false) — main because it must stay fully verified, an integration
+  # branch because its tip is what gets dogfooded and a docs-only merge still
+  # changes that tip.
   changes:
     name: detect docs-only
     runs-on: ubuntu-latest
@@ -95,6 +161,27 @@ jobs:
               app/*) app_changed=true ;;
               llms.txt|llms-full.txt) ;;
               README.md|CHANGELOG.md|CONTRIBUTING.md|PRIVACY.md|ARCHITECTURE.md|RELEASING.md|LICENSE) ;;
+              # The version bump, which is the entire diff of a release PR
+              # (#875). A release runs the full matrix a third time here, for a
+              # branch cut from main that adds only these, and the third run
+              # costs 42 minutes.
+              #
+              # Safe because nothing in the suite READS them, which was measured
+              # rather than read off a grep: with all four set to a nonsense
+              # version, test_cut_release / test_install / test_release_dist_tag
+              # / test_bump_app_version / test_codex_monitor stayed green across
+              # 91 tests, and a control (exit 42 appended to scripts/version.sh)
+              # reddened two of them, so that green was an observation and not a
+              # suite that failed to run. The five files that MENTION VERSION
+              # all write their own into a throwaway fixture; a grep hit is not
+              # a read.
+              #
+              # This list is not maintained by hand. `cut-release.sh` declares
+              # the set it commits in its own FILES variable, and
+              # tests/test_release_ci_skip.bats fails if the two disagree — so
+              # adding a file there without adding it here is caught, rather
+              # than silently skipping the suite for a file nobody measured.
+              VERSION|package.json|.claude-plugin/plugin.json) ;;
               # NOTE: SKILL.md is intentionally not here — the suite tests it.
               *) docs_only=false ;;
             esac
@@ -104,7 +191,14 @@ jobs:
           echo "app_changed=$app_changed" >> "$GITHUB_OUTPUT"
 
   bats-shard:
-    name: bats (${{ matrix.os }} ${{ matrix.shard }}/4)
+    # The docs-only skip below reports this check green without running the
+    # suite -- correctly, so the required aggregate can be satisfied -- but a
+    # green that measured nothing must not read like one that ran 24 files
+    # (#798). The name says which it was. Only the shard checks change name;
+    # the required contexts are `bats` (the aggregate) and the Windows install
+    # leg, and neither is renamed, so branch protection sees exactly what it
+    # saw. `needs` is one of the contexts a job name may read.
+    name: bats (${{ matrix.os }} ${{ matrix.shard }}/5)${{ needs.changes.outputs.docs_only == 'true' && ' — docs-only, suite skipped' || '' }}
     needs: changes
     # Run even if `changes` somehow failed/was skipped — fail open to the full
     # suite rather than leaving the required check unreported (which would
@@ -116,45 +210,42 @@ jobs:
     # down instead of falling back to running everything.
     if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
-    # Bound a hung runner/test so a stall fails fast (and is re-runnable) instead
-    # of pinning this REQUIRED check for the GitHub default of 6h.
+    # NOT "a timeout is a genuine hang" (#848): a cancellation here is a wall-
+    # clock cap being reached, and a shard that is still passing tests right up
+    # to the cap looks identical to one that is actually stuck. #857 hit this
+    # on macOS at 25m29s with all 335 of its tests ok and the last one landing
+    # at 24m53s -- a shard that finished normally a heartbeat too late, not a
+    # hang. Distinguishing the two needs the job's own log (does the last `ok`
+    # land seconds before cancellation, or does output stop cold with time
+    # left on the cap), not this number.
     #
-    # Keep this comfortably above the real suite time, not just above it. The
-    # cap was 15 when the suite ran in ~5 min; the suite has since grown to 728
-    # tests and macOS measures 11m57s-14m10s, leaving 1-3 min of headroom. The
-    # result was that ~47% of macOS runs (9 of 19 sampled) were killed mid-suite
-    # at ~15m18s, at whatever test happened to be running — a REQUIRED check
-    # behaving like a coin flip on PRs that changed nothing relevant. 25 matches
-    # the app-test-windows job below.
-    #
-    # If a shard starts firing this cap, re-shard (raise SHARD_TOTAL) rather
-    # than re-running until it passes: a job that always dies at the same
-    # elapsed time is a timeout, not a flaky test.
-    # bats-windows sets its own timeout; this covers ubuntu/macos.
-    #
-    # Left at the pre-sharding value on purpose. A shard is a quarter of the
-    # suite, so this is now generous headroom rather than a tight bound — and
-    # a cap that only ever fires on a genuine hang is the one that carries no
-    # false positives. (It was 15 against a 12-14 min macOS suite, and killed
-    # ~47% of macOS runs mid-suite at whatever test was running.)
-    timeout-minutes: 25
+    # Sized with real margin, not "generous" by assertion. Measured 2026-08-19
+    # (run 32193147987, macOS): the four shards ran 890s/824s/540s/1230s, and
+    # the heaviest (1230s) had 270s of the old 1500s cap left -- 18%. After
+    # #847's pin (shard-tests.sh) removes the two disproportionate files
+    # (722s, 380s) from the ordinary weighted pool, the worst remaining shard
+    # is estimated at the heavier pin's own floor (722s) plus a fair share of
+    # what is left of the suite (~2382s / 4 shards =~ 595s, generously ~700s
+    # unevenly) =~ 1420s, plus runner-speed variance -- call it 1700s. 1800s
+    # (30m) leaves real headroom over that estimate, not merely over last
+    # week's number. The 2 known intermittent reds (ubuntu 4/4's
+    # `_wait_pidfile`, windows runtime #567) are unrelated to this cap.
+    timeout-minutes: 30
     strategy:
       # Cover both GNU (Linux) and BSD (macOS) userlands — the scripts shell out
       # to sed/stat/mktemp/ps etc. whose flags differ between them.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # Must list exactly 1..SHARD_TOTAL. The `bats` summary job verifies
-        # end-to-end that the shards actually covered every test file, so a
-        # drift here fails the required check instead of silently dropping a
-        # slice of the suite.
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
 
       - name: Docs-only change — skipping suite
         if: needs.changes.outputs.docs_only == 'true'
-        run: echo "Diff is documentation-only; skipping the bats suite and reporting green to satisfy the required check."
+        run: |
+          echo "Diff is documentation-only; skipping the bats suite and reporting green to satisfy the required check."
+          echo "::notice title=bats shard skipped::docs-only diff — this shard ran 0 test files; its green satisfies the required check and measures nothing (#798)"
 
       - name: Compute this shard's test files
         if: needs.changes.outputs.docs_only != 'true'
@@ -196,17 +287,124 @@ jobs:
           sqlite3 --version
           bats --version
 
+      # Diagnostics for the shards that report every test ok and then sit
+      # silent until the job's cap. The sampler writes to a file and never to
+      # this step's stdout: a process holding that pipe is one of the things
+      # under suspicion, so the instrument must not be able to cause what it is
+      # measuring. It closes fds 3 and 4 for the same reason, and gives itself a
+      # hard lifetime so it cannot outlive the job it is watching.
+      - name: Start hang sampler
+        if: needs.changes.outputs.docs_only != 'true'
+        continue-on-error: true
+        run: |
+          set +e
+          cat > "$RUNNER_TEMP/sampler.sh" <<'SAMPLER'
+          #!/usr/bin/env bash
+          out="$RUNNER_TEMP/hang-samples.txt"
+          : > "$out"
+          for i in $(seq 1 46); do
+            [ -f "$RUNNER_TEMP/bats-done" ] && { echo "== bats finished, sampler stopping at sample $i" >> "$out"; break; }
+            {
+              echo "===== sample $i  $(date -u +%H:%M:%S)"
+              ps -ef 2>/dev/null | grep -vE '\[' | tail -n +2
+              # One lsof over every candidate at once. Per-pid calls put the two
+              # ends of a pipe in separate blocks minutes apart in the log, and
+              # a reader has to spot that two numbers match; in the 08-01 hang
+              # nobody did, and a 14-line cap had cut the decisive line anyway.
+              pids="$(ps -eo pid=,comm= 2>/dev/null \
+                | awk '$2 ~ /node|python|bats|bash/ {printf "%s%s", sep, $1; sep=","}')"
+              if [ -n "$pids" ]; then
+                lsof -F pcftDin -p "$pids" 2>/dev/null > "$RUNNER_TEMP/sample-lsof.txt"
+                echo "----- pipes held by more than one process:"
+                awk -f "$GITHUB_WORKSPACE/.github/scripts/pipe-holders.awk" "$RUNNER_TEMP/sample-lsof.txt"
+                echo "----- every descriptor they hold (no cap):"
+                lsof -p "$pids" 2>/dev/null
+              fi
+              echo "----- bats temp dirs left behind:"
+              ls -la "${TMPDIR:-/tmp}" 2>/dev/null \
+                | awk 'tolower($0) ~ /bats/ { n++; if (n <= 20) print }'
+            } >> "$out" 2>&1
+            sleep 30
+          done
+          SAMPLER
+          chmod +x "$RUNNER_TEMP/sampler.sh"
+          nohup "$RUNNER_TEMP/sampler.sh" >/dev/null 2>&1 3>&- 4>&- &
+          echo "sampler pid $!"
+
       - name: Run bats suite (this shard)
         if: needs.changes.outputs.docs_only != 'true'
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
-          set -euo pipefail
-          # Paths come from shard-tests.sh over tests/*.bats and contain no
-          # spaces; xargs keeps them as separate arguments to one bats run.
-          xargs bats --print-output-on-failure < shard-files.txt
+          set +e
+          .github/scripts/run-bats-timed.sh shard-files.txt "$RUNNER_TEMP/bats-timings.tsv"
+          status=$?
+          : > "$RUNNER_TEMP/bats-done"
+          exit $status
 
-      # What the summary job checks the partition against. Uploaded only when
-      # the suite actually ran, so a docs-only PR produces none — and the
-      # summary skips the check for exactly that case.
+      # always() so this also runs when the job is cancelled at its cap, which
+      # is the only case that matters here.
+      # continue-on-error and a best-effort body: this step exists to describe a
+      # failure, and a probe that returns non-zero -- lsof on a pid that has just
+      # exited, a grep that matches nothing -- must never be what turns a green
+      # shard red. The runner's default shell is `bash -e`, so -e is dropped
+      # explicitly and every probe is allowed to fail. `head` is avoided in
+      # pipelines for the same reason: it closes the pipe early and SIGPIPEs
+      # whatever was writing.
+      - name: Hang forensics
+        if: always() && needs.changes.outputs.docs_only != 'true'
+        continue-on-error: true
+        run: |
+          set +e
+          set +o pipefail 2>/dev/null || true
+          echo "##### live snapshot at $(date -u +%H:%M:%S 2>/dev/null)"
+          ps -ef 2>/dev/null | awk 'NR > 1 && NR <= 61'
+          # One snapshot over every candidate, so both ends of a pipe are in the
+          # same dump and can be matched by machine rather than by eye.
+          pids="$(ps -eo pid=,comm= 2>/dev/null \
+            | awk '$2 ~ /node|python|bats|bash|sleep/ {printf "%s%s", sep, $1; sep=","}')"
+          if [ -n "$pids" ]; then
+            lsof -F pcftDin -p "$pids" 2>/dev/null > "$RUNNER_TEMP/forensic-lsof.txt"
+          else
+            : > "$RUNNER_TEMP/forensic-lsof.txt"
+          fi
+          echo "##### pipes held by more than one process:"
+          echo "##### (a shard that reported every test ok and is still open is usually one of these:"
+          echo "#####  a process that outlived its caller, holding the pipe bats is waiting to see close)"
+          awk -f "$GITHUB_WORKSPACE/.github/scripts/pipe-holders.awk" "$RUNNER_TEMP/forensic-lsof.txt"
+          echo "##### every descriptor those processes hold (no per-pid cap):"
+          lsof -p "$pids" 2>/dev/null
+          echo "##### bats temp remnants:"
+          ls -la "${TMPDIR:-/tmp}" 2>/dev/null \
+            | awk 'tolower($0) ~ /bats/ { n++; if (n <= 20) print }'
+          echo "##### sampler timeline:"
+          if [ -s "$RUNNER_TEMP/hang-samples.txt" ]; then
+            cat "$RUNNER_TEMP/hang-samples.txt" 2>/dev/null
+          else
+            echo "(no samples)"
+          fi
+          exit 0
+
+      - name: Upload hang samples
+        if: always() && needs.changes.outputs.docs_only != 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: hang-samples-${{ matrix.os }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/hang-samples.txt
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Upload bats timings
+        if: always() && needs.changes.outputs.docs_only != 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: bats-timings-${{ matrix.os }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/bats-timings.tsv
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Record which files this shard ran
         if: needs.changes.outputs.docs_only != 'true'
         uses: actions/upload-artifact@v4
@@ -246,7 +444,15 @@ jobs:
 
       - name: Docs-only change — no shard manifests to verify
         if: needs.changes.outputs.docs_only == 'true'
-        run: echo "Diff is documentation-only; the shards reported green without running, so there is no partition to verify."
+        # Same conclusion as a full pass -- this is the required context and a
+        # docs-only PR must stay mergeable -- but the run says which green it
+        # is, where a person reads it: the checks tab (annotation) and the run
+        # summary. `gh pr checks` still prints `bats pass`; the shard lines
+        # beside it now carry "docs-only, suite skipped" (#798).
+        run: |
+          echo "Diff is documentation-only; shard manifests are not expected."
+          echo "::notice title=bats::docs-only diff — the bats suite did not run on any shard; this green satisfies the required check and measures nothing (#798)"
+          printf '%s\n' "## bats: docs-only, suite skipped" "" "The diff was documentation-only, so no shard ran the bats suite. This green satisfies the required check; it is not evidence that the suite passes (#798)." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Download shard manifests
         if: needs.changes.outputs.docs_only != 'true'
@@ -289,6 +495,10 @@ jobs:
               printf '::error::%s: file(s) run by more than one shard:\n%s\n' "$os" "$dupes"
             fi
           done
+          # The other green, named the same way (#798): how many files the
+          # shards ran, so a full pass and a skip never read alike.
+          count="$(printf '%s\n' "$expected" | grep -c .)"
+          printf '%s\n' "## bats: suite ran" "" "The shards ran $count test files on ubuntu-latest and macos-latest and every shard passed." >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
   # Windows coverage for the native helpers shipped in #103 (Git Bash runner,
@@ -321,6 +531,21 @@ jobs:
           - leg: install helpers
             filter: "[Ww]indows"
             target: tests/test_install.bats
+          # The Windows runtime path, which nothing here covered until #567: a
+          # change to how liveness is decided on Windows shipped through a CI
+          # that never decided liveness on Windows. Everything else about that
+          # class is proved against a `tasklist` stub on a POSIX host, which
+          # shows what the code does when a probe says "not found" -- not that
+          # Git Bash says it, and not that a launch survives it.
+          #
+          # These two run with the real tasklist and the real MSYS pid space,
+          # and they assert the EFFECT rather than the premise: the TUI reaches
+          # its bridged --remote handoff, and a bridge is actually started.
+          # Reaching the handoff is not delivering a message -- they are
+          # separate failure points and each has its own test.
+          - leg: windows runtime (#567)
+            filter: "windows-native"
+            target: tests/test_codex_monitor.bats tests/test_codex_bridge_launcher.bats
     defaults:
       run:
         # bats is bash; on Windows runners `shell: bash` is Git Bash, the same
@@ -333,25 +558,70 @@ jobs:
         if: needs.changes.outputs.docs_only == 'true'
         run: echo "Diff is documentation-only; skipping the Windows bats legs."
 
-      # chocolatey's community feed intermittently returns 504, which leaves the
-      # runner with no sqlite3 at all ("Chocolatey installed 0/0 packages").
-      # Retry rather than let a transient feed outage redden an unrelated PR.
+      # A THIRD PARTY'S BAD MINUTE MUST NOT BE REPORTED AS THIS CHANGE'S RED
+      # (#824). `choco install sqlite -y --no-progress` was one call with no
+      # retry, no cache and — the part that did the damage — no check. On a 503
+      # from the community feed it printed "Chocolatey installed 0/0 packages"
+      # and EXITED ZERO, so the step went green, the version step's
+      # `|| echo "not found"` turned a missing binary into a success line, and
+      # the red landed three steps later on `Run tests`. Measured on
+      # run 31869238895: steps 4, 5, 6 and 7 all `success`, step 8 `failure`,
+      # with `sqlite3: command not found` in step 7's own log.
+      #
+      # Reading that check list, the failure belongs to the change under test.
+      # It did not. The feed's flakiness is not ours to fix; which step goes red
+      # is.
+      #
+      # EVERY STEP HERE IS GATED ON `matrix.sqlite`, which #822 added. A leg that
+      # never opens a store must not be stopped by a package feed either — that
+      # is the contract #822 built, and hardening the install would have
+      # cancelled it by making `driver input (#817)` depend on chocolatey again.
+      #
+      # The restore is tried first so most runs never ask the feed at all: the
+      # key is the pinned version, so a hit is the same binary and a miss is the
+      # only thing that needs the network.
+      - name: Restore sqlite3 (cache)
+        if: needs.changes.outputs.docs_only != 'true' && matrix.sqlite
+        id: sqlite-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\ProgramData\chocolatey\lib\SQLite
+            C:\ProgramData\chocolatey\bin\sqlite3.exe
+          key: sqlite3-${{ runner.os }}-choco-${{ env.WINDOWS_SQLITE_VERSION }}
+
       - name: Install sqlite3
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && matrix.sqlite && steps.sqlite-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
+          # Three attempts with a widening pause. The observed failures are 503
+          # and 504 from `community.chocolatey.org`, and they are per-request
+          # rather than an outage: on run 31869238895 the two Windows legs ran
+          # concurrently and one of them installed fine.
           for ($attempt = 1; $attempt -le 3; $attempt++) {
-            choco install sqlite -y --no-progress
-            if ($LASTEXITCODE -eq 0) { exit 0 }
-            Write-Host "::warning::choco install sqlite failed (attempt $attempt of 3); retrying"
-            Start-Sleep -Seconds 15
+            choco install sqlite --version=$env:WINDOWS_SQLITE_VERSION -y --no-progress
+            if (Test-Path 'C:\ProgramData\chocolatey\bin\sqlite3.exe') { exit 0 }
+            Write-Host "::warning::sqlite3 not installed on attempt $attempt; the chocolatey feed is answering errors"
+            Start-Sleep -Seconds (10 * $attempt)
           }
-          Write-Host "::error::sqlite3 could not be installed after 3 attempts"
-          exit 1
+          exit 0   # the hard check is its own step, so a retry loop cannot decide the colour
 
       - name: Put chocolatey shims on PATH (Git Bash form)
         if: needs.changes.outputs.docs_only != 'true'
         run: echo "/c/ProgramData/chocolatey/bin" >> "$GITHUB_PATH"
+
+      # THE STEP THAT IS ALLOWED TO BE RED ABOUT THIS. Separate from the install
+      # on purpose: whether the dependency is present is a different question
+      # from whether one `choco` invocation worked, and only this one may decide
+      # the job's colour. Named so the check list says what is wrong — a reader
+      # seeing this red does not go looking through the diff.
+      - name: sqlite3 must be present, or this leg is about chocolatey
+        if: needs.changes.outputs.docs_only != 'true' && matrix.sqlite
+        run: |
+          if ! sqlite3 --version; then
+            echo "::error::sqlite3 is missing. The chocolatey community feed did not serve it (503/504 seen on 2026-08-15). This leg reports on that, NOT on the change under test — see #824."
+            exit 1
+          fi
 
       - name: Install bats
         if: needs.changes.outputs.docs_only != 'true'
@@ -369,7 +639,23 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         run: |
           bash --version | head -1
-          sqlite3 --version || sqlite3.exe --version
+          # Two changes here, pulling in opposite directions (#824).
+          #
+          # The `|| sqlite3.exe --version || echo "sqlite3 not found on PATH"`
+          # fallback is gone: it turned a missing binary into a success line, so
+          # nothing between a failed install and `Run tests` said anything was
+          # wrong. Absence is decided by the presence check above, which is
+          # allowed to be red about it.
+          #
+          # Without the fallback this line would fail on a leg that never
+          # installs sqlite3 — `driver input (#817)` carries `sqlite: false`
+          # precisely so a package feed cannot stop a leg driving a mock bash
+          # driver. Reporting a version it was never meant to have would
+          # re-create, one step lower, the coupling #822 removed.
+          # `matrix.sqlite` is a fixed value from the matrix above.
+          if [ "${{ matrix.sqlite }}" = "true" ]; then
+            sqlite3 --version
+          fi
           bats --version
 
       - name: Run tests
@@ -391,7 +677,8 @@ jobs:
   # cargo check + tsc --noEmit is a few minutes, not the full-bundle cost.
   # Same always-report pattern as bats: the job always completes, and only
   # the heavy steps are gated, so it can be promoted to a required check
-  # without ever leaving a PR stuck pending. Pushes to main always run it.
+  # without ever leaving a PR stuck pending. Every push runs it (the gate is
+  # scoped to pull_request by event name), main and integration alike.
   # Fail-open mirrors bats too: steps skip only on an EXPLICIT
   # app_changed=false — if the changes job breaks and its output is empty,
   # the typecheck runs rather than green-washing a possibly-app diff.
@@ -495,3 +782,59 @@ jobs:
       - name: Rust tests
         if: needs.changes.outputs.app_changed != 'false'
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # Internal team names must not reach what we publish. This runs on EVERY diff,
+  # with no docs-only skip: the docs tree is exactly where prose names people,
+  # and a check that skips the files most likely to carry the problem is
+  # decoration. It costs one node process over `git ls-files`.
+  #
+  # SHAPE ONLY, AND THAT IS A DECISION, NOT AN ACCIDENT.
+  #
+  # Seat names have a shape (<base>-cc<n> / <base>-co<n>), so a pattern catches
+  # the whole class -- including seats nobody has created yet -- while putting
+  # no name into this repository. That half runs here.
+  #
+  # Names with no shape (a person's handle, a project nickname) are NOT checked
+  # by CI. Checking them needs the list of them, and the only way to give CI
+  # that list is to hand it to GitHub as a secret -- publishing, to a third
+  # party, the names the rule exists to keep unpublished. So that half runs
+  # before push, from a private checkout that holds the list, and never here.
+  #
+  # A green here therefore means "no seat-shaped name", not "no internal name".
+  # The script prints that in a banner rather than letting the distinction live
+  # only in this comment. `none` is passed explicitly for the same reason: an
+  # UNSET list is exit 2, so a run that checks half of what it claims can only
+  # happen because someone wrote it down, never because a variable was missing.
+  enforced-assertions:
+    name: enforceable assertions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Always runs and always reports, like every other job here: a job that
+    # skips on some diffs is a required context that can sit pending forever
+    # (see the paths-ignore note at the top of this file). It reads only
+    # `tests/*.bats`, so it is cheap enough to run unconditionally rather than
+    # to gate.
+    steps:
+      - uses: actions/checkout@v4
+
+      # No bats, no bash 3.2, no runners: this is a static read of the test
+      # sources. The BEHAVIOUR it encodes was measured on both shells (#670);
+      # what runs here is the count.
+      - name: No new assertion that cannot fail
+        run: .github/scripts/check-enforced-assertions.sh
+
+  private-names:
+    name: internal names
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # `none` is written out here on purpose: it is the difference between
+      # "we check the shapes" and "nobody configured anything".
+      - name: Check the shapes we publish (unshaped names are checked before push)
+        run: AGMSG_PRIVATE_NAMES=none node scripts/check-private-names.mjs

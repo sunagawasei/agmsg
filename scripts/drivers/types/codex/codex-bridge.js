@@ -5,6 +5,7 @@ const { spawn, spawnSync } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
 const net = require("net");
+const os = require("os");
 const path = require("path");
 const readline = require("readline");
 
@@ -19,22 +20,56 @@ const RUN_DIR = path.join(SKILL_DIR, "run");
 // context); honour the same overrides delivery.sh's windows_wrap uses.
 const BASH_BIN = process.env.GIT_BASH || process.env.AGMSG_BASH || "bash";
 
-function encodeRunKey(value) {
-  return Array.from(Buffer.from(String(value), "utf8"), (byte) => {
-    const char = String.fromCharCode(byte);
-    return /[A-Za-z0-9._-]/.test(char) ? char : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
-  }).join("");
-}
+// A ceiling on how often watch-once may be re-armed, across every re-arm path
+// (a clean deadline, a wake and its turn, an idle transition). watch-once's own
+// deadline paces the healthy case at one arm per --timeout, so this is only ever
+// felt by a degenerate loop: a stream of DISTINCT wakes re-arms with no delay
+// otherwise -- 2094 arms in 56 s measured against the real bridge (#936) -- and
+// every arm forks watch-once's library sourcing, which is the fork pressure the
+// #906 incident saturated a per-user pid limit with. A rate, not a poll cadence.
+const MIN_ARM_INTERVAL_MS = 1000;
 
-function drainLeaseStaleSeconds() {
-  const envValue = Number(process.env.AGMSG_DRAIN_LEASE_STALE_S || "");
-  if (Number.isInteger(envValue) && envValue > 0) return envValue;
-  const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, "config.sh"), "get", "drain.lease_stale_s", "120"], {
-    encoding: "utf8",
-  });
-  const configured = Number(String(result.stdout || "").trim());
-  return Number.isInteger(configured) && configured > 0 ? configured : 120;
+// Delay before re-arming watch-once after a FAILED run (a clean deadline exit
+// re-arms immediately; this is the failure-path backoff only). Production
+// default 5000ms, unchanged. AGMSG_TEST_CODEX_BRIDGE_WATCH_REARM_MS lets a
+// test that drives several failure/re-arm cycles to prove a failure-count
+// behavior (not this delay's length) skip paying 5s per cycle. Anything but a
+// plain positive integer falls back to the production default rather than
+// being trusted, the same reasoning as remote.sh's
+// AGMSG_TEST_SYNC_START_READY_CEILING (#1252): an empty or malformed value
+// must not silently change real re-arm timing.
+//
+// Digit check by literal character comparison, not a regex character class --
+// same reasoning as remote.sh's _remote_ceiling_is_plain_digits: keeps the
+// check's own alphabet fixed regardless of engine/locale quirks, rather than
+// trusting whatever a class like \d resolves to.
+function _isPlainDigitString(s) {
+  const digits = "0123456789";
+  if (typeof s !== "string" || s.length === 0) return false;
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s[i];
+    let found = false;
+    for (let j = 0; j < digits.length; j += 1) {
+      if (c === digits[j]) { found = true; break; }
+    }
+    if (!found) return false;
+  }
+  return true;
 }
+// Node's setTimeout treats a delay above this 32-bit signed-int ceiling (and
+// one that resolves to Infinity, which a long-enough all-digit string does)
+// as if it were 1ms, not "wait longer" -- a plain-digit-string check alone
+// passes both, so it is not enough on its own: it has to also stay inside the
+// range setTimeout itself honors, or a huge override does the opposite of
+// falling back to the production delay.
+const MAX_SET_TIMEOUT_MS = 2147483647;
+function _resolveWatchRearmMs() {
+  const raw = process.env.AGMSG_TEST_CODEX_BRIDGE_WATCH_REARM_MS;
+  if (raw === undefined || !_isPlainDigitString(raw)) return 5000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 1 && n <= MAX_SET_TIMEOUT_MS ? n : 5000;
+}
+const WATCH_REARM_MS = _resolveWatchRearmMs();
 
 function usage() {
   console.log(`Usage: codex-bridge.js --project <path> [--type codex] [--team <team>] [--name <agent>]
@@ -73,10 +108,103 @@ Options:
                           of total duration — only true silence trips it.
   --inline-inbox          Read inbox in the bridge and include message text in the turn input.
   --resolve-only          Print resolved team/name and exit.
+  --print-loaded-threads  Print the app-server's loaded thread ids (one per
+                          line) and exit. Needs --app-server. Used by
+                          codex-record-session.sh to seat a role without
+                          guessing from rollout files (#579).
   --help                  Show this help.
 
 Set AGMSG_CODEX_APP_SERVER_CMD to override the app-server command for tests.`);
 }
+
+// EVERY DIAGNOSTIC LINE NAMES THE PROCESS THAT WROTE IT, AND REACHES THE FILE
+// IN ONE WRITE.
+//
+// The launcher appends this process's stderr to a per-identity log
+// (`codex-bridge-launcher.sh`: `>>"$log" 2>&1`), and that file has more than
+// one writer by construction: the bridge that is running, plus every launch
+// attempt that finds it already there, says so, and exits. Two such lines were
+// reported spliced mid-word, and other logs were reported losing their line
+// beginnings (#784).
+//
+// This does not claim to prevent that, and it is deliberately not written as
+// if it did. What it does:
+//
+//   ONE WRITE PER LINE. The newline is part of the same `write` as the text,
+//   so a line is never split into two writes by this side. Whether two
+//   processes' writes can still interleave is a property of the platform's
+//   append, not of this code — and the report is from Windows/Git Bash, where
+//   that is exactly the open question.
+//
+//   THE WRITER IS NAMED. A spliced line now carries two pids, and a line that
+//   lost its beginning no longer starts with `[<pid>] `. Corruption that
+//   cannot be prevented from here can at least stop being invisible: the log
+//   is the only evidence for the other reports on that platform, and one that
+//   is quietly wrong is worse than one that is obviously wrong.
+//
+// stdout is deliberately NOT prefixed. `usage()`, the thread-id list and
+// `--resolve-only` are read by people and asserted by tests; a prefix there
+// would change an interface, not a diagnostic.
+//
+// THREE THINGS REACH STDERR FROM THIS FILE, and only one of them is a log
+// record. Derived by grepping every write rather than by listing the ones that
+// came to mind — the first version of this change named only the first and was
+// wrong about the other two (raised in review):
+//
+//   1. DIAGNOSTICS — `console.error`, forty-odd sites. Whole lines, ours.
+//      These are the log records: prefixed, one write each.
+//   2. CHILD DIAGNOSTICS — the app-server's own stderr, forwarded in whatever
+//      chunks it arrives in. Not ours to frame: a chunk is not a line, and
+//      buffering it would delay someone's only view of a child that is hanging.
+//   3. STREAMED AGENT OUTPUT — `agent/message/delta`, partial BY NAME. There is
+//      no newline to wait for; that is what makes it a delta.
+//
+// 2 and 3 are passed through unchanged and are NOT log records. What they must
+// not do is make a log record unreadable, and before this they could: a delta
+// that ends mid-word, followed immediately by a diagnostic, produces one
+// physical line containing both — the exact shape reported in #784, reachable
+// INSIDE ONE PROCESS with no concurrent writer and no platform question.
+//
+// So everything goes through one funnel that remembers whether the last byte
+// was a newline, and a diagnostic starts a fresh line when it was not.
+const LOG_PREFIX = `[${process.pid}] `;
+
+let atLineStart = true;
+
+// The funnel. Streamed content passes through byte-for-byte; all it does is
+// keep the flag honest.
+//
+// A BUFFER IS WRITTEN AS A BUFFER. The first version of this decoded every
+// chunk with `toString()`, which is wrong at exactly the boundary this code
+// exists for: a multi-byte character split across two `data` events decodes to
+// a replacement character in each half, and the child's diagnostic arrives
+// corrupted — a regression the direct `process.stderr.write(chunk)` it replaced
+// did not have (raised in review). "byte-for-byte" has to be true of the code,
+// not only of the comment.
+//
+// The newline flag comes from the last BYTE for a Buffer and the last CHARACTER
+// for a string. Those agree: `\n` is 0x0a and is never part of a multi-byte
+// UTF-8 sequence.
+function writeErr(text) {
+  if (text === undefined || text === null || text.length === 0) return;
+  // One call, string or Buffer alike: `process.stderr.write` takes both, and
+  // keeping it to one is what lets a test assert that nothing writes to stderr
+  // outside this function.
+  process.stderr.write(text);
+  atLineStart = typeof text === "string" ? text.endsWith("\n") : text[text.length - 1] === 0x0a;
+}
+
+function logLine(...args) {
+  const line = `${LOG_PREFIX}${require("util").format(...args)}\n`;
+  // The leading newline is the whole point: without it this diagnostic would
+  // continue whatever half-line a delta or a child chunk left open.
+  writeErr(atLineStart ? line : `\n${line}`);
+}
+
+// Rebound rather than applied at the forty-odd call sites: a helper that has
+// to be remembered is one a later line will forget, and the point of this
+// change is that EVERY diagnostic carries the pid.
+console.error = logLine;
 
 function die(message) {
   console.error(`codex-bridge: ${message}`);
@@ -121,6 +249,8 @@ function parseArgs(argv) {
       opts.help = true;
     } else if (arg === "--resolve-only") {
       opts.resolveOnly = true;
+    } else if (arg === "--print-loaded-threads") {
+      opts.printLoadedThreads = true;
     } else if (arg === "--project") {
       opts.project = argv[++i];
     } else if (arg === "--workspace-root") {
@@ -131,6 +261,8 @@ function parseArgs(argv) {
       opts.team = argv[++i];
     } else if (arg === "--name") {
       opts.name = argv[++i];
+    } else if (arg === "--owner") {
+      opts.owner = argv[++i];
     } else if (arg === "--pair") {
       const [team, name] = (argv[++i] || "").split("\t");
       if (!team || !name) die("--pair must be team<TAB>agent");
@@ -169,6 +301,14 @@ function parseArgs(argv) {
   }
 
   if (opts.help) return opts;
+  // The loaded-thread probe neither watches an inbox nor resolves an identity,
+  // so every option below is meaningless to it. --project in particular is the
+  // one thing its caller cannot supply usefully: a project is how you find a
+  // ROLE, and the probe exists precisely because no role is seated yet.
+  if (opts.printLoadedThreads) {
+    if (!opts.appServer) die("--print-loaded-threads requires --app-server");
+    return opts;
+  }
   if (!opts.project) die("--project is required");
   if (opts.workspaceRoots.some((root) => !root)) die("--workspace-root requires a path");
   opts.workspaceRoots = [...new Set([opts.project, ...opts.workspaceRoots])];
@@ -329,7 +469,10 @@ class AppServerClient {
     });
 
     this.child.stderr.on("data", (chunk) => {
-      process.stderr.write(chunk);
+      // Through the funnel so a chunk that does not end in a newline cannot
+      // leave the next diagnostic continuing the child's half-line. The Buffer
+      // is passed on undecoded: see `writeErr`.
+      writeErr(chunk);
     });
 
     const lines = readline.createInterface({ input: this.child.stdout });
@@ -393,7 +536,13 @@ class AppServerClient {
       if (!pending) return;
       this.pending.delete(message.id);
       if (message.error) {
-        pending.reject(new Error(message.error.message || JSON.stringify(message.error)));
+        const rpcError = new Error(message.error.message || JSON.stringify(message.error));
+        // Carry the JSON-RPC error code through, not just its text. ensureThread
+        // decides on the message ("already has an active writer"), so the code is
+        // not what gates that today; it is kept for diagnostics and any future
+        // caller that wants the numeric reason without parsing the text (#906).
+        if (typeof message.error.code === "number") rpcError.code = message.error.code;
+        pending.reject(rpcError);
       } else {
         pending.resolve(message.result);
       }
@@ -735,7 +884,13 @@ class WebSocketAppServerClient {
       if (!pending) return;
       this.pending.delete(message.id);
       if (message.error) {
-        pending.reject(new Error(message.error.message || JSON.stringify(message.error)));
+        const rpcError = new Error(message.error.message || JSON.stringify(message.error));
+        // Carry the JSON-RPC error code through, not just its text. ensureThread
+        // decides on the message ("already has an active writer"), so the code is
+        // not what gates that today; it is kept for diagnostics and any future
+        // caller that wants the numeric reason without parsing the text (#906).
+        if (typeof message.error.code === "number") rpcError.code = message.error.code;
+        pending.reject(rpcError);
       } else {
         pending.resolve(message.result);
       }
@@ -879,17 +1034,19 @@ class CodexBridge {
     this.turnTimer = null;
     this.authoritativeIdle = true;
     this.pendingWake = false;
+    this.startInFlight = false;
+    this.inFlightTurnId = null;
+    this.inFlightTurnEnded = false;
     this.watchHandle = null;
     this.wakeCount = 0;
-    this.lastWakeMaxId = 0;
+    this.lastWakeMaxId = "";
     this.staleWakeCount = 0;
     this.watchFailureBackoff = new WatchFailureBackoff({
       log: (message) => console.error(message),
     });
     this.watchTimeoutKillCount = 0;
     this.watchRearmTimer = null;
-    this.drainRecheckTimer = null;
-    this.drainHeldAssumedEnd = false;
+    this.lastArmAt = 0;
     this.inlineInboxText = "";
     // inline-inbox consumption tracking. turn/start's RESPONSE carries no turn id
     // in this protocol (result: {}), so each started turn gets a local, monotonic
@@ -909,21 +1066,13 @@ class CodexBridge {
       : crypto.createHash("sha1").update(identities.map((p) => `${p.team}\t${p.name}`).join("\n")).digest("hex");
     this.pidfile = path.join(RUN_DIR, `codex-bridge.${key}.pid`);
     this.metafile = path.join(RUN_DIR, `codex-bridge.${key}.meta`);
-    this.drainFence = path.join(RUN_DIR, `drain.${encodeRunKey(this.identity.team)}.fence`);
-    this.drainMarker = path.join(
-      RUN_DIR,
-      `draining.${encodeRunKey(this.identity.team)}__${encodeRunKey(this.identity.name)}.${process.pid}`,
-    );
-    this.drainLeaseStaleSeconds = drainLeaseStaleSeconds();
-    // Failure notices whose send failed, persisted so they survive a restart and
-    // are retried before each new turn (cursor-bridge's outbound-first rule).
-    // Keep the spool keyed by the worker name even though bridge PID state is
-    // role-scoped: it has one consumer and must never be shared across workers.
-    this.outboundFile = path.join(
-      RUN_DIR,
-      `codex-bridge.${this.identity.team}.${this.identity.name}.outbound.json`,
-    );
-    this._pidStartToken = "";
+    // A per-PID identity lease the launcher reaper reads to tell an orphan of THIS
+    // (project, role) from any other bridge, without reconstructing argv from ps
+    // (#943). Keyed by pid so duplicates are each enumerable; content is hashes,
+    // so no raw project/role value with a separator can be misread.
+    this.leasefile = path.join(RUN_DIR, `codex-bridge-lease.${process.pid}`);
+    this.leaseStart = "";
+    this.leaseStartSrc = "";
   }
 
   inflightCli(...args) {
@@ -1050,6 +1199,17 @@ class CodexBridge {
     this.client.on("item/agentMessage/delta", this.clientHandler("item/agentMessage/delta", (params) => this.onAgentMessageDelta(params)));
     this.client.on("thread/status/changed", this.clientHandler("thread/status/changed", (params) => this.onThreadStatus(params)));
     this.client.on("turn/started", this.clientHandler("turn/started", (params) => {
+      // The app-server holds threads beyond ours; another thread's turn must
+      // not flip our state (and, below, must not be mistaken for the turn we
+      // are starting).
+      if (params && params.threadId && params.threadId !== this.threadId) return;
+      // The app-server may notify the turn tryStartTurn() is starting BEFORE
+      // it ACKs the turn/start request. Capture its IDENTITY: only an end
+      // signal carrying this same turn id may be attributed to the new turn
+      // while the request is in flight (see onTurnCompleted).
+      if (this.startInFlight) {
+        this.inFlightTurnId = (params && params.turn && params.turn.id) || null;
+      }
       this.turnActive = true;
       this.threadIdle = false;
       this.authoritativeIdle = false;
@@ -1084,6 +1244,32 @@ class CodexBridge {
     await this.ensureThread();
     if (await this.handleDrainCheckpoint()) return;
     await this.armWatch();
+    // After armWatch, not before: the seat is a claim that this role is being
+    // delivered to, and until the watch is armed that is not yet true.
+    this.recordSeat();
+  }
+
+  // Write the seat from the thread the bridge actually armed on (#579). Seating
+  // before this point can only ever be inference -- the app-server is the one
+  // that knows which thread this session got, and it does not know it until the
+  // resume above succeeded. So whatever seeded the seat earlier, the value it
+  // guessed is replaced here by one the app-server confirmed.
+  //
+  // Best-effort by design: a failure to record costs the NEXT session a resume,
+  // not this one, which is already armed and delivering. Never let it take the
+  // bridge down.
+  recordSeat() {
+    if (!this.threadId || this.threadId === "loaded") return;
+    for (const pair of this.identities) {
+      try {
+        spawnSync(BASH_BIN, [
+          path.join(SCRIPT_DIR, "codex-record-session.sh"),
+          pair.team, pair.name, toPosixPath(this.opts.project),
+        ], { cwd: SKILL_DIR, encoding: "utf8", env: { ...process.env, CODEX_THREAD_ID: this.threadId } });
+      } catch (error) {
+        console.error(`codex-bridge: could not record seat for ${pair.team}/${pair.name}: ${error.message}`);
+      }
+    }
   }
 
   clientHandler(method, handler) {
@@ -1113,6 +1299,121 @@ class CodexBridge {
         "drain_capable=1",
       ].join("\n") + "\n",
     );
+    this.writeLease();
+  }
+
+  // The reaper's authority. It is published atomically (temp + rename) so a
+  // reader never sees a half-written file, and BEFORE any thread/network work,
+  // so a bridge is reapable the instant it exists. project and pairs are stored
+  // as SHA-1 hashes -- the launcher hashes its own PROJECT and sorted pair set
+  // the same way and compares hex, so no separator inside a project path or role
+  // can make one identity read as another (the whole class of bugs argv parsing
+  // hit). host and the process start time are what let the reaper reject a
+  // recycled pid or another machine before it kills anything.
+  // This process's start token, at the best precision the platform offers and by
+  // the SAME method _reap_orphan_bridges (codex-bridge-launcher.sh) recomputes it
+  // for a live pid, so the two agree:
+  //   Linux -> /proc/<pid>/stat field 22 (starttime in clock ticks): lossless, so
+  //            a recycled pid is always distinguishable from the one we leased.
+  //   else  -> `ps -o lstart=` (second precision): a pid reused within the SAME
+  //            second is the documented residual on such platforms; no external
+  //            observer can do better there (etime/mtime are second-grained too),
+  //            and the only victim would be a same-(project,pair) bridge in the
+  //            sub-ms window before it overwrites this pid's lease, self-corrected
+  //            by the launcher respawning it.
+  //   win32 -> Process.StartTime.Ticks, read through PowerShell. Windows has no
+  //            /proc, and MSYS's `ps` rejects -o outright, so both POSIX sources
+  //            yield an empty token and no lease can be published at all.
+  //            ONE source, not a preference list: WMIC is deprecated and already
+  //            absent from some Windows 11 installs, and letting each side choose
+  //            between WMIC and PowerShell independently would let this writer and
+  //            _start_token (codex-bridge-launcher.sh) record differently-
+  //            FORMATTED tokens for the same process. powershell.exe and pwsh
+  //            return identical Ticks, so falling back between those two binaries
+  //            is safe: the src label names the format, not the executable.
+  startToken() {
+    if (process.platform === "win32") {
+      for (const bin of ["powershell.exe", "pwsh"]) {
+        const r = spawnSync(
+          bin,
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `(Get-Process -Id ${process.pid}).StartTime.Ticks`,
+          ],
+          { encoding: "utf8" },
+        );
+        const ticks = (r.status === 0 ? (r.stdout || "") : "").trim();
+        if (/^\d+$/.test(ticks)) return { src: "pwsh", token: ticks };
+      }
+      return { src: "pwsh", token: "" };
+    }
+    try {
+      const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+      const after = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+      const ticks = after[19];
+      if (/^\d+$/.test(ticks || "")) return { src: "proc", token: ticks };
+    } catch (_) { /* no /proc (macOS/BSD) or unreadable */ }
+    const ps = spawnSync("ps", ["-o", "lstart=", "-p", String(process.pid)], { encoding: "utf8" });
+    const token = (ps.status === 0 ? (ps.stdout || "") : "").trim();
+    return { src: "ps", token };
+  }
+
+  writeLease() {
+    const { src, token } = this.startToken();
+    // Fail CLOSED at the source. A bridge that cannot publish a well-formed,
+    // enumerable lease must not go on to arm its network/thread -- that is exactly
+    // the authority-less orphan #906 is about. Each failure below throws, and run()
+    // publishes the lease before client.start(), so the throw aborts startup rather
+    // than leaving a live-but-unreapable bridge.
+    if (!token) throw new Error("cannot determine process start token for identity lease");
+    const host = os.hostname();
+    if (!host) throw new Error("cannot determine hostname for identity lease");
+    const projectHash = crypto.createHash("sha1").update(this.opts.project).digest("hex");
+    // Canonicalize the pair SET before hashing: hash each "team\tname" pair, then
+    // sort the hex hashes (pure ASCII, so a byte sort in the launcher and a JS
+    // code-unit sort here agree even for non-ASCII names) and hash the joined
+    // list. codex-bridge-launcher.sh computes BRIDGE_PAIRS_HASH identically.
+    const pairsHash = crypto.createHash("sha1")
+      .update(
+        this.identities
+          .map((pair) => crypto.createHash("sha1").update(`${pair.team}\t${pair.name}`).digest("hex"))
+          .sort()
+          .join("\n"),
+      )
+      .digest("hex");
+    this.leaseStart = token;
+    this.leaseStartSrc = src;
+    const body = [
+      "v=1",
+      `project=${projectHash}`,
+      `pairs=${pairsHash}`,
+      `host=${host}`,
+      `pid=${process.pid}`,
+      `start=${token}`,
+      `startsrc=${src}`,
+    ].join("\n") + "\n";
+    const tmp = `${this.leasefile}.tmp`;
+    // writeFileSync / renameSync throw on failure -> fatal, by design (see above).
+    // rename is atomic, so a reader never sees a half-written lease.
+    fs.writeFileSync(tmp, body, { mode: 0o600 });
+    fs.renameSync(tmp, this.leasefile);
+  }
+
+  // Remove only OUR lease: read it back and unlink only when both the pid and the
+  // start token still name this process, so a lease a recycled pid's new owner
+  // may have written to the same path is never deleted from under it.
+  cleanupLease() {
+    try {
+      if (!fs.existsSync(this.leasefile)) return;
+      const text = fs.readFileSync(this.leasefile, "utf8");
+      const pid = (text.match(/^pid=(.*)$/mu) || [])[1];
+      const start = (text.match(/^start=(.*)$/mu) || [])[1];
+      if (pid === String(process.pid) && start === this.leaseStart) {
+        fs.unlinkSync(this.leasefile);
+      }
+    } catch (_) { /* best effort */ }
   }
 
   installSignals() {
@@ -1137,6 +1438,7 @@ class CodexBridge {
     process.on("exit", () => {
       this.client.stop();
       this.cleanupMeta();
+      this.cleanupLease();
     });
   }
 
@@ -1202,6 +1504,23 @@ class CodexBridge {
         // below is a distinct failure (a resume that succeeded but returned
         // the wrong thread) and should still die() as before, not be
         // silently swallowed by this fallback.
+        // Two failures reach this catch and they need opposite handling. The
+        // benign one below -- a Codex 0.142+ --remote session that never created
+        // a rollout -- is what it was written for: turn/start needs only the
+        // threadId, so the bridge stays alive idle.
+        //
+        // "already has an active writer" is the other, and it is deterministic:
+        // another writer -- a co-resident Codex Desktop, or a second bridge --
+        // owns this thread, and resume cannot succeed while that holds. A bridge
+        // that proceeds anyway still arms watchers and holds ~10 threads, so
+        // duplicates accumulate until a per-user pid limit is saturated (#906).
+        // Match the message, not the JSON-RPC code alone (-32600 is the generic
+        // "invalid request", carried here now for diagnostics): the message is
+        // the condition, and a rewording that kept the code would not be this.
+        // Exit non-zero so a bridge that cannot own its thread does not linger.
+        if (/already has an active writer/iu.test(err && err.message ? err.message : "")) {
+          die(`thread/resume failed: ${err.message}`);
+        }
         console.error(`codex-bridge: thread/resume failed (${err.message}); proceeding without resume`);
         this.threadIdle = true;
         this.turnActive = false;
@@ -1236,6 +1555,19 @@ class CodexBridge {
   async armWatch() {
     this.clearWatchRearmTimer();
     if (this.stopping || this.watchHandle) return;
+    // The rate ceiling, on the one path every re-arm goes through. If the last
+    // arm was too recent, defer this one to fill the interval rather than spawn
+    // now; the watchHandle guard above and clearWatchRearmTimer keep a single
+    // pending arm. Nothing is dropped -- a deferred arm still runs.
+    const wait = MIN_ARM_INTERVAL_MS - (Date.now() - this.lastArmAt);
+    if (wait > 0) {
+      this.watchRearmTimer = setTimeout(() => {
+        this.watchRearmTimer = null;
+        this.armWatch().catch((error) => this.failClientHandler("process/exited", error));
+      }, wait);
+      return;
+    }
+    this.lastArmAt = Date.now();
     const handle = `agmsg-watch-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     this.watchHandle = handle;
     const command = [
@@ -1276,7 +1608,15 @@ class CodexBridge {
     if (await this.handleDrainCheckpoint()) return;
 
     if (params.exitCode === 0) {
-      this.watchFailureBackoff.success();
+      // Decay, not reset. A wake is progress, but a wake arriving amid failures
+      // does not prove the host recovered -- it proves one message moved. The
+      // old reset-to-0 let a fail/fail/wake churn hold the counter below the
+      // limit forever, so a bridge that never stopped delivering also never
+      // stopped failing (#936 (b)). Forgiving ONE failure per delivery lets a
+      // genuinely-recovered bridge (mostly wakes) fall to 0 while a churn still
+      // climbs to the cap. A clean deadline (exit 2 below) is the stronger
+      // signal -- a full timeout ran end to end -- and still resets outright.
+      this.watchFailureCount = Math.max(0, this.watchFailureCount - 1);
       const maxId = parseMaxId(params.stdout);
       if (this.isStaleWake(maxId)) {
         await this.shutdown();
@@ -1324,7 +1664,7 @@ class CodexBridge {
     this.watchRearmTimer = setTimeout(() => {
       this.watchRearmTimer = null;
       this.armWatch().catch((error) => this.failClientHandler("process/exited", error));
-    }, delayMs);
+    }, WATCH_REARM_MS);
   }
 
   clearWatchRearmTimer() {
@@ -1348,7 +1688,10 @@ class CodexBridge {
       return;
     }
     if (type === "idle") {
-      this.threadIdle = true;
+      // While a turn/start request is in flight, that start owns the state;
+      // a stale idle from the previous turn must not flip threadIdle under
+      // it. onTurnEnded() below decides (and defers) via the same ownership.
+      if (!this.startInFlight) this.threadIdle = true;
       // The real app-server signals idle but may never send turn/completed;
       // treat idle as the end of the turn so detection resumes. See #41.
       this.onTurnEnded({ authoritative: true }).catch((error) =>
@@ -1407,21 +1750,24 @@ class CodexBridge {
       await this.onTurnFailed(params);
       return;
     }
-    console.error(`codex-bridge: turn completed on thread ${this.threadId}`);
-    const { epoch, turnId } = this.resolveTurnEpoch(params);
-    if (epoch && this.turnSnapshots.has(epoch)) {
-      this.dropTurnEpoch(epoch);   // settled: the turn handled its consumed messages
-    } else if (turnId) {
-      console.error(`codex-bridge: turn/completed for unknown turn ${turnId}; no snapshot to settle`);
+    // Attribution while our turn/start request is unanswered. The previous
+    // turn's tail and the NEW turn's own completion are both legal here, and
+    // a phase flag cannot tell them apart (a stale tail can land AFTER the
+    // new turn was seen starting). Identity can: defer the end only when it
+    // carries the SAME turn id turn/started reported for the turn we are
+    // starting. Anything else — a different id, or no id on either side — is
+    // unattributable mid-start and is dropped; if it really was the new
+    // turn's end, the idle watchdog closes the turn (#41).
+    if (this.startInFlight) {
+      const completedId = params.turn && params.turn.id;
+      if (completedId && this.inFlightTurnId && completedId === this.inFlightTurnId) {
+        this.inFlightTurnEnded = true;
+      }
+      return;
     }
-    this.settleInflightEpoch(epoch);
-    await this.onTurnEnded({ authoritative: true });
+    await this.onTurnEnded();
   }
 
-  // turn/failed: in inline-inbox mode the messages were already consumed (marked
-  // read at fetch, see readInboxForPrompt), so without compensation the failed
-  // turn loses them silently. Notify each sender via the normal send path instead
-  // of un-reading them — un-reading would re-run the failed turn on every wake,
   // the runaway-retry pattern behind the cursor-bridge incident. Only THIS turn's
   // snapshot (resolved via the event's turn id) is notified; a late failure whose
   // snapshot is gone or whose id was never seen logs and settles nothing. KNOWN
@@ -1444,11 +1790,24 @@ class CodexBridge {
     await this.onTurnEnded({ authoritative: true });
   }
 
+
   // Single exit point for "the turn is no longer running", reachable from
   // turn/completed, turn/failed, thread/status idle, OR the turn watchdog. The
   // real app-server does not reliably deliver turn/completed, so a bridge that
   // gates re-arm on it never re-arms and sleeps after one message. See #41.
   async onTurnEnded({ authoritative = false } = {}) {
+    // While our turn/start request is unanswered, the only turn-end signal
+    // that can be attributed to the turn being started is an id-matching
+    // turn/completed — and onTurnCompleted defers that one itself before it
+    // ever reaches here. Everything else that funnels in mid-start (a stale
+    // thread/status idle from the previous turn, an id-less completion, a
+    // watchdog firing) is unattributable: acting on it reset turnActive /
+    // threadIdle under the in-flight start and re-entered tryStartTurn with
+    // the same wake, injecting a duplicate turn whose inbox read — after the
+    // first read consumed the rows — was empty. Drop them; a genuinely-ended
+    // new turn that only signalled ambiguously is closed by the idle
+    // watchdog (#41).
+    if (this.startInFlight) return;
     this.clearTurnWatchdog();
     const drainFence = !authoritative ? this.readDrainFence() : null;
     if (drainFence) {
@@ -1532,6 +1891,16 @@ class CodexBridge {
       this.turnSnapshots.set(this.turnEpoch, this.pendingConsumption);
     }
     this.pendingConsumption = null;
+    // Claim the wake BEFORE the request goes out, not after it succeeds. With
+    // the claim left set across the await, a turn-end signal arriving mid-
+    // request re-entered this method with the same wake and started a second
+    // turn. The claim is restored on failure so the wake fires again (the
+    // inline inbox rows are already marked read by then, so the retry
+    // re-delivers the wake, not the payload — unchanged from before).
+    this.pendingWake = false;
+    this.startInFlight = true;
+    this.inFlightTurnId = null;
+    this.inFlightTurnEnded = false;
     try {
       await this.client.request("turn/start", {
         threadId: this.threadId,
@@ -1540,12 +1909,12 @@ class CodexBridge {
         runtimeWorkspaceRoots: this.opts.workspaceRoots,
       });
       console.error(`codex-bridge: started turn on thread ${this.threadId}`);
-      this.pendingWake = false;
       // Bound how long we treat the turn as active. The real app-server may
       // never send turn/completed; the watchdog (and thread/status idle) drive
       // onTurnEnded so detection re-arms instead of sleeping forever. See #41.
       this.startTurnWatchdog();
     } catch (error) {
+      this.pendingWake = true;
       this.turnActive = false;
       this.threadIdle = true;
       this.clearTurnWatchdog();
@@ -1554,6 +1923,14 @@ class CodexBridge {
       this.compensateInflightEpoch(this.activeTurnEpoch, "turn/start failed", error.message);
       this.activeTurnEpoch = 0;
       throw error;
+    } finally {
+      this.startInFlight = false;
+    }
+    // A fast turn can be fully notified (started AND ended) before the ACK
+    // arrived; its deferred end is processed now that the start is settled.
+    if (this.inFlightTurnEnded) {
+      this.inFlightTurnEnded = false;
+      await this.onTurnEnded();
     }
   }
 
@@ -1735,7 +2112,9 @@ class CodexBridge {
 
   onAgentMessageDelta(params) {
     if (params.threadId !== this.threadId) return;
-    process.stderr.write(params.delta);
+    // Same funnel: a delta is partial by name, so the flag it leaves behind is
+    // what stops the next diagnostic from joining it into one line (#784).
+    writeErr(params.delta);
     // Watchdog re-arm on this activity is handled generically by
     // client.onThreadActivity (see run()), covering every notification type,
     // not just this one.
@@ -1812,10 +2191,16 @@ class CodexBridge {
         .split(/\r?\n/)
         .filter(Boolean)
         .map((line) => {
-          const [id, from, body, ts] = line.split("\x1f");
+          const parts = line.split("\x1f");
+          if (parts.length < 4) return null;
+          const id = parts[0];
+          const from = parts[1];
+          const ts = parts[parts.length - 1];
+          const body = parts.slice(2, -1).join("\x1f");
           return { id, from, body: body || "", ts: ts || "" };
         })
-        .filter((row) => /^\d+$/.test(row.id) && row.from);
+        .filter(Boolean)
+        .filter((row) => row.id && row.from && /^[0-9a-fA-F-]+$/.test(row.id));
       if (!rows.length) continue;
       const pairBySender = new Map();
       for (const row of rows) {
@@ -1846,8 +2231,8 @@ class CodexBridge {
         continue;
       }
       if (countText !== "0") {
-        console.error(`codex-bridge: mark-read-ids left unread rows for ${pair.team}/${pair.name}; dropping in-flight record`);
-        this.inflightCli("settle", pair.team, pair.name, String(nextEpoch), this.pidStartToken());
+        console.error(`codex-bridge: mark-read-ids left unread rows for ${pair.team}/${pair.name}; keeping in-flight record and leaving the turn unstarted`);
+        reservedEpoch = true;
         continue;
       }
       for (const [sender, ids] of pairBySender) {
@@ -1857,7 +2242,7 @@ class CodexBridge {
       sections.push([
         `${rows.length} new message(s):`,
         "",
-        ...rows.map((row) => `  [${row.ts}] ${row.from}: ${row.body}`),
+        ...rows.map((row) => `  [${row.ts}] ${row.from}: ${unescapeMachineBody(row.body)}`),
         "",
       ].join("\n"));
     }
@@ -2032,7 +2417,9 @@ class CodexBridge {
   }
 
   isStaleWake(maxId) {
-    if (maxId <= 0 || this.lastWakeMaxId !== maxId) {
+    // maxId is an OPAQUE token (the unread frontier id from watch-once), compared
+    // only for equality — never ordered. An empty token means "no unread".
+    if (!maxId || this.lastWakeMaxId !== maxId) {
       this.lastWakeMaxId = maxId;
       this.staleWakeCount = 0;
       return false;
@@ -2111,13 +2498,21 @@ function readPid(file) {
 }
 
 function parseMaxId(stdout) {
-  const match = String(stdout || "").match(/\bmax_id=([0-9]+)/);
-  return match ? Number(match[1]) : 0;
+  // max_id is now an opaque token (UUIDv7 / legacy decimal / any whitespace-free
+  // string), not an integer — return it verbatim for equality-only comparison.
+  const match = String(stdout || "").match(/\bmax_id=(\S+)/);
+  return match ? match[1] : "";
 }
 
 // Best-effort human-readable reason from a turn/failed payload. The app-server
 // ships { turn: { error } } or { error }; fall back to "unknown reason" and
 // truncate so a huge payload cannot bloat the compensation notice.
+function unescapeMachineBody(text) {
+  return String(text || "")
+    .replace(/\\t/g, "\t")
+    .replace(/\\n/g, "\n")
+    }
+
 function turnFailureReason(params) {
   const err = (params && ((params.turn && params.turn.error) || params.error)) || null;
   let text = "";
@@ -2130,6 +2525,31 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) {
     usage();
+    return;
+  }
+
+  // Read-only probe: no identities, no pidfile, no thread resumed. Runs before
+  // resolveIdentities because seating a role is exactly what has not happened
+  // yet when this is called -- requiring an identity here would be circular.
+  if (opts.printLoadedThreads) {
+    const client = createAppServerClient(opts);
+    try {
+      // start() arms the connection; ready() is what resolves once the WebSocket
+      // handshake has completed. Awaiting start() alone sends the first request
+      // into a socket that is not connected yet.
+      client.start();
+      await client.ready?.();
+      await client.request("initialize", {
+        clientInfo: { name: "agmsg-codex-bridge", title: "agmsg Codex bridge", version: readVersion() },
+        capabilities: { experimentalApi: true, requestAttestation: false, optOutNotificationMethods: [] },
+      });
+      client.notify("initialized");
+      const response = await client.request("thread/loaded/list", {});
+      const ids = response && Array.isArray(response.data) ? response.data : [];
+      if (ids.length > 0) console.log(ids.join("\n"));
+    } finally {
+      client.stop();
+    }
     return;
   }
 
@@ -2150,6 +2570,8 @@ if (require.main === module) {
 module.exports = {
   CodexBridge,
   toPosixPath,
+  writeErr,
+  logLine,
   WatchFailureBackoff,
   WATCH_FAILURE_DELAYS_MS,
   WATCH_FAILURE_STOP_MS,

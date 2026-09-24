@@ -27,3 +27,18 @@ agmsg_sha1() {
     cksum | awk '{print $1}'
   fi
 }
+
+# Portable SHA-256 of stdin. Terminal drivers use this only to derive a stable,
+# non-secret internal pane key; unlike SHA-1 socket naming there is no
+# compatibility fallback because a collision-prone checksum is not suitable.
+agmsg_sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 | awk '{print $NF}'
+  else
+    return 1
+  fi
+}

@@ -97,6 +97,112 @@ while IFS= read -r team; do
   agmsg_role_session_record "$team" "$NAME" "$BARE_SID" "$PROJECT_PHYS" "$TYPE" || true
 done <<< "$TEAMS"
 
+# A monitored Codex seat's dispatcher reads its role pair from the seat request
+# rather than inferring it from the project roster. Actas can change the role
+# after SessionStart, so publish the new pair (or an empty pair when the claim
+# is ambiguous) atomically at the same event. Other agent types have no request
+# file and do not enter this branch.
+if [ -z "${SKILL_DIR:-}" ] || [ -z "${TYPE:-}" ]; then
+  echo "actas claim: missing TYPE or SKILL_DIR; refusing bridge request publication" >&2
+elif [ "$TYPE" = "codex" ] && [ -n "${AGMSG_CODEX_SEAT_KEY:-}" ] \
+  && [ -r "$SCRIPT_DIR/drivers/types/codex/_seat-key.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/drivers/types/codex/_seat-key.sh"
+  if _agmsg_codex_seat_key_ok "$AGMSG_CODEX_SEAT_KEY"; then
+    request_file="$SKILL_DIR/run/codex-bridge-request.$AGMSG_CODEX_SEAT_KEY"
+    request_server="${AGMSG_CODEX_BRIDGE_APP_SERVER:-}"
+    if [ -z "$request_server" ] && [ -f "$request_file" ]; then
+      _request_line=""
+      IFS= read -r _request_line < "$request_file" 2>/dev/null || true
+      _agmsg_codex_request_parse "$_request_line" || true
+      request_server="${AGMSG_CODEX_REQUEST_APP_SERVER:-}"
+    fi
+    if [ -z "$request_server" ] && [ -r "$SCRIPT_DIR/drivers/types/codex/_app-server.sh" ]; then
+      # Resume can enter actas from the app-server process without inheriting
+      # its URL. Recover the same per-seat URL from the atomic seat record.
+      . "$SCRIPT_DIR/drivers/types/codex/_app-server.sh"
+      request_server="$(_agmsg_codex_app_server_url "$PROJECT")"
+    fi
+    request_tmp="$request_file.$$"
+    mkdir -p "$SKILL_DIR/run" 2>/dev/null || true
+    team_count=$(printf '%s\n' "$TEAMS" | grep -c . || true)
+    if [ "$team_count" -eq 1 ] && [ -n "$request_server" ]; then
+      IFS= read -r request_team <<EOF
+$TEAMS
+EOF
+      printf '%s\t%s\t%s\t%s\t%s\n' "$TYPE" "$BARE_SID" "$request_server" "$request_team" "$NAME" > "$request_tmp"
+    else
+      # Publish an empty-pair tombstone even when this seat's endpoint is
+      # unavailable. This retires the old role instead of leaving it as the
+      # dispatcher's stale authority; a later SessionStart can publish the
+      # non-empty pair once the per-seat URL is recoverable.
+      printf '%s\t%s\t%s\t\n' "$TYPE" "$BARE_SID" "$request_server" > "$request_tmp"
+    fi
+    mv "$request_tmp" "$request_file"
+  fi
+fi
+
+# Name this pane for the role just claimed, so peek/poke can reach a session a
+# human started by hand — not only one `spawn` placed. `|| true` twice over: the
+# claim is what the caller is waiting on, and naming must not be able to fail it
+# or delay its status line. A terminal that cannot name says so on stderr once.
+#
+# BARE_SID, not $SESSION_ID. In THIS script $SESSION_ID has been overwritten with
+# the normalized composite "<sid>.<pid>" (above), a token that exists only inside
+# agmsg; in session-start.sh the identically named variable holds the BARE sid the
+# CLI handed the hook, and it passes that. What a terminal knows is the bare one —
+# herdr stores exactly it in agent_session.value — so handing over the composite
+# asks a question no terminal can answer. It comes back as "cannot identify this
+# pane", which reads as a resolution problem and is an identifier mismatch, and
+# the `|| true` below means the claim still reports success while the pane goes
+# unnamed and unaddressable. watch.sh does the same lookup and was corrected the
+# same way (watch.sh:271); this was the remaining site.
+#
+# Once per claimed team, mirroring the role-session loop above: each (team, role)
+# gets its own record, because that pair is what peek/poke resolve by. The
+# VISIBLE pane name is whichever team comes last — panes have one name and a role
+# in two teams is one pane. Stable, since the order is $TEAMS'.
+if declare -F agmsg_terminal_name_self_safe >/dev/null 2>&1; then
+  while IFS= read -r team; do
+    [ -z "$team" ] && continue
+    agmsg_terminal_name_self_safe "$BARE_SID" "$team" "$NAME" "$PROJECT_PHYS" "$TYPE" record || true
+  done <<< "$TEAMS"
+fi
+
+# Start the engine for each claimed team, if one is not already up (#774).
+#
+# The second of the two trigger points. `actas` is where a session takes on a
+# role and therefore a team, and a session that arrives this way never passes
+# through session-start's block with that team in hand — a spawn's boot prompt
+# is `actas`, so on a rebooted machine this is the first moment the team is
+# known.
+#
+# AFTER the claim and BEFORE the status line: the claim is the thing the caller
+# is waiting on, and nothing about starting an engine may delay or fail it.
+#
+# DELAY IS THE HALF THAT NEEDED WORK. Returning 0 is not enough — a synchronous
+# `sync start` holds `status=ok` back for as long as the engine takes to become
+# ready, which is up to ~16s per team before the command even gives up. The
+# helper bounds the WAIT (`AGMSG_SYNC_AUTOSTART_TIMEOUT_S`, 5s for the whole
+# call) and leaves a slow start running rather than killing it. `|| true` says
+# the exit-status half a second time.
+#
+# Whether an engine is already running is not asked here — `sync start` answers
+# it under the per-team lock, and the concurrent case (several sessions claiming
+# roles at once) is exactly the one a second answer gets wrong. See
+# scripts/lib/sync-autostart.sh.
+if [ -x "$SKILL_DIR/scripts/remote.sh" ] && [ -r "$SKILL_DIR/scripts/lib/sync-autostart.sh" ]; then
+  # shellcheck source=scripts/lib/sync-autostart.sh
+  . "$SKILL_DIR/scripts/lib/sync-autostart.sh"
+  _autostart_teams=()
+  while IFS= read -r _t; do
+    [ -n "$_t" ] && _autostart_teams+=("$_t")
+  done <<< "$TEAMS"
+  if [ ${#_autostart_teams[@]} -gt 0 ]; then
+    agmsg_sync_autostart "$SKILL_DIR/scripts/remote.sh" "${_autostart_teams[@]}" || true
+  fi
+fi
+
 # Print a line describing each claimed team. One team per most projects but
 # the underlying model allows multi-team same-name registrations.
 printf 'status=ok'

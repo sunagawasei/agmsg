@@ -15,9 +15,45 @@ setup() {
   # its pidfile on the raw session_id it passes — deterministic in CI and when
   # the suite runs under an agent process.
   export AGMSG_AGENT_PID=""
+  # Newline-separated "pid<TAB>expected cmdline substring" records. Only the
+  # tests below that intentionally leave a background process running past
+  # their next assertion populate this; harmless (stays empty) elsewhere.
+  WATCHED_PIDS=""
+}
+
+# Register <pid> for teardown, together with a substring that MUST appear in
+# its cmdline (read fresh from the real ps, below) before teardown may signal
+# it. Call this immediately after the pid becomes known -- before any
+# assertion that could end the test, not after (#963 review): `run` cannot
+# fail a test, but the check that follows it can, and a pid recorded only
+# after that point never reaches teardown if the test ends there. Two engines
+# leaked exactly that way and were found still running, days later, on a
+# shared machine.
+_agmsg_watch_pid() {
+  local pid="$1" expect="$2"
+  [ -n "$pid" ] || return 0
+  WATCHED_PIDS="${WATCHED_PIDS}${WATCHED_PIDS:+$'\n'}${pid}"$'\t'"${expect}"
 }
 
 teardown() {
+  local pid expect cmd
+  while IFS=$'\t' read -r pid expect; do
+    [ -n "$pid" ] || continue
+    # A pid recorded from a pidfile only says where the number came from, not
+    # which process holds it now -- the engine may have already exited and
+    # the number been reused by an unrelated process. /bin/ps by absolute
+    # path, never through $PATH: a test above may have prepended a fixture
+    # directory whose fake ps claims every pid matches, and by teardown that
+    # override is normally out of scope again (it was only ever exported for
+    # one `run env PATH=... ...` child), but naming the real binary directly
+    # costs nothing and removes the dependency on that being true.
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    cmd="$(/bin/ps -p "$pid" -o args= 2>/dev/null)"
+    case "$cmd" in
+      *"$expect"*) kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true ;;
+    esac
+  done <<< "$WATCHED_PIDS"
   rm -rf "$FAKE_HOME"
 }
 
@@ -34,6 +70,101 @@ teardown() {
   run bash "$SK/scripts/inbox.sh" demo bob
   [ "$status" -eq 0 ]
   [[ "$output" =~ "hello from install" ]]
+}
+
+@test "install: Antigravity TUI shim resolves installed launcher and forwards actions first" {
+  skip_unless_linux
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  local shim="$FAKE_HOME/.agents/bin/agy-tui"
+  [ -x "$shim" ]
+  grep -Fq "# agmsg-shim-owner: $SK/scripts/drivers/types/antigravity/agy-tui.sh" "$shim"
+
+  run env HOME="$FAKE_HOME" PATH=/usr/bin:/bin "$shim" status \
+    --project /tmp/not-joined --team demo --name agy
+  [ "$status" -eq 0 ]
+  grep -qF 'runtime: tui-pty not started' <<<"$output"
+
+  run env HOME="$FAKE_HOME" PATH=/usr/bin:/bin "$shim" reset-guard \
+    --project /tmp/not-joined --team demo --name agy
+  [ "$status" -eq 1 ]
+  grep -qF 'no state exists for recovery' <<<"$output"
+
+  run env HOME="$FAKE_HOME" PATH=/usr/bin:/bin "$shim" ack \
+    --project /tmp/not-joined --team demo --name agy --batch batch-1 --confirm-id message-1
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no reservation or state exists for recovery"* ]]
+}
+
+@test "install: Antigravity TUI shim preserves foreign files and refreshes its owner only" {
+  mkdir -p "$FAKE_HOME/.agents/bin"
+  local shim="$FAKE_HOME/.agents/bin/agy-tui"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo user-owned' > "$shim"
+  local before; before="$(cat "$shim")"
+
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  [ "$(cat "$shim")" = "$before" ]
+
+  rm "$shim"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  # Not `sed -i`: BSD sed (macOS) reads the word after -i as a BACKUP SUFFIX, so
+  # the expression is taken as the filename and the whole call fails with
+  # "invalid command code". `\n` in a replacement is a GNU extension too. awk
+  # does both portably. (#1073)
+  awk '{ if ($0 ~ /exec bash /) print "# stale"; print }' "$shim" > "$shim.portable"
+  cat "$shim.portable" > "$shim"
+  rm -f "$shim.portable"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  refute grep -q '^# stale$' "$shim"
+
+  local owned_before; owned_before="$(cat "$shim")"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-second
+  [ "$(cat "$shim")" = "$owned_before" ]
+}
+
+@test "install: Antigravity TUI shim replaces its symlink without writing through it" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  local shim="$FAKE_HOME/.agents/bin/agy-tui"
+  local linked="$FAKE_HOME/linked-agy-tui"
+  cp "$shim" "$linked"
+  rm "$shim"
+  ln -s "$linked" "$shim"
+
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ ! -L "$shim" ]
+  [ -x "$shim" ]
+  cmp "$shim" "$linked"
+}
+
+@test "install: Antigravity TUI launcher resolves one registered identity" {
+  skip_unless_linux
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  local project="$FAKE_HOME/project"
+  local fake_agy="$FAKE_HOME/bin/agy"
+  mkdir -p "$project" "$(dirname "$fake_agy")"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_agy"
+  chmod +x "$fake_agy"
+  bash "$SK/scripts/join.sh" demo agy antigravity "$project"
+
+  run env HOME="$FAKE_HOME" PATH="$FAKE_HOME/bin:$PATH" \
+    "$FAKE_HOME/.agents/bin/agy-tui" status --project "$project"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"runtime: tui-pty not started"* ]]
+}
+
+@test "uninstall: removes only the owned Antigravity TUI shim" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  local shim="$FAKE_HOME/.agents/bin/agy-tui"
+  [ -f "$shim" ]
+
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/uninstall.sh" --yes
+  [ ! -e "$shim" ]
+}
+
+@test "install: Codex skill documents safe Git Bash quoting for Windows PowerShell" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+
+  grep -Fq "& 'C:\\Program Files\\Git\\bin\\bash.exe' -lc '~/.agents/skills/agmsg/scripts/whoami.sh \"\$(pwd)\" codex'" "$SK/SKILL.md"
+  grep -Fq "Do not use POSIX \`'\"'\"'\` quote splicing in PowerShell" "$SK/SKILL.md"
 }
 
 @test "install: --update restores scripts/lib even if it went missing" {
@@ -71,11 +202,57 @@ teardown() {
 
   run env HOME="$FAKE_HOME" AGMSG_FORCE_WINDOWS=1 bash "$REPO_ROOT/install.sh" --cmd agmsg --update
   [ "$status" -eq 0 ]
-  [[ "$output" =~ "Updating agmsg..." ]]
-  [[ ! "$output" =~ "Updating agmsg.backup-keep" ]]
+  printf '%s\n' "$output" | grep -Fq "Updating agmsg..."
+  refute grep -Fq "Updating agmsg.backup-keep" <<<"$output"
   [ ! -f "$FAKE_HOME/.agents/agmsg.ps1" ]
   [ ! -f "$FAKE_HOME/.agents/agmsg.backup-keep.ps1" ]
   grep -q "backup sentinel" "$backup/SKILL.md"
+}
+
+@test "install: --update with no --cmd refuses to guess between two real installs (#599)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-second
+  # Distinct per-install sentinels, not just each install's VERSION (which is
+  # the same source-derived string for both and would not distinguish "one of
+  # them got silently updated" from "neither did" -- co2 review, #659).
+  echo "agmsg sentinel" > "$FAKE_HOME/.agents/skills/agmsg/SKILL.md"
+  echo "agmsg-second sentinel" > "$FAKE_HOME/.agents/skills/agmsg-second/SKILL.md"
+
+  run env HOME="$FAKE_HOME" AGMSG_FORCE_WINDOWS=1 bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -ne 0 ]
+  printf '%s\n' "$output" | grep -Fq "Several agmsg installs found"
+  printf '%s\n' "$output" | grep -Fq "agmsg"
+  printf '%s\n' "$output" | grep -Fq "agmsg-second"
+  # Neither install was touched -- this is a refusal, not a guess.
+  grep -q "agmsg sentinel" "$FAKE_HOME/.agents/skills/agmsg/SKILL.md"
+  grep -q "agmsg-second sentinel" "$FAKE_HOME/.agents/skills/agmsg-second/SKILL.md"
+}
+
+@test "install: --update with no --cmd treats a leftover backup-shaped directory as another candidate, not a silent exclusion (#599)" {
+  # No code in this repo creates a ".bak-"-named directory -- that name is a
+  # human backup convention, not something install.sh generates. A pattern
+  # narrow enough to exclude it is therefore also narrow enough to still
+  # exclude nothing on a real machine, while remaining broad enough to
+  # collide with a legitimately chosen --cmd name (--cmd has no reserved-name
+  # validation: "agmsg.bak-tool" installs today with no error). Two rounds of
+  # narrowing hit that same collision from co2 review on #659; the fix is to
+  # not special-case names at all. A directory that still carries the .agmsg
+  # marker is just another candidate, and more than one candidate is exactly
+  # the ambiguity this fix already refuses to guess through.
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  local leftover="$FAKE_HOME/.agents/skills/agmsg.bak-20260731"
+  mkdir -p "$leftover/scripts" "$leftover/templates" "$leftover/db" "$leftover/agents"
+  touch "$leftover/.agmsg"
+  echo "leftover sentinel" > "$leftover/SKILL.md"
+  echo "agmsg sentinel" > "$FAKE_HOME/.agents/skills/agmsg/SKILL.md"
+
+  run env HOME="$FAKE_HOME" AGMSG_FORCE_WINDOWS=1 bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -ne 0 ]
+  printf '%s\n' "$output" | grep -Fq "Several agmsg installs found"
+  printf '%s\n' "$output" | grep -Fq "agmsg"
+  printf '%s\n' "$output" | grep -Fq "agmsg.bak-20260731"
+  grep -q "agmsg sentinel" "$FAKE_HOME/.agents/skills/agmsg/SKILL.md"
+  grep -q "leftover sentinel" "$leftover/SKILL.md"
 }
 
 @test "install: Claude Code command file gates actas/drop's fresh Monitor on delivery mode (#280)" {
@@ -86,6 +263,14 @@ teardown() {
   # already has (line ~90 in the template). The Claude Code command file is
   # only installed when ~/.claude exists (install.sh), separate from the
   # shared codex-typed $SK/SKILL.md.
+  #
+  # The substring shape checked here changed under #687 (review round 3):
+  # the old prose "Only if the project's delivery mode is monitor or both"
+  # became a per-mode bullet list (mode: monitor/both starts Monitor; every
+  # other mode -- turn, off (no hooks), off (unrecognized) -- leaves it
+  # stopped, some of them now with a required user-facing message). The
+  # #280 regression this guards -- Monitor invoked unconditionally -- is
+  # still what's being checked; only the literal wording moved.
   mkdir -p "$FAKE_HOME/.claude"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
   local cmd_file="$FAKE_HOME/.claude/commands/agmsg.md"
@@ -93,9 +278,9 @@ teardown() {
   local actas_block drop_block
   actas_block="$(sed -n '/If argument starts with "actas"/,/If argument starts with "drop"/p' "$cmd_file")"
   drop_block="$(sed -n '/If argument starts with "drop"/,/If argument starts with "spawn"/p' "$cmd_file")"
-  [[ "$actas_block" == *"delivery mode is"*"monitor"*"both"* ]]
+  [[ "$actas_block" == *"mode: monitor"*"mode: both"* ]]
   [[ "$actas_block" == *"delivery.sh status"* ]]
-  [[ "$drop_block" == *"delivery mode is"*"monitor"*"both"* ]]
+  [[ "$drop_block" == *"mode: monitor"*"mode: both"* ]]
   [[ "$drop_block" == *"delivery.sh status"* ]]
 }
 
@@ -107,6 +292,92 @@ teardown() {
   # SessionStart/Stop hook, so the user is told to re-run delivery.sh set.
   [[ "$output" =~ "delivery.sh set" ]]
   [[ "$output" =~ "#133" ]]
+}
+
+# #963: a running sync engine either keeps executing the code it already
+# loaded (the write below never touches an in-memory process) or crashes
+# reading a half-written driver file mid-write -- either way it does not come
+# back on its own. Drives this through the real installer, not a unit-level
+# call, since the bug is specifically about what --update does around the
+# write. AGMSG_NODE + the ps fixture below stand in for a real Node/server so
+# the engine reaches readiness deterministically and in-process, the same
+# technique test_remote_status_liveness.bats uses; entirely within
+# FAKE_HOME, so this never touches a real installed engine.
+@test "install --update: replaces a running sync engine with one on the new code (#963)" {
+  skip "remote sync engine is outside this fork's supported feature set"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  bash "$SK/scripts/join.sh" testteam alice claude-code /tmp/install-963-proj
+
+  local cfg="$SK/teams/testteam/config.json" escaped updated
+  escaped="$(sed "s/'/''/g" "$cfg")"
+  updated="$(sqlite_mem "
+    SELECT json_set('$escaped', '\$.remote_binding', json_object(
+      'endpoint', 'https://remote.example',
+      'server_instance_id', '018f0000-0000-7000-8000-000000000001',
+      'remote_team_id', '018f0000-0000-7000-8000-000000000002',
+      'protocol_version', 1,
+      'capabilities', json_object('write_allowed_ciphers', json_array('none')),
+      'connected_at', '2026-07-30T00:00:00Z',
+      'disconnected_at', null
+    ));")"
+  printf '%s\n' "$updated" > "$cfg"
+  mkdir -p "$SK/run"
+
+  local fake_node="$SK/fake-node" fake_bin="$SK/fake-node-bin"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'if [ "${1:-}" = "--version" ]; then echo v23.0.0; exit 0; fi' \
+    'echo "{\"event\":\"capabilities\",\"startup_nonce\":\"${AGMSG_SYNC_START_NONCE:-}\"}"' \
+    'trap "exit 0" TERM INT' \
+    'while :; do sleep 1; done' > "$fake_node"
+  chmod +x "$fake_node"
+  mkdir -p "$fake_bin"
+  # Answers only "-p <any pid> -o args=" -- with a fixed, matching cmdline for
+  # any pid asked about, since the engine's real pid is not known until after
+  # each start. Anything else goes to the real ps.
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'args=0' \
+    'case " $* " in *" -o args= "*) args=1 ;; esac' \
+    '[ "$args" = 1 ] || exec /bin/ps "$@"' \
+    "printf '%s\\n' 'bash $SK/scripts/internal/remote-sync.mjs run --team testteam'" > "$fake_bin/ps"
+  chmod +x "$fake_bin/ps"
+
+  local engine_signature="$SK/scripts/internal/remote-sync.mjs run --team testteam"
+
+  run env PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" bash "$SK/scripts/remote.sh" sync start testteam
+  # Captured and registered with teardown BEFORE the assertion below, not
+  # after: `run` itself cannot fail the test, but the `[ ]` that reads its
+  # status can end it right here, and a pid read only after that point is
+  # never watched -- an engine this call actually started then outlives the
+  # test with nothing left to stop it (leaked on this machine, found and
+  # killed by hand; #963 review).
+  local old_pid=""
+  [ -f "$SK/run/remote-sync.testteam.pid" ] && old_pid="$(cat "$SK/run/remote-sync.testteam.pid")"
+  _agmsg_watch_pid "$old_pid" "$engine_signature"
+  [ "$status" -eq 0 ]
+  kill -0 "$old_pid"
+
+  run env HOME="$FAKE_HOME" PATH="$fake_bin:$PATH" AGMSG_NODE="$fake_node" \
+    bash "$REPO_ROOT/install.sh" --cmd agmsg --update
+  # Same reason as above: whatever the pidfile names now -- the restarted
+  # engine on success, or the old one still if the restart step never ran --
+  # is registered before the status assertion that follows can end the test.
+  local new_pid=""
+  [ -f "$SK/run/remote-sync.testteam.pid" ] && new_pid="$(cat "$SK/run/remote-sync.testteam.pid")"
+  _agmsg_watch_pid "$new_pid" "$engine_signature"
+  [ "$status" -eq 0 ]
+
+  # No engine from before the update remains.
+  sleep 1
+  run kill -0 "$old_pid"
+  [ "$status" -ne 0 ]
+
+  # The engine process now running executes the new install's code: a fresh
+  # pid, alive, and reported running by the (also just-updated) status command.
+  [ "$new_pid" != "$old_pid" ]
+  kill -0 "$new_pid"
+  run env PATH="$fake_bin:$PATH" bash "$SK/scripts/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"connected (engine running, pid $new_pid)"* ]]
 }
 
 @test "install: AGMSG_STORAGE_PATH override works against the installed skill" {
@@ -160,7 +431,7 @@ _wait_pidfile_value() {
   # The Copilot SKILL.md must drive whoami with type=copilot, not codex,
   # otherwise Copilot sessions get mis-identified.
   grep -q "whoami.sh \"\$(pwd)\" copilot" "$copilot_skill"
-  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$copilot_skill"
+  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$copilot_skill"
   # Frontmatter has the substituted skill name.
   grep -q "^name: agmsg" "$copilot_skill"
 }
@@ -180,7 +451,7 @@ _wait_pidfile_value() {
   # Mutate the file so we can verify --update overwrites.
   echo "tampered" > "$copilot_skill"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  ! grep -q "^tampered$" "$copilot_skill"
+  refute grep -q "^tampered$" "$copilot_skill"
   grep -q "whoami.sh \"\$(pwd)\" copilot" "$copilot_skill"
 }
 
@@ -208,7 +479,7 @@ _wait_pidfile_value() {
   # The OpenCode SKILL.md must drive whoami with type=opencode, not codex,
   # otherwise OpenCode sessions get mis-identified.
   grep -q "whoami.sh \"\$(pwd)\" opencode" "$opencode_skill"
-  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$opencode_skill"
+  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$opencode_skill"
   grep -q "^name: agmsg" "$opencode_skill"
 }
 
@@ -225,7 +496,7 @@ _wait_pidfile_value() {
   [ -f "$opencode_skill" ]
   echo "tampered" > "$opencode_skill"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  ! grep -q "^tampered$" "$opencode_skill"
+  refute grep -q "^tampered$" "$opencode_skill"
   grep -q "whoami.sh \"\$(pwd)\" opencode" "$opencode_skill"
 }
 
@@ -326,12 +597,20 @@ PS1
   bash "$SK/scripts/join.sh" demo alice claude-code /tmp/install-projA
   local sid="resue-sid-$$"
 
+  local watch_signature="$SK/scripts/watch.sh $sid"
+
   bash "$SK/scripts/watch.sh" "$sid" /tmp/install-projA claude-code 3>&- &
   local first=$!
+  # Registered right after the pid is known, before wait_for_pidfile_pid --
+  # which can time out and end the test -- gets a chance to (#963 review,
+  # same shape as the sync-engine leak above: a pid recorded only after an
+  # assertion that can end the test is never watched by teardown).
+  _agmsg_watch_pid "$first" "$watch_signature"
   wait_for_pidfile_pid "$SK/run/watch.$sid.pid" "$first"
 
   bash "$SK/scripts/watch.sh" "$sid" /tmp/install-projA claude-code 3>&- &
   local second=$!
+  _agmsg_watch_pid "$second" "$watch_signature"
   wait_for_pidfile_pid "$SK/run/watch.$sid.pid" "$second"
   # The pidfile can flip to $second a beat before $first's TERM trap has
   # actually run — poll for its exit rather than checking the instant the
@@ -389,7 +668,7 @@ PS1
   [ -d "$FAKE_HOME/.agents/skills/agmsg" ]
   grep -q '^rm -rf "\$TMP"$' "$stdin_capture"
   grep -q '^SENTINEL_SURVIVED$' "$stdin_capture"
-  ! grep -q 'rm -rf' "$stdout_capture"
+  refute grep -q 'rm -rf' "$stdout_capture"
   rm -f "$stdin_capture" "$stdout_capture"
 }
 
@@ -417,7 +696,7 @@ PS1
   # tag landed after the last core v* tag, installs recorded provenance like
   # "app-v0.2.0-26-gHASH" instead of "v1.1.8-27-gHASH", which the desktop
   # app's own version comparison can't parse as semver and treats as
-  # unconditionally outdated. See aggie/koit bug report.
+  # unconditionally outdated. Observed on a real install, not hypothetical.
   # Resolve to the PHYSICAL path: on macOS $BATS_TEST_TMPDIR lands under
   # /var/folders/... which is itself a symlink to /private/var/folders/....
   # install.sh's SCRIPT_DIR uses plain `pwd` (logical, follows the symlink
@@ -525,7 +804,7 @@ EOF
 
   # The empty-array path used to emit `[, "..."]` — a leading comma, which is
   # invalid TOML and broke the user's Codex config.
-  ! grep -Eq '\[[[:space:]]*,' "$FAKE_HOME/.codex/config.toml"
+  refute grep -Eq '\[[[:space:]]*,' "$FAKE_HOME/.codex/config.toml"
   grep -q "$SK/db" "$FAKE_HOME/.codex/config.toml"
   grep -q "$SK/teams" "$FAKE_HOME/.codex/config.toml"
   grep -q "$SK/run" "$FAKE_HOME/.codex/config.toml"
@@ -542,6 +821,67 @@ with open(sys.argv[1], "rb") as f:
     tomllib.load(f)
 PY
   fi
+}
+
+@test "install: a symlinked Codex config.toml keeps its link and the edit lands on the target (#747, writable_roots exists)" {
+  mkdir -p "$FAKE_HOME/.codex" "$FAKE_HOME/dotfiles"
+  # The reporter's exact shape: writable_roots already present with an entry, and
+  # config.toml is a symlink into a dotfiles repo (stow/chezmoi/manual).
+  cat > "$FAKE_HOME/dotfiles/config.toml" <<'EOF'
+[sandbox_workspace_write]
+writable_roots = ["/some/existing/path"]
+EOF
+  ln -s "$FAKE_HOME/dotfiles/config.toml" "$FAKE_HOME/.codex/config.toml"
+  [ -L "$FAKE_HOME/.codex/config.toml" ] || skip "filesystem did not create a real symlink here"
+
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+
+  # The link survives: `mv` would have replaced it with a plain file (#747).
+  [ -L "$FAKE_HOME/.codex/config.toml" ]
+  # The edit reached the link's target, not a detached copy at the link path.
+  grep -q "$SK/db" "$FAKE_HOME/dotfiles/config.toml"
+  grep -q "$SK/teams" "$FAKE_HOME/dotfiles/config.toml"
+  grep -q "$SK/run" "$FAKE_HOME/dotfiles/config.toml"
+  # The pre-existing entry is kept.
+  grep -q "/some/existing/path" "$FAKE_HOME/dotfiles/config.toml"
+}
+
+@test "install: a symlinked Codex config.toml keeps its link when only the section exists (#747, second branch)" {
+  mkdir -p "$FAKE_HOME/.codex" "$FAKE_HOME/dotfiles"
+  # Section present, no writable_roots — the other mv-based branch.
+  cat > "$FAKE_HOME/dotfiles/config.toml" <<'EOF'
+[sandbox_workspace_write]
+EOF
+  ln -s "$FAKE_HOME/dotfiles/config.toml" "$FAKE_HOME/.codex/config.toml"
+  [ -L "$FAKE_HOME/.codex/config.toml" ] || skip "filesystem did not create a real symlink here"
+
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+
+  [ -L "$FAKE_HOME/.codex/config.toml" ]
+  grep -q "$SK/db" "$FAKE_HOME/dotfiles/config.toml"
+  grep -q "$SK/run" "$FAKE_HOME/dotfiles/config.toml"
+}
+
+@test "install: an ordinary Codex config.toml is replaced atomically, not truncated in place (#747 control)" {
+  mkdir -p "$FAKE_HOME/.codex"
+  cat > "$FAKE_HOME/.codex/config.toml" <<'EOF'
+[sandbox_workspace_write]
+writable_roots = ["/some/existing/path"]
+EOF
+  # The reverse of the symlink tests, guarding the ordinary-file arm so the atomic
+  # mv cannot be dropped again unseen (#747). An atomic `mv` gives the destination
+  # a NEW inode (the temp file's); a truncate-then-write (`cat >`, the symlink arm)
+  # keeps the old inode. So an unchanged inode here would mean the ordinary path
+  # silently became non-atomic.
+  local ino_before; ino_before="$(ls -i "$FAKE_HOME/.codex/config.toml" | awk '{print $1}')"
+
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+
+  [ ! -L "$FAKE_HOME/.codex/config.toml" ]
+  grep -q "$SK/db" "$FAKE_HOME/.codex/config.toml"
+  grep -q "/some/existing/path" "$FAKE_HOME/.codex/config.toml"
+  local ino_after; ino_after="$(ls -i "$FAKE_HOME/.codex/config.toml" | awk '{print $1}')"
+  [ "$ino_after" != "$ino_before" ]
 }
 
 
@@ -562,8 +902,8 @@ PY
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
   local hermes_skill="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
   [ -f "$hermes_skill" ]
-  ! grep -q "spawn hermes reviewer" "$hermes_skill"
-  ! grep -q 'must be `claude-code`, `codex`, or `hermes`' "$hermes_skill"
+  refute grep -q "spawn hermes reviewer" "$hermes_skill"
+  refute grep -q 'must be `claude-code`, `codex`, or `hermes`' "$hermes_skill"
   grep -q "hermes.*is not spawnable\|hermes.*not spawnable" "$hermes_skill"
 }
 
@@ -581,8 +921,8 @@ PY
 @test "install: --agent-type hermes makes shared SKILL.md Hermes-typed" {
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type hermes
   grep -q "whoami.sh \"\$(pwd)\" hermes" "$SK/SKILL.md"
-  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
-  ! grep -q "whoami.sh \"\$(pwd)\" gemini" "$SK/SKILL.md"
+  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
+  refute grep -q "whoami.sh \"\$(pwd)\" gemini" "$SK/SKILL.md"
   ! grep -q "whoami.sh \"\$(pwd)\" antigravity" "$SK/SKILL.md"
 }
 
@@ -602,7 +942,7 @@ PY
   [ -f "$hermes_skill" ]
   echo "tampered" > "$hermes_skill"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  ! grep -q "^tampered$" "$hermes_skill"
+  refute grep -q "^tampered$" "$hermes_skill"
   grep -q "whoami.sh \"\$(pwd)\" hermes" "$hermes_skill"
 }
 
@@ -629,7 +969,7 @@ PY
   sed 's#/scripts/drivers/types/codex/#/scripts/codex/#g' "$shim" > "$tmp"
   mv "$tmp" "$shim"
   grep -q '/scripts/codex/codex-shim.sh' "$shim"
-  ! grep -q '/scripts/drivers/types/codex/codex-shim.sh' "$shim"
+  refute grep -q '/scripts/drivers/types/codex/codex-shim.sh' "$shim"
 
   # --update must regenerate it back to the post-move path.
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
@@ -645,6 +985,157 @@ PY
   [ ! -e "$FAKE_HOME/.agents/bin/codex" ]
 }
 
+# #553: a second install under a different --cmd name used to silently
+# rewrite ~/.agents/bin/codex to point at itself, so every Codex launch on the
+# machine (through the shim) started dispatching into the second install's
+# drivers/storage instead of the production one -- with no warning, printed
+# as if it were a routine "refreshed" no-op.
+
+@test "install: a second, differently-named install does NOT clobber the first's Codex shim (#553)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
+  local shim="$FAKE_HOME/.agents/bin/codex"
+  [ -f "$shim" ]
+  # Positive control: pin exactly which install owns it before touching
+  # anything else, byte for byte -- if this does not already say "agmsg",
+  # the rest of the test proves nothing.
+  local before; before="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
+  printf '%s' "$before" | grep -qF "/skills/agmsg/"
+
+  local sk2="$FAKE_HOME/.agents/skills/agmsg-dfr"
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --agent-type codex
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -qF "owned by a different install"
+
+  # The shim's bytes must be completely unchanged, not just "still valid" --
+  # comparing the whole recorded line rather than only the owning dir catches
+  # a partial/malformed rewrite too.
+  local after; after="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
+  [ "$before" = "$after" ]
+  [ -d "$sk2" ]  # the second install itself still succeeded
+}
+
+@test "install: --update --cmd can reclaim a Codex shim owned by a different install (#553)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
+  local shim="$FAKE_HOME/.agents/bin/codex"
+
+  local sk2="$FAKE_HOME/.agents/skills/agmsg-dfr"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --agent-type codex >/dev/null
+  grep -q "/skills/agmsg/" "$shim"  # still the first install's, per the test above
+
+  # --update --cmd names a specific, already-registered install explicitly --
+  # that explicit targeting is the documented recovery path, so it is allowed
+  # to reclaim the shim rather than being blocked like the fresh install above.
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --update
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -qF "refreshed Codex monitor shim"
+  grep -q "/skills/agmsg-dfr/" "$shim"
+}
+
+@test "install: bare --update (no --cmd) does NOT force-steal a Codex shim owned by a different install (#553)" {
+  # Unlike --update --cmd <name>, a bare --update resolves its target by
+  # scanning for an existing install rather than the caller naming one.
+  # Forcing the shim reclaim unconditionally for bare --update would let
+  # whichever install the scan landed on steal the shim from another one the
+  # caller never named at all (review finding). This pins that a shim already
+  # owned by a DIFFERENT install survives a bare --update.
+  #
+  # Since #599 (PR #659) the scan fails closed when more than one install is
+  # present, so with two installs a bare --update now refuses before it
+  # touches anything -- which is the strongest form of "does not steal": the
+  # refusal is asserted, and the shim's owner line is asserted unchanged
+  # across it. The single-install case, where a bare --update does proceed,
+  # is the next test.
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
+  local shim="$FAKE_HOME/.agents/bin/codex"
+  local before; before="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
+  printf '%s' "$before" | grep -qF "/skills/agmsg/"
+
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --agent-type codex >/dev/null
+  grep -q "/skills/agmsg/" "$shim"  # still the first install's, per the earlier tests
+
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -ne 0 ]
+  printf '%s\n' "$output" | grep -Fq "Several agmsg installs found"
+  local after; after="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
+  [ "$before" = "$after" ]
+}
+
+@test "install: bare --update migrates this machine's own pre-#553 (owner-unknown) Codex shim (#553)" {
+  # The two fixes above -- fail closed on an owner-unknown shim, and bare
+  # --update no longer forcing -- are each correct alone but combined to
+  # block the single-install upgrade they were never meant to touch: nearly
+  # every real machine's shim predates ownership tracking, has no owner
+  # comment, and a routine `install.sh --update` with no --cmd (the normal
+  # way a single-install user upgrades) must still be able to refresh it
+  # (review finding). Provably only one agmsg install existing at all is what
+  # makes that safe without needing --cmd or --force: there is no other
+  # install the shim could actually belong to.
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  local shim="$FAKE_HOME/.agents/bin/codex"
+  mkdir -p "$FAKE_HOME/.agents/bin"
+  # A legacy shim: real marker, but written before this PR added the owner
+  # comment -- exactly what every pre-existing production shim looks like.
+  cat > "$shim" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Optional Codex entrypoint shim for agmsg monitor mode.
+# Generated by agmsg. Dispatches to the installed skill script.
+export AGMSG_CODEX_SHIM_WRAPPER=1
+export AGMSG_CODEX_SHIM_SCRIPT_DIR=/some/stale/pre-move/path
+exec /some/stale/pre-move/path/codex-shim.sh "$@"
+EOF
+  chmod +x "$shim"
+  refute grep -q "agmsg-shim-owner" "$shim"
+
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -qF "refreshed Codex monitor shim"
+  grep -q "agmsg-shim-owner" "$shim"
+  grep -q "/skills/agmsg/scripts/drivers/types/codex" "$shim"
+  refute grep -q "/some/stale/pre-move/path" "$shim"
+}
+
+@test "install: a second, differently-named FRESH install does NOT silently claim a pre-existing legacy shim (#553 review)" {
+  # Review finding: install.sh checks/refreshes the Codex shim (~line 436)
+  # BEFORE it touches this install's own .agmsg marker (~line 452). So when a
+  # second, differently-named install's fresh `install.sh --cmd` run reaches
+  # the shim step, agmsg_only_one_install sees only the FIRST install's
+  # marker on disk -- its own marker does not exist yet -- and (wrongly)
+  # concludes only one install exists anywhere, which is exactly the
+  # condition meant to let ONLY a genuinely sole install claim an
+  # owner-unknown legacy shim without --force. This pins that a second,
+  # differently-named install must not benefit from that allowance just
+  # because its own marker hasn't been written yet.
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  local shim="$FAKE_HOME/.agents/bin/codex"
+  mkdir -p "$FAKE_HOME/.agents/bin"
+  # A legacy shim: real marker, but no owner comment -- same shape as any
+  # shim written before this PR, and the same fixture the bare-`--update`
+  # migration test above uses.
+  cat > "$shim" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Optional Codex entrypoint shim for agmsg monitor mode.
+# Generated by agmsg. Dispatches to the installed skill script.
+export AGMSG_CODEX_SHIM_WRAPPER=1
+export AGMSG_CODEX_SHIM_SCRIPT_DIR=/some/stale/pre-move/path
+exec /some/stale/pre-move/path/codex-shim.sh "$@"
+EOF
+  chmod +x "$shim"
+  local before; before="$(cat "$shim")"
+
+  # A second, DIFFERENT, freshly-created install -- not --update, so this
+  # install's own .agmsg marker genuinely does not exist until after the
+  # shim step runs.
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-dfr --agent-type codex
+  [ "$status" -eq 0 ]
+
+  [ "$(cat "$shim")" = "$before" ]  # byte-for-byte unchanged, not silently claimed
+}
+
 # --- grok-build skill (~/.grok/skills/<name>/SKILL.md) ---
 
 @test "install: drops a Grok Build SKILL.md when ~/.grok exists" {
@@ -653,7 +1144,7 @@ PY
   local grok_skill="$FAKE_HOME/.grok/skills/agmsg/SKILL.md"
   [ -f "$grok_skill" ]
   grep -q "whoami.sh \"\$(pwd)\" grok-build" "$grok_skill"
-  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$grok_skill"
+  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$grok_skill"
   grep -q "^name: agmsg" "$grok_skill"
 }
 
@@ -676,4 +1167,130 @@ PY
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type grok-build
   grep -q "whoami.sh \"\$(pwd)\" grok-build" "$SK/SKILL.md"
   ! grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
+}
+
+# Positive control for #846 (A), covering every type the installer can render a
+# shared SKILL.md for: install fresh with that type, then run bare --update
+# (no --agent-type, forcing the on-disk re-detection path) and confirm the
+# type survives. Before the fix, only antigravity/gemini/grok-build were
+# grepped for at re-detection time -- opencode/hermes/cursor silently fell
+# through to the codex default and got their SKILL.md overwritten with the
+# codex template, i.e. the installer clobbering what it had itself just
+# written. codex itself is included as the baseline case (it was never
+# grepped for and was never broken -- it IS the fallback).
+@test "install: bare --update preserves every renderable type's SKILL.md flavor (#846)" {
+  local t
+  for t in codex gemini antigravity opencode hermes cursor grok-build; do
+    local cmd="agmsg-$t"
+    HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd "$cmd" --agent-type "$t"
+    local skill_md="$FAKE_HOME/.agents/skills/$cmd/SKILL.md"
+    grep -q "whoami.sh \"\$(pwd)\" $t" "$skill_md"
+
+    HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update --cmd "$cmd"
+    grep -q "whoami.sh \"\$(pwd)\" $t" "$skill_md"
+  done
+}
+
+# The Windows leg of the bats matrix selects by test NAME (filter "[Ww]indows"),
+# and until this test existed it ran only the two install-helper checks above --
+# so join.sh, which is the first thing any Windows user runs, executed in no
+# Windows job at all. #669 is exactly what that hole let through: on Git Bash
+# join.sh printed "Created team: <team>" and then exited 1 in silence, because
+# the roster journal handed sqlite an MSYS path readfile() could not open.
+#
+# Asserting the exit status alone would not have caught the earlier shape of
+# this bug, where the team directory appears and the membership does not. So
+# this asserts the membership is actually there afterwards.
+@test "install: on Windows too, join.sh writes the membership it just announced" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+
+  run bash "$SK/scripts/join.sh" wteam alice claude-code /tmp/install-wteam
+  [ "$status" -eq 0 ]
+
+  run bash "$SK/scripts/team.sh" wteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *alice* ]]
+}
+
+# --- provenance across path spaces (#830) --------------------------------
+#     The test above passes on any POSIX host because `$SCRIPT_DIR` and
+#     `git rev-parse --show-toplevel` agree there. On Windows they do not:
+#     bash hands out `/tmp/tmp.XXXX/agmsg` and git answers
+#     `C:/Users/.../tmp.XXXX/agmsg`, so the equality guarding the describe
+#     branch was always false and every Git Bash install silently recorded the
+#     fallback instead. This reproduces that mismatch on this host.
+
+@test "install: records provenance even when git reports the toplevel in another path space (#830)" {
+  # A git that answers `rev-parse --show-toplevel` in native Windows form and
+  # passes everything else — including `describe` — through to the real one.
+  # Rewriting only that one answer is what makes this a model of the platform
+  # rather than a broken git.
+  local shim_dir="$FAKE_HOME/shim-git"
+  mkdir -p "$shim_dir"
+  cat >"$shim_dir/git" <<'SHIM'
+#!/usr/bin/env bash
+real="$(PATH="${PATH#*:}" command -v git)"
+for a in "$@"; do
+  if [ "$a" = "--show-toplevel" ]; then
+    top="$("$real" "$@")" || exit $?
+    # `/tmp/x` -> `C:/tmp/x`: a different space, same directory.
+    printf 'C:%s\n' "$top"
+    exit 0
+  fi
+done
+exec "$real" "$@"
+SHIM
+  chmod +x "$shim_dir/git"
+
+  # BOTH HALVES OF THE PLATFORM, or the model is one-sided. Windows does not
+  # merely disagree about the path — it also ships `cygpath`, which is how the
+  # two forms are reconciled. Stubbing only the disagreement made the first
+  # version of this test unable to exercise the fix at all: it fell back, and
+  # the fix looked broken when it was the model that was incomplete.
+  # THE FLAG IS THE CLAIM, so this stub refuses to answer anything else. Real
+  # cygpath picks the output path space from the option: `-m` is the mixed form
+  # git reports, while the default and `-u` are the Unix form the comparison
+  # already holds — calling either of those would leave #830 exactly where it
+  # was. An earlier version printed `C:<last arg>` whatever it was handed, so
+  # dropping the flag or passing `-u` in production kept this test green
+  # (raised in review). Refusing is what makes the flag observable.
+  cat >"$shim_dir/cygpath" <<'CYG'
+#!/usr/bin/env bash
+[ "$#" -eq 2 ] || { echo "cygpath stub: want 2 args, got $#: $*" >&2; exit 64; }
+[ "$1" = "-m" ] || { echo "cygpath stub: want -m, got '$1'" >&2; exit 64; }
+[ -f "$2/install.sh" ] || { echo "cygpath stub: not the source dir: '$2'" >&2; exit 64; }
+printf 'C:%s\n' "$2"
+CYG
+  chmod +x "$shim_dir/cygpath"
+
+  # The premise, checked rather than assumed: the shim really does answer in
+  # the other form, so a green result below cannot come from the shim being
+  # bypassed.
+  #
+  # `[ "${output#C:}" != "$output" ]` rather than a `[[ ]]` prefix match: a
+  # non-last `[[ ]]` cannot fail the test on macOS bash 3.2 (#670), and this
+  # line exists to keep an unnoticed pass from happening. It would have been a
+  # blind check guarding against blind checks — which is the whole subject of
+  # this test.
+  run env PATH="$shim_dir:$PATH" git -C "$REPO_ROOT" rev-parse --show-toplevel
+  [ "$status" -eq 0 ]
+  [ "${output#C:}" != "$output" ]
+
+  # What the describe branch WOULD record, taken from the real git.
+  local expected
+  expected="$(git -C "$REPO_ROOT" describe --tags --always --dirty --abbrev=7 --match 'v[0-9]*')"
+  [ -n "$expected" ]
+  # And what the fallback would record, so the assertion below is known to
+  # tell them apart. Without this the test passes on the fallback: the VERSION
+  # file holds a plausible version string too, which is how the first version
+  # of this test stayed green with the fix reverted.
+  local fallback=""
+  [ -f "$REPO_ROOT/VERSION" ] && fallback="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
+  [ "$expected" != "$fallback" ]
+
+  run env PATH="$shim_dir:$PATH" env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  [ "$status" -eq 0 ]
+  [ -f "$SK/VERSION" ]
+  run cat "$SK/VERSION"
+  [ "$output" = "$expected" ]
 }

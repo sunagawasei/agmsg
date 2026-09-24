@@ -208,4 +208,30 @@ if [ "${JOIN_CHANGED:-1}" -ne 0 ]; then
   agmsg_team_config_audit "$TEAM" join "$AGENT_ID" "$PROJECT_PATH" || true
 fi
 
+# Joining may set this pane's visible seat label, but must not claim placement:
+# another live session can already own the same role through actas.
+_agmsg_tr_rc=0
+_agmsg_tr_e=0
+case $- in *e*) _agmsg_tr_e=1 ;; esac
+set +e
+# shellcheck disable=SC1091
+[ -r "$SCRIPT_DIR/lib/terminal-registry.sh" ] && . "$SCRIPT_DIR/lib/terminal-registry.sh"
+_agmsg_tr_rc=$?
+[ "$_agmsg_tr_e" = 1 ] && set -e
+if [ "$_agmsg_tr_rc" -eq 0 ] \
+    && declare -F agmsg_terminal_name_self_safe >/dev/null 2>&1; then
+  _agmsg_session_id=""
+  _agmsg_session_env="$(agmsg_type_get "$AGENT_TYPE" session_env)"
+  case "$_agmsg_session_env" in
+    [A-Za-z_]*)
+      case "$_agmsg_session_env" in
+        *[!A-Za-z0-9_]*) ;;
+        *) _agmsg_session_id="${!_agmsg_session_env:-}" ;;
+      esac
+      ;;
+  esac
+  agmsg_terminal_name_self_safe "$_agmsg_session_id" "$TEAM" "$AGENT_ID" \
+    "$PROJECT_PATH" "$AGENT_TYPE" || true
+fi
+
 echo "Joined team $TEAM as $AGENT_ID"

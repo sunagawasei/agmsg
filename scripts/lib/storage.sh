@@ -38,7 +38,99 @@ agmsg_storage_dir() {
   printf '%s\n' "$skill_dir/db"
 }
 
-# Echo the full path to messages.db, in a form the sqlite3 binary can open.
+# Echo the full path to a team's message store, in a form sqlite3 can open.
+#
+# Echo the full path to a team's message store, in a form sqlite3 can open.
+#
+# WHICH store depends on the team's partition driver, and teams choose separately:
+# `shared` (the default) puts every team in one file, `per-team` gives the team
+# its own. A team only leaves the default when connecting requires it, because
+# external programs read the shared store directly and lose sight of any team
+# that moves out. See scripts/drivers/partition/.
+#
+# The argument is required rather than optional on purpose. An optional one
+# leaves two ways to reach the store, and a caller that forgot the selector
+# would silently read a different team's messages instead of failing.
+#
+# The selector reaches the filesystem as a path segment under per-team, so it is
+# validated here rather than in the driver: this is the last point that can
+# refuse to build a path it cannot vouch for.
+agmsg_db_path() {
+  local team="${1-}"
+  if [ -z "$team" ]; then
+    echo "Error: agmsg_db_path requires a team selector" >&2
+    return 1
+  fi
+  agmsg_validate_team_name "$team" || return 1
+  _agmsg_partition_load "$team" || return 1
+  _agmsg_db_file "$(partition_store_relpath "$team")"
+}
+
+# Source the partition driver this team uses, memoized so repeated resolution in
+# one process costs nothing. Re-sources when a caller moves between teams on
+# different partitions — watch.sh loops over a subscription that can contain both.
+#
+# Deliberately NOT caching agmsg_driver_for_team's own answer (which driver a
+# team uses) per team, on top of this: a team's partition CAN change under a
+# running watcher, via an ordinary operation (internal/migrate-team-store.sh,
+# reached mid remote-connect) that flips a team from shared to per-team and
+# then removes its row from the shared store. A watcher that had cached
+# "shared" would keep reading the now-stale shared store forever, silently
+# never delivering anything the migrated store receives. The un-cached read
+# below is what notices the switch, exactly as it always has (review, #1329
+# round 2: a first attempt at this cache shipped the exact regression this
+# comment describes).
+_AGMSG_PARTITION_LOADED=""
+_agmsg_partition_load() {
+  # The registry may not be sourced yet — agmsg_db_path is reachable without
+  # going through agmsg_storage_load. Same guarded pull-in that uses.
+  if ! command -v agmsg_driver_for_team >/dev/null 2>&1; then
+    local _lib
+    _lib="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    # shellcheck disable=SC1091
+    [ -n "$_lib" ] && . "$_lib/driver-registry.sh"
+  fi
+  local name
+  name="$(agmsg_driver_for_team partition "$1" shared)"
+  [ "$name" = "$_AGMSG_PARTITION_LOADED" ] && return 0
+  local base kind file found=""
+  while IFS="$(printf '\t')" read -r kind base; do
+    [ -n "$base" ] || continue
+    file="$base/partition/$name.sh"
+    [ -f "$file" ] || continue
+    # Externals stay gated by the same opt-in every other axis uses.
+    if [ "$kind" = external ] && ! agmsg_driver_is_trusted partition "$name" "$file"; then
+      continue
+    fi
+    found="$file"
+  done <<EOF
+$(agmsg_driver_bases)
+EOF
+  if [ -z "$found" ]; then
+    # Loud rather than falling back to shared: a team recorded a partition, and
+    # quietly reading a different store than the one it names is the exact
+    # failure this axis exists to make impossible.
+    echo "Error: no partition driver '$name' for team '$1'" >&2
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  . "$found" || return 1
+  _AGMSG_PARTITION_LOADED="$name"
+}
+
+# The store that is NOT team-scoped, and the only resolver allowed to take no
+# selector. Two things live here that are not message data: the runtime `locks`
+# table (its resources are project-scoped — there is no team to pass), and the
+# pre-split store that migration reads from.
+#
+# Runtime state deliberately did not follow the messages when they split: a lock
+# on a project is not a fact about any one team, and per-team lock files would
+# let two teams in the same project take the same lock.
+_agmsg_runtime_db_path() { _agmsg_db_file; }
+
+# Join a store-relative path onto the storage directory. Defaults to the
+# pre-split shared file, which is what the runtime store still is.
+#
 # On Windows, sqlite3.exe is a native binary that cannot open a Git Bash path
 # like /c/Users/.../db/messages.db: open() fails, so inbox/send/watch all fail
 # to reach the store and the team goes silent (#197, reported by vhsvhafmwf).
@@ -173,16 +265,85 @@ agmsg_sqlite_mem() {
   sqlite3 :memory: "$@" | tr -d '\r'
 }
 
-# Turn a filesystem path into a form sqlite3's readfile() can open, then escape
-# it as a SQL string literal. On Windows, sqlite3.exe is a native binary that
-# can't open a Git Bash path like /d/a/agmsg/x.json — readfile() returns NULL
-# and the surrounding json parse silently yields no rows. cygpath -w converts to
-# the native D:\a\agmsg\x.json form first. No-op off Windows (cygpath absent).
-# Mirrors delivery.sh's sql_readfile_path for the registry readfile() sites.
-agmsg_sql_readfile_path() {
-  local path="$1"
-  if command -v cygpath >/dev/null 2>&1; then
-    path=$(cygpath -w "$path" 2>/dev/null || printf '%s' "$path")
+# agmsg_sql_readfile_path lives in lib/sqlpath.sh — one definition, so the rule
+# "a path bound for SQL goes through this function" has one answer. It used to
+# be defined here and again in hooks-json.sh, and a third caller wrote its own
+# escaper rather than reach for either (#669).
+if ! declare -F agmsg_sql_readfile_path >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  source "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/sqlpath.sh"
+fi
+
+# Escape an arbitrary scalar for safe interpolation into a SQL string literal
+# (double every single quote). Same semantics as the sqlite driver's internal
+# _sqlite_lit / storage_send escaping, but driver-agnostic and available to the
+# registry scripts that still write the legacy messages table directly
+# (rename.sh / rename-team.sh). A team or agent name may legitimately contain a
+# single quote (validate.sh only blocks path traversal), which would otherwise
+# break the INSERT/UPDATE and is an injection surface (#223, #87).
+agmsg_sqlesc() {
+  printf '%s' "$1" | sed "s/'/''/g"
+}
+
+# ── Storage driver facade (storage axis) ─────────────────────────────────────
+# The helpers above resolve the legacy sqlite path and run raw SQL; call sites
+# keep using them until #206 migrates them onto the contract below. The facade
+# resolves the *active* storage driver, sources it, and makes the storage_*
+# contract (docs/spec/driver-interface.md §2 / ADR 0003) available. Driver
+# discovery + trust reuse the axis-generic registry (ADR 0002, driver-registry.sh).
+
+# Path to the machine-wide driver config (spec §4). Overridable for tests.
+_agmsg_storage_config_path() {
+  printf '%s\n' "${AGMSG_CONFIG:-$HOME/.agents/agmsg/config.json}"
+}
+
+# Active storage driver name: env override > config "storage" key > built-in.
+agmsg_storage_driver() {
+  if [ -n "${AGMSG_STORAGE_DRIVER:-}" ]; then
+    printf '%s\n' "$AGMSG_STORAGE_DRIVER"
+    return 0
   fi
-  printf '%s' "$path" | sed "s/'/''/g"
+  local cfg name
+  cfg="$(_agmsg_storage_config_path)"
+  if [ -n "$cfg" ] && [ -f "$cfg" ]; then
+    name="$(sqlite3 :memory: \
+      "SELECT COALESCE(json_extract(readfile('$(agmsg_sql_readfile_path "$cfg")'), '\$.storage'), '')" \
+      2>/dev/null | tr -d '\r')"
+    if [ -n "$name" ] && [ "$name" != "null" ]; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+  fi
+  printf 'sqlite\n'
+}
+
+# Locate and source the active storage driver's storage_* functions. Idempotent.
+# Resolution reuses the registry search bases (in-tree builtins always trusted;
+# external plugin dirs gated by the opt-in trustfile, ADR 0002).
+_AGMSG_STORAGE_LOADED=""
+agmsg_storage_load() {
+  [ -n "$_AGMSG_STORAGE_LOADED" ] && return 0
+  # Pull in the axis-generic registry once (its functions may not be sourced yet).
+  if ! command -v agmsg_driver_bases >/dev/null 2>&1; then
+    local _lib
+    _lib="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    # shellcheck disable=SC1091
+    [ -n "$_lib" ] && . "$_lib/driver-registry.sh"
+  fi
+  local name file kind base
+  name="$(agmsg_storage_driver)"
+  while IFS="$(printf '\t')" read -r kind base; do
+    [ -n "$base" ] || continue
+    file="$base/storage/$name.sh"
+    [ -f "$file" ] || continue
+    if [ "$kind" = external ] && ! agmsg_driver_is_trusted storage "$name" "$file"; then
+      continue
+    fi
+    # shellcheck disable=SC1090
+    . "$file"
+    _AGMSG_STORAGE_LOADED="$name"
+    return 0
+  done < <(agmsg_driver_bases)
+  printf 'agmsg: no trusted storage driver "%s" found\n' "$name" >&2
+  return 1
 }

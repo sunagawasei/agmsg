@@ -192,9 +192,9 @@ _agmsg_grok_emit_monitor_directive() {
   if [ -f "$pidfile" ]; then
     local existing
     existing=$(cat "$pidfile" 2>/dev/null || true)
-    if agmsg_process_dedup_should_suppress watch "$pidfile" \
-        "watch|$session_id|$watch_project|$type" \
-        "$watch" "$session_id" "$project" "$type"; then
+    # _agmsg_pid_alive_local, mirroring delivery.sh emit dedup: the recorded pid is
+    # watch.sh's own $$, which tasklist cannot see (#567).
+    if [ -n "$existing" ] && _agmsg_pid_alive_local "$existing"; then
       cat <<EOF
 
 A watch.sh is already streaming into this session (pid $existing). No

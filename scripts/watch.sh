@@ -4,6 +4,12 @@ set -u
 source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 WATCH_ORIGINAL_ARGS=("$@")
 
+# Captured before anything below parses or resolves them, so a self-restart
+# (see _install_changed's handling in the main loop) can exec the installed
+# watch.sh with the exact argv this process was launched with, rather than
+# replaying already-resolved values through resolution logic a second time.
+ORIG_ARGS=("$@")
+
 # Stream new agmsg messages for the current session as they arrive.
 #
 # Intended to be launched by Claude Code's Monitor tool from the SessionStart
@@ -46,40 +52,26 @@ WATCH_ORIGINAL_ARGS=("$@")
 # subscription to one team for session-team mode.
 ARG_COUNT=$#
 SESSION_ID="${1:-}"
-[ "$SESSION_ID" = "-" ] && SESSION_ID=""
-PROJECT_PATH="${2:-}"
-AGENT_TYPE="${3:-}"
-
-# Missing required args fail on STDOUT, not via ${n:?}: bash prints the :?
-# message to stderr, which the monitor tool consuming this stream never
-# surfaces — the launch would die invisibly. A short arg list is also how a
-# shifted three-argument launch (no active_name; empty session id dropped by
-# the caller shell, see above) presents, so name that cause here too.
-if [ -z "$PROJECT_PATH" ] || [ -z "$AGENT_TYPE" ]; then
-  echo "ERROR: watch.sh needs <session_id> <project_path> <agent_type> [active_name] [--team <team>]; got $ARG_COUNT argument(s). A caller shell may have dropped an empty session_id argument and shifted the rest. Pass the sentinel '-' (e.g. \"\${GROK_SESSION_ID:--}\") instead of an empty string."
-  exit 1
-fi
+[ "$SESSION_ID" = "-" ] && SESSION_ID="" # #477: caller sentinel for empty session id
+PROJECT_PATH="${2:?Missing project_path}"
+AGENT_TYPE="${3:?Missing agent_type}"
 shift 3
-
-# [active_name] narrows the subscription to one agent name (actas mode).
-# [--team <team>] pins the subscription to a single team — required by
-# session-team mode, where one project dir is registered into many s-<uuid>
-# teams and identities.sh would otherwise enumerate all of them (cross-session
-# delivery). With the pin, only the current session's team is subscribed.
 ACTIVE_NAME=""
 TEAM_PIN=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --team)
-      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+      [ "$#" -ge 2 ] && [ -n "$2" ] || {
         echo "ERROR: watch.sh --team needs a value"
         exit 1
-      fi
+      }
       TEAM_PIN="$2"
       shift 2
       ;;
     *)
-      if [ -z "$ACTIVE_NAME" ]; then ACTIVE_NAME="$1"; shift
+      if [ -z "$ACTIVE_NAME" ]; then
+        ACTIVE_NAME="$1"
+        shift
       else
         echo "ERROR: watch.sh unexpected argument: $1"
         exit 1
@@ -91,12 +83,15 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
+agmsg_storage_load
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/process-identity.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/watch-stuck-map.sh"
 
 # Fail loudly on an unknown agent_type instead of running with zero
 # subscriptions. The dominant real-world cause is a shifted argument list: a
@@ -172,46 +167,511 @@ PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
 # monitor/actas/drop steps pass a bare session_id and we self-derive here.
 SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$AGENT_TYPE")"
 
+DB="$(agmsg_db_path)"
+RUN_DIR="$SKILL_DIR/run"
+PIDFILE="$RUN_DIR/watch.$SESSION_ID.pid"
+LOGFILE="$RUN_DIR/watch.$SESSION_ID.log"
+
+# Everything this process has to say, somewhere a person can read afterwards.
+#
+# stderr alone was not that place (#691). In the configuration this actually
+# runs in, fd2 is /dev/null: the watcher's fd1 is the socket to its session and
+# its fd2 goes nowhere. So every message explaining an otherwise invisible
+# state -- roles skipped, a claim refused, the reason a watcher stopped -- was
+# written to a file descriptor with no reader. A delivery investigation then
+# has to reconstruct from process tables and database state what the one
+# component that knew was unable to say.
+#
+# Beside the pidfile, because this process already owns that directory and the
+# pair is what a reader wants: which pid, and what it thought it was doing.
+#
+# Bounded by rotation, one generation kept: an unbounded log in a directory
+# nobody prunes is its own defect. The ceiling is stated exactly, because the
+# first version claimed one it did not deliver -- it compared the size BEFORE
+# the write, so a live log at cap-1 could take one more line and end over the
+# cap, and a live log already past the cap was moved to `.1` still oversized.
+#
+# The decision includes the bytes about to be written, so:
+#
+#   live file    never exceeds cap, EXCEPT when one record is itself larger
+#                than cap -- then the file is exactly that record, because
+#                rotating first and writing it whole is better than dropping
+#                the one line someone is looking for.
+#   `.1`         a former live file, so bounded the same way.
+#   on disk      at most 2 x max(cap, longest single record).
+#
+# A record here is one diagnostic line with a timestamp and a pid; the longest
+# realistic one is a few hundred bytes against a 128 KiB default.
+#
+# Still echoed to stderr: when someone runs watch.sh by hand, stderr IS the
+# place they are looking, and losing that to make the file work would trade one
+# silence for another.
+WATCH_LOG_MAX_BYTES="${AGMSG_WATCH_LOG_MAX_BYTES:-131072}"
+# Normalized the way INTERVAL above is. What an un-normalized value costs was
+# measured rather than assumed, because the first version of this comment named
+# a failure that does not happen here: the value never enters `$(( ))`, so it
+# cannot be read as a variable name, and this script sets `-u` but not `-e`, so
+# nothing dies.
+#
+# It reaches the right-hand side of `[ ... -gt "$WATCH_LOG_MAX_BYTES" ]`. A
+# word there makes the test error non-fatally and read as false, forever, so
+# rotation simply never fires and the log grows unbounded -- the one property
+# this design was chosen for. A cap of `0` is the opposite failure: every
+# record is over it, so each one rotates and throws the previous generation
+# away, which is the diagnostics this exists to keep.
+#
+# Anything that is not a positive integer -- empty, words, 0, negative --
+# becomes the default, so a misconfigured cap degrades to the shipped bound
+# rather than to no bound or to a one-line window.
+case "$WATCH_LOG_MAX_BYTES" in
+  ''|*[!0-9]*) WATCH_LOG_MAX_BYTES=131072 ;;
+  *) [ "$WATCH_LOG_MAX_BYTES" -gt 0 ] || WATCH_LOG_MAX_BYTES=131072 ;;
+esac
+
+# Pairs already reported as storeless, so the notice is once per process.
+NO_STORE_REPORTED=""
+STUCK_MAP=""
+STUCK_THRESHOLD=3
+
+watch_log() {
+  local msg="$*" record size=0 bytes
+  printf 'agmsg watch: %s\n' "$msg" >&2
+  mkdir -p "$RUN_DIR" 2>/dev/null || return 0
+  # Built first, so the rotation decision can weigh what is actually going to
+  # be appended rather than only what is already there.
+  record="$(printf '%s [%s] %s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$msg")"
+  if [ -f "$LOGFILE" ]; then
+    size="$(compat_file_size "$LOGFILE" 2>/dev/null || echo 0)"
+    case "$size" in ''|*[!0-9]*) size=0 ;; esac
+    # +1 for the newline. Rotate when this write WOULD cross the cap, not once
+    # it already has.
+    #
+    # Counted in BYTES, with `wc -c`, because the cap is bytes and so is the
+    # size `stat` returns. `${#record}` counts CHARACTERS in a UTF-8 locale, and
+    # a team or agent name may legally be Unicode -- the storeless and actas
+    # diagnostics put those names in the record. A multibyte line then passes a
+    # character-count check and lands over the byte cap, which is the contract
+    # this rotation exists to hold. One extra process per diagnostic is nothing:
+    # these are emitted a handful of times per watcher, not per poll.
+    bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]' 2>/dev/null)"
+    # If the byte count cannot be had, rotate rather than guess. Falling back
+    # to `${#record}` would reinstate the character count this just replaced --
+    # the exact wrong unit, and fail-OPEN: the bound would quietly stop holding
+    # whenever `wc` is missing or answers oddly. Rotating costs one early
+    # generation; the diagnostic itself is still written whole below.
+    case "$bytes" in ''|*[!0-9]*) bytes="$WATCH_LOG_MAX_BYTES" ;; esac
+    if [ "$(( size + bytes + 1 ))" -gt "$WATCH_LOG_MAX_BYTES" ]; then
+      mv -f "$LOGFILE" "$LOGFILE.1" 2>/dev/null || true
+    fi
+  fi
+  # Never fatal: a sandbox that cannot write here must not take delivery down.
+  printf '%s\n' "$record" >> "$LOGFILE" 2>/dev/null || true
+}
+
 # A resumed session may replay an old Monitor directive whose composite id
 # still embeds the previous agent pid. Rebind every downstream artifact and
 # liveness check to the live agent ancestor before claiming the watcher slot.
+# Uses watch_log (#691): stderr is often discarded in production launchers.
 if agmsg_instance_is_composite "$SESSION_ID" && ! agmsg_instance_alive "$SESSION_ID"; then
   stale_pid="${SESSION_ID##*.}"
   live_pid="$(agmsg_agent_pid "$AGENT_TYPE" || true)"
   case "$live_pid" in
     ''|*[!0-9]*)
-      echo "agmsg watch: composite instance pid $stale_pid is dead and no live $AGENT_TYPE agent found in ancestry; exiting (stale directive?)" >&2
+      watch_log "session $SESSION_ID is no longer alive; stopping."
       exit 0
       ;;
   esac
   if ! _agmsg_pid_alive "$live_pid"; then
-    echo "agmsg watch: composite instance pid $stale_pid is dead and no live $AGENT_TYPE agent found in ancestry; exiting (stale directive?)" >&2
+    watch_log "session $SESSION_ID is no longer alive; stopping."
     exit 0
   fi
   SESSION_ID="$(agmsg_instance_id_from_pid "${SESSION_ID%.*}" "$live_pid")"
-  echo "agmsg watch: instance pid $stale_pid is gone; adopted live agent pid $live_pid (stale directive, e.g. resumed session)" >&2
+  PIDFILE="$RUN_DIR/watch.$SESSION_ID.pid"
+  LOGFILE="$RUN_DIR/watch.$SESSION_ID.log"
+  watch_log "instance pid $stale_pid is gone; adopted live agent pid $live_pid (stale directive, e.g. resumed session)"
 fi
 
-DB="$(agmsg_db_path)"
-RUN_DIR="$SKILL_DIR/run"
-PIDFILE="$RUN_DIR/watch.$SESSION_ID.pid"
+watch_report() {
+  printf 'agmsg watch: %s\n' "$*"
+}
+
+# Close THIS member's own pane at the end of a graceful despawn, through the
+# terminal driver named by its placement record.
+#
+# It used to be `tmux kill-pane -t "$TMUX_PANE"`, which is the asymmetry the v1
+# scope named: a tmux member could fold itself away and a herdr member could
+# not, for no reason other than which multiplexer the teardown was written
+# against. The record already says which terminal placed the pane, and
+# despawn.sh already tears down through it; this is the same route for the
+# member tearing down ITSELF.
+#
+# Two things this deliberately does NOT do:
+#
+# 1. It does not fall back to $TMUX_PANE when the record is unusable. Keeping
+#    that fallback would leave tmux on a private path and reinstate the very
+#    asymmetry being removed — and it would make the failure invisible, because
+#    the one terminal that still worked is the one nobody would notice.
+#
+# 2. It does not fold a pane it cannot show is its own. `despawn.sh` tears down
+#    SOMEBODY ELSE from a record; this path tears down ITSELF, and the two need
+#    different proof. A record naming (team, name) says a pane was placed for
+#    that seat — it does not say the pane this process is running in IS that
+#    pane. Acting on the weaker fact is how a record gets used as authority it
+#    was never given. So the record's terminal+id must match what this session
+#    resolves to right now, and anything short of a match is reported, not
+#    guessed at.
+#
+# Silence is never the answer here: a pane that should have closed and did not
+# is exactly the state an operator cannot see. Every path that declines says
+# why, on stderr and in the watcher log.
+# Fold this session's own pane, and SAY WHICH of three things happened:
+#
+#   0  closed            the driver confirmed the pane is folded
+#   1  could-not-close   a pane was placed for this seat and this call did not
+#                        fold it — it may still be open
+#   2  nothing-to-close  nothing of ours was ever placed here (no record, or the
+#                        record names another session's pane)
+#
+# The channel follows the same split, and that is the rule rather than a habit:
+# 1 goes to STDOUT (`watch_report`) because an operator has a window to deal
+# with and the shipped launcher discards stderr (#691); 2 goes to stderr, because
+# there is nothing for anyone to do.
+#
+# Every branch used to `return 0`, including the one where the driver refused —
+# so the caller could not tell a folded pane from an open one, and reported
+# success either way (#1051). The failures also announced themselves only on
+# stderr, which the shipped launcher discards (#691), so they reached nobody.
+# Re-verify, at the act, that this pair is still in the state the turn read it
+# in. #983: the lock is read once per pair per turn (`pair_state=`), and the
+# irreversible acts happen ~200 lines later; a claim landing in between made this
+# watcher deliver, consume and even fold on behalf of a role it no longer held.
+#
+# The comparison is against the state we READ, not against "is it ours": the gate
+# serves a pair that is `free` as well as one that is `mine` (a broad watcher
+# holds no lock at all), so demanding `mine` here would stop the ordinary case.
+# What must not happen is the state CHANGING under us — `free`/`mine` becoming
+# `other:<sid>` — and equality catches that without needing to know which of the
+# two we started from.
+#
+# LIMIT, stated rather than left to be discovered: this NARROWS the window to the
+# distance between this re-read and the syscall after it. It does not make
+# read-and-act atomic, and it cannot see an ABA (the same instance id releasing
+# and reclaiming) — unreachable in practice because the id carries the pid, but
+# not impossible. Closing it means holding the actas lock across the turn, which
+# needs a critical-section protocol the lock does not have today; that is its own
+# issue, deliberately not smuggled in here.
+_pair_unchanged_since_read() {   # <team> <agent> <owner-as-read-this-turn>
+  # 0 unchanged | 1 changed | 2 unknown (unknown is refused, same as changed).
+  #
+  # ONE read, and the comparison is on the RAW owner. Two earlier shapes were both
+  # wrong, and the second is the subtler one:
+  #
+  #   `|| echo free`        turned an unreadable lock into "free", which COMPARED
+  #                         EQUAL to a pair read as free (review, round 1).
+  #   probe then re-derive  checked the status of one read and then used a second
+  #                         one's answer: actas_lock_state does its own read and
+  #                         collapses ITS failure to free/rc0, so for a broad
+  #                         watcher (pair_state=free) the unknown was laundered
+  #                         back into unchanged (review, round 2).
+  #
+  # Deriving `free`/`mine`/`other:` also drags in liveness, and
+  # actas_lock_sid_alive -> agmsg_instance_alive is a boolean with no "cannot
+  # tell": an unreadable run dir makes a live owner look dead, i.e. free again.
+  # None of that is needed to answer THIS question. "Did the pair move?" is
+  # answered by the owner string alone, so the guard reads it once, checks that
+  # read's own status, and compares bytes.
+  #
+  # A stale owner that dies mid-turn keeps the same string and is correctly
+  # `unchanged` — the role did not move to anyone. A lock removed mid-turn reads
+  # empty against a non-empty capture and is `changed`, which refuses; that is the
+  # conservative direction and costs one cycle.
+  #
+  # The reader is the three-valued one (#983): `absent` and `unreadable` are
+  # NOT the same answer here. Absent means there is no owner, which compares
+  # equal to an empty baseline and is correctly `unchanged` -- that is the
+  # ordinary case for a broad watcher on a free pair. Unreadable means we cannot
+  # say, and cannot say is refused. `actas_lock_owner` returned "" and rc 0 for
+  # both, so a run directory that became unsearchable mid-turn matched the free
+  # baseline exactly and the guard waved the act through (review).
+  local _r _rd _now
+  # Cached path resolution (actas_lock_read_cached): this guard runs several
+  # times per cycle for the same pair, and the path it resolves cannot change
+  # for the life of this process's PAIRS subscription -- see
+  # actas_lock_path_cached's own comment for exactly what is and is not
+  # memoized. The LOCK CONTENTS are still read fresh every call; only the
+  # path computation is skipped on a repeat.
+  _r="$(actas_lock_read_cached "$1" "$2")" || return 2
+  _rd="${_r%%$'\t'*}"
+  case "$_rd" in
+    ok)     _now="${_r#*$'\t'}" ;;
+    absent) _now="" ;;
+    *)      return 2 ;;
+  esac
+  [ "$3" = "__unreadable__" ] && return 2
+  [ "$_now" = "$3" ] && return 0
+  return 1
+}
+
+# Say why an act was refused, on the channel a reason survives on. The three
+# refusals below use watch_report (stdout), NOT watch_log: the shipped launcher
+# runs the watcher with fd2 on /dev/null (#691), so a refusal on stderr is a
+# refusal nobody can see -- and this is the moment an operator most needs to know
+# why their message did not arrive. `unknown` is reported with different words
+# from `changed`: one says the role moved, the other says we could not tell, and
+# the operator's next step differs.
+_report_pair_refusal() {   # <verdict-rc> <team> <agent> <what-was-skipped>
+  case "$1" in
+    2) watch_report "${2}/${3}: could not verify who holds this role (the actas lock could not be read), so ${4} was skipped this cycle; it will be retried." ;;
+    *) watch_report "${2}/${3} changed hands while this turn was running; ${4} skipped, and its messages stay for the session that claimed it." ;;
+  esac
+}
+
+close_own_placement() {
+  local team="$1" name="$2"
+  local rec ref rec_term rec_id mine my_term my_id
+
+  rec="$(agmsg_spawn_path "$team" "$name")"
+  if [ ! -f "$rec" ]; then
+    # A record is written when a pane is PLACED. A seat that joined by hand and
+    # never went through spawn has none — normal, not an error, and there is
+    # nothing here to close. Say so rather than exiting quietly, because the
+    # same silence would also cover "the record was lost".
+    watch_log "despawned '$name' (role dropped); no placement record for '$team/$name', so there is no pane to close from here — if a window remains it was not placed by agmsg; close it directly"
+    return 2
+  fi
+  IFS=$'\t' read -r ref _ _ _ < "$rec"
+  if [ -z "$ref" ]; then
+    watch_report "despawned '$name' (role dropped); the placement record at $rec is empty, so the pane cannot be identified — close this window manually"
+    return 1
+  fi
+
+  if ! declare -F agmsg_terminal_ref_terminal >/dev/null 2>&1; then
+    watch_report "despawned '$name' (role dropped); the terminal registry is not available in this install, so the recorded pane cannot be closed — close this window manually"
+    return 1
+  fi
+
+  # The ref parser fails CLOSED (non-zero) on a corrupt/unknown-scheme ref. A bare
+  # assignment would leave rec_term/rec_id empty and fall through to the "belongs to
+  # someone else" branch with an empty recorded side — a misleading message, and
+  # under a caller's `set -e` it would take the watcher down with no log at all.
+  # Give the unresolvable ref its OWN contract, in the sibling guards' shape.
+  rec_term=""; rec_id=""
+  rec_term="$(agmsg_terminal_ref_terminal "$ref")" || rec_term=""
+  rec_id="$(agmsg_terminal_ref_id "$ref")" || rec_id=""
+  if [ -z "$rec_term" ] || [ -z "$rec_id" ]; then
+    watch_report "despawned '$name' (role dropped); the placement record's pane ref ($ref) did not resolve to a terminal and pane id, so the pane cannot be identified — close this window manually"
+    return 1
+  fi
+
+  # Which pane is THIS process in, right now. resolve-for-name is the strict
+  # resolver: it answers only with a self-id it could actually establish, and
+  # says why when it cannot. That is the property wanted here — an unidentified
+  # pane must not be matched against a record by default.
+  #
+  # The BARE session id, not $SESSION_ID. watch.sh normalises its argument into
+  # an instance id (watch.sh:99), which for claude-code is the composite
+  # "<sid>.<pid>" — that composite exists only inside agmsg. What a terminal
+  # knows is what the CLI told it at SessionStart, which is the bare sid; herdr
+  # stores exactly that in agent_session.value. Handing it the composite asks a
+  # question no terminal can answer, and the answer comes back as "this session
+  # cannot identify its own pane" — a fail-closed that looks like a resolution
+  # problem and is really an identifier mismatch. Caught by the herdr test,
+  # which is the whole reason it stubs a session id rather than trusting one.
+  mine=""
+  if declare -F agmsg_terminal_resolve_name >/dev/null 2>&1; then
+    local bare_sid="$SESSION_ID"
+    if declare -F agmsg_instance_bare_sid >/dev/null 2>&1; then
+      bare_sid="$(agmsg_instance_bare_sid "$SESSION_ID")"
+    fi
+    mine="$(agmsg_terminal_resolve_name "$bare_sid" 2>/dev/null || true)"
+  fi
+  if [ -z "$mine" ]; then
+    watch_report "despawned '$name' (role dropped); this session cannot identify its own pane, so the recorded placement ($ref) is not provably ours and was left alone — close this window manually"
+    return 1
+  fi
+  my_term="${mine%%	*}"
+  my_id="${mine#*	}"
+
+  # Compare at the precision BOTH sides have. A record written before refs
+  # carried the tmux socket says `%9`; this session now resolves itself as
+  # `<socket>:%9`, and a literal comparison calls its own pane someone else's —
+  # measured: the member stopped being able to fold itself. So when either side
+  # is missing the socket, compare the bare ids.
+  #
+  # That is the legacy ambiguity, not a new one: a bare `%9` cannot name a server
+  # (two servers can both hold it), and this is the same assumption the record
+  # has always carried. New records carry the socket and compare at full
+  # precision.
+  local _my_cmp="$my_id" _rec_cmp="$rec_id"
+  case "$my_id:$rec_id" in
+    *:*)
+      if [ "${my_id#*:}" = "$my_id" ] || [ "${rec_id#*:}" = "$rec_id" ]; then
+        _my_cmp="${my_id##*:}"; _rec_cmp="${rec_id##*:}"
+      fi ;;
+  esac
+  if [ "$my_term" != "$rec_term" ] || [ "$_my_cmp" != "$_rec_cmp" ]; then
+    watch_log "despawned '$name' (role dropped); the placement record names $rec_term:$rec_id but this session is in $my_term:$my_id, so that pane belongs to someone else and was left alone — close this window manually"
+    return 2
+  fi
+
+  if ! agmsg_terminal_load "$rec_term" 2>/dev/null; then
+    watch_report "despawned '$name' (role dropped); the '$rec_term' terminal driver would not load, so the pane could not be closed — close this window manually"
+    return 1
+  fi
+  if ! terminal_despawn "$rec_id" >/dev/null 2>&1; then
+    # 13 is the drivers' "unsupported" — plain has no addressable pane, so there
+    # is genuinely nothing to close and the member must be told, not left with a
+    # window it thinks was folded.
+    watch_report "despawned '$name' (role dropped); the '$rec_term' terminal did not close pane $rec_id — close this window manually"
+    return 1
+  fi
+  return 0
+}
+
+# Resolve poll interval. Env var wins over config, default 5s.
+INTERVAL="${AGMSG_WATCH_INTERVAL:-}"
+if [ -z "$INTERVAL" ]; then
+  INTERVAL="$("$SCRIPT_DIR/config.sh" get delivery.monitor.poll_interval 5 2>/dev/null || echo 5)"
+fi
+case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
+
 mkdir -p "$RUN_DIR" 2>/dev/null || true
-WATCH_OWNER_SCOPE="watch|$SESSION_ID|$PROJECT_PATH|$AGENT_TYPE"
-if agmsg_process_assert_bootstrap watch "$PIDFILE" "$WATCH_OWNER_SCOPE"; then
-  WATCH_OWNER_SCOPE_HASH="$AGMSG_PROCESS_SCOPE_HASH"
-else
-  _owner_bootstrap_rc=$?
-  [ "$_owner_bootstrap_rc" -eq 75 ] || exit "$_owner_bootstrap_rc"
-  exec "$SCRIPT_DIR/internal/process-owner-launch.sh" \
-    --kind watch --pidfile "$PIDFILE" --scope "$WATCH_OWNER_SCOPE" --replace-owned \
-    --legacy-needle "$SCRIPT_DIR/watch.sh" --legacy-needle "$SESSION_ID" \
-    --legacy-needle "$PROJECT_PATH" --legacy-needle "$AGENT_TYPE" \
-    -- "$SCRIPT_DIR/watch.sh" "${WATCH_ORIGINAL_ARGS[@]}"
+
+# Sequential re-invocation of Monitor for this same session_id leaves the
+# previous watch.sh running but loses track of it (pidfile gets clobbered).
+# The prior holder has to go. ps args check defends against pid recycling —
+# only touch processes whose cmdline still matches our watch.sh. See #66.
+#
+# When ps is unavailable (e.g. Claude Code sandbox), fall back to kill -0
+# which confirms the pid is alive but cannot validate the cmdline.
+#
+# WHO to displace is decided here; the signal is sent AFTER this process has
+# written its own pid (#595). Sending it first is what made the predecessor's
+# own EXIT guard unsound: that guard removes the pidfile only if it still
+# records the predecessor's pid, and read-check-remove is three steps, so a
+# successor writing between the read and the remove has its record deleted by
+# a process on its way out. The successor never writes again, so the slot
+# stays empty while a live watcher owns it.
+#
+# Claiming first removes the interleaving rather than narrowing it: once the
+# file names the successor before the predecessor is ever signalled, the read
+# that the predecessor's cleanup performs cannot see the predecessor's own
+# pid, so the guard's condition is false and it deletes nothing.
+#
+# The comment on that guard already described this order as the one in force.
+# It was not; the code signalled first.
+PREV_PID_TO_DISPLACE=""
+if [ -f "$PIDFILE" ]; then
+  prev_pid=$(cat "$PIDFILE" 2>/dev/null || true)
+  if [ -n "$prev_pid" ] && [ "$prev_pid" != "$$" ] && _agmsg_pid_alive_local "$prev_pid"; then
+    prev_cmd=$(compat_get_cmdline "$prev_pid" 2>/dev/null || true)
+    if [ -n "$prev_cmd" ]; then
+      case "$prev_cmd" in
+        *"$SKILL_DIR/scripts/watch.sh"*) PREV_PID_TO_DISPLACE="$prev_pid" ;;
+      esac
+    else
+      # ps unavailable (sandboxed) — skip cmdline validation, rely on kill -0
+      PREV_PID_TO_DISPLACE="$prev_pid"
+    fi
+  fi
 fi
 
-# The acquire-then-exec bootstrap above is the single-owner claim.  Do not add
-# a PID-based takeover here: signal authorization belongs exclusively to
-# agmsg_process_signal_owned, and a duplicate never reaches this body.
+# Metadata BEFORE the pidfile, deliberately.
+#
+# A reader that finds a live pid with no filter file cannot tell what that
+# watcher is doing OR which project it serves, so it SKIPS it. Written the other
+# way round, every filtered watcher spends its startup window in exactly that
+# state, and a scan landing in the window reaches the opposite conclusion from
+# the one this metadata exists to support -- it would count nothing where there
+# is something to count, or, before the project was recorded, warn about a
+# watcher sharing nothing. The pidfile is what makes this process visible at
+# all, so nothing may be visible before what describes it (raised in review).
+#
+# The project is part of the record because RUN_DIR is per INSTALL, not per
+# project: two projects using the same install both write here, and their
+# watchers do not share a subscription -- the pairs come from the project's own
+# registrations. Counting across projects would warn about a hazard that does
+# not exist (also raised in review).
+FILTERFILE="$RUN_DIR/watch.$SESSION_ID.filter"
+# Three lines: role, project, and OWNER PID.
+#
+# The owner is what makes this survive a successor. The replacement path signals
+# the previous watcher and does not wait for it, so the order is: successor
+# writes this file, predecessor's EXIT runs, reads the pidfile (still its own
+# pid), and removes both -- taking the successor's fresh metadata with it. The
+# successor is then live with a pidfile and no filter, which a reader classifies
+# as pre-change and skips, so a real second unfiltered watcher in this project
+# goes unreported. The pidfile transfers ownership by being overwritten; this
+# file has to carry its own (raised in review).
+printf '%s\n%s\n%s\n' "${ACTIVE_NAME:-unfiltered}" "$PROJECT_PATH" "$$" > "$FILTERFILE" 2>/dev/null || true
+
+echo $$ > "$PIDFILE"
+
+# The slot is ours on disk; now the previous holder can be told to go (#595).
+# Nothing waits for it to finish: it is displaced, not depended on, and its
+# EXIT will find a pidfile that names this process and leave it alone.
+if [ -n "$PREV_PID_TO_DISPLACE" ]; then
+  kill "$PREV_PID_TO_DISPLACE" 2>/dev/null || true
+fi
+
+# --- Say when this watcher is sharing an inbox with another (#683). ---
+#
+# A watcher started WITHOUT an active name subscribes to every (team, agent)
+# registered for this project that nobody else has claimed. The read cursor is
+# one per pair, so when two such watchers exist, whoever polls first takes the
+# row and the other sees nothing -- the comment at the subscription site says
+# exactly this. The message is not duplicated and it is not lost loudly: it is
+# delivered to one of them, and the other's `inbox.sh` truthfully answers "no
+# new messages" because the row was read.
+#
+# Nothing observable is left behind, which is why this has to be said at the one
+# moment something can be said: startup.
+#
+# NOT a lease. This process still subscribes to exactly what it would have
+# subscribed to; it only stops being quiet about the fact that someone else is
+# doing the same. Exclusion is a separate decision.
+# Only when the hazard is real. A warning printed on every start is a warning
+# nobody reads, and an unfiltered watcher running alone is not in danger.
+if [ -z "$ACTIVE_NAME" ]; then
+  _sharing=0
+  for _pf in "$RUN_DIR"/watch.*.pid; do
+    [ -f "$_pf" ] || continue
+    [ "$_pf" = "$PIDFILE" ] && continue
+    _other_pid="$(cat "$_pf" 2>/dev/null || true)"
+    case "$_other_pid" in ''|*[!0-9]*) continue ;; esac
+    # `_agmsg_pid_alive_local`, not a bare `kill -0`. The bare form reads EPERM
+    # as "dead", so a watcher this process cannot signal -- another user, a
+    # sandbox -- would be counted as gone and its inbox-sharing left unsaid. The
+    # repo enforces this (`no shipped script decides liveness with a bare
+    # kill -0`), and it caught this line: the first version used the bare form
+    # while the comment above it claimed to use what the rest of the file uses.
+    #
+    # A pidfile left by a crashed watcher names nobody, which is why liveness is
+    # checked at all: counting one would fire the warning on an installation
+    # that has no second watcher.
+    _agmsg_pid_alive_local "$_other_pid" || continue
+    _other_filter="${_pf%.pid}.filter"
+    # An absent filter file is a watcher from BEFORE this change. It cannot be
+    # asked which project it serves, so it is not counted: warning on it would
+    # fire for every unrelated project sharing this install, and this warning is
+    # only worth having if it is true. A pre-change watcher in the SAME project
+    # is a real hazard that goes unreported here -- named in the PR rather than
+    # papered over, and it disappears as installs update.
+    [ -f "$_other_filter" ] || continue
+    _other_name="$(sed -n '1p' "$_other_filter" 2>/dev/null || true)"
+    _other_project="$(sed -n '2p' "$_other_filter" 2>/dev/null || true)"
+    # Same project only. RUN_DIR is per install; the subscription is per
+    # project, so a watcher in another project shares no pairs with this one.
+    [ "$_other_project" = "$PROJECT_PATH" ] || continue
+    [ "$_other_name" = "unfiltered" ] || continue
+    _sharing=$((_sharing + 1))
+  done
+  if [ "$_sharing" -gt 0 ]; then
+    watch_log "another watcher ($_sharing) is receiving for the same unclaimed roles in this project."
+    watch_log "messages addressed to those roles will reach whichever of us polls first, and the others will not see them."
+    watch_log "to receive only your own: /agmsg actas <name>"
+  fi
+fi
 # Readiness sentinels this watcher created (see #108). Populated once the
 # subscription is resolved; removed on exit so the file is present iff a live
 # watcher is currently receiving for that role.
@@ -219,9 +679,37 @@ READY_FILES=""
 cleanup() {
   # EXIT only removes the pidfile if it still records our pid. A successor
   # watcher (Monitor re-invoked for the same session_id) overwrites $PIDFILE
-  # with its own pid before killing us; without this guard our EXIT trap
-  # would erase the successor's record. See #66.
-  agmsg_process_cleanup_self watch "$PIDFILE" "@hash:$WATCH_OWNER_SCOPE_HASH"
+  # with its own pid before signalling us, so this read sees the successor's
+  # pid and leaves its record alone. See #66, and #595 for what happened when
+  # the signal came first: read, then the successor's write, then this remove
+  # — a guard that is three steps cannot decide anything about a file another
+  # process may write between them. The order is what makes it sound, not the
+  # comparison.
+  #
+  # This is still not atomic, and it is not relied on to be: a predecessor
+  # that entered cleanup for its OWN reasons before any successor existed can
+  # still race a newcomer's write. That window is not the relaunch path and
+  # is not what #595 observed.
+  local pidfile_pid=""
+  [ -f "$PIDFILE" ] && IFS= read -r pidfile_pid < "$PIDFILE" || true
+  # Both files are removed by their owner, but they do not share an owner test:
+  # the pidfile's owner is whoever it names, and the filter file's is whoever it
+  # records. See below for why the pidfile cannot answer for both.
+  #
+  # Neither may be left behind. A stale pidfile makes the next watcher count a
+  # ghost. A stale filter file is worse in the direction that matters: it keeps
+  # asserting a role on behalf of a dead process, and if that role is a name,
+  # every other watcher reads it as "filtered, not sharing" -- so the warning is
+  # SUPPRESSED by a process that no longer exists.
+  [ "$pidfile_pid" = "$$" ] && rm -f "$PIDFILE"
+  # The filter file is judged on ITS OWN recorded owner, not on the pidfile.
+  # During a replacement the pidfile still names the predecessor while the
+  # successor's metadata is already on disk, so deciding by the pidfile lets the
+  # predecessor delete a file it did not write.
+  _ff="$RUN_DIR/watch.$SESSION_ID.filter"
+  if [ -f "$_ff" ] && [ "$(sed -n '3p' "$_ff" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$_ff" 2>/dev/null || true
+  fi
   if [ -n "$READY_FILES" ]; then
     while IFS= read -r _rf; do
       [ -z "$_rf" ] && continue
@@ -234,138 +722,240 @@ cleanup() {
       [ "$_owner" = "$SESSION_ID" ] && rm -f "$_rf" 2>/dev/null || true
     done <<< "$READY_FILES"
   fi
+  [ -n "${INSTALL_STAMP:-}" ] && rm -f "$INSTALL_STAMP" 2>/dev/null || true
 }
 # Install these traps as early as re-entry permits because owner publication
 # can precede the target becoming signal-ready.
 trap cleanup EXIT
 trap 'exit 0' INT TERM HUP
 
-# Resolve poll interval. Env var wins over config, default 5s.
-INTERVAL="${AGMSG_WATCH_INTERVAL:-}"
-if [ -z "$INTERVAL" ]; then
-  INTERVAL="$("$SCRIPT_DIR/config.sh" get delivery.monitor.poll_interval 5 2>/dev/null || echo 5)"
-fi
-case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
+# A resident process keeps executing the code it was started with. An update
+# rewrites the scripts in place (same inode -- confirmed with lsof, #684), so
+# after one this watcher is running code from before it while everything it
+# talks to has moved on. Measured on the reported pair: a 1.1.13 watcher, after
+# `npx agmsg@1.2.0-rc.1 install` landed under it, stayed ALIVE and stopped
+# delivering -- the message was never printed and never marked read, and
+# nothing was written to stderr. Liveness is exactly what made it invisible.
+#
+# The guard is a timestamp rather than a version comparison, so it does not
+# only catch the table that moved this time. ANY file under scripts/ being
+# newer than this watcher's start means the code it is running is no longer the
+# code on disk, whatever changed -- which is the class, not the instance.
+#
+# `run/` is deliberately outside the watched tree: pidfiles and readiness
+# sentinels are written by watchers themselves and would trip it immediately.
+#
+# Keyed on the PID as well as the session id, because two watchers can hold the
+# same session id at once: Monitor re-invoked for one session leaves the old
+# watcher running until the successor kills it (#66), and both run cleanup. A
+# stamp named for the session alone is one file they share, so the loser's EXIT
+# trap deletes the winner's. `_install_changed` returns false when its stamp is
+# missing, so the successor would go on running with the guard silently off --
+# the same shape as the bug this guard exists for, and failing in the same
+# reassuring direction. $PIDFILE and $READY_FILES carry ownership checks for
+# exactly this; a per-process name gets it without a check to keep in sync.
+# Found in review.
+#
+# A SIGKILLed watcher leaves its stamp behind, which is the same exposure the
+# pidfile already has, and the file is empty.
+INSTALL_STAMP="$RUN_DIR/.watch-start.$SESSION_ID.$$"
+: > "$INSTALL_STAMP" 2>/dev/null || true
 
-# The watchdog is intentionally configured separately from the inbox poll:
-# it is a periodic health check for this watcher team's own worker. A malformed
-# or non-positive value falls back to a safe default so a bad config cannot
-# turn the normal poll loop into a busy loop.
-WATCHDOG_INTERVAL="$("$SCRIPT_DIR/config.sh" get watchdog.interval_s 60 2>/dev/null || echo 60)"
-case "$WATCHDOG_INTERVAL" in ''|*[!0-9]*) WATCHDOG_INTERVAL=60 ;; esac
-[ "$WATCHDOG_INTERVAL" -gt 0 ] || WATCHDOG_INTERVAL=60
-WATCHDOG_LAST_RUN=0
-WATCHDOG_DATE_ERROR_LAUNCHED=0
-WATCHDOG_TOMBSTONE="$RUN_DIR/watchdog.${TEAM_PIN}.tombstone"
-WATCHDOG_STAMP_MAX=256
-
-# A tombstone suppresses recovery only while it is a readable, single-line
-# owner stamp written recently by SessionEnd. Any ambiguity or filesystem
-# error fails open so a stale marker cannot disable recovery indefinitely.
-watchdog_tombstone_fresh() {
-  local now="$1" stamp extra mtime age mtime_status read_status extra_status valid=1
-  # Check the object before opening it. In particular, a FIFO must never be
-  # opened by the polling hook: no writer is expected and the read would block.
-  [ -f "$WATCHDOG_TOMBSTONE" ] || return 1
-  [ ! -L "$WATCHDOG_TOMBSTONE" ] || return 1
-  [ -O "$WATCHDOG_TOMBSTONE" ] || return 1
-  [ -r "$WATCHDOG_TOMBSTONE" ] || return 1
-
-  # INSTANCE_ID values are short path-safe strings. Read at most one extra byte
-  # beyond the documented maximum; never use wc/cat on an attacker-sized file.
-  # Bash read discards NUL bytes, so inspect the same bounded prefix separately
-  # before reading it into a shell variable.
-  dd if="$WATCHDOG_TOMBSTONE" bs=1 count=$((WATCHDOG_STAMP_MAX + 1)) 2>/dev/null \
-    | od -An -tx1 2>/dev/null \
-    | grep -Eq '(^|[[:space:]])00([[:space:]]|$)'
-  local -a probe_status=( "${PIPESTATUS[@]}" )
-  [ "${probe_status[0]:-1}" -eq 0 ] || return 1
-  [ "${probe_status[1]:-1}" -eq 0 ] || return 1
-  [ "${probe_status[2]:-1}" -eq 1 ] || return 1
-  exec 9<"$WATCHDOG_TOMBSTONE" 2>/dev/null || return 1
-  IFS= read -r -n $((WATCHDOG_STAMP_MAX + 1)) stamp <&9
-  read_status=$?
-  if [ "${#stamp}" -eq 0 ] || [ "${#stamp}" -gt "$WATCHDOG_STAMP_MAX" ]; then
-    valid=0
-  fi
-  # read -n consumes the newline delimiter. Any byte left after the first line
-  # therefore proves multiline or oversized content and fails closed.
-  if [ "$valid" -eq 1 ]; then
-    IFS= read -r -n 1 extra <&9
-    extra_status=$?
-    [ "$extra_status" -eq 1 ] || valid=0
-  fi
-  exec 9<&-
-  [ "$valid" -eq 1 ] || return 1
-  case "$read_status" in
-    0) ;;
-    1) [ -n "$stamp" ] || return 1 ;;
-    *) return 1 ;;
-  esac
-  case "$stamp" in *[![:graph:]]*) return 1 ;; esac
-  mtime_status=0
-  mtime="$(compat_file_mtime "$WATCHDOG_TOMBSTONE" 2>/dev/null)" || mtime_status=$?
-  [ "$mtime_status" -eq 0 ] || return 1
-  case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$now" -ge "$mtime" ] || return 1
-  age=$((now - mtime))
-  [ "$age" -le 600 ] || return 1
-  return 0
+# True when anything under scripts/ was written after this watcher started.
+# `-print -quit` stops at the first hit, so the common case is one stat-walk
+# that exits early rather than a full tree scan every cycle.
+_install_changed() {
+  [ -f "$INSTALL_STAMP" ] || return 1
+  [ -n "$(find "$SCRIPT_DIR" -newer "$INSTALL_STAMP" -print -quit 2>/dev/null)" ]
 }
 
-WATCHDOG_OWNER_START=""
-if agmsg_instance_is_composite "$SESSION_ID"; then
-  WATCHDOG_OWNER_START="$(agmsg_pid_start_token \
-    "${SESSION_ID##*.}" 2>/dev/null || true)"
-fi
+# True only once the install that touched scripts/ has FINISHED, not merely
+# started (review finding: install.sh rewrites the tree over a window, #963,
+# so watch.sh itself can already be executable while a sibling file it
+# sources is still old, missing, or half-written -- _install_changed alone
+# cannot tell "one file so far" from "the whole generation").
+#
+# VERSION is install.sh's own last write that touches anything under
+# scripts/ (cp -R scripts/, then chmod, THEN VERSION -- confirmed by reading
+# both its --update and fresh-install paths). No new marker to invent: an
+# install that has finished leaves VERSION newer than everything it just
+# copied, and one still mid-copy has not written it yet, or has not written
+# it again since this watcher's own start.
+#
+# STRICTLY newer, not "at least as new as" (review finding, round 3): a
+# non-strict comparison lets an OLD, unrelated VERSION whose timestamp
+# happens to TIE with this watcher's own start -- a real possibility on a
+# coarse-timestamp filesystem -- pass as "complete" the moment a later
+# install's scripts write lands, before that install has written its OWN
+# VERSION. A tie proves nothing either way, so it is treated as NOT
+# complete: the one cost is that a genuinely-finished install landing in the
+# very same clock tick as this watcher's own start falls back to today's
+# visible exit instead of restarting -- rare, and no worse than before this
+# PR, never a mixed-generation exec.
+_install_complete() {
+  local version_file="$SKILL_DIR/VERSION"
+  [ -f "$version_file" ] || return 1
+  [ "$version_file" -nt "$INSTALL_STAMP" ]
+}
 
-# Bash has no portable monotonic-clock builtin, so the watchdog cadence uses
-# wall-clock seconds. If the clock moves backward, resetting this process-local
-# baseline prevents a negative delta from wedging future watchdog runs.
-maybe_run_watchdog() {
-  [ -n "$TEAM_PIN" ] || return 0
+# True once BOTH a complete generation and an executable watch.sh are in
+# place -- the two conditions a restart actually needs. Split out so the main
+# handler below can ask "can I go now?" without repeating both checks.
+_install_ready() {
+  _install_complete && [ -x "$SCRIPT_DIR/watch.sh" ]
+}
 
-  local now date_status
-  date_status=0
-  now="$(date +%s 2>/dev/null)" || date_status=$?
-  if [ "$date_status" -ne 0 ]; then
-    if [ "$WATCHDOG_DATE_ERROR_LAUNCHED" -eq 0 ]; then
-      AGMSG_WATCHDOG_OWNER_INSTANCE="$SESSION_ID" \
-        AGMSG_WATCHDOG_OWNER_START="$WATCHDOG_OWNER_START" \
-        "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
-      WATCHDOG_DATE_ERROR_LAUNCHED=1
+# How long an install that has started (changed files exist) but not yet
+# finished (not _install_ready) is tolerated before falling back to the
+# visible exit (review finding, round 4, #684 follow-up). install.sh writes
+# scripts/ over many separate file operations before its own last write
+# (VERSION); a watcher's poll can land in that window on essentially any real
+# install, not just a rare half-written one, so committing to the visible
+# exit the FIRST time this is observed was giving up too early.
+#
+# Time-based, not a poll count (#779's own reasoning applies here too): the
+# poll interval is itself configurable, so a count-based bound would silently
+# change how long this actually waits whenever the interval changes.
+#
+# Fixed production ceiling of 60s. The environment may only LOWER it, to an
+# integer from 1 to 60 inclusive (review finding, round 5): anything else --
+# non-numeric, zero, or above 60 -- is rejected back to 60, so an inherited or
+# forged value can never raise or remove the bound. 3-or-more-digit input is
+# rejected by pattern alone, before any numeric comparison, specifically so a
+# very long digit string is never handed to `[ -gt ]`/`-lt` at all -- some
+# shells' arithmetic evaluation is not guaranteed well-defined for arbitrarily
+# large integers, and this avoids relying on it being.
+AGMSG_WATCH_INSTALL_INCOMPLETE_TIMEOUT="${AGMSG_WATCH_INSTALL_INCOMPLETE_TIMEOUT:-60}"
+case "$AGMSG_WATCH_INSTALL_INCOMPLETE_TIMEOUT" in
+  [1-9]|[1-5][0-9]|60) ;;
+  *) AGMSG_WATCH_INSTALL_INCOMPLETE_TIMEOUT=60 ;;
+esac
+
+# Time this cycle first observed "changed but not ready" -- empty means
+# either nothing has changed yet, or it already resolved (readied and
+# restarted, which never returns here to clear it -- exec starts a fresh
+# process with this unset again -- so no explicit reset is needed there).
+#
+# Measured with $SECONDS, not `date +%s`: it needs no external command (so it
+# has no failure mode to handle), but it is NOT a monotonic clock -- per
+# bash's own manual, both the value recorded at shell startup and each later
+# reference are obtained by querying the system clock, so an administrative
+# clock change moves it exactly as it would move `date +%s`. The negative-
+# elapsed handling below stays in place because of this, not despite it.
+_INSTALL_INCOMPLETE_SINCE=""
+
+# Fixed, internal, non-negotiable (review finding: an env-supplied limit can
+# be forged or inherited from an unrelated process). Tagged with this exact
+# (session id, pid) chain so a restart count inherited from a DIFFERENT
+# watcher's chain -- e.g. a stray leaked environment variable -- is never
+# mistaken for this one's own; exec preserves both session id and pid, so
+# this chain's own count always matches itself across every restart in it.
+_WATCH_INSTALL_RESTART_LIMIT=5
+_WATCH_INSTALL_RESTART_CHAIN="$SESSION_ID.$$"
+
+# Counts only CONSECUTIVE restarts: reset to zero the first time a cycle
+# passes with nothing changed (see the main loop below), so an ordinary,
+# well-spaced-out install is never more than one restart closer to the cap,
+# no matter how many separate installs this watcher has already lived
+# through.
+_install_restart_count() {
+  if [ "${AGMSG_WATCH_RESTART_CHAIN:-}" = "$_WATCH_INSTALL_RESTART_CHAIN" ]; then
+    case "${AGMSG_WATCH_RESTART_COUNT:-}" in
+      ''|*[!0-9]*) printf '0' ;;
+      *) printf '%s' "$AGMSG_WATCH_RESTART_COUNT" ;;
+    esac
+  else
+    printf '0'
+  fi
+}
+
+_install_restart_count_reset() {
+  [ -z "${AGMSG_WATCH_RESTART_COUNT:-}" ] && [ -z "${AGMSG_WATCH_RESTART_CHAIN:-}" ] && return 0
+  unset AGMSG_WATCH_RESTART_COUNT AGMSG_WATCH_RESTART_CHAIN
+}
+
+# Restart on the new code in place of exiting (#684 follow-up). `exec` replaces
+# this process image without forking, so there is never a moment with two
+# watchers polling the same subscription, and the read cursor lives in the
+# storage driver, not in this process, so a restart resumes from consumed
+# state and delivers nothing twice, exactly as a manual restart already does
+# today.
+#
+# `cleanup` (the EXIT trap's own function) runs BEFORE exec, releasing
+# $PIDFILE/$FILTERFILE/$READY_FILES under THIS image's own naming -- exec
+# skips the EXIT trap, so without this a future release that ever changes one
+# of those paths or formats would orphan the old-named file forever, nobody
+# left holding its name to clean it up. The new image re-creates all three
+# fresh under whichever naming its own code uses, exactly as a freshly
+# launched watcher would.
+#
+# The actas lock is deliberately NOT released here. Its lock file names this
+# session's own owner token ($SESSION_ID), and exec changes neither that nor
+# the pid, so the file stays continuously correct across the swap -- there is
+# no window where it reads as free. The new image's own startup still calls
+# actas_lock_claim for each pair it owns; since the recorded owner already
+# equals its own sid, that call is a no-op self-confirmation (see
+# _actas_lock_try_claim's existing==sid branch), never a fresh claim that
+# could race a peer.
+#
+# This is scoped to today's lock ABI, unlike $PIDFILE/$FILTERFILE/$READY_FILES
+# above: cleanup does not touch the lock at all, so nothing here migrates it.
+# If a future release ever changes the lock's own path or format, the new
+# image's claim can no longer be counted on to see existing==sid, and this
+# self-restart path must not be used for that release -- it falls back to
+# today's stop-and-manually-rearm behavior instead, same as before this PR.
+#
+# Not ready yet is NOT an immediate exit (review finding, round 4): it just
+# returns, leaving the rest of this cycle's loop body -- the liveness guard,
+# message delivery, the sleep -- to run exactly as it would have if nothing
+# had changed. Delivery keeps working while an install is still in flight;
+# only once AGMSG_WATCH_INSTALL_INCOMPLETE_TIMEOUT seconds have passed
+# without ever becoming ready does this fall back to the ORIGINAL, unchanged
+# exit -- a still-changing-past-the-timeout or genuinely broken install still
+# produces the same clear stop it always has, rather than an indefinite wait.
+#
+# A negative elapsed reading (round 5: only possible if the system clock was
+# moved backward mid-wait, since $SECONDS is wall-clock-based, not monotonic
+# -- confirmed against bash's own manual) is treated the same as "timeout
+# elapsed", not as "keep waiting": an elapsed time that cannot be trusted is
+# exactly the case the visible exit exists for, the same reasoning as an
+# install that is taking implausibly long.
+_handle_install_changed() {
+  local new_watch="$SCRIPT_DIR/watch.sh" restarts elapsed
+
+  if _install_ready; then
+    _INSTALL_INCOMPLETE_SINCE=""
+    restarts="$(_install_restart_count)"
+    if [ "$restarts" -lt "$_WATCH_INSTALL_RESTART_LIMIT" ]; then
+      watch_log "the agmsg installation was updated while this watcher was running; restarting on the new code (same process, same subscription)."
+      cleanup
+      AGMSG_WATCH_RESTART_COUNT=$((restarts + 1))
+      AGMSG_WATCH_RESTART_CHAIN="$_WATCH_INSTALL_RESTART_CHAIN"
+      export AGMSG_WATCH_RESTART_COUNT AGMSG_WATCH_RESTART_CHAIN
+      # The watch_report call below is reached only if exec itself fails to
+      # replace the process image (e.g. an interpreter it can no longer
+      # exec); it is the fallback for that failure, not dead code.
+      # shellcheck disable=SC2093
+      exec "$new_watch" "${ORIG_ARGS[@]}"
+      watch_report "exec of the updated watch.sh failed; exiting instead of running stale code."
+      exit 1
     fi
-    return 0
+    watch_report "the agmsg installation kept changing across $restarts restart(s) in a row; exiting rather than looping. Restart this session (or run /agmsg actas <name>) to resume delivery."
+    exit 0
   fi
-  case "$now" in
-    ''|*[!0-9]*)
-      if [ "$WATCHDOG_DATE_ERROR_LAUNCHED" -eq 0 ]; then
-        AGMSG_WATCHDOG_OWNER_INSTANCE="$SESSION_ID" \
-          AGMSG_WATCHDOG_OWNER_START="$WATCHDOG_OWNER_START" \
-          "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
-        WATCHDOG_DATE_ERROR_LAUNCHED=1
-      fi
-      return 0
-      ;;
-  esac
-  WATCHDOG_DATE_ERROR_LAUNCHED=0
 
-  if [ "$now" -lt "$WATCHDOG_LAST_RUN" ]; then
-    WATCHDOG_LAST_RUN="$now"
+  if [ -z "$_INSTALL_INCOMPLETE_SINCE" ]; then
+    _INSTALL_INCOMPLETE_SINCE="$SECONDS"
     return 0
   fi
-  if [ $(( now - WATCHDOG_LAST_RUN )) -lt "$WATCHDOG_INTERVAL" ]; then
+  elapsed=$((SECONDS - _INSTALL_INCOMPLETE_SINCE))
+  if [ "$elapsed" -ge 0 ] && [ "$elapsed" -lt "$AGMSG_WATCH_INSTALL_INCOMPLETE_TIMEOUT" ]; then
     return 0
   fi
 
-  WATCHDOG_LAST_RUN="$now"
-  watchdog_tombstone_fresh "$now" && return 0
-  AGMSG_WATCHDOG_OWNER_INSTANCE="$SESSION_ID" \
-    AGMSG_WATCHDOG_OWNER_START="$WATCHDOG_OWNER_START" \
-    "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
+  watch_report "the agmsg installation was updated while this watcher was running, so it is still executing the code from before the update. Exiting rather than appearing to work. Restart this session (or run /agmsg actas <name>) to resume delivery."
+  exit 0
 }
-
-mkdir -p "$RUN_DIR" 2>/dev/null || true
 
 # Resolve subscription set.
 PAIRS="$("$SCRIPT_DIR/identities.sh" "$PROJECT_PATH" "$AGENT_TYPE")"
@@ -443,18 +1033,13 @@ if [ -z "$PAIRS" ]; then
   exit 0
 fi
 
-# Build the SQL WHERE clause. Each pair contributes:
-#   (team='<team>' AND to_agent='<agent>')
-# joined by OR. Single quotes inside team/agent names are doubled for SQL.
-sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
-
-WHERE_PAIRS=""
+# SUB_PAIRS holds the subscription as <team>:<agent> tokens — the argument form
+# the storage facade's watch ops take (§2.2). Live delivery goes entirely through
+# storage_watch_tip / storage_watch_after now, so no SQL WHERE clause is built here.
+SUB_PAIRS=()
 while IFS=$'\t' read -r team agent; do
   [ -z "$team" ] && continue
-  t_esc=$(sql_escape "$team")
-  a_esc=$(sql_escape "$agent")
-  pair="(team='$t_esc' AND to_agent='$a_esc')"
-  WHERE_PAIRS="${WHERE_PAIRS:+$WHERE_PAIRS OR }$pair"
+  SUB_PAIRS+=("$team:$agent")
 done <<< "$PAIRS"
 
 # Determine the starting watermark.
@@ -472,6 +1057,9 @@ done <<< "$PAIRS"
 # A *fresh* session (no persisted watermark) still starts from the current
 # MAX(id) — live push, no replay of history (the no-arg inbox check covers
 # historical unread, not this stream).
+# The watermark is now an OPAQUE delivery cursor (§2.2), not an integer id — the
+# active storage driver issues and interprets it; this script only persists the
+# latest token and passes it back unchanged.
 WATERMARK_FILE="$RUN_DIR/watch.$SESSION_ID.watermark"
 persist_watermark() { printf '%s\n' "$LAST" > "$WATERMARK_FILE" 2>/dev/null || true; }
 
@@ -512,15 +1100,14 @@ mark_read() {
 
 LAST=""
 if [ -f "$WATERMARK_FILE" ]; then
-  LAST="$(cat "$WATERMARK_FILE" 2>/dev/null || true)"
-  case "$LAST" in ''|*[!0-9]*) LAST="" ;; esac
+  # Opaque token: a single whitespace-free line. No integer validation — just
+  # strip stray surrounding whitespace.
+  LAST="$(tr -d '[:space:]' < "$WATERMARK_FILE" 2>/dev/null || true)"
 fi
 if [ -z "$LAST" ]; then
-  LAST=0
-  if [ -f "$DB" ]; then
-    LAST="$(agmsg_sqlite "$DB" "SELECT COALESCE(MAX(id), 0) FROM messages WHERE $WHERE_PAIRS;" 2>/dev/null || echo 0)"
-  fi
-  case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+  # A fresh watcher starts from the current tip (live push, no history replay).
+  LAST="$(storage_watch_tip "${SUB_PAIRS[@]}" 2>/dev/null || true)"
+  case "$LAST" in '') LAST=0 ;; esac
   persist_watermark
 fi
 
@@ -557,7 +1144,63 @@ if [ -n "$ACTIVE_NAME" ]; then
   done <<< "$PAIRS"
 fi
 
+# Pairs another session currently holds, so each departure and each return is
+# announced once instead of every cycle. Membership is not a decision -- the
+# lock is -- it only records what has already been said (#683).
+#
+# Held as newline-separated entries and compared as EXACT strings, never as
+# patterns. A team name is arbitrary UTF-8 minus a path deny-list and an agent
+# name minus a JSON-path deny-list (validate.sh), so either may contain glob
+# metacharacters, a sed delimiter, or a space. A `case` pattern or an
+# `s|…|…|` built out of one is a bug that only appears for some names --
+# the class this repo has paid for before with quotes in names (#87). Newline
+# is the one byte a name cannot contain, control characters being rejected, so
+# it is the safe separator.
+HELD_ELSEWHERE=""
+
+_held_elsewhere_has() {
+  local want="$1" line
+  [ -n "$HELD_ELSEWHERE" ] || return 1
+  while IFS= read -r line; do
+    [ "$line" = "$want" ] && return 0
+  done <<< "$HELD_ELSEWHERE"
+  return 1
+}
+
+_held_elsewhere_without() {
+  local drop="$1" line out=""
+  [ -n "$HELD_ELSEWHERE" ] || return 0
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    [ "$line" = "$drop" ] && continue
+    out="${out:+$out
+}$line"
+  done <<< "$HELD_ELSEWHERE"
+  printf '%s' "$out"
+}
+
 while true; do
+  # The installation changed under us (#684). _handle_install_changed execs
+  # the new watch.sh in place once it can prove the generation is finished,
+  # so the stream never visibly stops; its own exit paths still report on
+  # STDOUT (watch_report, not watch_log -- every launcher we ship sends this
+  # watcher's stderr to /dev/null) so "the monitor stopped" is what the
+  # session sees, instead of a live process silently delivering nothing.
+  # Not-yet-ready is handled by returning rather than exiting, so this falls
+  # through to the rest of the loop body below on a cycle spent waiting --
+  # delivery is not paused while an install is still in flight.
+  if _install_changed; then
+    _handle_install_changed
+  else
+    # Reaching here means this cycle saw no change at all -- the "one clean
+    # cycle" that ends a run of consecutive restarts (see
+    # _install_restart_count above). A no-op on a watcher that never
+    # restarted. Deliberately NOT run on a cycle spent waiting for
+    # completion (the `if` branch above): the change is still pending, so
+    # resetting the consecutive-restart count here would let a rapid
+    # restart-wait-restart cycle dodge the cap it exists to enforce.
+    _install_restart_count_reset
+  fi
   # Liveness guard (#67): exit promptly once the originating agent session is
   # gone. A plain pipe gives no portable way to notice a *downstream* consumer
   # that closed silently — printf '' raises no EPIPE, and macOS buffers a final
@@ -568,21 +1211,321 @@ while true; do
   # _agmsg_pid_alive). Gated on a composite id only: a bare id (degraded, no
   # resolved agent pid) keeps the prior behavior and is not liveness-gated.
   if agmsg_instance_is_composite "$SESSION_ID" && ! agmsg_instance_alive "$SESSION_ID"; then
-    printf 'agmsg watch: owner token=%s exit_reason=owner-dead\n' "$SESSION_ID" >&2
+    # Say which condition fired and which token it decided about (#692). The
+    # guard is right; the silence is what costs. A watcher that stops here, one
+    # that was killed, one that crashed early and one that was never started
+    # were four indistinguishable states -- and a test watcher launched with a
+    # session id that does not resolve hits this immediately, so the test then
+    # runs against no watcher at all while looking exactly like one that did.
+    # That happened twice in one investigation before anyone noticed.
+    watch_log "session $SESSION_ID is no longer alive; stopping."
     exit 0
   fi
-  maybe_run_watchdog
-  if [ -f "$DB" ]; then
-    ROWS="$(agmsg_sqlite -separator $'\x1f' "$DB" "
-      SELECT id, created_at, team, from_agent, to_agent,
-             replace(replace(body, char(13), ''), char(10), '\\n')
-      FROM messages
-      WHERE id > $LAST AND ($WHERE_PAIRS)
-      ORDER BY id;
-    " 2>/dev/null || true)"
+  while IFS=$'\t' read -r pair_team pair_agent; do
+    [ -z "$pair_team" ] && continue
+    # Warm the actas-lock path cache as a PLAIN STATEMENT, never via $(...): a
+    # command substitution forks a subshell, and a cache array populated
+    # inside one is discarded the instant that subshell exits (the exact
+    # hazard role-session.sh's own _agmsg_role_session_path_into documents,
+    # #466). Both consumers below (actas_lock_observe_cached and
+    # _pair_unchanged_since_read's actas_lock_read_cached) reach this cache
+    # through a $(...) of their own, so warming it here, in this loop's own
+    # top-level (non-subshell) frame, is what makes the warmth actually
+    # survive to the NEXT cycle instead of being rebuilt from scratch every
+    # single call (#1321 first-stage follow-up). Storage's own partition
+    # driver is deliberately NOT cached this way — see
+    # _agmsg_partition_load's comment in lib/storage.sh (#1329 round 2).
+    _actas_lock_primitives_into "$pair_team" "$pair_agent"
+    # Ownership is re-read every cycle, because it can change under a running
+    # watcher and nothing else notices. The subscription set and the startup
+    # lock check both happen once, above; a session that claims this role
+    # afterwards moves the lock file and starts its own watcher, and this
+    # process would otherwise keep polling the same pair forever.
+    #
+    # That is not a harmless duplicate. The read cursor is one per
+    # (team, agent) and storage_watch_after excludes rows already read, so
+    # whoever polls first TAKES the row and the other sees nothing. When the
+    # one that takes it is this stale process, its printf succeeds -- stdout is
+    # still an open pipe to a live session -- so the id is marked read and the
+    # message is gone, delivered to a stream nobody is reading (#683).
+    #
+    # Only the lock file is read here, not the whole subscription set: losing a
+    # pair is the half a running process can detect for the price of a file
+    # read. Gaining one is the caller's job, at the point it creates the team.
+    # ONE read, in the lock library, returning BOTH the classification and the raw
+    # owner (actas_lock_observe). Reading state and owner separately left a window
+    # between the two calls: a claim landing there produced a stale `free` state
+    # (so the gate chose serve) paired with a FRESH owner baseline (so the guard
+    # compared new-to-new and said unchanged), and the pair was served for a role
+    # someone else held. Found in review; the fix belongs in the library, so every
+    # caller that needs both gets them from one observation. (#983)
+    # actas_lock_observe_cached: same read-and-verdict rule as
+    # actas_lock_observe, only the path resolution behind it is memoized
+    # per (team, agent) for the life of this process (#1321 first-stage
+    # follow-up) -- see actas_lock_path_cached's comment in actas-lock.sh.
+    IFS="$(printf '\t')" read -r pair_state pair_owner <<EOF
+$(actas_lock_observe_cached "$pair_team" "$pair_agent" "$SESSION_ID")
+EOF
+    # Test seam: a two-file barrier that parks the watcher immediately AFTER the
+    # lock read, so the race regression test can land a claim inside the window
+    # deterministically instead of guessing a sleep wide enough to hit it. Same
+    # shape as inbox.sh's AGMSG_TEST_MARK_BARRIER; no-op unless set.
+    if [ -n "${AGMSG_TEST_CLAIM_BARRIER:-}" ]; then
+      : > "$AGMSG_TEST_CLAIM_BARRIER.reached"
+      _agmsg_claim_barrier_waited=0
+      while [ ! -e "$AGMSG_TEST_CLAIM_BARRIER.release" ]; do
+        sleep 0.05
+        _agmsg_claim_barrier_waited=$((_agmsg_claim_barrier_waited + 1))
+        # 60s cap. Deliberately much longer than the time a test waits to NOTICE
+        # `.reached`: the two are a race, and if the cap is the same order as the
+        # test's wait, a loaded machine releases the watcher before the test has
+        # acted and the window the barrier exists to hold is simply gone. Measured
+        # — four of these back to back under load never saw `.reached` at a 10s
+        # cap, and each passed alone. The cap only bounds a wedged test; it costs
+        # nothing in production, where the variable is unset and none of this runs.
+        [ "$_agmsg_claim_barrier_waited" -ge 1200 ] && break
+      done
+    fi
+    # actas-fatal: a watcher that exists to serve exactly this one role, and no
+    # longer owns it, stops -- and says so on stderr (the only place a reason
+    # survives; a watcher that ends without one is indistinguishable from a
+    # crash). This is decided here, before the gate, because it EXITS rather than
+    # skips; the gate only decides serve-vs-skip for a watcher that keeps running.
+    if [ -n "$ACTIVE_NAME" ]; then
+      case "$pair_state" in
+        other:*)
+          watch_log "${pair_team}/${pair_agent} is now held by session ${pair_state#other:}."
+          watch_log "this watcher no longer owns that role and is stopping."
+          watch_log "messages for it stay unread and reach the session that claimed it."
+          exit 0
+          ;;
+      esac
+    fi
+    _pair_gate "$pair_team" "$pair_agent" "$pair_state"
+    case "$PAIR_VERDICT" in
+      held:*)
+        # Broad subscription: this watcher serves other roles too, so skip the
+        # pair rather than ending the process -- exiting here would take down a
+        # whole session's delivery because one of its roles moved elsewhere.
+        #
+        # Skipped FOR AS LONG AS someone else holds it, not permanently. When
+        # the holder goes away the lock reads free again and this watcher takes
+        # the pair back, which is the same rule the startup filter uses (a
+        # stale lock is free). Dropping it for good would be worse: the role is
+        # still registered to this project, so nobody would deliver for it
+        # until the session restarted.
+        #
+        # Announced on each transition, not each cycle -- a per-cycle message
+        # would bury the log, and announcing only the first time would make a
+        # second departure invisible.
+        if ! _held_elsewhere_has "${pair_team}/${pair_agent}"; then
+          HELD_ELSEWHERE="${HELD_ELSEWHERE:+$HELD_ELSEWHERE
+}${pair_team}/${pair_agent}"
+          echo "agmsg watch: ${pair_team}/${pair_agent} was claimed by session ${PAIR_VERDICT#held:}; not serving it while they hold it." >&2
+        fi
+        continue
+        ;;
+      unverified:*)
+        # We could not establish who holds this pair. Neither serve nor stop:
+        # skip it this cycle and say why on the channel that survives (#691) —
+        # the next poll asks again and nothing is lost. Decided in _pair_gate
+        # rather than before it, so there is ONE place that turns a state into a
+        # verdict; a second decision here would be the arm that never runs.
+        watch_report "${pair_team}/${pair_agent}: ${PAIR_VERDICT#unverified:} — skipping this pair this cycle; it will be retried."
+        continue
+        ;;
+      nostore)
+        # Per team: with a store per team, "one team has no store yet" is a
+        # normal state, and a single check outside this loop would silence
+        # delivery for every OTHER team as well. Said once per pair per process
+        # (#692) -- a line every poll interval would bury the log it exists to
+        # make readable.
+        case " $NO_STORE_REPORTED " in
+          *" $pair_team:$pair_agent "*) ;;
+          *) NO_STORE_REPORTED="$NO_STORE_REPORTED $pair_team:$pair_agent"
+             watch_log "${pair_team}/${pair_agent}: no store yet; skipping this pair until one exists." ;;
+        esac
+        continue
+        ;;
+    esac
+    # serve: free or ours, store present. If we had stepped aside for it, say we
+    # are taking it back -- otherwise the log shows a role leaving and never
+    # returning, which reads as a permanent drop.
+    if _held_elsewhere_has "${pair_team}/${pair_agent}"; then
+      HELD_ELSEWHERE="$(_held_elsewhere_without "${pair_team}/${pair_agent}")"
+      echo "agmsg watch: ${pair_team}/${pair_agent} is unheld again; serving it here." >&2
+    fi
+    # Read this pair's delivery state -- its read frontier, then the messages
+    # past it -- and KEEP THE STATUS separate from the output. A failed read must
+    # not collapse to "" and fall into the caught-up arm below: that arm drops the
+    # tracker and continues in silence, which is the exact outage #1045 exists to
+    # catch, one level earlier. The stuck guard cannot see this one -- a failed
+    # scan returns no message_sent row to count, so the pair looks caught up
+    # forever. So on a failed observation, say why on stdout (a plain
+    # "agmsg watch:" line, not the delivery shape) and exit: a bounded, visible
+    # stop, never silent continuation. This is the same failure-is-not-empty
+    # collapse the cursor-only fix above closed, at the read itself.
+    #
+    # The two OTHER reads in this cycle that also fall back to empty are the
+    # DIFFERENT case the stuck guard already covers, so they are left as-is: the
+    # mktemp and the ':memory:' delivery query (below) can fail to "", but OUT
+    # still holds the message_sent rows, so a frozen cursor climbs to the
+    # threshold and fires. actas_lock_state's fall back to "free" (above) is a
+    # deliberate fail-open (a stale/unreadable lock is free, #595), not this
+    # class. Reverting either read here to `|| true` reopens the silent hole --
+    # a mutation test asserts it.
+    if READ_CURSOR="$(storage_read_cursor_get "$pair_team" "$pair_agent" 2>/dev/null)" \
+       && OUT="$(storage_watch_after "$READ_CURSOR" "$pair_team:$pair_agent" 2>/dev/null)"; then
+      [ -n "$READ_CURSOR" ] || READ_CURSOR=0
+    else
+      printf 'agmsg watch: cannot read delivery state for %s — the store read failed, so whether messages are waiting is unknown. Treating "unknown" as "no messages" would leave this watcher alive and silent, so it is exiting instead; restart this session (or run /%s actas <name>) to resume delivery (#1045/#777).\n' \
+        "$pair_team:$pair_agent" "$(basename "$SKILL_DIR")"
+      cleanup
+      exit "$_AGMSG_EXIT_DELIVERY_UNHEALTHY"
+    fi
+    # fix 2 (#1045): update this pair's stuck-cursor tracker (see the block comment
+    # before the loop). "Pending" here means real undelivered MESSAGE rows -- not a
+    # non-empty OUT. storage_watch_after also emits a trailing "cursor" high-water
+    # line, and that line is present for a CAUGHT-UP pair too, because the team's
+    # sequence advances whenever ANY pair in the team receives a message. Keying the
+    # tracker on [ -n "$OUT" ] would therefore treat every idle pair as perpetually
+    # pending, and on any cycle its cursor could not advance (e.g. a delivery stall
+    # that is not this pair's fault) the count would climb and fire the guard on a
+    # perfectly healthy watcher. So track a pair only while a message_sent row is
+    # actually waiting for it; a glob avoids forking grep in the poll loop. When
+    # READ_CURSOR is UNCHANGED from the previous cycle delivery did not advance it --
+    # count that; at the threshold say why on stdout and exit. With no message row
+    # waiting the pair is caught up, so drop its tracker and a future backlog starts
+    # a fresh count.
+    _agmsg_pair_key="$pair_team:$pair_agent"
+    # _agmsg_has_new_message, set here alongside the stuck-tracker's own read
+    # of the same fact, gates the formatting pass below (#1321 first-stage
+    # follow-up: watch.sh process-count reduction) -- one case statement,
+    # reused, rather than testing the same glob against $OUT twice.
+    _agmsg_has_new_message=0
+    case "$OUT" in
+      *'"type":"message_sent"'*)
+        _agmsg_has_new_message=1
+        IFS=$'\x1f' read -r _agmsg_prev_c _agmsg_prev_n <<< "$(_stuck_get "$_agmsg_pair_key")"
+        [ -n "$_agmsg_prev_n" ] || _agmsg_prev_n=0
+        if [ "$_agmsg_prev_c" = "$READ_CURSOR" ]; then
+          _agmsg_n=$((_agmsg_prev_n + 1))
+        else
+          _agmsg_n=1
+        fi
+        if [ "$_agmsg_n" -ge "$STUCK_THRESHOLD" ]; then
+          _agmsg_bytes="$(printf '%s' "$OUT" | wc -c | tr -d ' ')"
+          printf 'agmsg watch: delivery for %s is STUCK — its read cursor (%s) has not advanced for %s poll cycles while %s bytes of messages wait behind it, so nothing is being delivered and nothing is being marked read. This watcher is exiting rather than looping in silence; restart this session (or run /%s actas <name>) to resume delivery. If it recurs, the pending batch may be hitting a system limit (#1045/#777).\n' \
+            "$_agmsg_pair_key" "$READ_CURSOR" "$_agmsg_n" "$_agmsg_bytes" "$(basename "$SKILL_DIR")"
+          cleanup
+          exit "$_AGMSG_EXIT_DELIVERY_UNHEALTHY"
+        fi
+        _stuck_set "$_agmsg_pair_key" "$READ_CURSOR" "$_agmsg_n"
+        ;;
+      *)
+        # Free or ours. If we had stepped aside for it, say that we are taking
+        # it back -- otherwise the log shows a role leaving and never returning,
+        # which reads as a permanent drop.
+        if _held_elsewhere_has "${pair_team}/${pair_agent}"; then
+          HELD_ELSEWHERE="$(_held_elsewhere_without "${pair_team}/${pair_agent}")"
+          echo "agmsg watch: ${pair_team}/${pair_agent} is unheld again; serving it here." >&2
+        fi
+        ;;
+    esac
+    if [ "$_agmsg_has_new_message" -eq 1 ]; then
+    # The quote is held in a variable, never written as \' in the pattern: bash 3.2
+    # (macOS /bin/bash) keeps the backslash of a \' REPLACEMENT, so the inline form
+    # doubles a quote into \'\' there while producing '' on bash 4+. Same shape as
+    # _sqlite_sync_lit_into in sqlite-sync.sh, which documents the same hazard.
+    _AGMSG_SQ="'"
+    _arr="[$(printf '%s' "$OUT" | paste -sd, -)]"
+    # #777/#1045: this pair's undelivered backlog grows independently of
+    # anything this loop bounds, so interpolating it into ONE argv element
+    # eventually exceeds the OS's per-argument ceiling (Linux
+    # MAX_ARG_STRLEN=131,072 bytes; smaller still on Windows/macOS) and
+    # `agmsg_sqlite` fails with "Argument list too long" -- every single
+    # poll, since a single long body can carry it past the ceiling on its
+    # own too, and because the failure below was already swallowed by
+    # `|| true` and the read cursor is only advanced from
+    # FINAL_CURSOR/DELIVERED_IDS further down, a silently empty ROWS here
+    # left the cursor stuck forever, repeating the same failure on every
+    # future poll -- a silent, self-locking outage. Pass the statement on
+    # stdin instead, mirroring drivers/storage/sqlite-sync.sh:1301
+    # (`_sqlite_data_stdin`, #882) and history.sh/inbox.sh: printf is a bash
+    # builtin, so writing a large value to a temp file never execs and can
+    # hit neither that ceiling nor argv's at all.
+    #
+    # No trap here: this script installs `trap cleanup EXIT` and
+    # `trap 'exit 0' INT TERM HUP` once, near the top (bash traps do not
+    # stack -- the last one set wins), and this runs inside that same
+    # process's long-lived polling loop, once per pair per interval. Adding a
+    # loop-local trap here would silently replace those for the rest of the
+    # process's life. The temp file is removed explicitly on every path
+    # instead; the one path that leaks it (a signal landing between mktemp
+    # and the following rm) is caught by the pre-existing INT/TERM/HUP
+    # handler tearing down the whole process. The stuck-cursor guard below is
+    # a separate backstop, for any OTHER cause that leaves the cursor stuck.
+    _agmsg_watch_sql="$(mktemp "${TMPDIR:-/tmp}/agmsg-watch-rows.XXXXXX" 2>/dev/null || true)"
+    if [ -n "$_agmsg_watch_sql" ]; then
+      {
+        printf "%s\n" "SELECT COALESCE(json_extract(value,'\$.type'),'') || char(31) ||"
+        printf "%s\n" "       COALESCE(json_extract(value,'\$.id'),'') || char(31) ||"
+        printf "%s\n" "       COALESCE(json_extract(value,'\$.at'),'') || char(31) ||"
+        printf "%s\n" "       COALESCE(json_extract(value,'\$.team'),'') || char(31) ||"
+        printf "%s\n" "       COALESCE(json_extract(value,'\$.from'),'') || char(31) ||"
+        printf "%s\n" "       COALESCE(json_extract(value,'\$.to'),'') || char(31) ||"
+        printf "%s\n" "       replace(replace(replace(COALESCE(json_extract(value,'\$.body'),''), char(13), ''), char(10), '\\n'), char(9), '\t') || char(31) ||"
+        printf "%s\n" "       COALESCE(json_extract(value,'\$.cursor'),'')"
+        printf "FROM json_each('"
+        printf '%s' "${_arr//$_AGMSG_SQ/$_AGMSG_SQ$_AGMSG_SQ}"
+        printf "');\n"
+      } > "$_agmsg_watch_sql"
+      ROWS="$(agmsg_sqlite ':memory:' < "$_agmsg_watch_sql" 2>/dev/null || true)"
+      rm -f "$_agmsg_watch_sql"
+    else
+      ROWS=""
+    fi
 
-    if [ -n "$ROWS" ]; then
-      while IFS=$'\x1f' read -r id ts team from to body; do
+    # Deliver (#983): re-verify at the act, like the two below. Checked ONCE here
+    # rather than per row, and that is a deliberate trade rather than an oversight:
+    # the loop's harm is a stranger's message appearing on this session's stdout,
+    # which is visible and leaves the row unread — recoverable, unlike consuming it
+    # or folding on it. A lock read per row would buy a narrower window at a file
+    # read per message; the two acts whose damage is permanent get their own check
+    # immediately before them.
+    _pair_verdict=0
+    _pair_unchanged_since_read "$pair_team" "$pair_agent" "$pair_owner" || _pair_verdict=$?
+    if [ "$_pair_verdict" -ne 0 ]; then
+      _report_pair_refusal "$_pair_verdict" "$pair_team" "$pair_agent" "delivery"
+      continue
+    fi
+    READ_CURSOR="$(storage_read_cursor_get "$pair_team" "$pair_agent" 2>/dev/null || true)"
+    [ -n "$READ_CURSOR" ] || READ_CURSOR=0
+    OUT="$(storage_watch_after "$READ_CURSOR" "$pair_team:$pair_agent" 2>/dev/null || true)"
+    if [ -n "$OUT" ]; then
+      _arr="[$(printf '%s' "$OUT" | paste -sd, -)]"
+      ROWS="$(agmsg_sqlite ':memory:' "
+        SELECT COALESCE(json_extract(value,'\$.type'),'') || char(31) ||
+               COALESCE(json_extract(value,'\$.id'),'') || char(31) ||
+               COALESCE(json_extract(value,'\$.at'),'') || char(31) ||
+               COALESCE(json_extract(value,'\$.team'),'') || char(31) ||
+               COALESCE(json_extract(value,'\$.from'),'') || char(31) ||
+               COALESCE(json_extract(value,'\$.to'),'') || char(31) ||
+               replace(replace(replace(COALESCE(json_extract(value,'\$.body'),''), char(13), ''), char(10), '\\n'), char(9), '\t') || char(31) ||
+               COALESCE(json_extract(value,'\$.cursor'),'')
+        FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
+      " 2>/dev/null || true)"
+
+      while IFS=$'\x1f' read -r kind id ts team from to body cursor; do
+        [ -z "$kind" ] && continue
+        if [ "$kind" = "cursor" ]; then
+          # Trailing cursor = the resume point. Advance + persist only after the
+          # batch's messages were delivered above; a crash mid-batch re-delivers
+          # from the old cursor (at-least-once, never skip — §2.2).
+          LAST="$cursor"; persist_watermark
+          continue
+        fi
+        [ "$kind" = "message_sent" ] || continue
         [ -z "$id" ] && continue
         # Control message: a leader's `despawn` sends `ctrl:despawn` to this
         # role. Tear ourselves down rather than printing it — drop the role
@@ -590,15 +1533,18 @@ while true; do
         # which also ends the agent CLI sharing it. Deterministic teardown, no
         # dependence on the agent LLM noticing the message. See #109.
         if [ "$body" = "ctrl:despawn" ]; then
-          mark_read "$id" "$team" "$to"
-          LAST="$id"; persist_watermark
           # Only an EXCLUSIVE watcher dedicated to exactly this role tears
           # itself down. A broad-subscription watcher (e.g. a leader whose
           # default watcher subscribes to every project role, including the
           # despawn target) must NOT act on it — its $TMUX_PANE is the leader's
           # own pane, so killing it would take down the leader's session. The
           # spawned member's watcher runs in actas mode (ACTIVE_NAME=$to) in its
-          # own pane; that's the one meant to respond. See #109.
+          # own pane; that's the one meant to respond. A broad watcher `continue`s
+          # and reaches the trailing cursor at batch end, so its watermark advances
+          # past this control message. The target watcher below exits BEFORE the
+          # cursor record, so it does not persist a cursor — harmless, since it
+          # drops the role and won't resume as it; a same-session resume would
+          # re-read the despawn (at-least-once) and re-tear-down idempotently. See #109.
           if [ -z "$ACTIVE_NAME" ] || [ "$to" != "$ACTIVE_NAME" ]; then
             continue
           fi
@@ -636,17 +1582,57 @@ while true; do
           cleanup
           exit 0
         fi
-        # Mark delivered so a later inbox.sh call (e.g. a respawned/resumed
-        # session's actas re-registration) does not re-surface this message as
-        # unread. Without this, every message ever streamed live stays
-        # read_at IS NULL forever, and a single inbox.sh call replays the
-        # entire history as "new".
-        mark_read "$id" "$team" "$to"
-        LAST="$id"
-        persist_watermark
       done <<< "$ROWS"
     fi
-  fi
+    if [ -n "$DESPAWN_TARGET" ]; then
+      "$SCRIPT_DIR/reset.sh" "$PROJECT_PATH" "$AGENT_TYPE" "$DESPAWN_TARGET" "$SESSION_ID" >/dev/null 2>&1 || true
+      if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
+        tmux kill-pane -t "$TMUX_PANE" 2>/dev/null || true
+      else
+        watch_log "despawned '$DESPAWN_TARGET' (role dropped); close this window manually"
+      fi
+      exit 0
+    fi
+    elif [ -n "$OUT" ]; then
+      # No new message for THIS pair, but storage_watch_after's trailing
+      # "cursor" line (present on every call, caught-up pair or not, because
+      # the team's sequence advances whenever ANY pair receives a message)
+      # moved. Advance our own frontier to it without the mktemp + `sqlite3
+      # :memory:` json_each/json_extract pass above: that pass exists to turn
+      # message ROWS into shell-safe delimited text (escaping newlines in a
+      # body, etc.), and a cursor-only page carries no message body needing
+      # that treatment -- so paying for it here forked sqlite3+mktemp on
+      # EVERY poll cycle a pair was simply idle, which is most of them
+      # (#1321 first-stage follow-up: watch.sh process-count reduction).
+      #
+      # The cursor line's own shape is controlled (storage_watch_after's own
+      # `json_object('type','cursor','cursor', CAST(... AS TEXT))`, always
+      # emitted last in the batch), so parameter-expansion pattern removal in
+      # pure bash is exactly equivalent to the sqlite3 json_extract this
+      # replaces for this one field, with no forks at all.
+      _agmsg_cursor_line="${OUT##*$'\n'}"
+      FINAL_CURSOR=""
+      case "$_agmsg_cursor_line" in
+        *'"cursor":"'*)
+          FINAL_CURSOR="${_agmsg_cursor_line#*'"cursor":"'}"
+          FINAL_CURSOR="${FINAL_CURSOR%%'"'*}"
+          ;;
+      esac
+      if [ -n "$FINAL_CURSOR" ]; then
+        # Consume (#983): the same re-verification the heavy path above does
+        # immediately before advancing the read frontier — a pair that
+        # changed hands is left entirely alone, cursor included, so the
+        # session that now owns it still sees everything from where it was.
+        _pair_verdict=0
+        _pair_unchanged_since_read "$pair_team" "$pair_agent" "$pair_owner" || _pair_verdict=$?
+        if [ "$_pair_verdict" -ne 0 ]; then
+          _report_pair_refusal "$_pair_verdict" "$pair_team" "$pair_agent" "marking them read"
+        else
+          storage_read_cursor_consume "$pair_team" "$pair_agent" "$FINAL_CURSOR" >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
+  done <<< "$PAIRS"
 
   # Run sleep in the background and `wait` for it so signal traps fire
   # immediately. Bash defers traps while a foreground builtin like `sleep`

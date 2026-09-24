@@ -34,7 +34,7 @@ AGENTS_DIR="$HOME/.agents"
 # uncommitted changes. Non-git (tarball via setup.sh/npx, no .git): fall back to
 # the canonical VERSION file. See #117.
 agmsg_source_version() {
-  local v top
+  local v top native
   # Only describe when SCRIPT_DIR is ITS OWN git checkout. `git describe`
   # searches ancestors for a .git, so a non-git copy unpacked under some other
   # git repo would otherwise record that PARENT repo's describe instead of
@@ -49,7 +49,34 @@ agmsg_source_version() {
   # app's own version comparison (agmsg_core_version_status in agmsg.rs)
   # can't parse as semver, which it then treats as "outdated" unconditionally.
   top="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
-  if [ -n "$top" ] && [ "$top" = "$SCRIPT_DIR" ] \
+  # THE TWO SIDES ARE IN DIFFERENT PATH SPACES ON WINDOWS, so the equality was
+  # always false there and every Git Bash install recorded the VERSION file
+  # instead of the describe string (#830):
+  #
+  #   $SCRIPT_DIR            /tmp/tmp.XXXX/agmsg        MSYS form, from bash
+  #   git --show-toplevel    C:/Users/.../tmp.XXXX/agmsg  native form, from git
+  #
+  # `cygpath -m` is the mixed form git reports — the same second chance this
+  # file already takes for the writable paths below, and the same one
+  # `agmsg_cmdline_names_path` takes in compat.sh, where the identical mismatch
+  # made four watcher-ownership checks answer "not ours" on Windows.
+  #
+  # The condition below is a CAPABILITY, not an operating system: where cygpath
+  # is not on PATH, `native` stays empty and this is the plain comparison and
+  # nothing else. Saying "off Windows" instead would be wider than the code —
+  # this file's own test drives the second branch on macOS and Linux by putting
+  # a cygpath stub on PATH.
+  #
+  # Where cygpath is absent, fails, returns nothing, or returns a path unequal
+  # to git's toplevel, the recorded value is the fallback, exactly as before.
+  # A wrong answer that happened to equal the toplevel would still take the
+  # describe branch, so this is a set of conditions and not a guarantee that
+  # the worst case is the old behaviour.
+  native=""
+  if command -v cygpath >/dev/null 2>&1; then
+    native="$(cygpath -m "$SCRIPT_DIR" 2>/dev/null || true)"
+  fi
+  if [ -n "$top" ] && { [ "$top" = "$SCRIPT_DIR" ] || { [ -n "$native" ] && [ "$top" = "$native" ]; }; } \
       && v="$(git -C "$SCRIPT_DIR" describe --tags --always --dirty --abbrev=7 --match 'v[0-9]*' 2>/dev/null)" \
       && [ -n "$v" ]; then
     printf '%s' "$v"
@@ -65,6 +92,38 @@ CMD_NAME=""
 UPDATE_ONLY=false
 INTERACTIVE=true
 AGENT_TYPE=""  # claude-code, codex, gemini, antigravity — passed via --agent-type, or empty for auto/default
+
+# Types the installer renders their OWN shared SKILL.md for (their template.md
+# differs from codex's). Everything else -- codex itself, plus claude-code and
+# copilot, which keep separate dedicated copies elsewhere -- gets the codex-
+# typed shared SKILL.md. One list, read by three call sites below (fresh
+# install's template pick, --update's template pick, and --update's type
+# re-detection from the SKILL.md already on disk): before #846, the third site
+# hardcoded its own, narrower copy of this same set (missing opencode/hermes/
+# cursor) that had already drifted from the other two -- re-detecting one of
+# those three types as "codex" and then, via the template pick, overwriting
+# the SKILL.md the installer itself had written with the wrong flavor.
+AGMSG_SHARED_SKILL_TPL_TYPES="gemini antigravity opencode hermes cursor grok-build"
+
+# Put <src> at <dest>, then remove any leftover <src>. The arm is chosen by
+# <dest>, so the fix's scope matches the defect's (#747):
+#   - regular <dest>: `mv` — an atomic rename, so an interrupted install leaves
+#     either the whole old config or the whole new one, never a torn file. This
+#     is the common path and must stay atomic.
+#   - symlinked <dest>: write THROUGH the link (a redirect follows it) so a
+#     config.toml managed as a symlink (stow/chezmoi/manual dotfiles) keeps its
+#     link and its target receives the edit. `mv` would replace the link with a
+#     plain file and strand the edit on a detached copy — the actual #747 bug.
+#     This arm is non-atomic (there is no atomic write-through-a-link with plain
+#     POSIX tools), but the exposure is confined to symlink users, whose target
+#     is typically a version-controlled dotfile.
+move_into_place() {
+  if [ -L "$2" ]; then
+    cat "$1" > "$2" && rm -f "$1"
+  else
+    mv "$1" "$2"
+  fi
+}
 
 configure_codex_sandbox() {
   # --- Configure Codex sandbox (if Codex is installed) ---
@@ -119,13 +178,13 @@ configure_codex_sandbox() {
         done=1
       }
       { print }
-    ' "$code_config" > "$code_config.tmp" && mv "$code_config.tmp" "$code_config"
+    ' "$code_config" > "$code_config.tmp" && move_into_place "$code_config.tmp" "$code_config"
   elif grep -q '^\[sandbox_workspace_write\]' "$code_config" 2>/dev/null; then
     # Section exists but no writable_roots
     awk -v entries="$entries" '
       { print }
       /^\[sandbox_workspace_write\]/ { print "writable_roots = [" entries "]" }
-    ' "$code_config" > "$code_config.tmp" && mv "$code_config.tmp" "$code_config"
+    ' "$code_config" > "$code_config.tmp" && move_into_place "$code_config.tmp" "$code_config"
   else
     # No section at all
     printf '\n[sandbox_workspace_write]\nwritable_roots = [%s]\n' "$entries" >> "$code_config"
@@ -165,6 +224,43 @@ install_windows_helpers() {
   fi
   if [ "$removed_sqlite_shim" = true ]; then
     rm -f "$AGENTS_DIR/run/sqlite3-shim.cache"
+  fi
+}
+
+install_antigravity_tui_shim() {
+  local source target target_dir owner expected_owner tmp quoted_source
+  source="$1"
+  target="$AGENTS_DIR/bin/agy-tui"
+  target_dir="$(dirname "$target")"
+  owner="# agmsg-shim-owner: $source"
+  expected_owner=""
+  mkdir -p "$target_dir"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    expected_owner="$(grep '^# agmsg-shim-owner: ' "$target" 2>/dev/null || true)"
+    if ! grep -q '^# agmsg Antigravity TUI launcher shim$' "$target" 2>/dev/null; then
+      echo "  ~ left existing ~/.agents/bin/agy-tui untouched"
+      return 0
+    fi
+    if [ "$expected_owner" != "$owner" ]; then
+      echo "  ~ left ~/.agents/bin/agy-tui owned by a different or legacy install untouched"
+      return 0
+    fi
+  fi
+  printf -v quoted_source '%q' "$source"
+  tmp="$(mktemp "$target_dir/.agy-tui.XXXXXX")"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'set -euo pipefail'
+    printf '%s\n' '# agmsg Antigravity TUI launcher shim'
+    printf '%s\n' "$owner"
+    printf 'exec bash %s "$@"\n' "$quoted_source"
+  } >"$tmp"
+  chmod +x "$tmp"
+  mv "$tmp" "$target"
+  if [ -n "$expected_owner" ]; then
+    echo "  + refreshed Antigravity TUI shim (~/.agents/bin/agy-tui)"
+  else
+    echo "  + installed Antigravity TUI shim (~/.agents/bin/agy-tui)"
   fi
 }
 
@@ -221,8 +317,27 @@ echo ""
 
 # --- Update mode ---
 if [ "$UPDATE_ONLY" = true ]; then
-  # Find existing install. If --cmd was passed, update exactly that skill;
-  # otherwise preserve the historical "first installed agmsg skill" behavior.
+  # Captured before CMD_NAME gets defaulted/resolved below, so it still means
+  # "the caller typed --cmd" specifically (#553's shim-force decision needs
+  # exactly that, not "we ended up with some skill name one way or another").
+  CMD_WAS_EXPLICIT=false
+  [ -n "$CMD_NAME" ] && CMD_WAS_EXPLICIT=true
+  # Find existing install. If --cmd was passed, update exactly that skill.
+  # Otherwise, scan for installs and require exactly one: a glob expands in
+  # collation order, not installation order, and nothing records which
+  # install came first, so guessing from a list of more than one is a
+  # silent coin flip on which install (and the shared ~/.agents/bin/codex
+  # shim it refreshes) gets updated (#599). A single install is unaffected
+  # -- this is the common case and it still "just works".
+  #
+  # No name-based exclusion for backup-shaped directories: --cmd has no
+  # reserved-name validation, so any pattern that would catch a real backup
+  # (e.g. "agmsg.bak-20260731") can equally match a legitimately chosen
+  # install name (e.g. "agmsg.bak-tool") -- there is no substring that is
+  # guaranteed to mean "not a real install" (co2 review, #659). A leftover
+  # backup directory that still carries the .agmsg marker is therefore just
+  # another candidate: it makes the set ambiguous, and ambiguous is exactly
+  # what this fix already refuses to guess through, below.
   if [ -n "$CMD_NAME" ]; then
     SKILL_DIR="$AGENTS_DIR/skills/$CMD_NAME"
     if [ ! -f "$SKILL_DIR/.agmsg" ]; then
@@ -230,13 +345,23 @@ if [ "$UPDATE_ONLY" = true ]; then
       exit 1
     fi
   else
-    SKILL_DIR=""
+    candidates=()
     for d in "$AGENTS_DIR"/skills/*/; do
-      if [ -f "${d}.agmsg" ]; then
-        SKILL_DIR="${d%/}"
-        break
-      fi
+      d="${d%/}"
+      [ -f "$d/.agmsg" ] && candidates+=("$d")
     done
+    case "${#candidates[@]}" in
+      0) SKILL_DIR="" ;;
+      1) SKILL_DIR="${candidates[0]}" ;;
+      *)
+        echo "  ! Several agmsg installs found:" >&2
+        for d in "${candidates[@]}"; do
+          echo "      $(basename "$d")" >&2
+        done
+        echo "  ! --update with no --cmd cannot tell which one you mean. Pass --cmd <name> to pick one." >&2
+        exit 1
+        ;;
+    esac
   fi
   if [ -z "$SKILL_DIR" ]; then
     echo "  ! Not installed. Run ./install.sh first." >&2
@@ -246,28 +371,60 @@ if [ "$UPDATE_ONLY" = true ]; then
   CMD_NAME="$SKILL_NAME"
   echo "  Updating $SKILL_NAME..."
   if [ -z "$AGENT_TYPE" ]; then
-    if grep -q "whoami.sh.*antigravity" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
-      AGENT_TYPE="antigravity"
-    elif grep -q "whoami.sh.*gemini" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
-      AGENT_TYPE="gemini"
-    elif grep -q "whoami.sh.*grok-build" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
-      AGENT_TYPE="grok-build"
-    else
-      AGENT_TYPE="codex"
-    fi
+    # Re-detect the type this install's shared SKILL.md was last rendered for,
+    # from the whoami.sh line its own template prints (#846) -- every
+    # renderable type's line is unambiguous against every other's; see the
+    # cross-grep this list is built from, noted alongside
+    # AGMSG_SHARED_SKILL_TPL_TYPES above. codex is not grepped for: it is the
+    # default a match against this list falls back to.
+    AGENT_TYPE="codex"
+    for _agmsg_t in $AGMSG_SHARED_SKILL_TPL_TYPES; do
+      if grep -q "whoami.sh.*$_agmsg_t" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+        AGENT_TYPE="$_agmsg_t"
+        break
+      fi
+    done
+    unset _agmsg_t
   fi
-  # The shared SKILL.md uses the codex template by default; gemini/antigravity/
-  # opencode get their own. (claude-code and copilot reuse the codex-typed
-  # shared SKILL.md; their dedicated copies are dropped separately below.)
+  # The shared SKILL.md uses the codex template by default; the types in
+  # AGMSG_SHARED_SKILL_TPL_TYPES get their own. (claude-code and copilot reuse
+  # the codex-typed shared SKILL.md; their dedicated copies are dropped
+  # separately below.)
   TPL_TYPE="codex"
-  case "$AGENT_TYPE" in
-    gemini|antigravity|opencode|hermes|cursor|grok-build) TPL_TYPE="$AGENT_TYPE" ;;
+  case " $AGMSG_SHARED_SKILL_TPL_TYPES " in
+    *" $AGENT_TYPE "*) TPL_TYPE="$AGENT_TYPE" ;;
   esac
   sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path "$TPL_TYPE")" > "$SKILL_DIR/SKILL.md"
   # Recursive copy so nested helper dirs (scripts/lib/, scripts/drivers/types/)
   # ship without enumerating files. The agent-type manifests and per-type runtimes
   # live under scripts/drivers/types/ now, so this single copy carries them too.
   cp -R "$SCRIPT_DIR/scripts/." "$SKILL_DIR/scripts/"
+  # #1249: drivers/terminals/{herdr,plain,tmux}/SKILL.md used to name each
+  # driver's own doc file, and a directory-scanning skill loader (e.g.
+  # codex's) treated it as a standalone skill missing YAML frontmatter,
+  # warning on every start. Renamed to README.md. A plain `cp -R` never
+  # deletes a file absent from the source tree, so an --update over an
+  # install from before this rename would otherwise keep the stale
+  # SKILL.md side by side with the new README.md forever. Named
+  # individually -- NOT a scripts/drivers/terminals/*/SKILL.md glob --
+  # because a user can drop a custom driver directory straight under
+  # scripts/drivers/terminals/ (nothing about that path is exclusive to
+  # agmsg's own three); a glob there would delete a file this install
+  # does not own (#1249 review).
+  for _agmsg_builtin_driver in herdr plain tmux; do
+    rm -f "$SKILL_DIR/scripts/drivers/terminals/$_agmsg_builtin_driver/SKILL.md"
+  done
+  unset _agmsg_builtin_driver
+  # The Antigravity resume helper moved under its type directory. A plain
+  # recursive copy cannot remove the old top-level file, so delete this one
+  # known agmsg-owned path during --update; do not sweep user scripts.
+  rm -f "$SKILL_DIR/scripts/antigravity-resume.sh"
+  # rearm.sh shipped in 1.3.1 and is removed again in 1.3.2 (#1321): a
+  # dedicated re-arm command is gone in favor of the same procedure done
+  # through poke.sh, described in natural language in each type's own
+  # template. A plain cp -R never deletes a file absent from the source
+  # tree, so an --update from 1.3.1 would otherwise keep this one forever.
+  rm -f "$SKILL_DIR/scripts/rearm.sh"
   # Ship the external-plugin drop-in dir (just its README) so the location exists
   # post-install. A plain cp — not cp -R --delete — preserves any plugins the
   # user dropped in and their db/trusted-plugins opt-ins.
@@ -319,16 +476,49 @@ if [ "$UPDATE_ONLY" = true ]; then
   chmod +x "$SKILL_DIR/scripts/"*.sh
   # Per-type folded runtime scripts (codex-*.sh, cursor-bridge.sh, watch-once.sh …).
   chmod +x "$SKILL_DIR/scripts/drivers/types/"*/*.sh 2>/dev/null || true
+  install_antigravity_tui_shim "$SKILL_DIR/scripts/drivers/types/antigravity/agy-tui.sh"
   # Refresh the Codex monitor shim (~/.agents/bin/codex) if it's ours. --update
   # cp's the new codex-shim-install.sh but does not re-run it, so a shim from an
   # older install keeps its stale baked exec path after the
   # types/ -> scripts/drivers/types/ move. Re-running install regenerates it with
   # the new path; install is idempotent and overwrites only an agmsg shim (a
   # user's own codex binary fails is_agmsg_shim and is left untouched).
+  #
+  # Forced ONLY when the caller typed --cmd (CMD_WAS_EXPLICIT, captured above
+  # before CMD_NAME could be defaulted/resolved to anything else): that is
+  # the documented recovery path for #553 (a different install's --cmd having
+  # clobbered the shim), and naming the target explicitly is what makes
+  # reclaiming it safe. Bare `--update` (no --cmd) resolves SKILL_DIR by
+  # scanning for an existing install WITHOUT failing closed on more than one
+  # candidate on this base (#599; the fail-closed fix is PR #659, not yet
+  # merged here) -- so on a multi-install machine, bare `--update` today can
+  # land on an install the caller never named at all. Forcing unconditionally
+  # would let THAT arbitrarily-selected install steal the shim from another
+  # one, compounding #599 with a #553-shaped consequence (review finding).
+  # Not forcing means bare `--update` still refreshes a shim this SAME
+  # install already owns (the common single-install case, unaffected either
+  # way) but no longer silently reaches past a shim someone else owns.
+  #
+  # Capture status into a variable rather than piping it straight into
+  # `grep -q` (measured, not theoretical): status now prints a second "owner:"
+  # line (#553), and `grep -q` exits the instant it matches the first line,
+  # closing its end of the pipe. status's own `echo` of the second line then
+  # hits a reader that is already gone -- SIGPIPE, a nonzero exit for that
+  # stage -- and under this script's `pipefail`, that alone flips the whole
+  # `if` to false even though grep DID match. A one-line status (as this had
+  # before #553) never triggers it: there is no second write for the closed
+  # pipe to reject. Capturing first reads status to completion regardless of
+  # how many lines it prints, so growing its output again later can't reopen
+  # this.
   CODEX_SHIM="$SKILL_DIR/scripts/drivers/types/codex/codex-shim-install.sh"
-  if [ -x "$CODEX_SHIM" ] && AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" status 2>/dev/null | grep -q '^installed:'; then
-    AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" install >/dev/null 2>&1 \
-      && echo "  + refreshed Codex monitor shim (~/.agents/bin/codex)"
+  CODEX_SHIM_STATUS=""
+  [ -x "$CODEX_SHIM" ] && CODEX_SHIM_STATUS="$(AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" status 2>/dev/null || true)"
+  if printf '%s' "$CODEX_SHIM_STATUS" | grep -q '^installed:'; then
+    CODEX_SHIM_FORCE=""
+    [ "$CMD_WAS_EXPLICIT" = true ] && CODEX_SHIM_FORCE=1
+    if AGMSG_CODEX_SHIM_INSTALL_QUIET=1 AGMSG_CODEX_SHIM_FORCE="$CODEX_SHIM_FORCE" "$CODEX_SHIM" install >/dev/null; then
+      echo "  + refreshed Codex monitor shim (~/.agents/bin/codex)"
+    fi
   fi
   install_windows_helpers
   INSTALLED_VERSION="$(agmsg_source_version)"
@@ -370,10 +560,10 @@ mkdir -p "$SKILL_DIR"/{scripts,types,db,db/spawn-roles,agents}
 
 # SKILL.md is generated from the agent-specific command template, resolved from
 # the type manifest (scripts/drivers/types/<type>/template.md). The shared SKILL.md uses the
-# codex template by default; gemini/antigravity/opencode get their own.
+# codex template by default; the types in AGMSG_SHARED_SKILL_TPL_TYPES get their own.
 TPL_TYPE="codex"
-case "$AGENT_TYPE" in
-  gemini|antigravity|opencode|hermes|cursor|grok-build) TPL_TYPE="$AGENT_TYPE" ;;
+case " $AGMSG_SHARED_SKILL_TPL_TYPES " in
+  *" $AGENT_TYPE "*) TPL_TYPE="$AGENT_TYPE" ;;
 esac
 sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path "$TPL_TYPE")" > "$SKILL_DIR/SKILL.md"
 # Recursive copy so nested helper dirs (scripts/lib/, scripts/drivers/types/) ship
@@ -395,12 +585,26 @@ cp "$SCRIPT_DIR/openai.yaml" "$SKILL_DIR/agents/openai.yaml" 2>/dev/null || true
 chmod +x "$SKILL_DIR/scripts/"*.sh
 # Per-type folded runtime scripts (codex-*.sh, cursor-bridge.sh, watch-once.sh …).
 chmod +x "$SKILL_DIR/scripts/drivers/types/"*/*.sh 2>/dev/null || true
+install_antigravity_tui_shim "$SKILL_DIR/scripts/drivers/types/antigravity/agy-tui.sh"
 # Re-point an existing Codex monitor shim at the new path on a reinstall over an
-# older layout (no-op when no agmsg shim is present). See the --update block above.
+# older layout (no-op when no agmsg shim is present). See the --update block
+# above. NOT forced (#553): unlike --update, a fresh install here gives no
+# signal that the caller means to take over an EXISTING install's shim, so a
+# --cmd for a second/different name must not silently repoint it away from
+# whichever install already owns it. codex-shim-install.sh itself refuses that
+# and says whose it is; surface that here instead of swallowing it.
 CODEX_SHIM="$SKILL_DIR/scripts/drivers/types/codex/codex-shim-install.sh"
-if [ -x "$CODEX_SHIM" ] && AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" status 2>/dev/null | grep -q '^installed:'; then
-  AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" install >/dev/null 2>&1 \
-    && echo "  + refreshed Codex monitor shim (~/.agents/bin/codex)"
+CODEX_SHIM_STATUS=""
+[ -x "$CODEX_SHIM" ] && CODEX_SHIM_STATUS="$(AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" status 2>/dev/null || true)"
+if printf '%s' "$CODEX_SHIM_STATUS" | grep -q '^installed:'; then
+  # Stdout suppressed (mirrors the --update block's success case above);
+  # stderr is NOT, since codex-shim-install.sh's own refusal already names the
+  # current owner and the exact consequence of forcing -- repeating a
+  # shorter, separate version of that here would risk saying something
+  # different from what actually happens.
+  if AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" install >/dev/null; then
+    echo "  + refreshed Codex monitor shim (~/.agents/bin/codex)"
+  fi
 fi
 install_windows_helpers
 
@@ -415,6 +619,12 @@ printf '%s\n' "$INSTALLED_VERSION" > "$SKILL_DIR/VERSION"
 if [ ! -f "$SKILL_DIR/db/messages.db" ]; then
   bash "$SKILL_DIR/scripts/internal/init-db.sh"
 fi
+
+# Nothing moves stores here. Installing must not change where a team's messages
+# live: programs outside agmsg read the shared store directly, and an install
+# that relocated their data would break them without anything saying so. A team
+# moves to its own store only when connecting requires it, and only that team —
+# see scripts/drivers/layout/ and internal/migrate-team-store.sh.
 
 # Initialize config
 if [ ! -f "$SKILL_DIR/db/config.yaml" ]; then

@@ -336,6 +336,52 @@ EOF
   [[ "$output" =~ "type=claude-code" ]]
 }
 
+@test "whoami: rejects an explicit unknown type instead of answering not_joined (#783)" {
+  bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/proj
+  clear_autodetect_env
+  mock_no_agent_ps
+  run bash "$SCRIPTS/whoami.sh" /tmp/proj not-a-real-type
+  [ "$status" -eq 1 ]
+  # Plain commands, not `[[ ]]`: a non-last `[[ ]]` cannot fail the test on
+  # bash 3.2 (#670), and the absence check below is the one that carries the
+  # point of this fix.
+  grep -qF "Unknown agent type: 'not-a-real-type'" <<<"$output"
+  # The old behaviour was a truthful answer to a question the caller did not
+  # mean to ask, and it is that answer which must not appear.
+  refute grep -qF "not_joined=true" <<<"$output"
+}
+
+@test "whoami: the unknown-type error lists the registry, like join.sh's does (#783)" {
+  clear_autodetect_env
+  mock_no_agent_ps
+  run bash "$SCRIPTS/whoami.sh" /tmp/proj bogus-type
+  [ "$status" -eq 1 ]
+  # Derived from the registry rather than compared against a written-out list,
+  # so adding a type cannot leave this assertion behind.
+  local expected
+  expected="$(cd "$SCRIPTS" && bash -c 'source lib/type-registry.sh; agmsg_known_types | sort -u | paste -sd, - | sed "s/,/, /g"')"
+  [[ "$output" =~ "supported: $expected" ]]
+}
+
+# THE CHECK IS GUARDED ON $2, AND THIS IS THE TEST THAT SAYS SO. Validating the
+# RESOLVED type instead would pass every other test in this file and fail only
+# here: detect_cli_type's last exit is a hardcoded `claude-code` that no
+# registry lookup stands behind, so tying the no-argument path to it makes a
+# registry that cannot offer that name stop everyone, not just a caller who
+# mistyped. Removing the `[ -n "${2:-}" ]` guard turns this red.
+@test "whoami: no type argument still answers when the fallback name is not in the registry (#783)" {
+  bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/proj
+  clear_autodetect_env
+  mock_no_agent_ps
+  # Move it aside rather than delete it: what is under test is the registry no
+  # longer offering the name detect_cli_type falls back to.
+  mv "$TYPES/claude-code" "$TYPES/.claude-code-hidden"
+  run bash "$SCRIPTS/whoami.sh" /tmp/proj
+  mv "$TYPES/.claude-code-hidden" "$TYPES/claude-code"
+  [ "$status" -eq 0 ]
+  [[ ! "$output" =~ "Unknown agent type" ]]
+}
+
 # --- reset.sh ---
 
 @test "reset: removes only current project registration" {
@@ -423,6 +469,51 @@ EOF
   [[ "$output" =~ "hello" ]]
 }
 
+@test "rename-team: atomically migrates cursor and sync sidecars" {
+  bash "$SCRIPTS/join.sh" oldteam alice claude-code /tmp/proj-a
+  export SKILL_DIR="$TEST_SKILL_DIR" AGMSG_STORAGE_DRIVER=sqlite
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  storage_init oldteam >/dev/null
+  storage_read_cursor_consume oldteam alice 0 >/dev/null
+  _sqlite_sync_schema oldteam
+  local generation db renamed_db store_dir
+  generation=$(_sqlite_sync_generation oldteam)
+  # This team is on the default shared layout, so both names resolve to the same
+  # file and the rename rewrites columns rather than moving anything. A team that
+  # owns its store is covered separately, in the layout tests.
+  db=$(agmsg_db_path oldteam)
+  renamed_db="$db"
+  store_dir=$(agmsg_storage_dir)
+  agmsg_sqlite "$db" "INSERT INTO sync_bindings
+    (local_team,server_instance_id,remote_team_id,protocol_version,driver_generation)
+    VALUES('oldteam','018f3f7e-0000-7000-8000-000000000000',
+      '018f3f7e-0000-7000-8000-000000000001',1,'$generation');"
+  mkdir -p "$store_dir/remote-sync"
+  printf '{"local_team":"oldteam","binding":"fixture"}\n' \
+    > "$store_dir/remote-sync/oldteam.json"
+  chmod 600 "$store_dir/remote-sync/oldteam.json"
+  bash "$SCRIPTS/rename-team.sh" oldteam newteam
+  [ "$(agmsg_sqlite "$renamed_db" "SELECT team FROM read_cursors;" | tr -d '\r')" = newteam ]
+  [ "$(agmsg_sqlite "$renamed_db" "SELECT local_team FROM sync_bindings;" | tr -d '\r')" = newteam ]
+  [ ! -e "$store_dir/remote-sync/oldteam.json" ]
+  [ "$(jq -r '.local_team' "$store_dir/remote-sync/newteam.json")" = newteam ]
+}
+
+@test "rename-team: JSONL keeps the cursor with the renamed event stream" {
+  export SKILL_DIR="$TEST_SKILL_DIR" AGMSG_STORAGE_DRIVER=jsonl
+  bash "$SCRIPTS/join.sh" oldteam alice claude-code /tmp/proj-a
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  local id tip
+  id=$(storage_send oldteam bob alice hello)
+  tip=$(storage_watch_tip oldteam:alice)
+  storage_read_cursor_consume oldteam alice "$tip" "$id" >/dev/null
+  bash "$SCRIPTS/rename-team.sh" oldteam newteam
+  [ "$(storage_read_cursor_get newteam alice)" = "$tip" ]
+  [ "$(storage_history newteam | jq -r '.team')" = newteam ]
+}
+
 @test "rename-team: fails when old team is missing" {
   run bash "$SCRIPTS/rename-team.sh" nope newname
   [ "$status" -ne 0 ]
@@ -502,9 +593,12 @@ EOF
   [ "$status" -eq 0 ]
   [[ ! "$output" =~ "syntax error" ]]
   [[ ! "$output" =~ ".parameter" ]]
-  run bash "$SCRIPTS/team.sh" myteam
-  [[ "$output" =~ "$new" ]]
-  [[ ! "$output" =~ "$old" ]]
+  run node -e '
+    const config = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+    process.exit(Number(!Object.hasOwn(config.agents, process.argv[2]) ||
+      Object.hasOwn(config.agents, process.argv[3])));
+  ' "$TEST_SKILL_DIR/teams/myteam/config.json" "$new" "$old"
+  [ "$status" -eq 0 ]
 }
 
 @test "rename: rejects an old/new agent name containing path-hazard characters" {
@@ -700,4 +794,46 @@ EOF
   run bash "$SCRIPTS/join.sh" myteam alice grok-build /tmp/proj
   [ "$status" -eq 0 ]
   [ -f "$TEST_SKILL_DIR/teams/myteam/config.json" ]
+}
+
+@test "team: a pulled member with no local registration is listed and counted" {
+  # A machine that pulled a team holds members it has never registered locally:
+  # the roster is real, the registrations are empty, and that is the correct
+  # state rather than a broken one. The listing joined through the
+  # registrations array, so those members produced no row at all and the team
+  # read as empty.
+  mkdir -p "$TEST_SKILL_DIR/teams/pulled"
+  cat > "$TEST_SKILL_DIR/teams/pulled/config.json" <<'JSON'
+{
+  "name": "pulled",
+  "team_id": "018f3f7e-2222-7000-8000-000000000002",
+  "agents": {
+    "alice": { "member_id": "018f3f7e-2222-7000-8000-000000000010", "registrations": [] },
+    "bob":   { "member_id": "018f3f7e-2222-7000-8000-000000000011", "registrations": [] },
+    "carol": { "member_id": "018f3f7e-2222-7000-8000-000000000012",
+               "registrations": [ { "type": "claude-code", "project": "/tmp/p" } ] }
+  },
+  "created_at": "2026-07-29T00:00:00Z"
+}
+JSON
+  run bash "$SCRIPTS/team.sh" pulled
+  [ "$status" -eq 0 ]
+  # Every member appears, not just the one with a registration.
+  [[ "$output" == *"alice"* ]]
+  [[ "$output" == *"bob"* ]]
+  [[ "$output" == *"carol"* ]]
+  # And the count agrees with the roster rather than with the join.
+  [[ "$output" == *"3 member(s)"* ]]
+  # The absence is described, not left blank.
+  [[ "$output" == *"no local registration"* ]]
+}
+
+@test "team: a locally registered member still lists its type and project" {
+  # The fix must not change what a normal member looks like.
+  bash "$SCRIPTS/join.sh" localteam alice claude-code /tmp/project-x >/dev/null
+  run bash "$SCRIPTS/team.sh" localteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"alice (claude-code) — /tmp/project-x"* ]]
+  [[ "$output" == *"1 member(s)"* ]]
+  [[ "$output" != *"no local registration"* ]]
 }

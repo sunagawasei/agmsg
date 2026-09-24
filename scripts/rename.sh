@@ -4,6 +4,23 @@ set -euo pipefail
 # Usage: rename.sh <team> <old_name> <new_name>
 #
 # Renames an agent in team config and updates all messages in DB.
+#
+# It deliberately does NOT touch run/. Those files are runtime state, not a
+# record of the team: `actas.<team>__<agent>.session` (the exclusivity lock),
+# `role-session.<team>__<agent>`, `ready.<team>__<agent>`, and the codex bridge's
+# `codex-bridge.<team>.<agent>.*`. Thirteen files read them between them, and
+# rewriting the state of a process that is currently running, because its name
+# changed, is a good way to break the one thing that was working.
+#
+# What that leaves behind is orphans under the old name. They are harmless:
+# nothing is running under that name to read them, and the next start writes
+# fresh ones. The exclusivity lock is the one worth clearing by hand — a lock
+# held by a name that no longer exists is the kind of thing a future reuse check
+# trips over.
+#
+# Written down because two renames in a row produced the same leftovers and the
+# second person asked whether it was intended. It is. A bulk rename would
+# multiply them, and nobody should have to rediscover that it was a choice.
 
 TEAM="${1:?Usage: rename.sh <team> <old_name> <new_name>}"
 OLD_NAME="${2:?Missing old agent name}"

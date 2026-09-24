@@ -222,7 +222,7 @@ write_node_launcher_fixtures() {
   write_node_launcher_fixtures
   run "$SCRIPTS/spawn.sh" nodetype someagent --project "$BATS_TEST_TMPDIR"
   [ "$status" -ne 0 ]
-  ! echo "$output" | grep -q "is not supported by spawn yet"
+  refute grep -q "is not supported by spawn yet" <<<"$output"
   ! echo "$output" | grep -q "unknown agent type"
 }
 

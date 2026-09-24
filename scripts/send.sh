@@ -83,43 +83,35 @@ source "$SCRIPT_DIR/lib/validate.sh"
 # never bypass team-name path safety.
 agmsg_validate_team_name "$TEAM" || exit 1
 
+# A seat that sends names its own pane if it is not named. Best-effort: terminal
+# discovery/naming must never make message delivery fail.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/self-name.sh"
+agmsg_self_name_on_action "$TEAM" "$FROM" || true
+
+agmsg_storage_load
 DB="$(agmsg_db_path)"
 
-# Cross-session isolation guard. A session team (s-<session-id>) is PRIVATE to one
-# Claude session; the bug this guards against is a message landing in ANOTHER
-# session's private team because the caller resolved $TEAM from the wrong source
-# (e.g. another session's pidfile/process list). The choke point: refuse a send
-# INTO a session team unless it is this session's own. Three gates keep it inert
-# everywhere it should be:
-#   1. only when the TARGET is a session team (s-*). A project-team target is
-#      legitimate shared traffic — e.g. a gemini/cursor agent whose env merely
-#      inherited CLAUDE_CODE_SESSION_ID still has whoami.sh resolve a PROJECT team
-#      (session-team resolution is claude-code-only, see whoami.sh), so its sends
-#      must never be blocked.
-#   2. only when CLAUDE_CODE_SESSION_ID is present. The codex bridge's own replies
-#      run send.sh inside codex's sandbox, which SCRUBS that env var (verified: the
-#      sandboxed grandchild has none), so the reply sees an empty id → inert. (A
-#      reply also only ever targets its own session team, so it would pass anyway.)
-#   3. only when this session's own team (s-<id>) differs from the target.
-# Residual (accepted): a session team's name is `s-<bare CLAUDE_CODE_SESSION_ID>`,
-# which is opaque (not provably a UUID — tests use s-sess-X), so the s-* prefix is
-# the only structural signal. A user who literally names a PROJECT team `s-foo`
-# collides with the pattern: a non-Claude agent with a leaked CLAUDE_CODE_SESSION_ID
-# sending there would be refused. Mitigation is the escape hatch; reserving the s-
-# prefix at team creation was judged too invasive for this low-likelihood case.
-# Escape hatch for a deliberate cross-team send: AGMSG_ALLOW_CROSS_TEAM=1.
-if [ "${AGMSG_ALLOW_CROSS_TEAM:-0}" != 1 ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+# A Claude session must not accidentally address another session's private
+# team. Project teams remain unrestricted; explicit cross-team work has an
+# opt-in escape hatch.
+if [ "${AGMSG_ALLOW_CROSS_TEAM:-0}" != 1 ] \
+    && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
   case "$TEAM" in
     s-*)
+      # shellcheck disable=SC1091
       source "$SCRIPT_DIR/lib/session-team.sh"
       EXPECT_TEAM="$(agmsg_session_team_name 2>/dev/null || true)"
       if [ -n "$EXPECT_TEAM" ] && [ "$TEAM" != "$EXPECT_TEAM" ]; then
         echo "send: refusing cross-session send — '$TEAM' is another session's private team; this session's own team is '$EXPECT_TEAM'. Use \$TEAM from whoami.sh; set AGMSG_ALLOW_CROSS_TEAM=1 to override." >&2
         exit 1
-      fi ;;
+      fi
+      ;;
   esac
 fi
 
+# Keep the full-schema bootstrap (registry + storage tables) for a first-ever
+# command; the message write itself goes through the storage facade below.
 [ -f "$DB" ] || bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
 
 # #355: reject a from/to that isn't registered in <team> — an unnoticed typo
@@ -164,34 +156,12 @@ if [ "$FORCE" -ne 1 ]; then
   _agmsg_roster_check "to" "$TO" || exit 1
 fi
 
-# Escape EVERY interpolated value as a SQL string literal, not just body: a
-# team/agent name containing a single quote would otherwise break the INSERT
-# (correctness) or change its meaning (injection surface).
-_agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
-T_ESC="$(_agmsg_sqlesc "$TEAM")"
-F_ESC="$(_agmsg_sqlesc "$FROM")"
-O_ESC="$(_agmsg_sqlesc "$TO")"
-B_ESC="$(_agmsg_sqlesc "$BODY")"
-
-# Insert and capture the new row id in one connection so --wait can scope the
-# reply strictly to messages that arrive AFTER this send. id is INTEGER PRIMARY
-# KEY AUTOINCREMENT, so last_insert_rowid() == messages.id.
-INSERT="INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('$T_ESC', '$F_ESC', '$O_ESC', '$B_ESC'); SELECT last_insert_rowid();"
-
-# Retry once after ensuring the schema. Under a concurrent first-write fan-out
-# (leader → N members against a fresh/override store), one process can see the
-# DB file exist before the winning initializer has finished creating the table,
-# so its INSERT would hit "no such table". init-db.sh is idempotent + uses the
-# busy_timeout, so re-running it waits for the schema, then the INSERT lands.
-# See #114.
-# Pipe the SQL via stdin (not as an argv) so a large body cannot overflow the
-# OS command-line limit (the "Argument list too long" crash). Capture the output
-# (last_insert_rowid) so --wait can scope the reply to messages after this send.
-if ! SENT_ID="$(printf '%s\n' "$INSERT" | agmsg_sqlite "$DB" 2>/dev/null)"; then
-  bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
-  SENT_ID="$(printf '%s\n' "$INSERT" | agmsg_sqlite "$DB")"
-fi
-case "$SENT_ID" in ''|*[!0-9]*) SENT_ID=0 ;; esac
+# Write through the storage axis (§2.1 storage_send) — the active driver now owns
+# the message log (an append-only message_sent event), not a direct INSERT.
+# storage_send re-inits its schema idempotently before writing, which subsumes the
+# #114 concurrent first-write race the old path retried around (a process seeing
+# the DB file before the table exists just creates it).
+SENT_EVENT_ID="$(storage_send "$TEAM" "$FROM" "$TO" "$BODY")"
 
 echo "Sent to $TO in team $TEAM"
 
@@ -201,6 +171,14 @@ echo "Sent to $TO in team $TEAM"
 # Block until <to> replies to <from> with a message newer than the one we sent.
 # Newlines in the body are flattened to a literal "\n" so the printed reply
 # stays a single line — same convention as watch.sh's stream.
+T_ESC="$(printf '%s' "$TEAM" | sed "s/'/''/g")"
+F_ESC="$(printf '%s' "$FROM" | sed "s/'/''/g")"
+O_ESC="$(printf '%s' "$TO" | sed "s/'/''/g")"
+E_ESC="$(printf '%s' "$SENT_EVENT_ID" | sed "s/'/''/g")"
+SENT_ID="$(agmsg_sqlite "$DB" \
+  "SELECT legacy_id FROM events WHERE type='message_sent' AND id='$E_ESC' LIMIT 1;" \
+  2>/dev/null | tr -d '\r')"
+case "$SENT_ID" in ''|*[!0-9]*) echo "send: could not resolve sent message id" >&2; exit 1 ;; esac
 REPLY_WHERE="id > $SENT_ID AND team='$T_ESC' AND from_agent='$O_ESC' AND to_agent='$F_ESC'"
 deadline=$(( $(date +%s) + TIMEOUT ))
 

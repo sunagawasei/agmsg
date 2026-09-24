@@ -222,7 +222,13 @@ STUB
   old_path="$(ipath 1)"
   old_pid="$BRIDGE_PID"
   old_start="$BRIDGE_START"
-  start_bridge
+  # ps(1) lstart is second-granularity on macOS; same-second spawns share a token
+  # and inflight paths collide (Linux proc starttime does not have this flake).
+  while :; do
+    start_bridge
+    [ "$BRIDGE_START" != "$old_start" ] && break
+    sleep 1
+  done
   write_consumers "$RUN/c2" "2"
   agmsg_inflight_write team worker codex 1 "$BRIDGE_PID" "$BRIDGE_START" "$RUN/c2"
   [ -f "$old_path" ]

@@ -174,7 +174,7 @@ teardown() {
   local quoted="$TEST_SKILL_DIR/pro'j"
   mkdir -p "$quoted"
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$quoted"
-  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$quoted"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$quoted" --no-wait
   [[ "$output" != *"no team is registered"* ]]
   [[ "$output" != *"syntax error"* ]]
 }
@@ -3022,7 +3022,7 @@ STUB
   run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait --window
   [ "$status" -eq 0 ]
   # Fell back to split, not tab create.
-  ! grep -q "tab create" "$HERDR_CALL_LOG"
+  refute grep -q "tab create" "$HERDR_CALL_LOG"
   grep -q "pane split" "$HERDR_CALL_LOG"
 }
 
@@ -3074,7 +3074,7 @@ _spawn_recorded_id() {
   run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
   [ "$status" -eq 0 ]
   grep -q "pane run wT:pRIGHT" "$HERDR_CALL_LOG"
-  ! grep -q "wT:pWRONG" "$HERDR_CALL_LOG"
+  refute grep -q "wT:pWRONG" "$HERDR_CALL_LOG"
   [ "$(_spawn_recorded_id)" = "herdr:wT:pRIGHT" ]
 }
 
@@ -3096,7 +3096,7 @@ _spawn_recorded_id() {
   run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait --window
   [ "$status" -eq 0 ]
   grep -q "pane run wT:pNESTED" "$HERDR_CALL_LOG"
-  ! grep -q "wT:pTABWRONG" "$HERDR_CALL_LOG"
+  refute grep -q "wT:pTABWRONG" "$HERDR_CALL_LOG"
   [ "$(_spawn_recorded_id)" = "herdr:wT:pNESTED" ]
 }
 

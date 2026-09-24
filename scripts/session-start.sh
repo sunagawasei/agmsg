@@ -65,6 +65,11 @@ source "$SCRIPT_DIR/lib/process-identity.sh"
 source "$SCRIPT_DIR/lib/pending-teardown.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/inflight.sh"
+# Only DEFINES agmsg_close_inherited_fds; nothing is closed here. The type
+# plug calls it inside a subshell around its own long-lived spawn, so this
+# shell's descriptors are untouched. See lib/close-fds.sh.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/close-fds.sh"
 
 # Session-team code paths are gated on type CAPABILITY (type.conf declares
 # session_team=yes) AND runtime opt-in (delivery.session_team) — capability

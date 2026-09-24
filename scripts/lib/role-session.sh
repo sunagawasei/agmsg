@@ -139,13 +139,16 @@ agmsg_role_session_load() {
 #   project=<project>      the resolved project root
 #   updated_at=<iso8601>   best-effort timestamp (empty if date(1) unavailable)
 agmsg_role_session_record() {
-  local team="$1" agent="$2" bare_sid="$3" project="${4:-}" type="${5:-}"
+  local team="$1" agent="$2" bare_sid="$3" project="${4:-}" type="${5:-}" owner="${6:-}"
   [ -n "$team" ] && [ -n "$agent" ] && [ -n "$bare_sid" ] || return 0
-  local path dir tmp ts
+  local path dir tmp ts named_ref="" named_epoch="" named_at=""
   _agmsg_role_session_path_into "$team" "$agent"
   path="$_AGMSG_ROLE_SESSION_PATH"
+  named_ref="$(_agmsg_role_session_field "$path" named_ref)"
+  named_epoch="$(_agmsg_role_session_field "$path" named_epoch)"
+  named_at="$(_agmsg_role_session_field "$path" named_at)"
   dir="$(_actas_lock_dir)"
-  mkdir -p "$dir" 2>/dev/null || return 0
+  mkdir -p "$dir" 2>/dev/null || true
   tmp="$(mktemp "$dir/.role-session.XXXXXX" 2>/dev/null)" || return 0
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
   {
@@ -155,7 +158,11 @@ agmsg_role_session_record() {
     printf 'agent=%s\n' "$agent"
     printf 'type=%s\n' "$type"
     printf 'project=%s\n' "$project"
+    [ -z "$owner" ] || printf 'owner=%s\n' "$owner"
     printf 'updated_at=%s\n' "$ts"
+    [ -z "$named_ref" ] || printf 'named_ref=%s\n' "$named_ref"
+    [ -z "$named_ref" ] || printf 'named_epoch=%s\n' "$named_epoch"
+    [ -z "$named_at" ] || printf 'named_at=%s\n' "$named_at"
   } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
   mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
   return 0
@@ -188,6 +195,48 @@ _agmsg_role_session_field() {
   return 0
 }
 
+# Persist that agmsg named the current terminal reference for this role while
+# preserving all session/owner fields already present in the record.
+agmsg_role_session_mark_named() {
+  local team="$1" agent="$2" ref="$3" epoch="${4:-}" project="${5:-}" type="${6:-}"
+  [ -n "$team" ] && [ -n "$agent" ] && [ -n "$ref" ] || return 0
+  local path dir tmp ts line
+  _agmsg_role_session_path_into "$team" "$agent"
+  path="$_AGMSG_ROLE_SESSION_PATH"
+  dir="$(_actas_lock_dir)"
+  mkdir -p "$dir" 2>/dev/null || true
+  tmp="$(mktemp "$dir/.role-session.XXXXXX" 2>/dev/null)" || return 0
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+  {
+    if [ -f "$path" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in named_ref=*|named_epoch=*|named_at=*) ;; *) printf '%s\n' "$line" ;; esac
+      done < "$path"
+    else
+      printf 'name=%s-%s\n' "$team" "$agent"
+      printf 'team=%s\n' "$team"
+      printf 'agent=%s\n' "$agent"
+      printf 'type=%s\n' "$type"
+      printf 'project=%s\n' "$project"
+      printf 'updated_at=%s\n' "$ts"
+    fi
+    printf 'named_ref=%s\n' "$ref"
+    printf 'named_epoch=%s\n' "$epoch"
+    printf 'named_at=%s\n' "$ts"
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+agmsg_role_session_named() {
+  local team="$1" agent="$2" ref epoch
+  _agmsg_role_session_path_into "$team" "$agent"
+  ref="$(_agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" named_ref)"
+  [ -n "$ref" ] || return 0
+  epoch="$(_agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" named_epoch)"
+  printf '%s\t%s\n' "$ref" "$epoch"
+}
+
 # Read back the recorded bare session id for (team, agent). Empty if no record.
 # This is the primary getter used by the boot wrapper (PR-C).
 agmsg_role_session_uuid() {
@@ -212,6 +261,25 @@ agmsg_role_session_lookup_by_name() {
       cat "$f" 2>/dev/null || true
       return 0
     fi
+  done
+  return 0
+}
+
+# Print the session id of every record of <type>, one per line (unordered, may
+# repeat across teams). Empty if none. Used by codex seat resolution (#579) to
+# subtract already-claimed threads from the app-server's loaded set: what is left
+# is the session that has not been seated yet.
+agmsg_role_session_recorded_uuids() {
+  local type="$1" dir f t v
+  [ -n "$type" ] || return 0
+  dir="$(_actas_lock_dir)"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/role-session.*; do
+    [ -f "$f" ] || continue
+    t="$(_agmsg_role_session_field "$f" type)"
+    [ "$t" = "$type" ] || continue
+    v="$(_agmsg_role_session_field "$f" session)"
+    [ -n "$v" ] && printf '%s\n' "$v"
   done
   return 0
 }

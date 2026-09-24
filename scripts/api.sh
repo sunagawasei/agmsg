@@ -37,6 +37,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
+agmsg_storage_load
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/validate.sh"
 
@@ -106,15 +107,21 @@ get_messages() {
       *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
   done
-  # Non-numeric values would otherwise land straight in the SQL text below —
-  # same guard history.sh uses for LIMIT.
+  # Non-numeric --limit would otherwise land straight in the SQL text below —
+  # same guard history.sh uses for LIMIT. --before-id is an opaque message id
+  # (event-log ids are UUIDs, not numeric — see below), so it is NOT
+  # numeric-filtered; it is bound as an escaped SQL string literal instead.
   case "$limit" in ''|*[!0-9]*) limit=30 ;; esac
-  case "$before_id" in ''|*[!0-9]*) before_id="" ;; esac
 
   local db; db="$(agmsg_db_path)"
   if [ ! -f "$db" ]; then
     return 0 # no store yet — empty result, not an error
   fi
+  # The events table is created lazily by the facade on first write, so a
+  # pure-legacy store (init-db.sh ran, storage_send never called) may have
+  # messages but no events table yet — the UNION below would fail to parse
+  # without it. storage_init is idempotent (CREATE TABLE IF NOT EXISTS).
+  storage_init >/dev/null
 
   local team_sql; team_sql="$(_agmsg_sqlesc "$team")"
   local where="team='$team_sql'"
@@ -122,31 +129,51 @@ get_messages() {
     local agent_sql; agent_sql="$(_agmsg_sqlesc "$agent")"
     where="$where AND (from_agent='$agent_sql' OR to_agent='$agent_sql')"
   fi
+  local before_clause=""
   if [ -n "$before_id" ]; then
-    where="$where AND id<$before_id"
+    local before_id_sql; before_id_sql="$(_agmsg_sqlesc "$before_id")"
+    # Anchor pagination on the target row's own position (ord, see below),
+    # not on comparing id values directly: a legacy row's id and an
+    # event-log row's id are not from the same counter, so "id < before_id"
+    # only makes sense within a single source. A before_id that matches no
+    # row (bad cursor, or a compacted-away message) makes the subquery NULL,
+    # so the whole clause is false — an empty page, not an error.
+    before_clause="AND ord < (SELECT ord FROM combined WHERE id='$before_id_sql')"
   fi
 
-  # Inner query takes the most recent `limit` by id DESC, outer re-sorts
+  # Inner query takes the most recent `limit` by ord DESC, outer re-sorts
   # ASC — oldest-first output, same ordering contract §2.1 of the driver
-  # spec requires of storage_history, so a future swap to that function
-  # doesn't change what this command prints.
-  # id is CAST to TEXT: the driver-interface spec treats every message id as
-  # opaque, and a legacy sqlite integer id is specifically passed through as
-  # a decimal STRING (not a JSON number) so a future UUIDv7/Redis-stream-id
-  # driver doesn't change this field's JSON type — a consumer parsing id as
-  # a string today needs no change once that lands.
+  # spec requires of storage_history.
+  # Reads BOTH the event log (where storage_send now writes) and the legacy
+  # messages table (pre-flip installs), mirroring storage_history's UNION —
+  # without it, any message sent after the storage flip would be invisible
+  # here. `ord` is each source's own native monotonic counter (events.seq /
+  # messages.id), used only to order rows and anchor before-id pagination;
+  # it is never compared across sources.
+  # id is exposed as TEXT: the driver-interface spec treats every message id
+  # as opaque — a legacy sqlite integer id is a decimal STRING (not a JSON
+  # number), same as an event-log UUID, so a consumer parsing id as a string
+  # today needs no change as drivers evolve.
   agmsg_sqlite "$db" "
+    WITH combined AS (
+      SELECT id, team, from_agent, to_agent, body, at AS created_at, seq AS ord
+      FROM events WHERE type='message_sent'
+      UNION ALL
+      SELECT CAST(id AS TEXT) AS id, team, from_agent, to_agent, body, created_at, id AS ord
+      FROM messages
+      WHERE NOT EXISTS (SELECT 1 FROM events e2 WHERE e2.legacy_id=messages.id)
+    )
     SELECT json_object(
       'type', 'message_sent',
-      'id', CAST(id AS TEXT),
+      'id', id,
       'team', team,
       'from', from_agent,
       'to', to_agent,
       'body', body,
       'at', created_at
     ) FROM (
-      SELECT * FROM messages WHERE $where ORDER BY id DESC LIMIT $limit
-    ) ORDER BY id ASC;
+      SELECT * FROM combined WHERE $where $before_clause ORDER BY ord DESC LIMIT $limit
+    ) ORDER BY ord ASC;
   "
 }
 
