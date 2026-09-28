@@ -853,6 +853,37 @@ if command -v agmsg_session_start_fast_path_ok >/dev/null 2>&1 \
 fi
 agmsg_session_start_common_init "$_fast_path_ok"
 
+# AGMSG_CC_MONITOR_KEEP_ALIVE, default OFF: timeout_ms: 1800000 always stays
+# (the Monitor tool caps every watch there regardless). What differs is
+# whether re-arming on expiry is UNCONDITIONAL or read off the expiry
+# notification itself. Claude Code counts the events on its own side and
+# names that count in the notification -- agmsg never counts it -- so the
+# default case below is worded as a plain word match on that notification
+# ("no events" present or not), never as reading a number: the exact
+# phrasing may drift, and a seat that has to parse a count is a seat this
+# can break by rewording the notification later. Kept word-for-word
+# identical to scripts/delivery.sh's emit_monitor_directive and
+# scripts/drivers/types/claude-code/template.md's actas overlay -- the
+# three surfaces must never disagree with each other.
+REARM_NOTE=""
+if [ -n "${AGMSG_CC_MONITOR_KEEP_ALIVE:-}" ]; then
+  REARM_NOTE="
+This watch expires after at most 30 minutes; when the expiry notice arrives,
+immediately re-arm it by invoking Monitor again with this exact command and
+description — delivery depends on it, since nothing else keeps the stream
+running. Re-arm it silently: no message to the user, no \"re-armed\", no
+acknowledgement, no summary — just invoke Monitor again and continue,
+since announcing it every 30 minutes wastes tokens for no benefit."
+else
+  REARM_NOTE="
+This watch expires after at most 30 minutes.
+If the expiry notification says it delivered no events, do not re-arm it.
+Otherwise (it says it delivered something), re-arm it by invoking Monitor again with this exact command and description.
+Re-arm it silently, when you do: no message to the user, no \"re-armed\", no
+acknowledgement, no summary — just invoke Monitor again and continue, since
+announcing it every 30 minutes wastes tokens for no benefit."
+fi
+
 # Shell-quote each argv so the host can paste the command into Monitor and run
 # it verbatim. A plain '...' wrap breaks on paths with an apostrophe
 # (/Users/o'brien/...); printf %q escapes spaces, quotes and other metacharacters
@@ -889,12 +920,30 @@ following parameters, before any other action in this session.
   command: $WATCH_COMMAND
   description: agmsg inbox stream (acting as $ROLE_NAME)
   persistent: true
+  timeout_ms: 1800000
+$REARM_NOTE
 
 The 4th argument restricts receive to \`$ROLE_NAME\` only and re-claims its actas
 exclusivity lock — a resume restores context but not runtime state, so this
 re-establishes the role. Send with \`send.sh ... $ROLE_NAME ...\` (this session's
 active FROM is \`$ROLE_NAME\`). Each output line is one message:
 \`<ts> | <team> | <from> → <to> | <body>\`. React as they arrive.
+
+Use Claude Code's generic Monitor tool only. First confirm ToolSearch
+select:Monitor finds that generic tool; Azure Monitor, MCP monitor, or other
+monitor-branded tools are not valid for agmsg delivery. Do not start watch.sh
+with Bash/background/nohup or a shell task. Success is:
+
+  - Monitor(agmsg inbox stream (acting as $ROLE_NAME)) starts
+  - TaskList shows a task whose description begins with "agmsg inbox
+    stream (acting as $ROLE_NAME)" for this session (the reliable check;
+    the background-task footer is not)
+  - the transcript later contains Monitor event: "agmsg inbox stream
+    (acting as $ROLE_NAME)"
+
+If the generic Monitor tool is unavailable, do not treat a background shell
+watcher as success. Switch to turn delivery or run manual inbox checks instead;
+those fallbacks are not real-time monitor delivery.
 
 Note: On a /clear or --continue/--resume re-fire, you may shortly see a
 "Monitor … stopped" notification for an earlier 'agmsg inbox stream'
@@ -909,10 +958,27 @@ before any other action in this session.
   command: $WATCH_COMMAND
   description: agmsg inbox stream
   persistent: true
+  timeout_ms: 1800000
+$REARM_NOTE
 
 This streams incoming agmsg messages into the session in real time. Each
 output line is one message: \`<ts> | <team> | <from> → <to> | <body>\`.
 React to messages as they arrive; reply with \`send.sh\`.
+
+Use Claude Code's generic Monitor tool only. First confirm ToolSearch
+select:Monitor finds that generic tool; Azure Monitor, MCP monitor, or other
+monitor-branded tools are not valid for agmsg delivery. Do not start watch.sh
+with Bash/background/nohup or a shell task. Success is:
+
+  - Monitor(agmsg inbox stream) starts
+  - TaskList shows a task whose description begins with "agmsg inbox
+    stream" for this session (the reliable check; the background-task
+    footer is not)
+  - the transcript later contains Monitor event: "agmsg inbox stream"
+
+If the generic Monitor tool is unavailable, do not treat a background shell
+watcher as success. Switch to turn delivery or run manual inbox checks instead;
+those fallbacks are not real-time monitor delivery.
 
 Note: On a /clear or --continue/--resume re-fire, you may shortly see a
 "Monitor … stopped" notification for an earlier 'agmsg inbox stream'

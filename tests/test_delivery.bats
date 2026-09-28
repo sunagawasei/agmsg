@@ -530,6 +530,21 @@ eperm_pid() {
   grep -q 'says it delivered no events, do not re-arm it' <<<"$output"
   grep -q 'Otherwise (it says it delivered something), re-arm it' <<<"$output"
   grep -q 'Re-arm it silently' <<<"$output"
+  # Absolute literal for the OFF/unset REARM_NOTE, owned by THIS test (not
+  # derived from session-start.sh's or template.md's own tests) -- so a drift
+  # in delivery.sh alone is caught here even if the other two surfaces still
+  # happen to agree with each other (see the session-start.sh and template.md
+  # counterparts of this literal, which independently golden-check their own
+  # surfaces the same way).
+  local expected_off='This watch expires after at most 30 minutes. If the expiry notification says it delivered no events, do not re-arm it. Otherwise (it says it delivered something), re-arm it by invoking Monitor again with this exact command and description. Re-arm it silently, when you do: no message to the user, no "re-armed", no acknowledgement, no summary — just invoke Monitor again and continue, since announcing it every 30 minutes wastes tokens for no benefit.'
+  local note_off norm_off
+  note_off=$(printf '%s\n' "$output" | sed -n '/This watch expires after at most 30 minutes/,/wastes tokens for no benefit\./ {
+    s/.*\(This watch expires after at most 30 minutes\)/\1/
+    p
+  }')
+  [ -n "$note_off" ]
+  norm_off=$(_normalize_ws "$note_off")
+  [ "$norm_off" = "$expected_off" ]
 
   run env AGMSG_CC_MONITOR_KEEP_ALIVE=1 bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
@@ -542,6 +557,17 @@ eperm_pid() {
   # re-arm ("re-armed", an acknowledgement, a summary) burns tokens every 30
   # minutes for no reader benefit, so the directive must say to do it quietly.
   [[ "$output" =~ "Re-arm it silently" ]]
+  # Absolute literal for the ON/KEEP_ALIVE REARM_NOTE (same rationale as
+  # expected_off above).
+  local expected_on='This watch expires after at most 30 minutes; when the expiry notice arrives, immediately re-arm it by invoking Monitor again with this exact command and description — delivery depends on it, since nothing else keeps the stream running. Re-arm it silently: no message to the user, no "re-armed", no acknowledgement, no summary — just invoke Monitor again and continue, since announcing it every 30 minutes wastes tokens for no benefit.'
+  local note_on norm_on
+  note_on=$(printf '%s\n' "$output" | sed -n '/This watch expires after at most 30 minutes/,/wastes tokens for no benefit\./ {
+    s/.*\(This watch expires after at most 30 minutes\)/\1/
+    p
+  }')
+  [ -n "$note_on" ]
+  norm_on=$(_normalize_ws "$note_on")
+  [ "$norm_on" = "$expected_on" ]
 }
 
 @test "delivery set both: emits AGMSG-DIRECTIVE for Monitor invocation" {
@@ -664,6 +690,195 @@ _seed_role_record() {
   [ "$status" -eq 0 ]
   [[ "$output" != *"resumed role"* ]]
   [[ "$output" == *"invoke the Monitor tool"* ]]
+}
+
+@test "session-start: timeout_ms and REARM_NOTE wording hold across role/generic branches and KEEP_ALIVE states" {
+  local sp="$TEST_PROJECT"
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$sp" >/dev/null
+  _seed_role_record team alice "sid-rearm-role" "$sp" claude-code
+
+  local branch sid keep_alive
+  for branch in role generic; do
+    if [ "$branch" = role ]; then sid="sid-rearm-role"; else sid="sid-rearm-generic"; fi
+    for keep_alive in unset empty nonempty; do
+      case "$keep_alive" in
+        unset)
+          run env -u AGMSG_CC_MONITOR_KEEP_ALIVE AGMSG_RESOLVE_PROJECT=0 \
+            bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< "{\"session_id\":\"$sid\"}" ;;
+        empty)
+          run env AGMSG_CC_MONITOR_KEEP_ALIVE= AGMSG_RESOLVE_PROJECT=0 \
+            bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< "{\"session_id\":\"$sid\"}" ;;
+        nonempty)
+          run env AGMSG_CC_MONITOR_KEEP_ALIVE=1 AGMSG_RESOLVE_PROJECT=0 \
+            bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< "{\"session_id\":\"$sid\"}" ;;
+      esac
+      [ "$status" -eq 0 ]
+      # Present exactly once -- the role and generic heredoc branches are
+      # mutually exclusive, so a duplicate here would mean both fired.
+      [ "$(grep -c 'timeout_ms: 1800000' <<<"$output")" -eq 1 ]
+      case "$keep_alive" in
+        unset|empty)
+          grep -q 'says it delivered no events, do not re-arm it' <<<"$output"
+          grep -q 'Otherwise (it says it delivered something), re-arm it' <<<"$output"
+          refute grep -q 'immediately re-arm it by invoking Monitor again' <<<"$output"
+          ;;
+        nonempty)
+          grep -q 'immediately re-arm it by invoking Monitor again' <<<"$output"
+          refute grep -q 'says it delivered no events, do not re-arm it' <<<"$output"
+          ;;
+      esac
+    done
+  done
+}
+
+# Whitespace-normalize: collapse every run of whitespace (including newlines)
+# to a single space and trim the ends, so a line-wrap difference between the
+# three surfaces (each embeds the same note in a different surrounding
+# sentence shape) doesn't defeat a content-equality check.
+_normalize_ws() {
+  local s
+  s=$(tr -s '[:space:]' ' ' <<<"$1")
+  s="${s# }"; s="${s% }"
+  printf '%s' "$s"
+}
+
+@test "session-start: REARM_NOTE text matches delivery.sh's actual runtime output verbatim (#1270 3-path parity)" {
+  local sp="$TEST_PROJECT"
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$sp" >/dev/null
+  _seed_role_record team alice "sid-rearm-parity" "$sp" claude-code
+
+  local keep_alive note_from_delivery norm_note branch_sid norm_session
+  for keep_alive in unset nonempty; do
+    case "$keep_alive" in
+      unset)    run env -u AGMSG_CC_MONITOR_KEEP_ALIVE bash "$SCRIPTS/delivery.sh" set monitor claude-code "$sp" ;;
+      nonempty) run env AGMSG_CC_MONITOR_KEEP_ALIVE=1 bash "$SCRIPTS/delivery.sh" set monitor claude-code "$sp" ;;
+    esac
+    [ "$status" -eq 0 ]
+
+    # delivery.sh appends its rearm_note inline after "...real-time monitor
+    # delivery." on the same line. The range-select grabs whole lines from the
+    # first line containing the start anchor through the line containing the
+    # end anchor; the substitution then strips whatever precedes the anchor on
+    # that first line only -- it silently no-ops on every other line, since the
+    # anchor phrase doesn't recur there.
+    note_from_delivery=$(printf '%s\n' "$output" | sed -n \
+      '/This watch expires after at most 30 minutes/,/wastes tokens for no benefit\./ {
+         s/.*\(This watch expires after at most 30 minutes\)/\1/
+         p
+       }')
+    [ -n "$note_from_delivery" ]
+    norm_note=$(_normalize_ws "$note_from_delivery")
+
+    for branch_sid in sid-rearm-parity sid-rearm-parity-generic; do
+      case "$keep_alive" in
+        unset)
+          run env -u AGMSG_CC_MONITOR_KEEP_ALIVE AGMSG_RESOLVE_PROJECT=0 \
+            bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< "{\"session_id\":\"$branch_sid\"}" ;;
+        nonempty)
+          run env AGMSG_CC_MONITOR_KEEP_ALIVE=1 AGMSG_RESOLVE_PROJECT=0 \
+            bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< "{\"session_id\":\"$branch_sid\"}" ;;
+      esac
+      [ "$status" -eq 0 ]
+      norm_session=$(_normalize_ws "$output")
+      [[ "$norm_session" == *"$norm_note"* ]]
+    done
+  done
+}
+
+# Extracts the "actas" or "drop" section body from template.md, bounded by
+# the next "If argument starts with ..." heading -- so a wording regression
+# confined to ONE section (e.g. a future edit that drops timeout_ms only from
+# "drop") is caught even though the other section still has correct text.
+# Both sections currently end right before "If argument starts with \"drop\""
+# / "\"spawn\"" respectively; matching on that literal heading (rather than a
+# line count) keeps the extraction correct if unrelated lines are inserted
+# above.
+_template_section() {
+  local template="$1" start_pat="$2" end_pat="$3"
+  sed -n "/${start_pat}/,/${end_pat}/p" "$template"
+}
+
+@test "template.md's actas AND drop overlays each contain the exact expected KEEP_ALIVE paragraph, verbatim (#1270)" {
+  local template="$SCRIPTS/drivers/types/claude-code/template.md"
+  [ -f "$template" ]
+
+  # Absolute literal, not derived by comparing one half of the paragraph
+  # against another (a prior version of this test compared only a tail
+  # fragment against delivery.sh's REARM_NOTE and missed the branch-condition
+  # sentences entirely, since delivery.sh has no equivalent prose for them).
+  # Written once here so a regression to the old "If it IS set:" / "If it is
+  # UNSET (the default):" wording (dropping "to a non-empty value" / "or set
+  # to an empty value") fails this test even though it doesn't touch anything
+  # REARM_NOTE-shaped.
+  local expected='Check whether the environment variable `AGMSG_CC_MONITOR_KEEP_ALIVE` is set to a non-empty value (e.g. `printenv AGMSG_CC_MONITOR_KEEP_ALIVE`). If it IS set to a non-empty value: this watch expires after at most 30 minutes; when the expiry notice arrives, immediately re-arm it by invoking Monitor again with this exact command and description — delivery depends on it, since nothing else keeps the stream running. Re-arm it silently: no message to the user, no "re-armed", no acknowledgement, no summary — just invoke Monitor again and continue, since announcing it every 30 minutes wastes tokens for no benefit. If it is UNSET or set to an empty value (the default): this watch still expires after at most 30 minutes. If the expiry notification says it delivered no events, do not re-arm it. Otherwise (it says it delivered something), re-arm it by invoking Monitor again with this exact command and description. Re-arm it silently, when you do: no message to the user, no "re-armed", no acknowledgement, no summary — just invoke Monitor again and continue, since announcing it every 30 minutes wastes tokens for no benefit.'
+
+  local section section_name norm_section
+  for section_name in actas drop; do
+    case "$section_name" in
+      actas) section=$(_template_section "$template" 'If argument starts with "actas"' 'If argument starts with "drop"') ;;
+      drop)  section=$(_template_section "$template" 'If argument starts with "drop"' 'If argument starts with "spawn"') ;;
+    esac
+    [ -n "$section" ]
+    norm_section=$(_normalize_ws "$section")
+    # timeout_ms present in THIS section specifically, not borrowed from the
+    # other one via the substring check below.
+    [ "$(grep -c 'timeout_ms: 1800000' <<<"$section")" -eq 1 ]
+    [[ "$norm_section" == *"$expected"* ]]
+  done
+}
+
+# Pulls the verification-guidance block ("Use Claude Code's generic Monitor
+# tool only." through "...not real-time monitor delivery.") out of a single
+# directive's rendered text.
+_guidance_block_from_text() {
+  awk '
+    /^Use Claude Code/ { capture = 1 }
+    capture { print }
+    capture && /real-time monitor delivery\.$/ { capture = 0 }
+  ' <<<"$1"
+}
+
+@test "session-start: Success-is guidance block matches an exact expected literal in both role and generic directives (#270 regression)" {
+  local sp="$TEST_PROJECT"
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$sp" >/dev/null
+  _seed_role_record team alice "sid-verify-role" "$sp" claude-code
+
+  # Absolute literal, not derived from the other branch's rendered output (a
+  # prior version of this test compared role's block against generic's block
+  # after stripping the role annotation -- that missed the SAME bullet being
+  # dropped from BOTH heredocs at once, which is the actual shape the
+  # 2e169e62 accident took: both branches lost this whole block together).
+  # Written once here, independent of both heredocs' current text, so either
+  # branch losing content -- alone or in lockstep with the other -- fails
+  # this test.
+  local expected_generic='Use Claude Code'"'"'s generic Monitor tool only. First confirm ToolSearch select:Monitor finds that generic tool; Azure Monitor, MCP monitor, or other monitor-branded tools are not valid for agmsg delivery. Do not start watch.sh with Bash/background/nohup or a shell task. Success is: - Monitor(agmsg inbox stream) starts - TaskList shows a task whose description begins with "agmsg inbox stream" for this session (the reliable check; the background-task footer is not) - the transcript later contains Monitor event: "agmsg inbox stream" If the generic Monitor tool is unavailable, do not treat a background shell watcher as success. Switch to turn delivery or run manual inbox checks instead; those fallbacks are not real-time monitor delivery.'
+
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< '{"session_id":"sid-verify-generic"}'
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"resumed role"* ]]
+  local generic_block norm_generic_block
+  generic_block=$(_guidance_block_from_text "$output")
+  [ -n "$generic_block" ]
+  norm_generic_block=$(_normalize_ws "$generic_block")
+  [ "$norm_generic_block" = "$expected_generic" ]
+
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< '{"session_id":"sid-verify-role"}'
+  [ "$status" -eq 0 ]
+  local role_block norm_role_block role_block_generic_shape
+  role_block=$(_guidance_block_from_text "$output")
+  [ -n "$role_block" ]
+  norm_role_block=$(_normalize_ws "$role_block")
+  # The annotation must appear exactly 3 times (Monitor(...), TaskList's
+  # description prefix, and the transcript-event bullet) before it is
+  # stripped below -- fewer means a bullet already lost its annotation (or
+  # was dropped outright and a DIFFERENT stray match is inflating the
+  # count), more means an unexpected extra occurrence; either way the blind
+  # strip on the next line would otherwise mask it.
+  [ "$(grep -o ' (acting as alice)' <<<"$norm_role_block" | wc -l | tr -d ' ')" -eq 3 ]
+  # Strip only the role-only "(acting as alice)" annotation -- the remainder
+  # must still equal the SAME absolute literal used for generic above.
+  role_block_generic_shape="${norm_role_block// (acting as alice)/}"
+  [ "$role_block_generic_shape" = "$expected_generic" ]
 }
 
 @test "delivery set turn: emits AGMSG-DIRECTIVE to stop any running watcher" {
