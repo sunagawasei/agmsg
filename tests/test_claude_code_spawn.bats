@@ -800,7 +800,7 @@ policy_shape() {
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$scratch"
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$scratch/tmp"
   ! json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$PROJ"
-  ! json_array_has "$settings" '$.sandbox.filesystem.allowRead' "/dev/fd"
+  refute json_array_has "$settings" '$.sandbox.filesystem.allowRead' "/dev/fd"
   ! grep -Fxq 'ARG=--add-dir' "$CAPTURE/bridge.args.consultant"
 
   pid="$(cat "$base.pid")"
