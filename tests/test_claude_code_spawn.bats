@@ -800,6 +800,7 @@ policy_shape() {
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$scratch"
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$scratch/tmp"
   ! json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$PROJ"
+  refute json_array_has "$settings" '$.sandbox.filesystem.allowRead' "/dev/fd"
   ! grep -Fxq 'ARG=--add-dir' "$CAPTURE/bridge.args.consultant"
 
   pid="$(cat "$base.pid")"
@@ -861,6 +862,7 @@ policy_shape() {
   ! grep -Fq 'Write(' "$settings"
   ! grep -Fq 'NotebookEdit(' "$settings"
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$PROJ"
+  ! json_array_has "$settings" '$.sandbox.filesystem.allowRead' "/dev/fd"
 }
 
 @test "bracketed Claude model alias reaches probe and bridge argv unchanged" {
@@ -917,6 +919,8 @@ policy_shape() {
   json_array_has "$settings" '$.sandbox.filesystem.allowRead' "$PROJ"
   json_array_has "$settings" '$.sandbox.filesystem.allowRead' "$TEST_SKILL_DIR"
   json_array_has "$settings" '$.sandbox.filesystem.allowRead' "/nix"
+  json_array_has "$settings" '$.sandbox.filesystem.allowRead' "/dev/fd"
+  [ "$(json_array_count "$settings" '$.sandbox.filesystem.allowRead' "/dev/fd")" -eq 1 ]
   json_array_has "$settings" '$.permissions.deny' 'Read(//**/*credentials*)'
   json_array_has "$settings" '$.permissions.deny' 'Read(//**/*credentials*/**)'
   ! json_array_has "$settings" '$.permissions.deny' 'Read(**/*credentials*)'
