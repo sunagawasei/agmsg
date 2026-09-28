@@ -333,6 +333,9 @@ agmsg_claude_render_settings_json() {
       ;;
     reviewer)
       allow_read_candidates+=("$project")
+      # Bash process substitution (`< <(...)`) opens /dev/fd/N; several agmsg
+      # scripts use it, and denyRead("/") below blocks it without this (#46).
+      allow_read_candidates+=("/dev/fd")
       deny_write+=("$project")
       deny_read+=("/")
       allow_rules+=("$(agmsg_claude_tool_rule Read "$project")")
