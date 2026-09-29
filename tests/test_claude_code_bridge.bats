@@ -40,10 +40,10 @@ env_file="$FAKE_CAPTURE/env.$n"
 prompt_file="$FAKE_CAPTURE/prompt.$n"
 : > "$args_file"
 for arg in "$@"; do printf 'ARG=%s\n' "$arg" >> "$args_file"; done
-printf 'cwd=%s\nconfig=%s\nsid=%s\nclaudecode=%s\nchild=%s\n' \
+printf 'cwd=%s\nconfig=%s\nsid=%s\nclaudecode=%s\nchild=%s\npdn=%s\n' \
   "$PWD" "${CLAUDE_CONFIG_DIR:-<unset>}" \
   "${CLAUDE_CODE_SESSION_ID:-<unset>}" "${CLAUDECODE:-<unset>}" \
-  "${CLAUDE_CODE_CHILD_SESSION:-<unset>}" > "$env_file"
+  "${CLAUDE_CODE_CHILD_SESSION:-<unset>}" "${CLAUDE_CODE_PROJECT_DIR_NAME:-<unset>}" > "$env_file"
 cat > "$prompt_file"
 
 mode=fresh
@@ -65,9 +65,10 @@ fi
 
 make_transcript() {
   munged=$(printf '%s' "$PWD" | LC_ALL=C sed 's/[^A-Za-z0-9-]/-/g')
-  mkdir -p "$CLAUDE_CONFIG_DIR/projects/$munged"
-  printf '{"sessionId":"%s"}\n' "$sid" \
-    >> "$CLAUDE_CONFIG_DIR/projects/$munged/$sid.jsonl"
+  dir="${CLAUDE_CODE_PROJECT_DIR_NAME:-$munged}"
+  mkdir -p "$CLAUDE_CONFIG_DIR/projects/$dir"
+  printf '{"sessionId":"%s","cwd":"%s"}\n' "$sid" "$PWD" \
+    >> "$CLAUDE_CONFIG_DIR/projects/$dir/$sid.jsonl"
 }
 
 send_outbound() {
@@ -371,6 +372,7 @@ WRAPPER
   grep -Fxq 'sid=<unset>' "$CAPTURE/env.1"
   grep -Fxq 'claudecode=<unset>' "$CAPTURE/env.1"
   grep -Fxq 'child=<unset>' "$CAPTURE/env.1"
+  grep -Fxq 'pdn=<unset>' "$CAPTURE/env.1"
   grep -Fxq 'unread_at_cli=0' "$CAPTURE/env.1"
 
   [ "$(sed -n '1p' "$CAPTURE/prompt.1")" = "STANDING ROLE" ]
@@ -543,6 +545,17 @@ WRAPPER
   [ "$status" -eq 0 ]
   [ ! -e "$(session_file)" ]
   [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE from_agent='worker' AND body LIKE '%no transcript exists%';")" -eq 1 ]
+}
+
+@test "an ambient CLAUDE_CODE_PROJECT_DIR_NAME from the invoking shell does not divert transcript storage" {
+  send_to_worker alice "inspect this change"
+  export CLAUDE_CODE_PROJECT_DIR_NAME=containerregistry
+  run bridge
+  [ "$status" -eq 0 ]
+  grep -Fxq 'pdn=<unset>' "$CAPTURE/env.1"
+  [ "$(cat "$(session_file)")" = "00000000-0000-4000-8000-000000000001" ]
+  [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE from_agent='worker' AND body LIKE '%no transcript exists%';")" -eq 0 ]
+  [ ! -d "$TEST_SKILL_DIR/db/claude-worker-home/projects/containerregistry" ]
 }
 
 @test "one MiB stdin cap leaves overflow unread and delivers each exact id once" {

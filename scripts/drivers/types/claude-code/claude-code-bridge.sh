@@ -152,7 +152,7 @@ fi
 
 CLAUDE_CONFIG_DIR="$SKILL_DIR/db/claude-worker-home"
 export CLAUDE_CONFIG_DIR
-unset CLAUDE_CODE_SESSION_ID CLAUDECODE CLAUDE_CODE_CHILD_SESSION
+unset CLAUDE_CODE_SESSION_ID CLAUDECODE CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_PROJECT_DIR_NAME
 mkdir -p "$CLAUDE_CONFIG_DIR" "$WORK_DIR" 2>/dev/null \
   || { echo "claude-code-bridge: cannot create worker config/cwd" >&2; exit 1; }
 cd "$WORK_DIR" \
