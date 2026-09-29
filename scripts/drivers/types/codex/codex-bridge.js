@@ -1057,7 +1057,13 @@ class CodexBridge {
     // late turn/failed can never consume a newer turn's snapshot.
     this.turnEpoch = 0;             // last locally started turn
     this.activeTurnEpoch = 0;       // epoch of the most recently started turn
-    this.turnSnapshots = new Map(); // epoch -> Map(sender -> [message ids]) consumed for that turn
+    // epoch -> { bySender: Map(sender -> [message ids]), pairs: [{team,name}] }.
+    // `pairs` is only the identities whose consumption for that epoch actually
+    // verified (mark-read + unread-count both passed, see readInboxForPrompt) —
+    // settleInflightEpoch must tell ONLY those to drop their durable record; an
+    // identity whose verification failed keeps its record, exactly as if the
+    // turn had never run for it.
+    this.turnSnapshots = new Map();
     this.turnIdToEpoch = new Map(); // server turn id -> epoch
     this.pendingConsumption = null; // staged by readInboxForPrompt, claimed by tryStartTurn
     this.stopping = false;
@@ -1129,11 +1135,14 @@ class CodexBridge {
     }
   }
 
-  settleInflightEpoch(epoch) {
-    if (!epoch) return;
+  // Only `pairs` — the identities whose consumption for this epoch actually
+  // verified — are settled; an identity whose mark-read/unread-count check
+  // failed for this epoch is not in `pairs` and keeps its durable record.
+  settleInflightEpoch(epoch, pairs) {
+    if (!epoch || !pairs || !pairs.length) return;
     const token = this.pidStartToken();
     if (!token) return;
-    for (const pair of this.identities) {
+    for (const pair of pairs) {
       this.inflightCli("settle", pair.team, pair.name, String(epoch), token);
     }
   }
@@ -1751,11 +1760,43 @@ class CodexBridge {
     }
   }
 
+  // Settle: the turn handled its consumed messages successfully, so the
+  // epoch's snapshot is dropped and its verified identities' durable records
+  // are cleared. A missing epoch/snapshot (already settled, or orphan
+  // -drained by a later tryStartTurn) settles nothing — see resolveTurnEpoch.
+  settleTurnEpoch(epoch) {
+    if (!epoch) return;
+    const snapshot = this.turnSnapshots.get(epoch);
+    if (!snapshot) return;
+    this.dropTurnEpoch(epoch);
+    this.settleInflightEpoch(epoch, snapshot.pairs);
+  }
+
   async onTurnCompleted(params = {}) {
     if (params.threadId && params.threadId !== this.threadId) return;
     if (params.turn && params.turn.error) {
       await this.onTurnFailed(params);
       return;
+    }
+    console.error(`codex-bridge: turn completed on thread ${this.threadId}`);
+    // Settle BEFORE the #889 gate below: an id match is unambiguous even
+    // while our own turn/start request is unanswered (a belated completion
+    // for an OLDER, already-bound turn), so (c)/(e) act on it regardless of
+    // startInFlight. Only the no-id case (d) needs that gate — with no id,
+    // resolveTurnEpoch attributes to activeTurnEpoch, which may actually be
+    // the turn we are STARTING and whose identity is unconfirmed until
+    // turn/started (or the ACK) arrives.
+    const { epoch, turnId } = this.resolveTurnEpoch(params);
+    if (turnId) {
+      if (epoch) {
+        this.settleTurnEpoch(epoch);
+      } else {
+        console.error(`codex-bridge: turn/completed for unknown turn ${turnId}; no snapshot to settle`);
+      }
+    } else if (!this.startInFlight) {
+      this.settleTurnEpoch(epoch);
+    } else {
+      console.error("codex-bridge: turn/completed with no turn id while a turn/start request is in flight; nothing to settle");
     }
     // Attribution while our turn/start request is unanswered. The previous
     // turn's tail and the NEW turn's own completion are both legal here, and
@@ -1772,7 +1813,16 @@ class CodexBridge {
       }
       return;
     }
-    await this.onTurnEnded();
+    // authoritative:true must be reserved for a completion attributable to
+    // the turn we consider active RIGHT NOW: an id bound to activeTurnEpoch,
+    // or no id at all (settled above, since !startInFlight here). An unbound
+    // id, or an id bound to an OLDER epoch a later turn has since superseded,
+    // is a late/foreign signal about a DIFFERENT turn — settled if it still
+    // had a snapshot, but not authoritative for whatever turn is running now.
+    // Treating it as authoritative would, e.g., cut a drain fence's real
+    // in-progress turn short and race it to shutdown on a stale signal.
+    const attributableToActiveTurn = turnId ? (epoch !== 0 && epoch === this.activeTurnEpoch) : true;
+    await this.onTurnEnded({ authoritative: attributableToActiveTurn });
   }
 
   // the runaway-retry pattern behind the cursor-bridge incident. Only THIS turn's
@@ -1890,12 +1940,14 @@ class CodexBridge {
     // request: turn/started (which binds the server's turn id to this epoch)
     // can arrive while the request is still in flight. readInboxForPrompt
     // already reserved the epoch when it published durable in-flight records.
-    if (!this.pendingConsumption || !this.pendingConsumption.size) {
+    const consumption = this.pendingConsumption;
+    const hasConsumption = !!(consumption && consumption.bySender && consumption.bySender.size);
+    if (!hasConsumption) {
       this.turnEpoch += 1;
     }
     this.activeTurnEpoch = this.turnEpoch;
-    if (this.pendingConsumption && this.pendingConsumption.size) {
-      this.turnSnapshots.set(this.turnEpoch, this.pendingConsumption);
+    if (hasConsumption) {
+      this.turnSnapshots.set(this.turnEpoch, consumption);
     }
     this.pendingConsumption = null;
     // Claim the wake BEFORE the request goes out, not after it succeeds. With
@@ -1937,7 +1989,7 @@ class CodexBridge {
     // arrived; its deferred end is processed now that the start is settled.
     if (this.inFlightTurnEnded) {
       this.inFlightTurnEnded = false;
-      await this.onTurnEnded();
+      await this.onTurnEnded({ authoritative: true });
     }
   }
 
@@ -2181,6 +2233,10 @@ class CodexBridge {
     const allowed = new Set((eligible.stdout || "").split(/\r?\n/).filter(Boolean));
     const sections = [];
     const bySender = new Map();
+    // Identities whose consumption for this epoch actually verified (mark-read
+    // + unread-count both passed below) -- the only ones settleInflightEpoch
+    // may later tell to drop their durable record.
+    const verifiedPairs = [];
     const nextEpoch = this.turnEpoch + 1;
     let reservedEpoch = false;
     for (const pair of this.identities) {
@@ -2242,6 +2298,7 @@ class CodexBridge {
         reservedEpoch = true;
         continue;
       }
+      verifiedPairs.push(pair);
       for (const [sender, ids] of pairBySender) {
         if (!bySender.has(sender)) bySender.set(sender, []);
         bySender.get(sender).push(...ids);
@@ -2261,7 +2318,7 @@ class CodexBridge {
       return "";
     }
     this.turnEpoch = nextEpoch;
-    this.pendingConsumption = bySender;
+    this.pendingConsumption = { bySender, pairs: verifiedPairs };
     return sections.join("\n\n");
   }
 

@@ -263,9 +263,14 @@ bridge.handleDrainCheckpointSync = () => {
   queueMicrotask(() => { microtaskRan = true; });
   return false;
 };
+const epochBefore = bridge.turnEpoch;
 bridge.readInboxForPrompt = () => {
   if (microtaskRan) throw new Error("event loop yielded between fence check and consume");
-  bridge.pendingConsumption = new Map([["sender", [1]]]);
+  // Mirrors the real contract: readInboxForPrompt advances turnEpoch itself
+  // and stages { bySender, pairs } -- pairs is the identities whose
+  // consumption verified this epoch (see codex-bridge.js).
+  bridge.turnEpoch += 1;
+  bridge.pendingConsumption = { bySender: new Map([["sender", [1]]]), pairs: [{ team: "team", name: "alice" }] };
   return "message";
 };
 bridge.buildPrompt = () => "message";
@@ -275,6 +280,8 @@ bridge.client.request = () => Promise.resolve({});
   await bridge.tryStartTurn();
   bridge.clearTurnWatchdog();
   if (!bridge.turnActive || bridge.pendingWake) process.exit(1);
+  if (bridge.turnEpoch !== epochBefore + 1) process.exit(3);
+  if (!bridge.turnSnapshots.has(bridge.activeTurnEpoch)) process.exit(4);
 })().catch(() => process.exit(2));
 NODE
   [ "$status" -eq 0 ]
@@ -1606,6 +1613,353 @@ EOF
   [ "${#leftover[@]}" -eq 0 ]
   run bash "$SCRIPTS/inbox.sh" team alice --format ids
   [ -z "$output" ]
+}
+
+@test "codex-bridge: two turns each ending via id-matching turn/started+turn/completed settle cleanly, no orphan" {
+  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
+  if [ "$status" -ne 0 ]; then
+    skip "node child_process.spawn is not available in this sandbox"
+  fi
+
+  # Regression for commit 280887cc dropping the success-path settle: without
+  # it, turn 1's consumption snapshot never leaves turnSnapshots, and turn 2's
+  # tryStartTurn() finds it there and treats it as an orphan — a spurious
+  # "[bridge-error] codex turn outcome unknown" to bob even though turn 1
+  # completed cleanly.
+  local fake="$TEST_SKILL_DIR/fake-app-server-two-clean-turns.js"
+  local log="$TEST_SKILL_DIR/fake-app-server-two-clean-turns.log"
+  cat >"$fake" <<'EOF'
+const fs = require("fs");
+const readline = require("readline");
+const { spawnSync } = require("child_process");
+const log = process.argv[2];
+const scripts = process.argv[3];
+const rl = readline.createInterface({ input: process.stdin });
+let turns = 0;
+let spawns = 0;
+function send(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  fs.appendFileSync(log, `${message.method}\n`);
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  } else if (message.method === "thread/resume") {
+    send({ jsonrpc: "2.0", id: message.id, result: { thread: { id: message.params.threadId, status: { type: "idle" } } } });
+  } else if (message.method === "process/spawn") {
+    spawns += 1;
+    // The second wake's message is created only once the watch re-arms after
+    // turn 1 fully ended -- the two turns never overlap.
+    if (spawns === 2) {
+      spawnSync("bash", [`${scripts}/send.sh`, "team", "bob", "alice", "second turn probe"], { encoding: "utf8" });
+    }
+    const id = spawns === 1 ? 5 : 6;
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+    setTimeout(() => {
+      send({ jsonrpc: "2.0", method: "process/exited", params: { processHandle: message.params.processHandle, exitCode: 0, stdout: `status=pending count=1 max_id=${id}\n`, stderr: "" } });
+    }, 10);
+  } else if (message.method === "turn/start") {
+    turns += 1;
+    const turnId = `clean-turn-${turns}`;
+    send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: message.params.threadId, turn: { id: turnId } } });
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+    setTimeout(() => {
+      send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId } } });
+    }, 10);
+  } else if (message.method === "process/kill") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  }
+});
+EOF
+
+  bash "$SCRIPTS/send.sh" team bob alice "first turn probe" >/dev/null
+
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake $log $SCRIPTS" run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --thread thread-clean \
+    --timeout 1 --interval 1 --turn-timeout 30 --max-wakes 2 --inline-inbox
+
+  # `grep -q` rather than `[[ ]]` in the non-last positions: on bash 3.2,
+  # which is what macOS CI runs, a false `[[ ]]` there reports ok.
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -Fq "wakeup 1"
+  printf '%s\n' "$output" | grep -Fq "wakeup 2"
+  [ "$(grep -c "^turn/start" "$log")" -eq 2 ]
+  [ "$(printf '%s\n' "$output" | grep -Fc "turn completed on thread")" -eq 2 ]
+  [ "$(printf '%s\n' "$output" | grep -Fc "orphaned snapshot")" -eq 0 ]
+  shopt -s nullglob
+  leftover=("$TEST_SKILL_DIR"/run/inflight-record.*)
+  [ "${#leftover[@]}" -eq 0 ]
+  run bash "$SCRIPTS/inbox.sh" team bob
+  [[ "$output" != *"[bridge-error]"* ]]
+}
+
+@test "codex-bridge: a stale id-less turn/completed mid-start does not settle the new turn's snapshot, which the eventual turn/failed still notifies" {
+  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
+  if [ "$status" -ne 0 ]; then
+    skip "node child_process.spawn is not available in this sandbox"
+  fi
+
+  # A live-observed shape distinct from the duplicate-turn-injection test: the
+  # NEW turn's own turn/started binds its id while turn/start is still
+  # unanswered, then an UNRELATED, id-less turn/completed (no attribution
+  # possible while our own start is in flight) lands before the ACK. That
+  # stale event must settle nothing -- the new turn's snapshot/record must
+  # still be there when the turn later genuinely fails, so its sender still
+  # gets a failure notice instead of the message silently vanishing.
+  local fake="$TEST_SKILL_DIR/fake-app-server-stale-idless-completed.js"
+  local log="$TEST_SKILL_DIR/fake-app-server-stale-idless-completed.log"
+  cat >"$fake" <<'EOF'
+const fs = require("fs");
+const readline = require("readline");
+const log = process.argv[2];
+const rl = readline.createInterface({ input: process.stdin });
+function send(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  fs.appendFileSync(log, `${message.method}\n`);
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  } else if (message.method === "thread/resume") {
+    send({ jsonrpc: "2.0", id: message.id, result: { thread: { id: message.params.threadId, status: { type: "idle" } } } });
+  } else if (message.method === "process/spawn") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+    setTimeout(() => {
+      send({ jsonrpc: "2.0", method: "process/exited", params: { processHandle: message.params.processHandle, exitCode: 0, stdout: "status=pending count=1 max_id=5\n", stderr: "" } });
+    }, 10);
+  } else if (message.method === "turn/start") {
+    // This turn's own turn/started binds "stale-t3" first, then an
+    // unrelated stale completion (no id at all) lands while the ACK is
+    // still outstanding.
+    send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: message.params.threadId, turn: { id: "stale-t3" } } });
+    send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: message.params.threadId } });
+    setTimeout(() => {
+      send({ jsonrpc: "2.0", id: message.id, result: {} });
+      setTimeout(() => {
+        send({ jsonrpc: "2.0", method: "turn/failed", params: { threadId: message.params.threadId, turn: { id: "stale-t3", error: { message: "boom" } } } });
+      }, 10);
+    }, 60);
+  } else if (message.method === "process/kill") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  }
+});
+EOF
+
+  bash "$SCRIPTS/send.sh" team bob alice "doomed after stale completion" >/dev/null
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  local mid="${output%%$'\x1f'*}"
+  [ -n "$mid" ]
+  local runner
+  runner=$(write_bridge_timeout_runner)
+
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake $log" run node "$runner" 5000 node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --thread thread-stale-completed \
+    --timeout 1 --interval 1 --turn-timeout 30 --max-wakes 1 --inline-inbox
+
+  [ "$status" -eq 0 ]
+  # The stale event was seen and logged as unattributable, not settled.
+  printf '%s\n' "$output" | grep -Fq "turn/completed with no turn id while a turn/start request is in flight"
+  [[ "$output" =~ "turn failed" ]]
+  run bash "$SCRIPTS/inbox.sh" team bob
+  [[ "$output" == *"[bridge-error] codex turn failed (ids $mid)"* ]]
+  [[ "$output" == *"boom"* ]]
+  shopt -s nullglob
+  leftover=("$TEST_SKILL_DIR"/run/inflight-record.*)
+  [ "${#leftover[@]}" -eq 0 ]
+}
+
+@test "codex-bridge: settling a completed turn drops only the identities whose consumption actually verified" {
+  bash "$SCRIPTS/join.sh" team carol codex "$PROJ" >/dev/null
+  bash "$SCRIPTS/send.sh" team bob alice "alice consumed ok" >/dev/null
+  bash "$SCRIPTS/send.sh" team bob carol "carol verification fails" >/dev/null
+  run node - "$TYPES/codex/codex-bridge.js" "$PROJ" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const { CodexBridge } = require(process.argv[2]);
+const project = process.argv[3];
+const skillDir = path.resolve(path.dirname(process.argv[2]), "..", "..", "..", "..");
+const runDir = path.join(skillDir, "run");
+const records = () => fs.readdirSync(runDir).filter((name) => name.startsWith("inflight-record."));
+
+const bridge = new CodexBridge({
+  project,
+  type: "codex",
+  requestTimeoutMs: 0,
+  turnTimeout: 0,
+  maxWakes: 0,
+  inlineInbox: true,
+}, [{ team: "team", name: "alice" }, { team: "team", name: "carol" }]);
+const orig = bridge.inflightCli.bind(bridge);
+bridge.inflightCli = (...args) => {
+  // carol's unread-count verification always fails; alice's is untouched.
+  if (args[0] === "unread-count" && args[2] === "carol") {
+    return { error: null, status: 1, stdout: "", stderr: "" };
+  }
+  return orig(...args);
+};
+
+const text = bridge.readInboxForPrompt();
+if (text.trim() === "") process.exit(1);
+const consumption = bridge.pendingConsumption;
+if (!consumption) process.exit(2);
+const settledPairs = consumption.pairs.map((p) => `${p.team}/${p.name}`).sort().join(",");
+if (settledPairs !== "team/alice") process.exit(3); // carol excluded: her verification failed
+if (records().length !== 2) process.exit(4); // both records still durable pre-settle
+
+// Mirror tryStartTurn()'s epoch registration, then a real id-matching
+// turn/started + turn/completed for that epoch.
+bridge.activeTurnEpoch = bridge.turnEpoch;
+bridge.turnSnapshots.set(bridge.turnEpoch, consumption);
+bridge.pendingConsumption = null;
+bridge.startInFlight = false;
+bridge.threadId = "thread-t4";
+bridge.onTurnEnded = async () => {}; // isolate the settle step from the rest of turn-end
+bridge.bindTurnId("t4-1");
+
+(async () => {
+  await bridge.onTurnCompleted({ threadId: bridge.threadId, turn: { id: "t4-1" } });
+  const remaining = records();
+  if (remaining.length !== 1) process.exit(5); // alice settled, carol's kept
+  if (!remaining[0].includes("carol")) process.exit(6);
+  process.stdout.write("ok\n");
+})().catch((e) => { console.error((e && e.stack) || e); process.exit(7); });
+NODE
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ok"* ]]
+}
+
+@test "codex-bridge: turn/completed during a drain fence ends the turn authoritatively and proceeds to the checkpoint" {
+  # The dual of the drain test above with a REAL terminal event instead of an
+  # assumed/watchdog end: turn/completed must never be held behind the fence
+  # (that is what the assumed-end path is for) -- goal 3's authoritative:true
+  # is what tells onTurnEnded this is not a local guess.
+  run node - "$TYPES/codex/codex-bridge.js" "$PROJ" <<'NODE'
+const { CodexBridge } = require(process.argv[2]);
+const project = process.argv[3];
+const bridge = new CodexBridge({
+  project,
+  type: "codex",
+  requestTimeoutMs: 0,
+  turnTimeout: 0,
+  maxWakes: 0,
+}, [{ team: "team", name: "alice" }]);
+bridge.threadId = "thread-drain-completed";
+bridge.turnActive = true;
+bridge.threadIdle = false;
+bridge.authoritativeIdle = false;
+bridge.startInFlight = false;
+bridge.turnEpoch = 1;
+bridge.activeTurnEpoch = 1;
+bridge.bindTurnId("drain-completed-1");
+// A drain fence is standing when the turn's real completion arrives.
+bridge.readDrainFence = () => ({ nonce: "test-nonce" });
+bridge.publishDrainingMarker = () => { throw new Error("must not hold turn/completed behind the fence"); };
+let checkpointCalls = 0;
+bridge.handleDrainCheckpoint = async () => { checkpointCalls += 1; return true; };
+(async () => {
+  await bridge.onTurnCompleted({ threadId: bridge.threadId, turn: { id: "drain-completed-1" } });
+  if (bridge.turnActive || !bridge.threadIdle || !bridge.authoritativeIdle) process.exit(1);
+  if (checkpointCalls !== 1) process.exit(2);
+})().catch((e) => { console.error((e && e.stack) || e); process.exit(3); });
+NODE
+  [ "$status" -eq 0 ]
+}
+
+@test "codex-bridge: an old turn's late or foreign turn/completed during a drain fence does not end the turn running now" {
+  # Cases (c) and (d): an id turn/started never bound (unattributable), and
+  # an id bound to an OLDER epoch the active turn has since superseded (a
+  # late completion for a turn that already ended). Neither may be
+  # authoritative for the turn running now -- ending it on either would cut
+  # a real in-progress turn short and race a drain to checkpoint/shutdown on
+  # a stale/foreign signal.
+  run node - "$TYPES/codex/codex-bridge.js" "$PROJ" <<'NODE'
+const { CodexBridge } = require(process.argv[2]);
+const project = process.argv[3];
+const bridge = new CodexBridge({
+  project,
+  type: "codex",
+  requestTimeoutMs: 0,
+  turnTimeout: 0,
+  maxWakes: 0,
+}, [{ team: "team", name: "alice" }]);
+bridge.threadId = "thread-old-completed";
+bridge.startInFlight = false;
+bridge.turnActive = true;
+bridge.threadIdle = false;
+bridge.authoritativeIdle = false;
+// Turn 1 ("old-1") already ended and was superseded; turn 2 is the one
+// actually running now (activeTurnEpoch=2), with a drain fence standing.
+bridge.turnEpoch = 2;
+bridge.activeTurnEpoch = 2;
+bridge.turnIdToEpoch.set("old-1", 1);
+bridge.readDrainFence = () => ({ nonce: "test-nonce" });
+bridge.publishDrainingMarker = () => {};
+let checkpointCalls = 0;
+bridge.handleDrainCheckpoint = async () => { checkpointCalls += 1; return true; };
+(async () => {
+  // (d): a bound id, but for an epoch the active turn has superseded.
+  await bridge.onTurnCompleted({ threadId: bridge.threadId, turn: { id: "old-1" } });
+  if (!bridge.turnActive || bridge.threadIdle || bridge.authoritativeIdle) process.exit(1);
+  if (checkpointCalls !== 0) process.exit(2);
+  // (c): an id turn/started never bound at all.
+  await bridge.onTurnCompleted({ threadId: bridge.threadId, turn: { id: "never-bound" } });
+  if (!bridge.turnActive || bridge.threadIdle || bridge.authoritativeIdle) process.exit(3);
+  if (checkpointCalls !== 0) process.exit(4);
+})().catch((e) => { console.error((e && e.stack) || e); process.exit(5); });
+NODE
+  [ "$status" -eq 0 ]
+}
+
+@test "codex-bridge: an id-less completion while no start is in flight settles the active epoch and ends the turn authoritatively" {
+  # Case (b): no id at all, and startInFlight is false -- the pre-id/legacy
+  # shape. Must both settle (drop the snapshot, clear the durable record)
+  # AND end the turn authoritatively, unlike the late/foreign (c)/(d) cases
+  # above.
+  bash "$SCRIPTS/send.sh" team bob alice "id-less completion probe" >/dev/null
+  run node - "$TYPES/codex/codex-bridge.js" "$PROJ" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const { CodexBridge } = require(process.argv[2]);
+const project = process.argv[3];
+const skillDir = path.resolve(path.dirname(process.argv[2]), "..", "..", "..", "..");
+const runDir = path.join(skillDir, "run");
+const records = () => fs.readdirSync(runDir).filter((name) => name.startsWith("inflight-record."));
+
+const bridge = new CodexBridge({
+  project,
+  type: "codex",
+  requestTimeoutMs: 0,
+  turnTimeout: 0,
+  maxWakes: 0,
+  inlineInbox: true,
+}, [{ team: "team", name: "alice" }]);
+
+const text = bridge.readInboxForPrompt();
+if (text.trim() === "") process.exit(1);
+const consumption = bridge.pendingConsumption;
+if (!consumption) process.exit(2);
+if (records().length !== 1) process.exit(3);
+
+// Mirror tryStartTurn()'s epoch registration for a turn with no server-side
+// id at all.
+bridge.activeTurnEpoch = bridge.turnEpoch;
+bridge.turnSnapshots.set(bridge.turnEpoch, consumption);
+bridge.pendingConsumption = null;
+bridge.startInFlight = false;
+bridge.threadId = "thread-idless";
+bridge.turnActive = true;
+bridge.threadIdle = false;
+bridge.authoritativeIdle = false;
+bridge.armWatch = async () => {}; // isolate settle/end from the real watch loop
+
+(async () => {
+  await bridge.onTurnCompleted({ threadId: bridge.threadId });
+  if (bridge.turnActive || !bridge.threadIdle || !bridge.authoritativeIdle) process.exit(4);
+  if (bridge.turnSnapshots.has(bridge.activeTurnEpoch)) process.exit(5);
+  if (records().length !== 0) process.exit(6);
+  process.stdout.write("ok\n");
+})().catch((e) => { console.error((e && e.stack) || e); process.exit(7); });
+NODE
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ok"* ]]
 }
 
 @test "codex-bridge: unverified unread-count keeps inflight and does not reuse the epoch" {
@@ -3214,6 +3568,71 @@ EOF
   [ "$status" -eq 0 ]                 # not 124: ended via the deferred end, not a hang
   printf '%s\n' "$output" | grep -Fq "started turn"
   printf '%s\n' "$output" | grep -Fq "turn completed"
+}
+
+@test "codex-bridge: a turn fully notified before its turn/start ACK still settles cleanly (no orphan, no durable record, no sender error)" {
+  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
+  if [ "$status" -ne 0 ]; then
+    skip "node child_process.spawn is not available in this sandbox"
+  fi
+
+  # Same pre-ACK ordering as the test above -- turn/started then
+  # turn/completed while turn/start is still unanswered -- but checking the
+  # settle side rather than just that the turn ends promptly: the deferred
+  # end must settle like any other success, so bob (whose message the turn
+  # actually consumed) never sees a stale/orphan notice, and no durable
+  # in-flight record is left for the next tryStartTurn to find.
+  local fake="$TEST_SKILL_DIR/fake-app-server-preack-turn-settle.js"
+  local log="$TEST_SKILL_DIR/fake-app-server-preack-turn-settle.log"
+  cat >"$fake" <<'EOF'
+const fs = require("fs");
+const readline = require("readline");
+const log = process.argv[2];
+const rl = readline.createInterface({ input: process.stdin });
+function send(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  fs.appendFileSync(log, `${message.method}\n`);
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  } else if (message.method === "thread/resume") {
+    send({ jsonrpc: "2.0", id: message.id, result: { thread: { id: message.params.threadId, status: { type: "idle" } } } });
+  } else if (message.method === "process/spawn") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+    setTimeout(() => {
+      send({ jsonrpc: "2.0", method: "process/exited", params: { processHandle: message.params.processHandle, exitCode: 0, stdout: "status=pending count=1 max_id=5\n", stderr: "" } });
+    }, 10);
+  } else if (message.method === "turn/start") {
+    // The turn runs to completion before the request is ACKed.
+    send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: message.params.threadId, turn: { id: "fast-settle-1" } } });
+    send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: "fast-settle-1" } } });
+    setTimeout(() => {
+      send({ jsonrpc: "2.0", id: message.id, result: {} });
+    }, 60);
+  } else if (message.method === "process/kill") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  }
+});
+EOF
+
+  bash "$SCRIPTS/send.sh" team bob alice "pre-ack fast turn settle probe" >/dev/null
+  local runner
+  runner=$(write_bridge_timeout_runner)
+
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake $log" run node "$runner" 5000 node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --thread thread-fast-settle \
+    --timeout 1 --interval 1 --turn-timeout 30 --max-wakes 1 --inline-inbox
+
+  # `grep -q` rather than `[[ ]]` in the non-last positions: on bash 3.2,
+  # which is what macOS CI runs, a false `[[ ]]` there reports ok.
+  [ "$status" -eq 0 ]                 # not 124: ended via the deferred end, not a hang
+  printf '%s\n' "$output" | grep -Fq "turn completed"
+  [ "$(printf '%s\n' "$output" | grep -Fc "orphaned snapshot")" -eq 0 ]
+  shopt -s nullglob
+  leftover=("$TEST_SKILL_DIR"/run/inflight-record.*)
+  [ "${#leftover[@]}" -eq 0 ]
+  run bash "$SCRIPTS/inbox.sh" team bob
+  [[ "$output" != *"[bridge-error]"* ]]
 }
 
 @test "codex-bridge: a stale idle landing after the new turn was seen starting does not end the running turn (id attribution)" {
