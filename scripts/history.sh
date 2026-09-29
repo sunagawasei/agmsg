@@ -104,6 +104,8 @@ done <<< "$RECIPIENTS"
 
 while IFS=$'\x1f' read -r from to body ts id; do
   [ -n "$ts$from$to$body" ] || continue
-  if printf '%s\n' "$UNREAD_IDS" | grep -Fxq "$id"; then status='●'; else status='○'; fi
+  # An empty id (sender-side generation failed) is unread-undecidable, not a
+  # blank-line match against a stray empty UNREAD_IDS entry — treat it as ○.
+  if [ -n "$id" ] && printf '%s\n' "$UNREAD_IDS" | grep -Fxq "$id"; then status='●'; else status='○'; fi
   echo "  $status [$ts] $from → $to: $body"
 done <<< "$ROWS"

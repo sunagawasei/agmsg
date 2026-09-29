@@ -1542,7 +1542,11 @@ EOF
           continue
         fi
         [ "$kind" = "message_sent" ] || continue
-        [ -z "$id" ] && continue
+        # An empty id (sender-side UUID generation failed) must not drop the
+        # row: nothing below reads id -- the printed line uses ts/team/from/
+        # to/body, and the cursor row (separate branch above) advances the
+        # frontier by seq, not by id.
+        [ -z "$id" ] && watch_log "message from $from to $to has no id (sender-side id generation failed); delivered anyway"
         # Control message: a leader's `despawn` sends `ctrl:despawn` to this
         # role. Tear ourselves down rather than printing it — drop the role
         # (releases the lock + registration) then close our own tmux pane,

@@ -31,30 +31,26 @@ _sqlite_data() {
   ( set -o pipefail; agmsg_sqlite "$(_sqlite_db)" "$1" | tr -d '\r' )
 }
 
-# UUIDv7: 48-bit ms timestamp + version/variant + random. python3 preferred;
-# fall back to a /dev/urandom shell build. No counter file (§2.5).
+# UUIDv7: 48-bit ms timestamp + version/variant + random, generated entirely by
+# sqlite3 — the sandbox this runs in has no usable python3 or /dev/urandom.
 _sqlite_uuid7() {
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - <<'PY'
-import os, time
-ms = int(time.time() * 1000) & ((1 << 48) - 1)
-b = bytearray(os.urandom(16))
-b[0] = (ms >> 40) & 0xFF; b[1] = (ms >> 32) & 0xFF
-b[2] = (ms >> 24) & 0xFF; b[3] = (ms >> 16) & 0xFF
-b[4] = (ms >> 8) & 0xFF;  b[5] = ms & 0xFF
-b[6] = 0x70 | (b[6] & 0x0F)            # version 7
-b[8] = 0x80 | (b[8] & 0x3F)            # variant 10
-h = b.hex()
-print(f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}")
-PY
-    return
-  fi
-  local ms hex rnd
-  ms=$(( $(date -u +%s) * 1000 ))
-  hex=$(printf '%012x' "$ms")
-  rnd=$(head -c 10 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  printf '%s-%s-7%s-8%s-%s\n' \
-    "${hex:0:8}" "${hex:8:4}" "${rnd:0:3}" "${rnd:3:3}" "${rnd:6:12}"
+  local out
+  out="$(agmsg_sqlite ':memory:' "
+    WITH t AS (
+      SELECT printf('%012x', CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)) AS ms,
+             lower(hex(randomblob(9))) AS r
+    )
+    SELECT substr(ms,1,8) || '-' || substr(ms,9,4) || '-7' || substr(r,1,3) || '-' ||
+           substr('89ab', (random() & 3) + 1, 1) || substr(r,4,3) || '-' || substr(r,7,12)
+    FROM t;
+  " 2>/dev/null | tr -d '\r\n')"
+  case "$out" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-7[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+      printf '%s\n' "$out"
+      return 0
+      ;;
+  esac
+  return 1
 }
 
 # IN (...) list of "team:agent" pairs.
@@ -155,7 +151,11 @@ _sqlite_message_sent_sql() {
 
 storage_send() {
   local team="$1" from="$2" to="$3" body="$4"
-  local id at db; id="$(_sqlite_uuid7)"; at="$(_sqlite_now)"; db="$(_sqlite_db)"
+  local id at db
+  # id generation failure must not fall through to an id='' INSERT (silently
+  # undeliverable row); fail the same way a SQL error here already does.
+  id="$(_sqlite_uuid7)" || return 1
+  at="$(_sqlite_now)"; db="$(_sqlite_db)"
   local insert; insert="$(_sqlite_message_sent_sql "$team" "$from" "$to" "$body" "$id" "$at")"
   # Try the INSERT first and only fall back to storage_init on failure (the #114
   # pattern). Running storage_init — which issues PRAGMA journal_mode=WAL and the
@@ -185,9 +185,10 @@ storage_read_cursor_consume() {
   db="$(_sqlite_db)"; tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
   at="$(_sqlite_now)"
   for id in "$@"; do
+    local mid; mid="$(_sqlite_uuid7)" || { echo runtime_error; return 13; }
     sql="$sql
       INSERT INTO events(type,id,team,agent,msg_id,at)
-      SELECT 'message_read','$(_sqlite_lit "$(_sqlite_uuid7)")','$tl','$al',
+      SELECT 'message_read','$(_sqlite_lit "$mid")','$tl','$al',
              '$(_sqlite_lit "$id")','$(_sqlite_lit "$at")'
        WHERE NOT EXISTS(SELECT 1 FROM events r WHERE r.type='message_read'
          AND r.team='$tl' AND r.agent='$al' AND r.msg_id='$(_sqlite_lit "$id")');
@@ -287,7 +288,8 @@ storage_mark_read_batch() {
   local id sql=""
   for id in "$@"; do
     local idl rid resolved
-    idl="$(_sqlite_lit "$id")"; rid="$(_sqlite_uuid7)"
+    idl="$(_sqlite_lit "$id")"
+    rid="$(_sqlite_uuid7)" || { echo runtime_error; return 13; }
     resolved="COALESCE((SELECT e.id FROM events e
       WHERE e.type='message_sent' AND e.team='$tl'
         AND CAST(e.legacy_id AS TEXT)='$idl'),'$idl')"
