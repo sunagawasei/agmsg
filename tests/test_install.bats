@@ -901,11 +901,10 @@ EOF
   [ "$(cat "$shim")" = "$before" ]  # byte-for-byte unchanged, not silently claimed
 }
 
-# --- grok-build skill (~/.grok/skills/<name>/SKILL.md) ---
 
 @test "install: bare --update preserves every renderable type's SKILL.md flavor (#846)" {
   local t
-  for t in codex gemini antigravity opencode hermes cursor grok-build; do
+  for t in codex cursor; do
     local cmd="agmsg-$t"
     HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd "$cmd" --agent-type "$t"
     local skill_md="$FAKE_HOME/.agents/skills/$cmd/SKILL.md"

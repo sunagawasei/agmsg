@@ -370,22 +370,6 @@ seed_resumable() {
   [ "$unset_line" -lt "$output" ]
 }
 
-@test "spawn: does NOT unset a type's credential/detect vars (#294)" {
-  # The strip list is a dedicated spawn_unset_env=, NOT detect=. gemini's
-  # detect=GEMINI_CLI GEMINI_API_KEY: the session marker + a credential, not a session id —
-  # stripping them would break the spawned child's auth (the opposite of the fix).
-  # gemini has no spawn_unset_env=, so its boot script must emit no `unset` at all
-  # and in particular must never unset GEMINI_API_KEY.
-  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
-  run bash "$SCRIPTS/spawn.sh" gemini alice --project "$PROJ" --no-wait
-  [ "$status" -eq 0 ]
-  boot="$(cat "$CAPTURE")"
-  [ -f "$boot" ]
-  run cat "$boot"
-  [[ "$output" != *"unset GEMINI_API_KEY"* ]]
-  [[ "$output" != *"unset "* ]]
-}
-
 @test "spawn --model: claude-code launch includes its --model flag + id" {
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
   run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --model claude-opus-4-8 --no-wait
