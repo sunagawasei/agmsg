@@ -306,7 +306,7 @@ _wait_for_file_contains() {
   run kill -0 "$w"; [ "$status" -ne 0 ]
   [ "$(_read_cursor team alice)" = "$first_cursor" ]
   refute grep -q "M2-undelivered" "$out"
-  run_watcher_for "after-liveness" "$TEST_SKILL_DIR/liveness-redelivery.log" 2
+  run_watcher_until_contains "after-liveness" "$TEST_SKILL_DIR/liveness-redelivery.log" "M2-undelivered"
   grep -q "M2-undelivered" "$TEST_SKILL_DIR/liveness-redelivery.log"
 }
 
