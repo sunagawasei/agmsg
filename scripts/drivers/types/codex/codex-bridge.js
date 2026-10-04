@@ -1288,6 +1288,9 @@ class CodexBridge {
   }
 
   writeMeta() {
+    // Lease before pidfile: once a peer can see our pid in the pidfile, lease.<pid>
+    // must already carry our start token, not a crashed predecessor's.
+    this.writeLease();
     fs.writeFileSync(this.pidfile, `${process.pid}\n`);
     fs.writeFileSync(
       this.metafile,
@@ -1299,7 +1302,6 @@ class CodexBridge {
         "drain_capable=1",
       ].join("\n") + "\n",
     );
-    this.writeLease();
   }
 
   // The reaper's authority. It is published atomically (temp + rename) so a
@@ -1331,7 +1333,7 @@ class CodexBridge {
   //            FORMATTED tokens for the same process. powershell.exe and pwsh
   //            return identical Ticks, so falling back between those two binaries
   //            is safe: the src label names the format, not the executable.
-  startToken() {
+  startToken(pid = process.pid) {
     if (process.platform === "win32") {
       for (const bin of ["powershell.exe", "pwsh"]) {
         const r = spawnSync(
@@ -1340,7 +1342,7 @@ class CodexBridge {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            `(Get-Process -Id ${process.pid}).StartTime.Ticks`,
+            `(Get-Process -Id ${pid}).StartTime.Ticks`,
           ],
           { encoding: "utf8" },
         );
@@ -1350,26 +1352,17 @@ class CodexBridge {
       return { src: "pwsh", token: "" };
     }
     try {
-      const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
       const after = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
       const ticks = after[19];
       if (/^\d+$/.test(ticks || "")) return { src: "proc", token: ticks };
     } catch (_) { /* no /proc (macOS/BSD) or unreadable */ }
-    const ps = spawnSync("ps", ["-o", "lstart=", "-p", String(process.pid)], { encoding: "utf8" });
+    const ps = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
     const token = (ps.status === 0 ? (ps.stdout || "") : "").trim();
     return { src: "ps", token };
   }
 
-  writeLease() {
-    const { src, token } = this.startToken();
-    // Fail CLOSED at the source. A bridge that cannot publish a well-formed,
-    // enumerable lease must not go on to arm its network/thread -- that is exactly
-    // the authority-less orphan #906 is about. Each failure below throws, and run()
-    // publishes the lease before client.start(), so the throw aborts startup rather
-    // than leaving a live-but-unreapable bridge.
-    if (!token) throw new Error("cannot determine process start token for identity lease");
-    const host = os.hostname();
-    if (!host) throw new Error("cannot determine hostname for identity lease");
+  leaseHashes() {
     const projectHash = crypto.createHash("sha1").update(this.opts.project).digest("hex");
     // Canonicalize the pair SET before hashing: hash each "team\tname" pair, then
     // sort the hex hashes (pure ASCII, so a byte sort in the launcher and a JS
@@ -1383,6 +1376,20 @@ class CodexBridge {
           .join("\n"),
       )
       .digest("hex");
+    return { projectHash, pairsHash };
+  }
+
+  writeLease() {
+    const { src, token } = this.startToken();
+    // Fail CLOSED at the source. A bridge that cannot publish a well-formed,
+    // enumerable lease must not go on to arm its network/thread -- that is exactly
+    // the authority-less orphan #906 is about. Each failure below throws, and run()
+    // publishes the lease before client.start(), so the throw aborts startup rather
+    // than leaving a live-but-unreapable bridge.
+    if (!token) throw new Error("cannot determine process start token for identity lease");
+    const host = os.hostname();
+    if (!host) throw new Error("cannot determine hostname for identity lease");
+    const { projectHash, pairsHash } = this.leaseHashes();
     this.leaseStart = token;
     this.leaseStartSrc = src;
     const body = [
@@ -2398,21 +2405,105 @@ class CodexBridge {
     // at a stale predecessor. When that write wins the startup race, this
     // process sees its own PID here; it owns the reservation, not a peer bridge.
     if (existing === process.pid) return;
+    let denied = false;
     try {
       process.kill(existing, 0);
-      die(`bridge already running for ${this.identity.team}/${this.identity.name} (pid ${existing})`);
     } catch (error) {
       if (error && error.code === "ESRCH") {
-        for (const file of [this.pidfile, this.metafile]) {
-          try {
-            if (fs.existsSync(file)) fs.unlinkSync(file);
-          } catch (_) {
-            // Best-effort stale cleanup.
-          }
-        }
+        this.removeStaleRecords(existing);
         return;
       }
-      die(`cannot verify existing bridge pid ${existing}: ${error.message}`);
+      if (!error || error.code !== "EPERM") {
+        die(`cannot verify existing bridge pid ${existing}: ${error && error.message}`);
+      }
+      denied = true;
+    }
+    // A live pid is not a live bridge: the number may have been recycled. Only
+    // positive proof that it names something other than the bridge we leased
+    // clears the record; any doubt keeps refusing.
+    if (this.pidRecycled(existing)) {
+      this.removeStaleRecords(existing);
+      return;
+    }
+    if (denied) die(`cannot verify existing bridge pid ${existing}: not permitted to signal it`);
+    die(`bridge already running for ${this.identity.team}/${this.identity.name} (pid ${existing})`);
+  }
+
+  // True when pid's lease was written by a bridge of this role that is gone: the
+  // lease is one the launcher would accept, its start token no longer matches the
+  // live pid's (same source), and the live command line is not a codex-bridge.
+  // The command line is advisory: a wrapper that pre-seeds the pidfile before
+  // exec-ing the bridge looks non-bridge here, which the non-atomic pidfile
+  // acquisition already leaves open. Project is not compared: the pidfile name
+  // has none, and a vanished bridge is gone whichever project it served. win32
+  // has no cmdline source here, so it never reports recycling.
+  pidRecycled(pid) {
+    if (process.platform === "win32") return false;
+    const lease = this.readLeaseStrict(path.join(RUN_DIR, `codex-bridge-lease.${pid}`));
+    if (!lease || lease.pid !== String(pid) || lease.host !== os.hostname()) return false;
+    const { pairsHash } = this.leaseHashes();
+    if (lease.pairs !== pairsHash) return false;
+    const cur = this.startToken(pid);
+    if (!cur.token || cur.src !== lease.startsrc || cur.token === lease.start) return false;
+    const cmd = processCommand(pid);
+    return cmd !== "" && !cmd.includes("codex-bridge");
+  }
+
+  // Same exact v=1 schema as _read_lease in codex-bridge-launcher.sh: seven keys,
+  // each once, nothing else. Returns null on any deviation.
+  readLeaseStrict(file) {
+    let text;
+    try {
+      text = fs.readFileSync(file, "utf8");
+    } catch (_) {
+      return null;
+    }
+    // bash's `read` accepts an unterminated last line and rejects blank ones.
+    if (text.endsWith("\n")) text = text.slice(0, -1);
+    const lines = text.split("\n");
+    if (lines.length !== 7) return null;
+    const values = new Map();
+    for (const line of lines) {
+      const eq = line.indexOf("=");
+      if (eq < 0) return null;
+      const key = line.slice(0, eq);
+      if (!["v", "project", "pairs", "host", "pid", "start", "startsrc"].includes(key)) return null;
+      if (values.has(key)) return null;
+      values.set(key, line.slice(eq + 1));
+    }
+    const lease = {
+      v: values.get("v"),
+      project: values.get("project"),
+      pairs: values.get("pairs"),
+      host: values.get("host"),
+      pid: values.get("pid"),
+      start: values.get("start"),
+      startsrc: values.get("startsrc"),
+    };
+    if (lease.v !== "1") return null;
+    if (!/^[0-9a-f]{40}$/.test(lease.project) || !/^[0-9a-f]{40}$/.test(lease.pairs)) return null;
+    if (!/^[0-9]+$/.test(lease.pid)) return null;
+    if (!["proc", "ps", "pwsh"].includes(lease.startsrc)) return null;
+    if (!lease.host || !lease.start) return null;
+    if (lease.startsrc !== "ps" && !/^[0-9]+$/.test(lease.start)) return null;
+    return lease;
+  }
+
+  // Delete the records only while they still name the pid we judged stale, so a
+  // bridge that replaced them during the check keeps its own.
+  removeStaleRecords(pid) {
+    if (readPid(this.pidfile) === pid) {
+      try {
+        fs.unlinkSync(this.pidfile);
+      } catch (_) {
+        // Best-effort stale cleanup.
+      }
+    }
+    try {
+      const meta = fs.readFileSync(this.metafile, "utf8");
+      if ((meta.match(/^pid=(.*)$/mu) || [])[1] === String(pid)) fs.unlinkSync(this.metafile);
+    } catch (_) {
+      // Missing or unreadable metafile: nothing of ours to clean.
     }
   }
 
@@ -2485,6 +2576,17 @@ function readVersion() {
   } catch (_) {
     return "unknown";
   }
+}
+
+// Command line of pid, or "" when it cannot be read. Used only to refuse, never to
+// kill: a lossy answer must leave the caller failing closed.
+function processCommand(pid) {
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8");
+    if (raw) return raw.replace(/\0/g, " ").trim();
+  } catch (_) { /* no /proc (macOS/BSD) or unreadable */ }
+  const ps = spawnSync("ps", ["-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+  return ps.status === 0 ? String(ps.stdout || "").trim() : "";
 }
 
 function readPid(file) {

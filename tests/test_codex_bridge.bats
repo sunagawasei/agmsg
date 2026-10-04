@@ -770,6 +770,317 @@ EOF
   [[ ! "$output" =~ "bridge already running" ]]
 }
 
+# --- single-instance identity (#12): a live pid is not necessarily our bridge ---
+
+# Start a bridge that idles in app-server startup, publish its lease, and leave the
+# project/pairs/host values a matching lease must carry in LEASE_PROJECT/PAIRS/HOST.
+capture_lease_values() {
+  local probe_pid lease i
+  AGMSG_CODEX_APP_SERVER_CMD="sleep 300" node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --request-timeout-ms 60000 \
+    >/dev/null 2>&1 &
+  probe_pid=$!
+  lease="$TEST_SKILL_DIR/run/codex-bridge-lease.$probe_pid"
+  for i in $(seq 1 100); do
+    [ -s "$lease" ] && break
+    sleep 0.1
+  done
+  [ -s "$lease" ] || { kill "$probe_pid" 2>/dev/null; return 1; }
+  LEASE_PROJECT="$(sed -n 's/^project=//p' "$lease")"
+  LEASE_PAIRS="$(sed -n 's/^pairs=//p' "$lease")"
+  LEASE_HOST="$(sed -n 's/^host=//p' "$lease")"
+  kill "$probe_pid" 2>/dev/null || true
+  wait "$probe_pid" 2>/dev/null || true
+  rm -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice".* "$lease"
+}
+
+# "<src> <token>" for pid, by the same method codex-bridge.js startToken() uses.
+current_start_token() {
+  local pid="$1" stat tok
+  if [ -r "/proc/$pid/stat" ]; then
+    stat="$(cat "/proc/$pid/stat")"
+    set -- ${stat##*)}
+    # $1 is stat field 3 (state), so starttime (field 22) is $20.
+    printf 'proc %s' "${20}"
+    return 0
+  fi
+  tok="$(ps -o lstart= -p "$pid")"
+  tok="${tok#"${tok%%[![:space:]]*}"}"
+  tok="${tok%"${tok##*[![:space:]]}"}"
+  printf 'ps %s' "$tok"
+}
+
+# A start token that differs from pid's real one but is well-formed for its src.
+other_start_token() {
+  case "$1" in
+    proc) printf '1' ;;
+    *) printf 'Thu Jan  1 00:00:01 1970' ;;
+  esac
+}
+
+# write_lease_file <pid> <src> <start> [mutation]
+write_lease_file() {
+  local pid="$1" src="$2" start="$3" mutation="${4:-}"
+  local file="$TEST_SKILL_DIR/run/codex-bridge-lease.$pid"
+  local v=1 proj="$LEASE_PROJECT" pairs="$LEASE_PAIRS" host="$LEASE_HOST" lpid="$pid" lsrc="$src"
+  local body trailer=$'\n'
+  case "$mutation" in
+    wrong-v) v=2 ;;
+    short-project) proj="${proj%?}" ;;
+    upper-project) proj="$(printf '%s' "$proj" | tr 'a-f' 'A-F')" ;;
+    foreign-project) proj="$(printf '%040d' 0)" ;;
+    foreign-pairs) pairs="$(printf '%040d' 0)" ;;
+    foreign-host) host="not-this-host.invalid" ;;
+    pid-mismatch) lpid=$((pid + 1)) ;;
+    pid-garbage) lpid="12x" ;;
+    unknown-src) lsrc=bogus ;;
+    no-trailing-newline) trailer="" ;;
+  esac
+  body="v=$v
+project=$proj
+pairs=$pairs
+host=$host
+pid=$lpid
+start=$start
+startsrc=$lsrc"
+  case "$mutation" in
+    missing-host) body="$(printf '%s\n' "$body" | grep -v '^host=')" ;;
+    duplicate-key) body="$body
+start=$start" ;;
+    unknown-key) body="$body
+extra=1" ;;
+    blank-trailing) trailer=$'\n\n' ;;
+    crlf) body="$(printf '%s\n' "$body" | sed 's/$/\r/')"; body="${body%$'\n'}" ;;
+    garbage-start) body="$(printf '%s\n' "$body" | sed 's/^start=.*/start=not-a-token/')" ;;
+  esac
+  printf '%s%s' "$body" "$trailer" > "$file"
+}
+
+# Occupant of the pidfile: a live, non-bridge process.
+start_occupant() {
+  sleep 300 &
+  OCCUPANT=$!
+}
+
+run_bridge_over_pidfile() {
+  mkdir -p "$TEST_SKILL_DIR/run"
+  echo "$1" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+  AGMSG_CODEX_APP_SERVER_CMD="exit 1" run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice
+}
+
+refused() {
+  [[ "$output" =~ "bridge already running" || "$output" =~ "cannot verify existing bridge pid" ]]
+}
+
+@test "codex-bridge: refuses a live pid whose lease start token still matches (#12)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  capture_lease_values
+  start_occupant
+  read -r src tok <<<"$(current_start_token "$OCCUPANT")"
+  write_lease_file "$OCCUPANT" "$src" "$tok"
+  run_bridge_over_pidfile "$OCCUPANT"
+  kill "$OCCUPANT" 2>/dev/null || true
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "bridge already running" ]]
+  [ "$(cat "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid")" = "$OCCUPANT" ]
+}
+
+@test "codex-bridge: replaces the record when the pid was recycled by a non-bridge process (#12)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  capture_lease_values
+  start_occupant
+  read -r src tok <<<"$(current_start_token "$OCCUPANT")"
+  write_lease_file "$OCCUPANT" "$src" "$(other_start_token "$src")"
+  run_bridge_over_pidfile "$OCCUPANT"
+  kill "$OCCUPANT" 2>/dev/null || true
+  [[ ! "$output" =~ "bridge already running" ]]
+  [[ ! "$output" =~ "cannot verify existing bridge pid" ]]
+}
+
+@test "codex-bridge: a mismatched token on a codex-bridge command line is still refused (#12)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  capture_lease_values
+  bash -c 'sleep 300; : codex-bridge.js' &
+  OCCUPANT=$!
+  sleep 0.3
+  read -r src tok <<<"$(current_start_token "$OCCUPANT")"
+  write_lease_file "$OCCUPANT" "$src" "$(other_start_token "$src")"
+  run_bridge_over_pidfile "$OCCUPANT"
+  kill "$OCCUPANT" 2>/dev/null || true
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "bridge already running" ]]
+}
+
+@test "codex-bridge: a lease from another start-token source is refused (#12)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  capture_lease_values
+  start_occupant
+  read -r src tok <<<"$(current_start_token "$OCCUPANT")"
+  if [ "$src" = proc ]; then other=ps; start="Thu Jan  1 00:00:01 1970"; else other=proc; start=1; fi
+  write_lease_file "$OCCUPANT" "$other" "$start"
+  run_bridge_over_pidfile "$OCCUPANT"
+  kill "$OCCUPANT" 2>/dev/null || true
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "bridge already running" ]]
+}
+
+@test "codex-bridge: a missing lease keeps refusing a live pid (#12)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  start_occupant
+  run_bridge_over_pidfile "$OCCUPANT"
+  kill "$OCCUPANT" 2>/dev/null || true
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "bridge already running" ]]
+}
+
+@test "codex-bridge: a pid it may not signal is refused without a lease (#12)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  [ "$(id -u)" -ne 0 ] || skip "root can signal pid 1"
+  run_bridge_over_pidfile 1
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "cannot verify existing bridge pid 1" ]]
+}
+
+@test "codex-bridge: lease acceptance matches the launcher's _read_lease (#12)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  capture_lease_values
+  eval "$(sed -n '/^_read_lease() {/,/^}/p' "$TYPES/codex/codex-bridge-launcher.sh")"
+  start_occupant
+  read -r src tok <<<"$(current_start_token "$OCCUPANT")"
+  local mutation accepted_by_launcher proceeded failures=""
+  for mutation in "" no-trailing-newline blank-trailing missing-host duplicate-key unknown-key \
+      wrong-v short-project upper-project pid-garbage unknown-src crlf garbage-start; do
+    write_lease_file "$OCCUPANT" "$src" "$(other_start_token "$src")" "$mutation"
+    if _read_lease "$TEST_SKILL_DIR/run/codex-bridge-lease.$OCCUPANT"; then accepted_by_launcher=1; else accepted_by_launcher=0; fi
+    run_bridge_over_pidfile "$OCCUPANT"
+    if refused; then proceeded=0; else proceeded=1; fi
+    [ "$accepted_by_launcher" = "$proceeded" ] || failures="$failures [${mutation:-valid}: launcher=$accepted_by_launcher node-proceeded=$proceeded]"
+  done
+  kill "$OCCUPANT" 2>/dev/null || true
+  [ -z "$failures" ] || { echo "parity broke:$failures"; return 1; }
+}
+
+@test "codex-bridge: a lease for another role, host, or pid is never proof of recycling (#12)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  capture_lease_values
+  start_occupant
+  read -r src tok <<<"$(current_start_token "$OCCUPANT")"
+  local mutation
+  for mutation in foreign-pairs foreign-host pid-mismatch; do
+    write_lease_file "$OCCUPANT" "$src" "$(other_start_token "$src")" "$mutation"
+    run_bridge_over_pidfile "$OCCUPANT"
+    refused || { kill "$OCCUPANT" 2>/dev/null || true; echo "$mutation was not refused"; return 1; }
+  done
+  kill "$OCCUPANT" 2>/dev/null || true
+}
+
+@test "codex-bridge: a recycled pid is reclaimed whichever project the old lease named (#12)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  capture_lease_values
+  start_occupant
+  read -r src tok <<<"$(current_start_token "$OCCUPANT")"
+  write_lease_file "$OCCUPANT" "$src" "$(other_start_token "$src")" foreign-project
+  run_bridge_over_pidfile "$OCCUPANT"
+  kill "$OCCUPANT" 2>/dev/null || true
+  [[ ! "$output" =~ "bridge already running" ]]
+  [[ ! "$output" =~ "cannot verify existing bridge pid" ]]
+}
+
+@test "codex-bridge: reclaiming a recycled pid leaves a metafile that names another pid (#12)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  capture_lease_values
+  start_occupant
+  read -r src tok <<<"$(current_start_token "$OCCUPANT")"
+  write_lease_file "$OCCUPANT" "$src" "$(other_start_token "$src")"
+  printf 'pid=999999\nproject=%s\n' "$PROJ" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta"
+  # Exit as soon as the bridge would write its own records, so only the
+  # single-instance cleanup has touched them.
+  local spy="$TEST_SKILL_DIR/stop-at-records.js"
+  cat >"$spy" <<'EOF'
+const fs = require("fs");
+const real = fs.writeFileSync;
+fs.writeFileSync = function (file, ...rest) {
+  if (/codex-bridge\.team\.alice\.(pid|meta)$/.test(String(file))) process.exit(0);
+  return real.call(this, file, ...rest);
+};
+EOF
+  NODE_OPTIONS="--require $spy" run_bridge_over_pidfile "$OCCUPANT"
+  kill "$OCCUPANT" 2>/dev/null || true
+  [ ! -e "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid" ]
+  grep -q '^pid=999999$' "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta"
+}
+
+@test "codex-bridge: an unreadable command line never proves a pid was recycled (#12)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  [ ! -r /proc/self/stat ] || skip "cmdline is read from /proc here, not ps"
+  mkdir -p "$TEST_SKILL_DIR/run" "$TEST_SKILL_DIR/fake-ps"
+  local real_ps
+  real_ps="$(command -v ps)"
+  cat >"$TEST_SKILL_DIR/fake-ps/ps" <<EOF
+#!/bin/sh
+case "\$*" in *command=*) exit 1 ;; esac
+exec "$real_ps" "\$@"
+EOF
+  chmod +x "$TEST_SKILL_DIR/fake-ps/ps"
+  capture_lease_values
+  start_occupant
+  read -r src tok <<<"$(current_start_token "$OCCUPANT")"
+  write_lease_file "$OCCUPANT" "$src" "$(other_start_token "$src")"
+  PATH="$TEST_SKILL_DIR/fake-ps:$PATH" run_bridge_over_pidfile "$OCCUPANT"
+  kill "$OCCUPANT" 2>/dev/null || true
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "bridge already running" ]]
+}
+
+@test "codex-bridge: the lease is published before the pidfile can name the bridge (#12)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  local spy="$TEST_SKILL_DIR/fs-order-spy.js" events="$TEST_SKILL_DIR/fs-events.log"
+  cat >"$spy" <<'EOF'
+const fs = require("fs");
+const log = process.env.FS_EVENTS_LOG;
+const append = fs.appendFileSync;
+const wrap = (name, label) => {
+  const real = fs[name];
+  fs[name] = function (...args) {
+    const target = String(args[args.length > 1 && name === "renameSync" ? 1 : 0]);
+    if (/codex-bridge(-lease)?\./.test(target) && !target.endsWith(".tmp")) {
+      append(log, `${label} ${target}\n`);
+    }
+    return real.apply(this, args);
+  };
+};
+wrap("writeFileSync", "write");
+wrap("renameSync", "rename");
+EOF
+  FS_EVENTS_LOG="$events" NODE_OPTIONS="--require $spy" \
+    AGMSG_CODEX_APP_SERVER_CMD="sleep 300" node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --request-timeout-ms 60000 \
+    >"$TEST_SKILL_DIR/spy-bridge.log" 2>&1 &
+  local bridge=$! i
+  for i in $(seq 1 100); do
+    grep -q "codex-bridge.team.alice.pid" "$events" 2>/dev/null && break
+    sleep 0.05
+  done
+  kill "$bridge" 2>/dev/null || true
+  wait "$bridge" 2>/dev/null || true
+  local lease_line pid_line
+  lease_line="$(grep -n "^rename .*codex-bridge-lease\." "$events" | head -1 | cut -d: -f1)"
+  pid_line="$(grep -n "^write .*codex-bridge.team.alice.pid" "$events" | head -1 | cut -d: -f1)"
+  [ -n "$lease_line" ] || { cat "$TEST_SKILL_DIR/spy-bridge.log"; return 1; }
+  [ -n "$pid_line" ]
+  [ "$lease_line" -lt "$pid_line" ]
+}
+
 @test "codex-bridge: starts a turn when app-server reports watch-once pending" {
   run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
   if [ "$status" -ne 0 ]; then
