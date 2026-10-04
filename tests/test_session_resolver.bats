@@ -533,6 +533,69 @@ start_bridge() {
   [[ "$output" == *"for-b"* ]]
 }
 
+# --- teardown never touches a project team that only shares a session team's name ---
+
+@test "session-end (cursor): a marker-less cur-<uuid> project team is left alone" {
+  bash "$SCRIPTS/join.sh" "cur-$CUR_A" alice cursor "$PROJ" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+  agmsg_test_start_session_owner
+  printf '{"session_id":"%s"}' "$CUR_A" | env -u CLAUDE_CODE_SESSION_ID \
+    bash "$SCRIPTS/session-end.sh" cursor "$PROJ" 2>/dev/null
+  agmsg_test_stop_session_owner
+  [ ! -e "$TEST_SKILL_DIR/run/watchdog.cur-$CUR_A.tombstone" ]
+}
+
+@test "pending teardown: a marker-less cur-<uuid> project team's worker is retained, never despawned" {
+  export SKILL_DIR="$TEST_SKILL_DIR" RUN="$TEST_SKILL_DIR/run"
+  mkdir -p "$RUN"
+  bash "$SCRIPTS/join.sh" "cur-$CUR_A" worker codex "$PROJ" >/dev/null
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/actas-lock.sh"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/pending-teardown.sh"
+  test_fixture_start_reaped_process sleep 300
+  local bridge_pid="$TEST_REAPED_PID" record
+  record="$(printf 'pid:%s\t%s\tcodex' "$bridge_pid" "$PROJ")"
+  printf '%s\n' "$record" > "$(agmsg_spawn_path "cur-$CUR_A" worker)"
+  printf 'pid=%s\n' "$bridge_pid" > "$RUN/codex-bridge.cur-$CUR_A.worker.meta"
+  local dead_instance="$CUR_A.2147483647"
+  agmsg_pending_teardown_write "cur-$CUR_A" worker codex test-project-team \
+    "$record" verified "$dead_instance" 2147483647 ps:dead-owner "$dead_instance" ""
+  run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"reason=not-session-team"* ]]
+  kill -0 "$bridge_pid"
+}
+
+# --- an id with an embedded newline or NUL is refused, not truncated -----------
+
+@test "an id with an embedded newline or NUL is refused by SessionStart and check-inbox, not cut to its first line" {
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  mk_cursor_team "$CUR_A"
+  bash "$SCRIPTS/send.sh" "cur-$CUR_A" human cursor-host "must-not-surface" >/dev/null
+  for tail in '\n extra' '\u0000extra' '\r'; do
+    local payload="{\"session_id\":\"$CUR_A$tail\"}"
+    run bash -c "printf '%s' '$payload' | env -u CLAUDE_CODE_SESSION_ID bash '$SCRIPTS/check-inbox.sh' cursor '$PROJ' 2>/dev/null"
+    [ -z "$output" ]
+    run bash -c "printf '%s' '$payload' | env -u CLAUDE_CODE_SESSION_ID bash '$SCRIPTS/session-start.sh' cursor '$PROJ' 2>/dev/null"
+    [[ "$output" != *"cur-$CUR_A"* ]]
+  done
+  run bash "$SCRIPTS/inbox.sh" "cur-$CUR_A" cursor-host --format ids
+  [[ "$output" == *"must-not-surface"* ]]
+}
+
+@test "check-inbox: a payload with no id reads project teams only, never a session team" {
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  mk_cursor_team "$CUR_A"
+  bash "$SCRIPTS/send.sh" "cur-$CUR_A" human cursor-host "session-private" >/dev/null
+  bash "$SCRIPTS/join.sh" plain cursor-host cursor "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" plain human cursor "$PROJ" >/dev/null
+  bash "$SCRIPTS/send.sh" plain human cursor-host "project-visible" >/dev/null
+  run bash -c "printf '{}' | env -u CLAUDE_CODE_SESSION_ID bash '$SCRIPTS/check-inbox.sh' cursor '$PROJ' 2>/dev/null"
+  [[ "$output" == *"project-visible"* ]]
+  [[ "$output" != *"session-private"* ]]
+}
+
 # --- children never inherit a session id ------------------------------------
 
 @test "unset: every host's session id is dropped for a launched child, nothing else" {

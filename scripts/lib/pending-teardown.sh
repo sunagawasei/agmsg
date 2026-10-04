@@ -448,6 +448,14 @@ agmsg_pending_teardown_recover_one() {
 $(agmsg_session_team_decode "$AGMSG_PENDING_TEAM")
 EOF2
   if [ -n "$peer_host" ] && [ -n "$bare_sid" ]; then
+    # A name shaped like a host's session team is acted on only when the team
+    # is a trusted session team (a marker host's team needs its marker): a
+    # project team that shares the name keeps its worker.
+    if [ "$(agmsg_session_team_class "$AGMSG_PENDING_TEAM")" != session ]; then
+      _agmsg_pending_unlock
+      _agmsg_pending_retain "" "" "" not-session-team
+      return 0
+    fi
     if agmsg_instance_alive "$bare_sid" 2>/dev/null; then
       _agmsg_pending_unlock
       _agmsg_pending_retain "" "" "" bare-owner-alive

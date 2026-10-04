@@ -141,15 +141,21 @@ agmsg_session_normalize_sid() {
 # not a JSON object with a top-level string session_id, or when conversation_id /
 # sessionId is present and is not that very string (a different value, a
 # non-string or null). Nothing is echoed for a failed check either, so callers
-# fail closed. The id is not validated here: agmsg_session_normalize_sid does it.
+# fail closed. The id is checked in SQL before it crosses the CLI/shell boundary
+# (length, NUL, allowed characters), so a value with an embedded newline or NUL
+# is refused rather than truncated to its first line; agmsg_session_normalize_sid
+# then applies the host's own id shape.
 agmsg_session_payload_id() {
   local input="${1:-}" lit sid bad
   lit="$(printf '%s' "$input" | sed "s/'/''/g")" || return 0
   sid="$(printf '%s\n' "
     WITH raw(j) AS (SELECT '$lit'),
     valid(j) AS (SELECT j FROM raw WHERE json_valid(j) AND json_type(j) = 'object')
-    SELECT json_extract(j, '\$.session_id') FROM valid
-    WHERE json_type(j, '\$.session_id') = 'text';" \
+    SELECT json_extract(j, '\$.session_id') AS sid FROM valid
+    WHERE json_type(j, '\$.session_id') = 'text'
+      AND length(json_extract(j, '\$.session_id')) BETWEEN 1 AND 128
+      AND instr(json_extract(j, '\$.session_id'), char(0)) = 0
+      AND json_extract(j, '\$.session_id') NOT GLOB '*[^0-9A-Za-z_-]*';" \
     | sqlite3 -init /dev/null -noheader -list :memory: 2>/dev/null | head -1 | tr -d '\r')" || return 0
   [ -n "$sid" ] || return 0
   case "$sid" in *\'*) return 0 ;; esac

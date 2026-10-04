@@ -24,6 +24,7 @@ source "$SCRIPT_DIR/lib/resolve-project.sh"
 source "$SCRIPT_DIR/lib/session-team.sh"
 STEAM="$(agmsg_session_hook_team "$TYPE" "$SESSION_ID")"
 [ -n "$STEAM" ] || exit 0
+[ "$(agmsg_session_team_class "$STEAM")" = session ] || exit 0
 WATCHDOG_TOMBSTONE="$RUN_DIR/watchdog.$STEAM.tombstone"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/identity-key.sh"

@@ -330,3 +330,17 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   [[ "$output" == *"for-a"* ]]
   [[ "$output" != *"for-other"* ]]
 }
+
+@test "check-inbox: a role session reaches its project role inbox without a private session team of its own" {
+  enable_st
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  bash "$SCRIPTS/join.sh" projteam reviewer cursor "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" projteam human cursor "$TEST_PROJECT" >/dev/null
+  agmsg_role_session_record projteam reviewer "$SID_R" "$TEST_PROJECT" cursor
+  # check-inbox serves the first registered agent of the project's teams; give
+  # each of the two something so the assertion does not depend on which it is.
+  bash "$SCRIPTS/send.sh" projteam human reviewer "for-the-role" >/dev/null
+  bash "$SCRIPTS/send.sh" projteam reviewer human "for-the-role" >/dev/null
+  run bash -c "echo '{\"session_id\":\"$SID_R\"}' | bash '$SCRIPTS/check-inbox.sh' cursor '$TEST_PROJECT' 2>/dev/null"
+  [[ "$output" == *"for-the-role"* ]]
+}

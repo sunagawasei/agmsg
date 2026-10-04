@@ -142,19 +142,23 @@ if [ -n "$RAW_SESSION_ID" ] && agmsg_type_has "$TYPE" session_team yes \
     && agmsg_session_team_enabled; then
   # shellcheck disable=SC1091
   source "$SCRIPT_DIR/lib/inbox-target.sh"
-  # The id must be the one SessionStart accepts: a payload whose id fields
-  # disagree, or whose id is unusable, reads no inbox at all.
+  # A payload that names an id must name one SessionStart accepts: an id that
+  # is unusable or whose fields disagree reads no inbox at all. (A payload
+  # with no id at all takes the project-team enumeration below, which never
+  # includes a session team.)
   RAW_SESSION_ID="$(agmsg_session_payload_id "$INPUT")"
   [ -n "$RAW_SESSION_ID" ] || exit 0
   _ci_steam="$(agmsg_session_team_name_from_id "$RAW_SESSION_ID" "$TYPE")"
   [ -n "$_ci_steam" ] || exit 0
-  # A session team that is not trusted (a project team that merely shares the
-  # name, or an unreadable marker) is never read from here.
-  [ "$(agmsg_session_team_class "$_ci_steam")" = session ] || exit 0
   _ci_target="$(agmsg_inbox_target "$TYPE" "$PROJECT" "$RAW_SESSION_ID" 2>/dev/null || true)"
   if [ "${_ci_target#*teams=}" != "$_ci_target" ]; then
     _ci_teams="${_ci_target#*teams=}"; _ci_teams="${_ci_teams%% *}"
     if [ "$_ci_teams" = "$_ci_steam" ]; then
+      # The session's own team: it must be a trusted session team (a project
+      # team that merely shares the name, or an unreadable marker, is never
+      # read from here). A role session resolves to its project team instead
+      # and takes the enumeration below.
+      [ "$(agmsg_session_team_class "$_ci_steam")" = session ] || exit 0
       AGENT="${_ci_target#agent=}"; AGENT="${AGENT%% *}"
       TEAM_LIST=("$_ci_steam")
       SESSION_ROUTED=1

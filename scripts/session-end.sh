@@ -107,6 +107,9 @@ fi
 source "$SCRIPT_DIR/lib/session-team.sh"
 STEAM="$(agmsg_session_hook_team "$TYPE" "$SESSION_ID")"
 [ -n "$STEAM" ] || exit 0
+# Only a trusted session team is torn down: a project team that merely shares a
+# session team's name (a cursor team without its marker) is left alone.
+[ "$(agmsg_session_team_class "$STEAM")" = session ] || exit 0
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 SNAPSHOT_PATH="$(mktemp "$RUN_DIR/.session-end-snapshot.XXXXXX" 2>/dev/null || true)"
 if [ -n "$SNAPSHOT_PATH" ]; then
