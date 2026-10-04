@@ -288,6 +288,115 @@ agmsg_claude_create_exclusive_file() {
   ) 2>/dev/null
 }
 
+# Writable roots the sandbox grants to a Claude worker. Shared by the settings
+# renderer and the reviewer guard so both see the same set. Filled into a global
+# array (not printed) so a path containing a newline stays one element.
+AGMSG_CLAUDE_WRITE_ROOTS=()
+agmsg_claude_set_write_roots() {
+  local storage_dir="$1" child_tmp="$2" scratch="$3"
+  AGMSG_CLAUDE_WRITE_ROOTS=(
+    "$storage_dir" "$SKILL_DIR/teams" "$SKILL_DIR/run"
+    "$child_tmp" "/tmp" "$scratch"
+  )
+}
+
+# Resolve a path component by component: symlinks (including ones met after a
+# `..`) are followed and `..` pops the already-resolved prefix. Components that
+# do not exist yet are kept lexically, so a root that has not been created is
+# still compared at the location it will land. Fails on a symlink cycle.
+agmsg_claude_resolve_path() {
+  local rest="$1" cur="/" comp cand target hops=0
+  case "$rest" in /*) ;; *) rest="$PWD/$rest" ;; esac
+  while [ -n "$rest" ]; do
+    rest="${rest#/}"
+    [ -n "$rest" ] || break
+    comp="${rest%%/*}"
+    if [ "$comp" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+    case "$comp" in
+      ''|.) ;;
+      ..) cur="${cur%/*}"; [ -n "$cur" ] || cur="/" ;;
+      *)
+        if [ "$cur" = / ]; then cand="/$comp"; else cand="$cur/$comp"; fi
+        if [ -L "$cand" ]; then
+          hops=$((hops + 1))
+          [ "$hops" -le 40 ] || return 1
+          # -n plus a sentinel keeps every byte of the target, including a
+          # trailing newline that command substitution would strip.
+          target="$(readlink -n "$cand" && printf x)" || return 1
+          target="${target%x}"
+          case "$target" in /*) cur="/" ;; esac
+          rest="$target${rest:+/$rest}"
+        else
+          cur="$cand"
+        fi
+        ;;
+    esac
+  done
+  printf '%s' "$cur"
+}
+
+# True when <path> or one of its existing ancestors is the same file as
+# <project> (-ef compares device+inode, so letter case and symlink spellings of
+# the same tree match). A sub-directory of the project mounted elsewhere (bind
+# mount) is not detected.
+agmsg_claude_path_inside_project() {
+  local cand="$1" project="$2"
+  while :; do
+    [ -e "$cand" ] && [ "$cand" -ef "$project" ] && return 0
+    [ "$cand" = / ] && return 1
+    cand="${cand%/*}"
+    [ -n "$cand" ] || cand="/"
+  done
+}
+
+# Claude's sandbox lets denyWrite win over allowWrite, and a reviewer denies
+# writes to the whole project. A writable root inside the project is therefore
+# unwritable for the reviewer (its own db/run/teams included). Refuse that
+# before any CLI call, lock or file is created. A root above the project is fine.
+# Anything that cannot be resolved is refused too: containment is unproven.
+agmsg_claude_reviewer_root_guard() {
+  local project="$1" root phys_root skill_q project_q
+  if [ ! -d "$project" ]; then
+    echo "spawn: reviewer sandbox cannot verify project '$project': it is not an existing directory" >&2
+    return 1
+  fi
+  for root in "${AGMSG_CLAUDE_WRITE_ROOTS[@]}"; do
+    [ -n "$root" ] || continue
+    if ! phys_root="$(agmsg_claude_resolve_path "$root")"; then
+      echo "spawn: reviewer sandbox cannot resolve writable root '$root' (symlink cycle?); refusing because containment in project '$project' is unproven" >&2
+      return 1
+    fi
+    if agmsg_claude_path_inside_project "$phys_root" "$project"; then
+      skill_q="$(printf '%q' "$SKILL_DIR")"
+      project_q="$(printf '%q' "$project")"
+      echo "spawn: reviewer sandbox cannot use project '$project': writable root '$root' (resolves to '$phys_root') lies inside it, so the project-wide write deny would also block the worker's own state." >&2
+      echo "  Move run/teams/db outside the project and leave symlinks behind (stop running workers first). Edit STATE (an existing absolute directory outside the project; mkdir -p it first); the snippet checks everything before it changes anything and can be re-run after a reported problem:" >&2
+      echo "    ( set -eu" >&2
+      echo "      STATE=/absolute/dir/outside/the/project; SK=$skill_q; PROJECT=$project_q" >&2
+      echo '      case "$STATE" in /*) ;; *) echo "STATE must be absolute" >&2; exit 1 ;; esac' >&2
+      echo '      [ -d "$STATE" ] || { echo "create STATE first (mkdir -p)" >&2; exit 1; }' >&2
+      echo '      for B in "$SK" "$PROJECT"; do' >&2
+      echo '        p="$(cd "$STATE" && pwd -P)"' >&2
+      echo '        while :; do [ "$p" -ef "$B" ] && { echo "STATE must be outside $B" >&2; exit 1; }; [ "$p" = / ] && break; p="$(dirname "$p")"; done' >&2
+      echo '      done' >&2
+      echo '      for d in run teams db; do' >&2
+      echo '        if [ -L "$SK/$d" ]; then [ "$(readlink "$SK/$d")" = "$STATE/$d" ] && [ -d "$STATE/$d" ] || { echo "$SK/$d: unexpected symlink" >&2; exit 1; }' >&2
+      echo '        elif [ -e "$SK/$d" ]; then [ ! -e "$STATE/$d" ] || { echo "$STATE/$d already exists" >&2; exit 1; }' >&2
+      echo '        else [ -d "$STATE/$d" ] || { echo "$SK/$d is missing" >&2; exit 1; }' >&2
+      echo '        fi' >&2
+      echo '      done' >&2
+      echo '      for d in run teams db; do' >&2
+      echo '        [ -L "$SK/$d" ] && continue' >&2
+      echo '        [ -e "$SK/$d" ] && mv "$SK/$d" "$STATE/$d"' >&2
+      echo '        ln -s "$STATE/$d" "$SK/$d"' >&2
+      echo '      done )' >&2
+      echo "  Alternatively set AGMSG_STORAGE_PATH=<dir outside the project>/db for the message store (run and teams still need the symlinks above)." >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
 # JSON emitter shared by the real spawn path and the probe cache key
 # (agmsg_claude_probe_cache_normalized_settings): given the same inputs it
 # prints the exact same bytes generate_settings would publish. mkdir of
@@ -300,10 +409,8 @@ agmsg_claude_render_settings_json() {
   local -a inherited=("$@")
   local -a allow_rules=("Bash(*)")
   local -a deny_rules=()
-  local -a allow_write_candidates=(
-    "$storage_dir" "$SKILL_DIR/teams" "$SKILL_DIR/run"
-    "$child_tmp" "/tmp" "$scratch"
-  )
+  agmsg_claude_set_write_roots "$storage_dir" "$child_tmp" "$scratch"
+  local -a allow_write_candidates=("${AGMSG_CLAUDE_WRITE_ROOTS[@]}")
   local -a deny_write=()
   local -a allow_read_candidates=(
     "$scratch" "$SKILL_DIR" "/tmp" "/bin" "/usr/bin" "/usr/lib"
@@ -1071,11 +1178,19 @@ agmsg_spawn_headless() {
   agmsg_validate_agent_name "$NAME" >/dev/null 2>&1 \
     || die "agent name '$NAME' is not valid for a headless bridge"
 
+  # The reviewer root guard also precedes the CLI call, the placement lock and
+  # every per-worker artifact, so a refusal leaves nothing behind.
+  local scratch="$run_dir/claude-code-$TEAM-$NAME-cwd"
+  if [ "$IMPLEMENTER" != 1 ] && [ "$REVIEWER" = 1 ]; then
+    agmsg_claude_set_write_roots "$storage_dir" "$scratch/tmp" "$scratch"
+    agmsg_claude_reviewer_root_guard "$PROJECT" || exit 1
+  fi
+
   # Version gating is deliberately before every per-worker artifact and launch.
   agmsg_claude_check_version
   agmsg_claude_resolve_turn_options "$NAME"
 
-  local idkey base pidfile metafile logfile rolefile settings_file scratch
+  local idkey base pidfile metafile logfile rolefile settings_file
   idkey="$(agmsg_identity_key "$TEAM" "$NAME")"
   base="$run_dir/claude-code-bridge.$TEAM.$NAME"
   pidfile="$base.pid"
@@ -1083,7 +1198,6 @@ agmsg_spawn_headless() {
   logfile="$base.log"
   rolefile="$base.role"
   settings_file="$base.settings.json"
-  scratch="$run_dir/claude-code-$TEAM-$NAME-cwd"
 
   # Claude's generated policy/probe files are per (team,name), so their whole
   # lifecycle must be serialized — not just the final placement-record write.
