@@ -720,42 +720,42 @@ policy_shape() {
   assert_json_path_alias "$implementer" '$.sandbox.filesystem.allowWrite' "$logical_project"
   assert_json_path_alias "$implementer" '$.sandbox.filesystem.allowRead' "$logical_project"
   assert_json_path_alias "$reviewer" '$.sandbox.filesystem.allowRead' "$logical_project"
-  ! json_array_has "$reviewer" '$.sandbox.filesystem.allowWrite' "$logical_project"
-  ! json_array_has "$reviewer" '$.sandbox.filesystem.allowWrite' "$physical_project"
+  refute json_array_has "$reviewer" '$.sandbox.filesystem.allowWrite' "$logical_project"
+  refute json_array_has "$reviewer" '$.sandbox.filesystem.allowWrite' "$physical_project"
   assert_json_path_alias "$reviewer" '$.sandbox.filesystem.allowRead' "$logical_inherited"
-  ! json_array_has "$reviewer" '$.sandbox.filesystem.allowWrite' "$logical_inherited"
-  ! json_array_has "$reviewer" '$.sandbox.filesystem.allowWrite' "$physical_inherited"
+  refute json_array_has "$reviewer" '$.sandbox.filesystem.allowWrite' "$logical_inherited"
+  refute json_array_has "$reviewer" '$.sandbox.filesystem.allowWrite' "$physical_inherited"
 
   json_array_has "$consultant" '$.sandbox.filesystem.denyWrite' "$logical_project"
   json_array_has "$reviewer" '$.sandbox.filesystem.denyWrite' "$logical_project"
   json_array_has "$reviewer" '$.sandbox.filesystem.denyRead' "/"
   json_array_has "$consultant" '$.permissions.allow' "Read(/$consultant_scratch/**)"
-  ! json_array_has "$consultant" '$.permissions.allow' "Read($consultant_scratch/**)"
+  refute json_array_has "$consultant" '$.permissions.allow' "Read($consultant_scratch/**)"
   json_array_has "$consultant" '$.permissions.deny' "Edit(/$logical_project/**)"
-  ! json_array_has "$consultant" '$.permissions.deny' "Edit($logical_project/**)"
+  refute json_array_has "$consultant" '$.permissions.deny' "Edit($logical_project/**)"
   json_array_has "$implementer" '$.permissions.allow' "Read(/$logical_project/**)"
   json_array_has "$implementer" '$.permissions.allow' "Edit(/$logical_project/**)"
   [ "$(json_array_count "$implementer" '$.permissions.allow' \
     "Edit(/$logical_project/**)")" -eq 1 ]
   json_array_has "$reviewer" '$.permissions.allow' "Read(/$logical_project/**)"
-  ! json_array_has "$reviewer" '$.permissions.allow' "Read($logical_project/**)"
+  refute json_array_has "$reviewer" '$.permissions.allow' "Read($logical_project/**)"
   json_array_has "$reviewer" '$.permissions.allow' "Read(/$logical_inherited/**)"
-  ! json_array_has "$reviewer" '$.permissions.allow' "Read($logical_inherited/**)"
+  refute json_array_has "$reviewer" '$.permissions.allow' "Read($logical_inherited/**)"
   json_array_has "$reviewer" '$.permissions.deny' "Edit(/$logical_project/**)"
-  ! json_array_has "$reviewer" '$.permissions.deny' "Edit($logical_project/**)"
+  refute json_array_has "$reviewer" '$.permissions.deny' "Edit($logical_project/**)"
   json_array_has "$reviewer" '$.permissions.deny' "Read(/$HOME/.ssh/**)"
-  ! grep -Fq 'Write(' "$consultant"
-  ! grep -Fq 'Write(' "$implementer"
-  ! grep -Fq 'Write(' "$reviewer"
-  ! grep -Fq 'NotebookEdit(' "$consultant"
-  ! grep -Fq 'NotebookEdit(' "$implementer"
-  ! grep -Fq 'NotebookEdit(' "$reviewer"
-  ! grep -Fq '(///' "$consultant"
-  ! grep -Fq '(///' "$implementer"
-  ! grep -Fq '(///' "$reviewer"
+  refute grep -Fq 'Write(' "$consultant"
+  refute grep -Fq 'Write(' "$implementer"
+  refute grep -Fq 'Write(' "$reviewer"
+  refute grep -Fq 'NotebookEdit(' "$consultant"
+  refute grep -Fq 'NotebookEdit(' "$implementer"
+  refute grep -Fq 'NotebookEdit(' "$reviewer"
+  refute grep -Fq '(///' "$consultant"
+  refute grep -Fq '(///' "$implementer"
+  refute grep -Fq '(///' "$reviewer"
   [ "$(grep -Fxc 'ARG=--disallowedTools' "$CAPTURE/bridge.args.alias-reviewer")" -eq 1 ]
   grep -Fxq 'ARG=Edit,Write,NotebookEdit' "$CAPTURE/bridge.args.alias-reviewer"
-  ! grep -Fq 'ARG=--disallowedTools' "$CAPTURE/probe.args.3"
+  refute grep -Fq 'ARG=--disallowedTools' "$CAPTURE/probe.args.3"
 
   missing_tmp="$BATS_TEST_TMPDIR/missing-process-tmp"
   missing_settings="$BATS_TEST_TMPDIR/missing-settings.json"
@@ -799,9 +799,9 @@ policy_shape() {
   [ "$(json_scalar "$settings" "json_extract(j,'\$.sandbox.allowUnsandboxedCommands')")" = 0 ]
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$scratch"
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$scratch/tmp"
-  ! json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$PROJ"
+  refute json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$PROJ"
   refute json_array_has "$settings" '$.sandbox.filesystem.allowRead' "/dev/fd"
-  ! grep -Fxq 'ARG=--add-dir' "$CAPTURE/bridge.args.consultant"
+  refute grep -Fxq 'ARG=--add-dir' "$CAPTURE/bridge.args.consultant"
 
   pid="$(cat "$base.pid")"
   [ -n "$pid" ]
@@ -848,7 +848,7 @@ policy_shape() {
   local settings="$base.settings.json"
   grep -Fxq 'ARG=--model' "$CAPTURE/bridge.args.impl"
   grep -Fxq 'ARG=cli-model' "$CAPTURE/bridge.args.impl"
-  ! grep -Fxq 'ARG=config-model' "$CAPTURE/bridge.args.impl"
+  refute grep -Fxq 'ARG=config-model' "$CAPTURE/bridge.args.impl"
   grep -Fxq 'ARG=--effort' "$CAPTURE/bridge.args.impl"
   grep -Fxq 'ARG=high' "$CAPTURE/bridge.args.impl"
   grep -Fxq 'ARG=--turn-timeout' "$CAPTURE/bridge.args.impl"
@@ -858,9 +858,9 @@ policy_shape() {
   grep -Fxq 'ARG=--role-file' "$CAPTURE/bridge.args.impl"
   [ "$(cat "$base.role")" = "IMPLEMENTER ROLE" ]
   json_array_has "$settings" '$.permissions.allow' "Edit(/$PROJ/**)"
-  ! json_array_has "$settings" '$.permissions.allow' "Edit($PROJ/**)"
-  ! grep -Fq 'Write(' "$settings"
-  ! grep -Fq 'NotebookEdit(' "$settings"
+  refute json_array_has "$settings" '$.permissions.allow' "Edit($PROJ/**)"
+  refute grep -Fq 'Write(' "$settings"
+  refute grep -Fq 'NotebookEdit(' "$settings"
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$PROJ"
   ! json_array_has "$settings" '$.sandbox.filesystem.allowRead' "/dev/fd"
 }
@@ -902,18 +902,18 @@ policy_shape() {
   [ "$status" -eq 0 ]
   [ "$(grep -Fxc 'ARG=--disallowedTools' "$CAPTURE/bridge.args.review")" -eq 1 ]
   grep -Fxq 'ARG=Edit,Write,NotebookEdit' "$CAPTURE/bridge.args.review"
-  ! grep -Fq 'ARG=--disallowedTools' "$CAPTURE/probe.args.1"
+  refute grep -Fq 'ARG=--disallowedTools' "$CAPTURE/probe.args.1"
   run diff -u "$CAPTURE/probe.env.1" "$CAPTURE/bridge.env.review"
   [ "$status" -eq 0 ]
 
   json_array_has "$settings" '$.permissions.allow' "Read(/$PROJ/**)"
-  ! json_array_has "$settings" '$.permissions.allow' "Read($PROJ/**)"
+  refute json_array_has "$settings" '$.permissions.allow' "Read($PROJ/**)"
   json_array_has "$settings" '$.permissions.deny' "Edit(/$PROJ/**)"
-  ! json_array_has "$settings" '$.permissions.deny' "Edit($PROJ/**)"
-  ! grep -Fq 'Write(' "$settings"
-  ! grep -Fq 'NotebookEdit(' "$settings"
-  ! grep -Fq '(///' "$settings"
-  ! json_array_has "$settings" '$.permissions.deny' "Read"
+  refute json_array_has "$settings" '$.permissions.deny' "Edit($PROJ/**)"
+  refute grep -Fq 'Write(' "$settings"
+  refute grep -Fq 'NotebookEdit(' "$settings"
+  refute grep -Fq '(///' "$settings"
+  refute json_array_has "$settings" '$.permissions.deny' "Read"
   json_array_has "$settings" '$.sandbox.filesystem.denyWrite' "$PROJ"
   json_array_has "$settings" '$.sandbox.filesystem.denyRead' "/"
   json_array_has "$settings" '$.sandbox.filesystem.allowRead' "$PROJ"
@@ -923,8 +923,8 @@ policy_shape() {
   [ "$(json_array_count "$settings" '$.sandbox.filesystem.allowRead' "/dev/fd")" -eq 1 ]
   json_array_has "$settings" '$.permissions.deny' 'Read(//**/*credentials*)'
   json_array_has "$settings" '$.permissions.deny' 'Read(//**/*credentials*/**)'
-  ! json_array_has "$settings" '$.permissions.deny' 'Read(**/*credentials*)'
-  ! json_array_has "$settings" '$.permissions.deny' 'Read(**/*credentials*/**)'
+  refute json_array_has "$settings" '$.permissions.deny' 'Read(**/*credentials*)'
+  refute json_array_has "$settings" '$.permissions.deny' 'Read(**/*credentials*/**)'
   json_array_has "$settings" '$.permissions.deny' \
     "Read(/$TEST_SKILL_DIR/db/claude-worker-home/projects/**)"
   grep -Fq "sensitive-read-target=$TEST_SKILL_DIR/db/claude-worker-home/projects/" \
@@ -932,9 +932,9 @@ policy_shape() {
   sentinel_target="$(sed -n 's/^sensitive-read-target=//p' \
     "$CAPTURE/probe.prompt.1" | head -1)"
   json_array_has "$settings" '$.permissions.deny' "Read(/$sentinel_target)"
-  ! json_array_has "$settings" '$.permissions.deny' "Read($sentinel_target)"
+  refute json_array_has "$settings" '$.permissions.deny' "Read($sentinel_target)"
   [ ! -e "$sentinel_target" ]
-  ! grep -Fq "sensitive-read-target=$TEST_SKILL_DIR/run/claude-code-team-review-cwd/" \
+  refute grep -Fq "sensitive-read-target=$TEST_SKILL_DIR/run/claude-code-team-review-cwd/" \
     "$CAPTURE/probe.prompt.1"
   grep -Fq '"id":"r2read","name":"Read"' "$CAPTURE/probe.events.1"
   grep -Fq 'marker agmsg-probe-' "$CAPTURE/probe.events.1"
@@ -969,8 +969,8 @@ policy_shape() {
   run spawn_claude off-default --reviewer
   [ "$status" -eq 0 ]
   wait_bridge_capture off-default
-  ! grep -Fxq "ARG=$shared" "$CAPTURE/bridge.args.off-default"
-  ! json_array_has "$TEST_SKILL_DIR/run/claude-code-bridge.team.off-default.settings.json" \
+  refute grep -Fxq "ARG=$shared" "$CAPTURE/bridge.args.off-default"
+  refute json_array_has "$TEST_SKILL_DIR/run/claude-code-bridge.team.off-default.settings.json" \
     '$.sandbox.filesystem.allowRead' "$shared"
 
   bash "$SCRIPTS/config.sh" set spawn.claude_inherit_add_dirs true
@@ -985,7 +985,7 @@ policy_shape() {
   run spawn_claude global-off --reviewer
   [ "$status" -eq 0 ]
   wait_bridge_capture global-off
-  ! grep -Fxq "ARG=$shared" "$CAPTURE/bridge.args.global-off"
+  refute grep -Fxq "ARG=$shared" "$CAPTURE/bridge.args.global-off"
 
   bash "$SCRIPTS/config.sh" set spawn.claude_inherit_add_dirs false
   bash "$SCRIPTS/config.sh" set spawn.claude_inherit_add_dirs.per-on true
@@ -1047,9 +1047,9 @@ policy_shape() {
   [[ "$output" == *"ignoring unsafe Claude effort"* ]]
   [[ "$output" == *"ignoring invalid Claude turn timeout"* ]]
   wait_bridge_capture safe
-  ! grep -Fq 'bad;model' "$CAPTURE/bridge.args.safe"
-  ! grep -Fq 'high$(oops)' "$CAPTURE/bridge.args.safe"
-  ! grep -Fxq 'ARG=--turn-timeout' "$CAPTURE/bridge.args.safe"
+  refute grep -Fq 'bad;model' "$CAPTURE/bridge.args.safe"
+  refute grep -Fq 'high$(oops)' "$CAPTURE/bridge.args.safe"
+  refute grep -Fxq 'ARG=--turn-timeout' "$CAPTURE/bridge.args.safe"
 
   run spawn_claude unsafe-cli --model 'x;touch'
   [ "$status" -eq 0 ]
@@ -1267,7 +1267,7 @@ HOSTILE
   run diff -u "$CAPTURE/probe.env.1" "$CAPTURE/bridge.env.hostile-env"
   [ "$status" -eq 0 ]
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$scratch/tmp"
-  ! json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$hostile_tmp"
+  refute json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$hostile_tmp"
   grep -Fq "run_path=$TEST_SKILL_DIR/run/.agmsg-probe-" \
     "$CAPTURE/probe.effects.1"
 
@@ -1568,7 +1568,7 @@ SYMLINKS
   [ ! -e "$CAPTURE/probe-count" ]
   [ ! -e "$CAPTURE/bridge.args.lockfail" ]
   [ ! -e "$CAPTURE/bridge-launches" ]
-  ! spawn_record_for lockfail
+  refute spawn_record_for lockfail
 
   [ "$(cat "$base.settings.json")" = '{"winner":true}' ]
   [ "$(cat "$base.log")" = winner-log ]
@@ -2088,9 +2088,9 @@ STUB
   local rule
   rule="$(permission_rule_for_path Read "$scratch")"
   json_array_has "$settings" '$.permissions.allow' "$rule"
-  ! json_array_has "$settings" '$.permissions.deny' "$rule"
+  refute json_array_has "$settings" '$.permissions.deny' "$rule"
   rule="$(permission_rule_for_path Edit "$scratch")"
-  ! json_array_has "$settings" '$.permissions.deny' "$rule"
+  refute json_array_has "$settings" '$.permissions.deny' "$rule"
   local deny_blob
   deny_blob="$(sqlite_mem "SELECT group_concat(value, char(10)) FROM json_each(readfile('$(rf "$settings")'), '\$.permissions.deny');")"
   [[ "$deny_blob" != *"$scratch"* ]]
