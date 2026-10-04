@@ -59,6 +59,9 @@ enable_claude_headless_fixture() {
 name=claude-code
 spawnable=yes
 headless=yes
+session_env=CLAUDE_CODE_SESSION_ID
+session_team_prefix=s-
+session_seat=claude
 CONF
 }
 
