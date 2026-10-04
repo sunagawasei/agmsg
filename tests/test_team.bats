@@ -726,20 +726,6 @@ EOF
   [ "$status" -eq 0 ]
 }
 
-@test "join: accepts gemini" {
-  run bash "$SCRIPTS/join.sh" myteam alice gemini /tmp/proj
-  [ "$status" -eq 0 ]
-}
-
-@test "join: accepts antigravity" {
-  run bash "$SCRIPTS/join.sh" myteam alice antigravity /tmp/proj
-  [ "$status" -eq 0 ]
-}
-
-@test "join: accepts opencode" {
-  run bash "$SCRIPTS/join.sh" myteam alice opencode /tmp/proj
-  [ "$status" -eq 0 ]
-}
 # --- #140: team-name path traversal ---
 
 @test "join: rejects a team name with path traversal (../)" {
@@ -807,18 +793,6 @@ EOF
   run bash "$SCRIPTS/join.sh" "テストチーム" alice claude-code /tmp/proj
   [ "$status" -eq 0 ]
   [ -f "$TEST_SKILL_DIR/teams/テストチーム/config.json" ]
-}
-
-@test "join: accepts hermes" {
-  run bash "$SCRIPTS/join.sh" myteam alice hermes /tmp/proj
-  [ "$status" -eq 0 ]
-  [ -f "$TEST_SKILL_DIR/teams/myteam/config.json" ]
-}
-
-@test "join: accepts grok-build" {
-  run bash "$SCRIPTS/join.sh" myteam alice grok-build /tmp/proj
-  [ "$status" -eq 0 ]
-  [ -f "$TEST_SKILL_DIR/teams/myteam/config.json" ]
 }
 
 @test "team: a pulled member with no local registration is listed and counted" {

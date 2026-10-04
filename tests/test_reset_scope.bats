@@ -155,20 +155,3 @@ audit_field() {
   [[ "$output" =~ "removed 1 registration" ]]
   [ ! -d "$TEST_SKILL_DIR/teams/team" ]
 }
-
-@test "Windows dispatch reset and drop retain all-team behavior" {
-  bash "$SCRIPTS/join.sh" first alice codex /tmp/project
-  bash "$SCRIPTS/join.sh" second alice codex /tmp/project
-
-  run bash "$SCRIPTS/windows/dispatch.sh" --type codex --project /tmp/project --team first --agent alice -- reset
-  [ "$status" -eq 0 ]
-  [ ! -d "$TEST_SKILL_DIR/teams/first" ]
-  [ ! -d "$TEST_SKILL_DIR/teams/second" ]
-
-  bash "$SCRIPTS/join.sh" first alice codex /tmp/project
-  bash "$SCRIPTS/join.sh" second alice codex /tmp/project
-  run bash "$SCRIPTS/windows/dispatch.sh" --type codex --project /tmp/project --team first -- drop alice
-  [ "$status" -eq 0 ]
-  [ ! -d "$TEST_SKILL_DIR/teams/first" ]
-  [ ! -d "$TEST_SKILL_DIR/teams/second" ]
-}

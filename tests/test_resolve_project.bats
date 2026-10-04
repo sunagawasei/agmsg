@@ -540,8 +540,7 @@ setup_git_repo() {
   rm -rf "$base"
 }
 
-@test "agent-binaries: grok-build maps to grok (#859)" {
-  [ "$(_agmsg_agent_binaries grok-build)" = "grok" ]
+@test "agent-binaries: claude-code maps to its manifest names (#859)" {
   # claude-code's own detect_proc lists both "claude" and "claude-code" as
   # literal (non-glob) tokens, and both now come from the manifest (#626/#631).
   [ "$(_agmsg_agent_binaries claude-code)" = "claude claude-code" ]
@@ -605,5 +604,5 @@ setup_git_repo() {
     echo "second=$_AGMSG_AGENT_BINARIES_OUT"
   ' _ "$SKILL_DIR"
   [ "$status" -eq 0 ]
-  [ "$output" = "$(printf 'first=claude codex gemini\nsecond=claude codex gemini')" ]
+  [ "$output" = "$(printf 'first=claude codex\nsecond=claude codex')" ]
 }

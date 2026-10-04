@@ -283,12 +283,8 @@ plant_lock() {
   [ ! -e "$TEST_SKILL_DIR/run/ensure-codex.s-sess-REL__codex.lock" ]
 }
 
-@test "ensure-headless: rejects invalid and non-headless types" {
+@test "ensure-headless: rejects an invalid type" {
   run bash "$SCRIPTS/ensure-headless.sh" bogus "$PROJ"
   [ "$status" -ne 0 ]
   [[ "$output" == *"unknown agent type"* ]]
-
-  run bash "$SCRIPTS/ensure-headless.sh" gemini "$PROJ"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"not headless-capable"* ]]
 }

@@ -138,16 +138,6 @@ teardown() {
   [[ "$output" =~ "not found on PATH" ]]
 }
 
-@test "spawn: a multi-word cli= (opencode) checks only its first word's existence (#277)" {
-  rm -f "$STUB_BIN/opencode"
-  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
-  run env PATH="$STUB_BIN:/usr/bin:/bin" bash "$SCRIPTS/spawn.sh" opencode foo --project "$PROJ"
-  [ "$status" -ne 0 ]
-  [[ "$output" =~ "'opencode' not found on PATH" ]]
-  # never searches for the literal multi-word string as one executable name
-  [[ "$output" != *"'opencode run --interactive' not found"* ]]
-}
-
 # --- team resolution ---
 
 @test "spawn: errors when no team is registered for the project" {

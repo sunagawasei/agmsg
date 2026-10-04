@@ -29,15 +29,15 @@ write_node_launcher_fixtures() {
   printf '// stub node launcher fixture\n' > "$nd/nodetype-launcher.mjs"
 }
 
-@test "type-registry: known_types lists the ten built-ins" {
+@test "type-registry: known_types lists the three built-ins" {
   run env -i PATH="$PATH" bash -c \
     "source '$SCRIPTS/lib/type-registry.sh'; agmsg_known_types | sort -u | paste -sd, -"
   [ "$status" -eq 0 ]
-  [ "$output" = "agmsg-app,antigravity,claude-code,codex,copilot,cursor,gemini,grok-build,hermes,opencode" ]
+  [ "$output" = "claude-code,codex,cursor" ]
 }
 
 @test "type-registry: is_known_type accepts a built-in and rejects a bogus type" {
-  run env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_is_known_type opencode"
+  run env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_is_known_type cursor"
   [ "$status" -eq 0 ]
   run env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_is_known_type bogus-type"
   [ "$status" -ne 0 ]
@@ -50,7 +50,7 @@ write_node_launcher_fixtures() {
   [ "$output" = ".codex/hooks.json" ]
   run env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_type_get codex cli"
   [ "$output" = "codex" ]
-  run env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_type_get gemini missingkey FALLBACK"
+  run env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_type_get cursor missingkey FALLBACK"
   [ "$output" = "FALLBACK" ]
 }
 
@@ -64,10 +64,7 @@ write_node_launcher_fixtures() {
   [ "$status" -ne 0 ]
 }
 
-@test "type-registry: spawnable set is exactly eight of the ten built-ins (#277, #279)" {
-  # hermes deliberately stays out (#279): no known CLI mode starts it
-  # interactive with a seeded initial prompt. agmsg-app also stays out: it's
-  # the desktop app itself (spawnable=no), not a spawnable agent type.
+@test "type-registry: spawnable set is exactly the three built-ins (#277, #279)" {
   run env -i PATH="$PATH" bash -c \
     "source '$SCRIPTS/lib/type-registry.sh'
      while IFS= read -r t; do
@@ -75,7 +72,7 @@ write_node_launcher_fixtures() {
        [ \"\$(agmsg_type_get \"\$t\" spawnable)\" = yes ] && echo \"\$t\"
      done <<< \"\$(agmsg_known_types | sort -u)\" | paste -sd, -"
   [ "$status" -eq 0 ]
-  [ "$output" = "antigravity,claude-code,codex,copilot,cursor,gemini,grok-build,opencode" ]
+  [ "$output" = "claude-code,codex,cursor" ]
 }
 
 @test "type-registry: cursor manifest declares headless capability" {
@@ -89,10 +86,7 @@ write_node_launcher_fixtures() {
   g() { env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_type_get $1 $2"; }
   [ "$(g claude-code detect)" = "CLAUDE_CODE_SESSION_ID" ]
   [ "$(g codex detect)" = "CODEX_SANDBOX CODEX_THREAD_ID" ]
-  [ "$(g gemini detect)" = "GEMINI_CLI GEMINI_API_KEY" ]
-  [ "$(g antigravity detect)" = "explicit" ]
-  [ "$(g copilot detect)" = "explicit" ]
-  [ "$(g opencode detect_proc)" = "opencode opencode-*" ]
+  [ "$(g cursor detect_proc)" = "cursor-agent cursor-agent-*" ]
 }
 
 @test "type-registry: whoami detects codex end-to-end from CODEX_THREAD_ID" {
@@ -104,9 +98,9 @@ write_node_launcher_fixtures() {
   echo "$output" | grep -q "type=codex"
 }
 
-@test "type-registry: env-detection precedence is claude-code < codex < gemini" {
+@test "type-registry: env-detection precedence is claude-code < codex" {
   # Reproduce whoami's manifest-driven env sweep (sorted order) and assert the
-  # historical precedence: a runtime's own session var beats the GEMINI_* family,
+  # historical precedence: a runtime's own session var wins in sorted order,
   # and detect=explicit types never win.
   sweep() {
     env -i PATH="$PATH" "$@" bash -c "
@@ -120,9 +114,8 @@ write_node_launcher_fixtures() {
       echo claude-code"
   }
   [ "$(sweep CODEX_THREAD_ID=x)" = codex ]
-  [ "$(sweep GEMINI_API_KEY=x)" = gemini ]
   [ "$(sweep CLAUDE_CODE_SESSION_ID=x CODEX_THREAD_ID=y)" = claude-code ]
-  [ "$(sweep CODEX_SANDBOX=x GEMINI_API_KEY=y)" = codex ]
+  [ "$(sweep CODEX_SANDBOX=x)" = codex ]
   [ "$(sweep)" = claude-code ]
 }
 
@@ -139,7 +132,7 @@ write_node_launcher_fixtures() {
 @test "type-registry: type_get returns its default under set -e + pipefail" {
   # A missing key must reach the default branch even when grep exits 1 under
   # pipefail (regression: the assignment used to abort silently).
-  run bash -c "set -euo pipefail; source '$SCRIPTS/lib/type-registry.sh'; agmsg_type_get gemini missingkey DEF; echo REACHED"
+  run bash -c "set -euo pipefail; source '$SCRIPTS/lib/type-registry.sh'; agmsg_type_get cursor missingkey DEF; echo REACHED"
   [ "$status" -eq 0 ]
   echo "$output" | grep -qx "DEF"
   echo "$output" | grep -qx "REACHED"
@@ -178,7 +171,7 @@ write_node_launcher_fixtures() {
   # fallback. The gate is NOT removable: a codex spawned from a Claude session
   # INHERITS that session's CLAUDE_CODE_SESSION_ID, so without the explicit type gate
   # a codex would be mis-resolved as `agent=claude`.
-  local types='claude-code|codex|gemini|antigravity|copilot|opencode|hermes'
+  local types='claude-code|codex|cursor'
   for f in join.sh spawn.sh; do
     run bash -c "sed 's/#.*//' '$SCRIPTS/$f' | grep -nE '$types' || true"
     [ -z "$output" ] || { echo "hardcoded type literal in $f:"; echo "$output"; false; }

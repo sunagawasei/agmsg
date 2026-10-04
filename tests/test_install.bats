@@ -72,94 +72,6 @@ teardown() {
   [[ "$output" =~ "hello from install" ]]
 }
 
-@test "install: Antigravity TUI shim resolves installed launcher and forwards actions first" {
-  skip_unless_linux
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  local shim="$FAKE_HOME/.agents/bin/agy-tui"
-  [ -x "$shim" ]
-  grep -Fq "# agmsg-shim-owner: $SK/scripts/drivers/types/antigravity/agy-tui.sh" "$shim"
-
-  run env HOME="$FAKE_HOME" PATH=/usr/bin:/bin "$shim" status \
-    --project /tmp/not-joined --team demo --name agy
-  [ "$status" -eq 0 ]
-  grep -qF 'runtime: tui-pty not started' <<<"$output"
-
-  run env HOME="$FAKE_HOME" PATH=/usr/bin:/bin "$shim" reset-guard \
-    --project /tmp/not-joined --team demo --name agy
-  [ "$status" -eq 1 ]
-  grep -qF 'no state exists for recovery' <<<"$output"
-
-  run env HOME="$FAKE_HOME" PATH=/usr/bin:/bin "$shim" ack \
-    --project /tmp/not-joined --team demo --name agy --batch batch-1 --confirm-id message-1
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"no reservation or state exists for recovery"* ]]
-}
-
-@test "install: Antigravity TUI shim preserves foreign files and refreshes its owner only" {
-  mkdir -p "$FAKE_HOME/.agents/bin"
-  local shim="$FAKE_HOME/.agents/bin/agy-tui"
-  printf '%s\n' '#!/usr/bin/env bash' 'echo user-owned' > "$shim"
-  local before; before="$(cat "$shim")"
-
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  [ "$(cat "$shim")" = "$before" ]
-
-  rm "$shim"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  # Not `sed -i`: BSD sed (macOS) reads the word after -i as a BACKUP SUFFIX, so
-  # the expression is taken as the filename and the whole call fails with
-  # "invalid command code". `\n` in a replacement is a GNU extension too. awk
-  # does both portably. (#1073)
-  awk '{ if ($0 ~ /exec bash /) print "# stale"; print }' "$shim" > "$shim.portable"
-  cat "$shim.portable" > "$shim"
-  rm -f "$shim.portable"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  refute grep -q '^# stale$' "$shim"
-
-  local owned_before; owned_before="$(cat "$shim")"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-second
-  [ "$(cat "$shim")" = "$owned_before" ]
-}
-
-@test "install: Antigravity TUI shim replaces its symlink without writing through it" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  local shim="$FAKE_HOME/.agents/bin/agy-tui"
-  local linked="$FAKE_HOME/linked-agy-tui"
-  cp "$shim" "$linked"
-  rm "$shim"
-  ln -s "$linked" "$shim"
-
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  [ ! -L "$shim" ]
-  [ -x "$shim" ]
-  cmp "$shim" "$linked"
-}
-
-@test "install: Antigravity TUI launcher resolves one registered identity" {
-  skip_unless_linux
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  local project="$FAKE_HOME/project"
-  local fake_agy="$FAKE_HOME/bin/agy"
-  mkdir -p "$project" "$(dirname "$fake_agy")"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_agy"
-  chmod +x "$fake_agy"
-  bash "$SK/scripts/join.sh" demo agy antigravity "$project"
-
-  run env HOME="$FAKE_HOME" PATH="$FAKE_HOME/bin:$PATH" \
-    "$FAKE_HOME/.agents/bin/agy-tui" status --project "$project"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"runtime: tui-pty not started"* ]]
-}
-
-@test "uninstall: removes only the owned Antigravity TUI shim" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  local shim="$FAKE_HOME/.agents/bin/agy-tui"
-  [ -f "$shim" ]
-
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/uninstall.sh" --yes
-  [ ! -e "$shim" ]
-}
-
 @test "install: Codex skill documents safe Git Bash quoting for Windows PowerShell" {
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
 
@@ -518,7 +430,6 @@ _wait_pidfile_value() {
   # The PowerShell port was removed; only the Bash dispatcher ships.
   [ ! -f "$FAKE_HOME/.agents/skills/msg/scripts/windows/agmsg.ps1" ]
   [ ! -f "$FAKE_HOME/.agents/skills/msg/scripts/windows/install-agmsg.ps1" ]
-  [ -f "$FAKE_HOME/.agents/skills/msg/scripts/windows/dispatch.sh" ]
 }
 
 @test "install --update: removes legacy Windows runner and sqlite shim" {
@@ -553,7 +464,6 @@ PS1
 
   [ ! -f "$SK/scripts/windows/agmsg.ps1" ]
   [ ! -f "$SK/scripts/windows/install-agmsg.ps1" ]
-  [ -f "$SK/scripts/windows/dispatch.sh" ]
   [ ! -f "$SK/scripts/windows/agmsg-run.sh" ]
   [ ! -f "$SK/scripts/windows/sqlite3-shim.sh" ]
 }
@@ -580,7 +490,7 @@ PS1
   [ -f "$SK/db/messages.db" ]
   [ -f "$SK/scripts/whoami.sh" ]
   # The substituted SKILL.md the installer drops should not still carry the
-  # __SKILL_NAME__ placeholder (Codex / Gemini / Antigravity all read it).
+  # __SKILL_NAME__ placeholder (Codex reads it).
   ! grep -q "__SKILL_NAME__" "$SK/SKILL.md"
 }
 
@@ -1293,4 +1203,10 @@ CYG
   [ -f "$SK/VERSION" ]
   run cat "$SK/VERSION"
   [ "$output" = "$expected" ]
+}
+
+@test "install: --agent-type of a removed type fails with an explicit message" {
+  run bash "$REPO_ROOT/install.sh" --cmd msg --agent-type gemini
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Unsupported --agent-type 'gemini'"* ]]
 }

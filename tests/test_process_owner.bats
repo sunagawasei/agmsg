@@ -942,7 +942,6 @@ PY
   assert_process_callsite_pattern scripts/drivers/types/codex/codex-bridge-launcher.sh 'process-owner-launch\.sh' 2
   assert_process_callsite_range scripts/drivers/types/cursor/_spawn.sh 211 223 'process-owner-launch\.sh'
   assert_process_callsite_range scripts/drivers/types/cursor/cursor-bridge.sh 171 180 'agmsg_process_assert_bootstrap cursor-bridge|process-owner-launch\.sh'
-  assert_process_callsite_range scripts/drivers/types/grok-build/_delivery.sh 195 202 'agmsg_process_dedup_should_suppress watch'
   # FD inheritance is a separate tier-1 invariant; retain an explicit check
   # for the Claude/Cursor background callsites in addition to watch.sh's
   # runtime four-callsite test above.

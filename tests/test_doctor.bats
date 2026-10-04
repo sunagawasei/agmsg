@@ -116,36 +116,6 @@ teardown() {
   [[ "$output" == *"path traversal"* ]]
 }
 
-# --- BLOCKING fix: a type with no real delivery (delivery_modes is nothing
-#     but "off" -- agmsg-app is the desktop app's own identity, which owns
-#     its own send/receive UI) must never be queried against delivery.sh, and
-#     must never turn into a warning. Running the pre-fix version against a
-#     healthy real installation returned "9 team(s), 56 registration(s), 5
-#     warning(s)" purely from this -- an exit-code-contract violation caught
-#     by koit running doctor against real data, not by any of these fixtures,
-#     which is exactly why real-data verification was asked for. -----------
-
-@test "doctor: a type with delivery_modes=off only is never queried against delivery.sh and never warns" {
-  bash "$SCRIPTS/join.sh" team carol agmsg-app "$PROJ" >/dev/null
-
-  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type agmsg-app
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"no warnings."* ]]
-  [[ "$output" != *"delivery.sh status exited"* ]]
-}
-
-@test "doctor: an installation with only no-delivery-type registrations is entirely clean (exit 0, 0 warnings)" {
-  local app_proj="$(mktemp -d)"
-  bash "$SCRIPTS/join.sh" team you agmsg-app "$app_proj" >/dev/null
-
-  run bash "$SCRIPTS/doctor.sh" --project "$app_proj"
-  [ "$status" -eq 0 ]
-  [[ "$output" == "1 team(s), 1 registration(s), 0 warning(s)"* ]]
-  [[ "$output" == *"no warnings."* ]]
-
-  rm -rf "$app_proj"
-}
-
 # --- the "watch processes: N alive, M stale pidfiles" line default runtime
 #     status emits scans the WHOLE run/ directory -- an installation-wide
 #     fact, not a (project, type) fact. Printing it inside every group that

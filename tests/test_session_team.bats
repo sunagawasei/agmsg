@@ -170,14 +170,14 @@ wait_for_db_body() {
 }
 
 @test "send: does not block a send to a PROJECT team even with a session id present" {
-  # Regression: a gemini/cursor agent whose env merely inherited
+  # Regression: a cursor agent whose env merely inherited
   # CLAUDE_CODE_SESSION_ID resolves a project team via whoami (session-team
   # resolution is claude-code-only). Its project-team send must NOT be refused —
   # the guard only protects session teams (s-*), not project teams.
   enable_st
-  bash "$SCRIPTS/join.sh" myproject gemini gemini "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" myproject cursoragent cursor "$PROJ" >/dev/null
   bash "$SCRIPTS/join.sh" myproject claude claude-code "$PROJ" >/dev/null
-  run env CLAUDE_CODE_SESSION_ID=sess-MINE bash "$SCRIPTS/send.sh" myproject gemini claude "ok"
+  run env CLAUDE_CODE_SESSION_ID=sess-MINE bash "$SCRIPTS/send.sh" myproject cursoragent claude "ok"
   [ "$status" -eq 0 ]
 }
 
