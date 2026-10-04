@@ -598,6 +598,22 @@ start_bridge() {
   [[ "$output" != *"session-private"* ]]
 }
 
+@test "check-inbox: {} reads project teams; an empty, null, numeric or non-JSON id reads nothing" {
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  mk_cursor_team "$CUR_A"
+  bash "$SCRIPTS/send.sh" "cur-$CUR_A" human cursor-host "session-private" >/dev/null
+  bash "$SCRIPTS/join.sh" plain cursor-host cursor "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" plain human cursor "$PROJ" >/dev/null
+  bash "$SCRIPTS/send.sh" plain human cursor-host "project-visible" >/dev/null
+  for payload in '{"session_id":""}' '{"session_id":null}' '{"session_id":5}' '{"sessionId":""}' 'not json' '[]' '""'; do
+    run bash -c "printf '%s' '$payload' | env -u CLAUDE_CODE_SESSION_ID bash '$SCRIPTS/check-inbox.sh' cursor '$PROJ' 2>/dev/null"
+    [ -z "$output" ]
+  done
+  run bash -c "printf '{}' | env -u CLAUDE_CODE_SESSION_ID bash '$SCRIPTS/check-inbox.sh' cursor '$PROJ' 2>/dev/null"
+  [[ "$output" == *"project-visible"* ]]
+  [[ "$output" != *"session-private"* ]]
+}
+
 # --- every reader of a session's inbox refuses an untrusted session team ---------
 
 @test "inbox-target and whoami: a marker-less cur-<uuid> project team is not this session's inbox or identity" {

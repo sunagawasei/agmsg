@@ -138,32 +138,58 @@ AGENT=""
 TEAM_LIST=()
 IDENTITIES=""
 SESSION_ROUTED=0
-if [ -n "$RAW_SESSION_ID" ] && agmsg_type_has "$TYPE" session_team yes \
-    && agmsg_session_team_enabled; then
+if agmsg_type_has "$TYPE" session_team yes && agmsg_session_team_enabled; then
   # shellcheck disable=SC1091
   source "$SCRIPT_DIR/lib/inbox-target.sh"
   # A payload that names an id must name one SessionStart accepts: an id that
-  # is unusable or whose fields disagree reads no inbox at all. (A payload
-  # with no id at all takes the project-team enumeration below, which never
-  # includes a session team.)
-  RAW_SESSION_ID="$(agmsg_session_payload_id "$INPUT")"
-  [ -n "$RAW_SESSION_ID" ] || exit 0
-  _ci_steam="$(agmsg_session_team_name_from_id "$RAW_SESSION_ID" "$TYPE")"
-  [ -n "$_ci_steam" ] || exit 0
-  _ci_target="$(agmsg_inbox_target "$TYPE" "$PROJECT" "$RAW_SESSION_ID" 2>/dev/null || true)"
-  if [ "${_ci_target#*teams=}" != "$_ci_target" ]; then
-    _ci_teams="${_ci_target#*teams=}"; _ci_teams="${_ci_teams%% *}"
-    if [ "$_ci_teams" = "$_ci_steam" ]; then
-      # The session's own team: it must be a trusted session team (a project
-      # team that merely shares the name, or an unreadable marker, is never
-      # read from here). A role session resolves to its project team instead
-      # and takes the enumeration below.
-      [ "$(agmsg_session_team_class "$_ci_steam")" = session ] || exit 0
-      AGENT="${_ci_target#agent=}"; AGENT="${AGENT%% *}"
-      TEAM_LIST=("$_ci_steam")
-      SESSION_ROUTED=1
-    fi
-  fi
+  # is empty, null, unusable or whose fields disagree, or a payload that is not
+  # a JSON object, reads no inbox at all. A JSON object that names no id takes
+  # the project-team enumeration below, which never includes a session team.
+  case "$(agmsg_session_payload_kind "$INPUT")" in
+    bad) exit 0 ;;
+    id)
+      RAW_SESSION_ID="$(agmsg_session_payload_id "$INPUT")"
+      _ci_steam="$(agmsg_session_team_name_from_id "$RAW_SESSION_ID" "$TYPE")"
+      [ -n "$_ci_steam" ] || exit 0
+      # inbox-target resolves a resumed role session to its project role team,
+      # else the session's own trusted session team, else the project teams.
+      _ci_target="$(agmsg_inbox_target "$TYPE" "$PROJECT" "$RAW_SESSION_ID" 2>/dev/null || true)"
+      case "$_ci_target" in
+        "agent="*" teams="*" type="*)
+          _ci_agent="${_ci_target#agent=}"; _ci_agent="${_ci_agent%% *}"
+          _ci_teams="${_ci_target#*teams=}"; _ci_teams="${_ci_teams%% *}"
+          _ci_ok=1
+          _ci_list=()
+          _ci_old_ifs="$IFS"; IFS=,
+          for _ci_t in $_ci_teams; do
+            [ -n "$_ci_t" ] || { _ci_ok=0; break; }
+            # a team the resolver returned that is a session team must be this
+            # session's own trusted one
+            case "$(agmsg_session_team_class "$_ci_t")" in
+              session) [ "$_ci_t" = "$_ci_steam" ] || _ci_ok=0 ;;
+              unknown) _ci_ok=0 ;;
+            esac
+            # the session's own team name resolving to something that is not a
+            # trusted session team is a name collision: read nothing
+            if [ "$_ci_t" = "$_ci_steam" ] \
+                && [ "$(agmsg_session_team_class "$_ci_t")" != session ]; then
+              exit 0
+            fi
+            _ci_list+=("$_ci_t")
+          done
+          IFS="$_ci_old_ifs"
+          if [ "$_ci_ok" -eq 1 ] && [ "${#_ci_list[@]}" -gt 0 ]; then
+            AGENT="$_ci_agent"
+            TEAM_LIST=("${_ci_list[@]}")
+            SESSION_ROUTED=1
+          elif [ "$_ci_teams" = "$_ci_steam" ]; then
+            # the session's own team name resolved but is not trusted
+            exit 0
+          fi
+          ;;
+      esac
+      ;;
+  esac
 fi
 
 SESSION_HOST_MODE=0
@@ -188,6 +214,9 @@ while IFS=$'\t' read -r identity_team identity_agent identity_extra; do
     case "$(agmsg_session_team_class "$identity_team")" in
       session|unknown) continue ;;
     esac
+    # the session's own team name, when it is not a trusted session team, is a
+    # name collision with a project team: not read either
+    [ -z "${_ci_steam:-}" ] || [ "$identity_team" != "$_ci_steam" ] || continue
   fi
 
   [ -n "$AGENT" ] || AGENT="$identity_agent"

@@ -333,16 +333,19 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   [[ "$output" != *"for-other"* ]]
 }
 
-@test "check-inbox: a role session reaches its project role inbox without a private session team of its own" {
+@test "check-inbox: a resumed role session reads only its role's inbox, without a private session team of its own" {
   enable_st
   bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  # a non-role agent registered first: enumeration would serve it, the role must win
+  bash "$SCRIPTS/join.sh" projteam alice cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" projteam reviewer cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" projteam human cursor "$TEST_PROJECT" >/dev/null
   agmsg_role_session_record projteam reviewer "$SID_R" "$TEST_PROJECT" cursor
-  # check-inbox serves the first registered agent of the project's teams; give
-  # each of the two something so the assertion does not depend on which it is.
   bash "$SCRIPTS/send.sh" projteam human reviewer "for-the-role" >/dev/null
-  bash "$SCRIPTS/send.sh" projteam reviewer human "for-the-role" >/dev/null
+  bash "$SCRIPTS/send.sh" projteam human alice "for-alice" >/dev/null
   run bash -c "echo '{\"session_id\":\"$SID_R\"}' | bash '$SCRIPTS/check-inbox.sh' cursor '$TEST_PROJECT' 2>/dev/null"
   [[ "$output" == *"for-the-role"* ]]
+  [[ "$output" != *"for-alice"* ]]
+  run bash "$SCRIPTS/inbox.sh" projteam alice --format ids
+  [[ "$output" == *"for-alice"* ]]
 }

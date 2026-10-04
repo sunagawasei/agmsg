@@ -172,6 +172,28 @@ agmsg_session_payload_id() {
   printf '%s' "$sid"
 }
 
+# Classify a hook payload (JSON on $1) for a session-team host:
+#   id    a usable session id (agmsg_session_payload_id would echo it)
+#   none  a JSON object that names no id at all ({} and the like)
+#   bad   anything else: invalid JSON, a non-object, an id field that is empty,
+#         null, not a string, unusable, or disagreeing with another id field
+# Callers read no inbox for "bad" and fall back to project teams for "none".
+agmsg_session_payload_kind() {
+  local input="${1:-}" lit named
+  [ -n "$(agmsg_session_payload_id "$input")" ] && { printf 'id'; return 0; }
+  lit="$(printf '%s' "$input" | sed "s/'/''/g")" || { printf 'bad'; return 0; }
+  named="$(printf '%s\n' "
+    WITH raw(j) AS (SELECT '$lit')
+    SELECT CASE
+      WHEN NOT json_valid(j) OR json_type(j) != 'object' THEN 'bad'
+      WHEN json_type(j, '\$.session_id') IS NULL
+       AND json_type(j, '\$.sessionId') IS NULL
+       AND json_type(j, '\$.conversation_id') IS NULL THEN 'none'
+      ELSE 'bad' END FROM raw;" \
+    | sqlite3 -init /dev/null -noheader -list :memory: 2>/dev/null)" || named=bad
+  [ "$named" = none ] && printf 'none' || printf 'bad'
+}
+
 # Echo <host>'s team name for a bare session id, or nothing.
 agmsg_session_team_for() {
   local host="$1" bare="$2" prefix
