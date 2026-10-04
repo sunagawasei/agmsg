@@ -546,3 +546,228 @@ configured_off() {
   [[ "$output" != *"agmsg/advisor"* ]]
   [[ "$output" != *"$HOME"* ]]
 }
+
+# #1507: per-seat run/ records outlive their team and keep claiming its pane.
+# One walk through the whole behavior, with the keep-set in the SAME run: the
+# report never deletes, the prompt defaults to no, and --yes removes exactly the
+# records whose team is provably gone -- not a live team's, not an ambiguous
+# "__" one, not an id-keyed one.
+@test "doctor: reports run/ records of a team that no longer exists, and removes only those on request (#1507)" {
+  local run_dir="$TEST_SKILL_DIR/run" gone='%2Ftmp%2Fsome%2Fproj'   # a project path used as the team name
+  local id_team='11111111-1111-1111-1111-111111111111' id_member='22222222-2222-2222-2222-222222222222'
+  mkdir -p "$run_dir"
+  # A live seat's records: must survive everything below.
+  printf 'herdr:live:w1:p1\t/proj\tclaude-code\n' > "$run_dir/spawn.team__alice"
+  printf 'name=team-alice\nteam=team\nagent=alice\n' > "$run_dir/role-session.team__alice"
+  # The orphan: all four record families, the pane claimed by spawn.
+  printf 'herdr:gone:w1:p9\t/proj\tclaude-code\n' > "$run_dir/spawn.${gone}__worker"
+  printf 'name=x\nteam=/tmp/some/proj\nagent=worker\nsession=s1\n' > "$run_dir/role-session.${gone}__worker"
+  printf 'owner\n' > "$run_dir/actas.${gone}__worker.session"
+  : > "$run_dir/ready.${gone}__worker"
+  # Cannot be attributed to one seat ("x___y" cuts as x_/y and as x/_y), and an id-keyed record.
+  printf 'herdr:amb:w1:p2\n' > "$run_dir/spawn.x___y"
+  printf 'herdr:id:w1:p3\n' > "$run_dir/spawn.${id_team}__${id_member}"
+  # A dot-joined codex bridge key collides across teams: gone team "live" /
+  # agent "part" and live team "live.part" / agent "worker" both spell
+  # codex-bridge.live.part.worker.* -- the gone team's records are removed, the
+  # live team's bridge file (never listed) must stay.
+  bash "$SCRIPTS/join.sh" live.part worker claude-code "$PROJ" >/dev/null
+  printf 'herdr:dot:w1:p5\t/proj\tclaude-code\n' > "$run_dir/spawn.live__part"
+  printf '4242\n' > "$run_dir/codex-bridge.live.part.worker.pid"
+
+  run bash "$SCRIPTS/doctor.sh"
+  [ "$status" -eq 1 ]
+  # grep and [ ], not [[ ]]: a [[ ]] that is not the last line of a test cannot
+  # fail it on the macOS bash 3.2 CI runs (#670).
+  grep -qF 'orphaned run/ records' <<<"$output"
+  grep -qF 'team: /tmp/some/proj  agent: worker  pane: herdr:gone:w1:p9' <<<"$output"
+  grep -qF 'team: live  agent: part  pane: herdr:dot:w1:p5' <<<"$output"
+  grep -qF 'not attributable to one seat' <<<"$output"
+  [ -z "$(grep -F 'agent: alice' <<<"$output")" ]
+  [ -z "$(grep -F 'herdr:id:w1:p3' <<<"$output")" ]
+  [ -f "$run_dir/spawn.${gone}__worker" ]            # reporting deletes nothing
+
+  run bash -c 'echo n | bash "$1" --fix' _ "$SCRIPTS/doctor.sh"
+  [ "$status" -eq 1 ]
+  [ -f "$run_dir/spawn.${gone}__worker" ]            # the prompt defaults to no
+
+  run bash "$SCRIPTS/doctor.sh" --fix --yes
+  [ "$status" -eq 0 ]
+  [ ! -e "$run_dir/spawn.${gone}__worker" ]
+  [ ! -e "$run_dir/role-session.${gone}__worker" ]
+  [ ! -e "$run_dir/actas.${gone}__worker.session" ]
+  [ ! -e "$run_dir/ready.${gone}__worker" ]
+  [ ! -e "$run_dir/spawn.live__part" ]
+  [ -f "$run_dir/codex-bridge.live.part.worker.pid" ]   # not listed, so not removed
+  [ -f "$run_dir/spawn.team__alice" ]
+  [ -f "$run_dir/role-session.team__alice" ]
+  [ -f "$run_dir/spawn.x___y" ]
+  [ -f "$run_dir/spawn.${id_team}__${id_member}" ]
+}
+
+# --- fork: --fix must not touch what a live or unverifiable worker still owns --
+
+# All four per-seat record families for <gone team>__<agent>, spawn holding $2.
+_orphan_seat() {   # <agent> <spawn first field>
+  local run_dir="$TEST_SKILL_DIR/run" gone="${GONE:-%2Ftmp%2Fgone}"
+  mkdir -p "$run_dir"
+  printf '%s\t/proj\tclaude-code\n' "$2" > "$run_dir/spawn.${gone}__$1"
+  printf 'name=x\nteam=/tmp/gone\nagent=%s\n' "$1" > "$run_dir/role-session.${gone}__$1"
+  printf 'owner\n' > "$run_dir/actas.${gone}__$1.session"
+  : > "$run_dir/ready.${gone}__$1"
+}
+_seat_files() {   # <agent> -> how many of the 4 records exist
+  local run_dir="$TEST_SKILL_DIR/run" gone="${GONE:-%2Ftmp%2Fgone}" n=0 f
+  for f in "spawn.${gone}__$1" "role-session.${gone}__$1" "actas.${gone}__$1.session" "ready.${gone}__$1"; do
+    if [ -e "$run_dir/$f" ]; then n=$((n + 1)); fi
+  done
+  echo "$n"
+}
+
+@test "doctor --fix: a gone team's seat whose headless worker (pid:) is alive is reported, kept; removed once the worker is dead" {
+  # MSYSTEM + a tasklist that sees nothing: the plain pid helper would read the
+  # live worker as dead there, the _local helper must not.
+  local stub="$BATS_TEST_TMPDIR/stub-bin"
+  mkdir -p "$stub"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$stub/tasklist"
+  chmod +x "$stub/tasklist"
+  test_fixture_start_reaped_process sleep 300
+  local wpid="$TEST_REAPED_PID"
+  _orphan_seat w "pid:$wpid"
+
+  run env MSYSTEM=MINGW64 PATH="$stub:$PATH" bash "$SCRIPTS/doctor.sh"
+  grep -qF 'worker process is still running' <<<"$output"
+  [ -z "$(grep -F 'agent: w ' <<<"$output")" ]       # not listed as an orphan to remove
+
+  run env MSYSTEM=MINGW64 PATH="$stub:$PATH" bash "$SCRIPTS/doctor.sh" --fix --yes
+  [ "$status" -eq 0 ]
+  [ "$(_seat_files w)" -eq 4 ]
+
+  kill "$wpid"; sleep 0.3
+  run bash "$SCRIPTS/doctor.sh" --fix --yes
+  [ "$status" -eq 0 ]
+  [ "$(_seat_files w)" -eq 0 ]
+}
+
+@test "doctor --fix: an empty, malformed, zero or oversized pid: placement is never removed" {
+  _orphan_seat badstr "pid:abc"
+  _orphan_seat zero "pid:0"
+  _orphan_seat huge "pid:99999999999"
+  _orphan_seat empty ""
+  : > "$TEST_SKILL_DIR/run/spawn.%2Ftmp%2Fgone__empty"
+
+  run bash "$SCRIPTS/doctor.sh" --fix --yes
+  [ "$status" -eq 0 ]
+  [ "$(_seat_files badstr)" -eq 4 ]
+  [ "$(_seat_files zero)" -eq 4 ]
+  [ "$(_seat_files huge)" -eq 4 ]
+  [ "$(_seat_files empty)" -eq 4 ]
+}
+
+@test "doctor --fix: a spawn record that cannot be read as a file keeps its seat; --redacted hides the pinned names" {
+  _orphan_seat d "herdr:gone:w1:p1"
+  rm "$TEST_SKILL_DIR/run/spawn.%2Ftmp%2Fgone__d"
+  mkdir "$TEST_SKILL_DIR/run/spawn.%2Ftmp%2Fgone__d"   # not a regular file
+  run bash "$SCRIPTS/doctor.sh" --redacted
+  grep -qF 'still running or whose pid cannot be verified' <<<"$output"
+  [ -z "$(grep -F 'gone' <<<"$output")" ]
+  run bash "$SCRIPTS/doctor.sh" --fix --yes
+  [ "$status" -eq 0 ]
+  [ -d "$TEST_SKILL_DIR/run/spawn.%2Ftmp%2Fgone__d" ]
+  [ -e "$TEST_SKILL_DIR/run/role-session.%2Ftmp%2Fgone__d" ]
+  [ -e "$TEST_SKILL_DIR/run/ready.%2Ftmp%2Fgone__d" ]
+}
+
+@test "doctor --fix: a live team whose name starts with a dot keeps its legacy records" {
+  local run_dir="$TEST_SKILL_DIR/run" t
+  for t in .dot ..dots; do
+    bash "$SCRIPTS/join.sh" "$t" bob claude-code "$PROJ" >/dev/null
+    printf 'herdr:live:w1:p1\t/proj\tclaude-code\n' > "$run_dir/spawn.${t}__bob"
+    : > "$run_dir/ready.${t}__bob"
+  done
+  run bash "$SCRIPTS/doctor.sh" --fix --yes
+  [ "$status" -eq 0 ]
+  [ -e "$run_dir/spawn..dot__bob" ] && [ -e "$run_dir/ready..dot__bob" ]
+  [ -e "$run_dir/spawn...dots__bob" ] && [ -e "$run_dir/ready...dots__bob" ]
+}
+
+@test "doctor --fix: a placement that turns into a live worker while the prompt waits is kept" {
+  sleep 0 & local dead=$!; wait "$dead" || true
+  _orphan_seat s "pid:$dead"
+  mkfifo "$BATS_TEST_TMPDIR/in"
+  bash "$SCRIPTS/doctor.sh" --fix < "$BATS_TEST_TMPDIR/in" > "$BATS_TEST_TMPDIR/out" 2>&1 &
+  local dpid=$!
+  exec 8> "$BATS_TEST_TMPDIR/in"
+  local i=0
+  while ! grep -q 'Remove the records' "$BATS_TEST_TMPDIR/out" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  test_fixture_start_reaped_process sleep 300
+  local wpid="$TEST_REAPED_PID"
+  printf 'pid:%s\t/proj\tclaude-code\n' "$wpid" > "$TEST_SKILL_DIR/run/spawn.%2Ftmp%2Fgone__s"
+  echo y >&8; exec 8>&-
+  wait "$dpid" || true
+  [ "$(_seat_files s)" -eq 4 ]
+  grep -qF 'left 1 seat(s) alone' "$BATS_TEST_TMPDIR/out"
+}
+
+@test "doctor --fix: a team created while the prompt waits keeps its records" {
+  export GONE=late
+  _orphan_seat t "herdr:gone:w1:p9"
+  mkfifo "$BATS_TEST_TMPDIR/in"
+  bash "$SCRIPTS/doctor.sh" --fix < "$BATS_TEST_TMPDIR/in" > "$BATS_TEST_TMPDIR/out" 2>&1 &
+  local dpid=$!
+  exec 8> "$BATS_TEST_TMPDIR/in"
+  local i=0
+  while ! grep -q 'Remove the records' "$BATS_TEST_TMPDIR/out" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  bash "$SCRIPTS/join.sh" late t claude-code "$PROJ" >/dev/null
+  echo y >&8; exec 8>&-
+  wait "$dpid" || true
+  [ "$(_seat_files t)" -eq 4 ]
+  grep -qF 'their team exists now' "$BATS_TEST_TMPDIR/out"
+}
+
+@test "doctor --fix: a failed removal is reported and exits 1; the other seats still go" {
+  _orphan_seat a "herdr:gone:w1:p1"
+  _orphan_seat b "herdr:gone:w1:p2"
+  _orphan_seat c "herdr:gone:w1:p3"
+  local shim="$BATS_TEST_TMPDIR/shim"
+  mkdir -p "$shim"
+  printf '%s\n' '#!/bin/sh' 'for a in "$@"; do case "$a" in *ready.*__b) exit 1 ;; esac; done' 'exec /bin/rm "$@"' > "$shim/rm"
+  chmod +x "$shim/rm"
+
+  run env PATH="$shim:$PATH" bash "$SCRIPTS/doctor.sh" --fix --yes
+  [ "$status" -eq 1 ]
+  [ "$(_seat_files a)" -eq 0 ]
+  [ "$(_seat_files c)" -eq 0 ]
+  [ "$(_seat_files b)" -eq 1 ]                       # only the one that failed is left
+  grep -qF 'removed the run/ records of 2 seat(s)' <<<"$output"
+  grep -qF 'failed to remove records of 1 seat(s)' <<<"$output"
+  grep -qF 'ready.%2Ftmp%2Fgone__b' <<<"$output"
+}
+
+@test "doctor --fix: run/ artifacts that are not per-seat records survive, even named after a gone team" {
+  local run_dir="$TEST_SKILL_DIR/run" gone='%2Ftmp%2Fgone'
+  _orphan_seat x "herdr:gone:w1:p1"
+  mkdir -p "$run_dir/claude-probe-ok"
+  local keep=("claude-code-bridge.${gone}.x.session" "cursor-bridge.${gone}.x.pid" "watch.${gone}.pid"
+    "watchdog.${gone}.tombstone" "pending-teardown.${gone}" "codex-bridge.${gone}.x.pid"
+    "inflight-record.${gone}__x" ".session-end-snapshot.ABC123" "claude-probe-ok/${gone}__x"
+    "spawn.${gone}" "role-session.${gone}" "ready.nounderscores")
+  local f
+  for f in "${keep[@]}"; do printf 'k\n' > "$run_dir/$f"; done
+
+  run bash "$SCRIPTS/doctor.sh" --fix --yes
+  [ "$status" -eq 0 ]
+  [ "$(_seat_files x)" -eq 0 ]
+  for f in "${keep[@]}"; do
+    [ -e "$run_dir/$f" ] || { echo "removed: $f" >&2; return 1; }
+  done
+}
+
+@test "doctor --fix: refuses scope flags, and --yes without --fix" {
+  run bash "$SCRIPTS/doctor.sh" --fix --team team
+  [ "$status" -eq 2 ]
+  run bash "$SCRIPTS/doctor.sh" --fix --redacted
+  [ "$status" -eq 2 ]
+  run bash "$SCRIPTS/doctor.sh" --yes
+  [ "$status" -eq 2 ]
+}
