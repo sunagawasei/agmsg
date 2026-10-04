@@ -2360,3 +2360,312 @@ STUB
   [ "$(claude_probe_count)" -eq 1 ]
   [[ "$output" != *"reusing cached Claude"* ]]
 }
+
+# --- reviewer guard: writable roots vs project (#51) --------------------------
+# Claude's sandbox lets denyWrite(project) win over allowWrite, so a reviewer
+# whose project contains a writable root (run/teams/db/...) could never write
+# its own state. The guard refuses exactly that case, before any CLI/lock/artifact.
+
+reviewer_guard_snapshot() {
+  { find "$TEST_SKILL_DIR/run" "$TEST_SKILL_DIR/teams" "$TEST_SKILL_DIR/db" 2>/dev/null | sort
+    find "$TEST_SKILL_DIR/run" "$TEST_SKILL_DIR/teams" "$TEST_SKILL_DIR/db" -type f \
+      -exec cksum {} + 2>/dev/null | sort
+    find "$TEST_SKILL_DIR/run" "$TEST_SKILL_DIR/teams" "$TEST_SKILL_DIR/db" -type l \
+      -exec sh -c 'for l; do printf "%s -> %s\n" "$l" "$(readlink "$l")"; done' sh {} + 2>/dev/null | sort
+  } > "$1"
+}
+
+assert_reviewer_refused_untouched() {
+  local project="$1" name="$2"
+  shift 2
+  reviewer_guard_snapshot "$TEST_SKILL_DIR/guard.before"
+  local invocations_before
+  invocations_before="$(cat "$CAPTURE/claude-invocations" 2>/dev/null || true)"
+  run spawn_claude_at team "$name" "$project" --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"reviewer sandbox"* ]]
+  [[ "$output" == *"AGMSG_STORAGE_PATH"* ]]
+  [[ "$output" == *"ln -s"* ]]
+  [ "$(cat "$CAPTURE/claude-invocations" 2>/dev/null || true)" = "$invocations_before" ]
+  [ ! -e "$CAPTURE/bridge.args.$name" ]
+  reviewer_guard_snapshot "$TEST_SKILL_DIR/guard.after"
+  cmp "$TEST_SKILL_DIR/guard.before" "$TEST_SKILL_DIR/guard.after"
+}
+
+@test "reviewer guard: project == install dir with in-tree run/teams/db is refused" {
+  assert_reviewer_refused_untouched "$TEST_SKILL_DIR" guard-self
+}
+
+@test "reviewer guard: project == a writable root is refused" {
+  assert_reviewer_refused_untouched "$TEST_SKILL_DIR/run" guard-run
+}
+
+@test "reviewer guard: project reached through a symlink alias is refused" {
+  ln -s "$TEST_SKILL_DIR" "$BATS_TEST_TMPDIR/alias"
+  assert_reviewer_refused_untouched "$BATS_TEST_TMPDIR/alias" guard-alias
+}
+
+@test "reviewer guard: a writable root that is a symlink into the project is refused" {
+  local other="$BATS_TEST_TMPDIR/other"
+  mkdir -p "$other/run" "$other/p"
+  rm -rf "$TEST_SKILL_DIR/run"
+  ln -s "$other/run" "$TEST_SKILL_DIR/run"
+  assert_reviewer_refused_untouched "$other" guard-rootlink
+}
+
+@test "reviewer guard: AGMSG_STORAGE_PATH with a missing component and .. that lands in the project is refused" {
+  local x="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$x/out" "$x/repo"
+  export AGMSG_STORAGE_PATH="$x/out/missing/../../repo/db"
+  assert_reviewer_refused_untouched "$x/repo" guard-dotdot
+}
+
+@test "reviewer guard: .. after a symlinked component is resolved physically" {
+  local x="$BATS_TEST_TMPDIR/x" y="$BATS_TEST_TMPDIR/y"
+  mkdir -p "$x/repo" "$y/out" "$y/repo"
+  ln -s "$y/out" "$x/out"
+  # kernel resolves x/out/.. to y, so this storage root is y/repo/db
+  export AGMSG_STORAGE_PATH="$x/out/../repo/db"
+  assert_reviewer_refused_untouched "$y/repo" guard-dotdot-link
+}
+
+@test "reviewer guard: .. after a symlinked component that leaves the project is accepted" {
+  export AGMSG_CLAUDE_PROBE_TIMEOUT=30
+  local x="$BATS_TEST_TMPDIR/x" y="$BATS_TEST_TMPDIR/y"
+  mkdir -p "$x/repo" "$y/out" "$y/repo"
+  ln -s "$y/out" "$x/out"
+  export AGMSG_STORAGE_PATH="$x/out/../repo/db"
+  run spawn_claude_at team guard-dotdot-ok "$x/repo" --reviewer
+  [ "$status" -eq 0 ]
+}
+
+@test "reviewer guard: root that is an ancestor of the project is accepted" {
+  export AGMSG_CLAUDE_PROBE_TIMEOUT=30
+  mkdir -p "$TEST_SKILL_DIR/run/sub"
+  run spawn_claude_at team guard-below-root "$TEST_SKILL_DIR/run/sub" --reviewer
+  [ "$status" -eq 0 ]
+}
+
+@test "reviewer guard: project inside the install dir but disjoint from every root is accepted" {
+  export AGMSG_CLAUDE_PROBE_TIMEOUT=30
+  run spawn_claude_at team guard-scripts "$TEST_SKILL_DIR/scripts" --reviewer
+  [ "$status" -eq 0 ]
+}
+
+@test "reviewer guard: root boundary is per path component" {
+  export AGMSG_CLAUDE_PROBE_TIMEOUT=30
+  local x="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$x/repo" "$x/repo2"
+  export AGMSG_STORAGE_PATH="$x/repo2/db"
+  run spawn_claude_at team guard-sibling "$x/repo" --reviewer
+  [ "$status" -eq 0 ]
+  export AGMSG_STORAGE_PATH="$x/repo/db"
+  assert_reviewer_refused_untouched "$x/repo" guard-child
+}
+
+@test "reviewer guard: AGMSG_STORAGE_PATH whose .. leaves the project is accepted" {
+  export AGMSG_CLAUDE_PROBE_TIMEOUT=30
+  local x="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$x/repo/sub"
+  export AGMSG_STORAGE_PATH="$x/repo/sub/../../out/db"
+  run spawn_claude_at team guard-leaves "$x/repo" --reviewer
+  [ "$status" -eq 0 ]
+}
+
+@test "reviewer guard: separated run/teams/db let project == install dir spawn with denyWrite(project) intact" {
+  export AGMSG_CLAUDE_PROBE_TIMEOUT=30
+  local state="$BATS_TEST_TMPDIR/state" d
+  mkdir -p "$state"
+  for d in run teams db; do
+    mv "$TEST_SKILL_DIR/$d" "$state/$d"
+    ln -s "$state/$d" "$TEST_SKILL_DIR/$d"
+  done
+  run spawn_claude_at team guard-separated "$TEST_SKILL_DIR" --reviewer
+  [ "$status" -eq 0 ]
+  wait_bridge_capture guard-separated
+  local settings="$state/run/claude-code-bridge.team.guard-separated.settings.json"
+  local phys_state
+  phys_state="$(cd "$state" && pwd -P)"
+  json_array_has "$settings" '$.sandbox.filesystem.denyWrite' "$TEST_SKILL_DIR"
+  json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$phys_state/run"
+}
+
+@test "reviewer guard: implementer and consultant layouts do not apply the guard" {
+  export AGMSG_CLAUDE_PROBE_TIMEOUT=30
+  run spawn_claude_at team guard-impl "$TEST_SKILL_DIR" --implementer
+  [ "$status" -eq 0 ]
+  run spawn_claude_at team guard-consult "$TEST_SKILL_DIR"
+  [ "$status" -eq 0 ]
+}
+
+@test "reviewer guard: project == / is refused" {
+  assert_reviewer_refused_untouched / guard-slash
+}
+
+@test "reviewer guard: a symlink cycle in a writable root fails closed" {
+  local x="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$x/repo"
+  ln -s "$x/b" "$x/a"
+  ln -s "$x/a" "$x/b"
+  export AGMSG_STORAGE_PATH="$x/a/db"
+  reviewer_guard_snapshot "$TEST_SKILL_DIR/guard.before"
+  run spawn_claude_at team guard-cycle "$x/repo" --reviewer
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot resolve writable root"* ]]
+  [ ! -e "$CAPTURE/claude-invocations" ]
+}
+
+@test "reviewer guard: letter case of the project path does not hide an in-tree root" {
+  local x="$BATS_TEST_TMPDIR/Case" alt="$BATS_TEST_TMPDIR/case"
+  mkdir -p "$x/repo"
+  [ -d "$alt" ] || skip "case-sensitive filesystem"
+  export AGMSG_STORAGE_PATH="$x/repo/db"
+  assert_reviewer_refused_untouched "$alt/repo" guard-case
+}
+
+@test "reviewer guard: a newline inside AGMSG_STORAGE_PATH keeps one root" {
+  local x="$BATS_TEST_TMPDIR/x" nl=$'\n'
+  mkdir -p "$x/repo"
+  export AGMSG_STORAGE_PATH="$x/repo/a${nl}b"
+  assert_reviewer_refused_untouched "$x/repo" guard-newline
+}
+
+@test "reviewer guard: a newline in an outside AGMSG_STORAGE_PATH is accepted as one root" {
+  export AGMSG_CLAUDE_PROBE_TIMEOUT=30
+  local x="$BATS_TEST_TMPDIR/x" nl=$'\n'
+  mkdir -p "$x/repo"
+  export AGMSG_STORAGE_PATH="$x/out${nl}side/db"
+  run spawn_claude_at team guard-newline-ok "$x/repo" --reviewer
+  [ "$status" -eq 0 ]
+  local settings="$TEST_SKILL_DIR/run/claude-code-bridge.team.guard-newline-ok.settings.json"
+  json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$AGMSG_STORAGE_PATH"
+  ! json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "side/db"
+}
+
+# spawn.sh cannot take a project whose name ends in a newline (command
+# substitution strips it), so the trailing-newline link target is exercised via a
+# sibling directory: resolved correctly it is outside the project, stripped it
+# would land inside.
+@test "reviewer guard: a symlink target ending in a newline is not confused with its newline-less sibling" {
+  export AGMSG_CLAUDE_PROBE_TIMEOUT=30
+  local x="$BATS_TEST_TMPDIR/x" nl=$'\n'
+  mkdir -p "$x/out" "$x/out${nl}"
+  ln -s "$x/out${nl}" "$x/link"
+  export AGMSG_STORAGE_PATH="$x/link/db"
+  run spawn_claude_at team guard-trailing-nl-ok "$x/out" --reviewer
+  [ "$status" -eq 0 ]
+}
+
+# The refusal prints a migration snippet; run exactly what it prints.
+guard_migration_snippet() {
+  local state="$1"
+  assert_reviewer_refused_untouched "$TEST_SKILL_DIR" guard-snippet
+  printf '%s\n' "$output" | sed -n '/^    ( set -eu/,/^      done )$/p' \
+    | sed "s#STATE=/absolute/dir/outside/the/project#STATE=$state#"
+}
+
+@test "reviewer guard: the printed migration snippet moves state, links it back and is re-runnable" {
+  local state="$BATS_TEST_TMPDIR/state" snippet
+  snippet="$(guard_migration_snippet "$state")"
+  [ -n "$snippet" ]
+  mkdir -p "$state"
+  run bash -c "$snippet"
+  [ "$status" -eq 0 ]
+  [ "$(readlink "$TEST_SKILL_DIR/run")" = "$state/run" ]
+  [ "$(readlink "$TEST_SKILL_DIR/db")" = "$state/db" ]
+  [ -d "$state/teams" ]
+  run bash -c "$snippet"
+  [ "$status" -eq 0 ]
+  # the migrated install is accepted for project == install dir
+  export AGMSG_CLAUDE_PROBE_TIMEOUT=30
+  run spawn_claude_at team guard-after-snippet "$TEST_SKILL_DIR" --reviewer
+  [ "$status" -eq 0 ]
+}
+
+@test "reviewer guard: the printed migration snippet rejects a relative STATE without changing anything" {
+  local snippet
+  snippet="$(guard_migration_snippet "relative/state")"
+  mkdir -p "$BATS_TEST_TMPDIR/relative/state"
+  reviewer_guard_snapshot "$TEST_SKILL_DIR/snip.before"
+  run bash -c "$snippet"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"STATE must be absolute"* ]]
+  reviewer_guard_snapshot "$TEST_SKILL_DIR/snip.after"
+  cmp "$TEST_SKILL_DIR/snip.before" "$TEST_SKILL_DIR/snip.after"
+}
+
+@test "reviewer guard: the printed migration snippet resumes after mv succeeded but ln -s did not" {
+  local state="$BATS_TEST_TMPDIR/state" snippet
+  snippet="$(guard_migration_snippet "$state")"
+  mkdir -p "$state"
+  mv "$TEST_SKILL_DIR/run" "$state/run"
+  run bash -c "$snippet"
+  [ "$status" -eq 0 ]
+  [ "$(readlink "$TEST_SKILL_DIR/run")" = "$state/run" ]
+  [ -d "$state/run" ]
+}
+
+@test "reviewer guard: the printed migration snippet rejects a dangling symlink" {
+  local state="$BATS_TEST_TMPDIR/state" snippet
+  snippet="$(guard_migration_snippet "$state")"
+  mkdir -p "$state"
+  rm -rf "$TEST_SKILL_DIR/run"
+  ln -s "$state/run" "$TEST_SKILL_DIR/run"
+  run bash -c "$snippet"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected symlink"* ]]
+}
+
+@test "reviewer guard: the printed migration snippet rejects a symlink to some other existing directory" {
+  local state="$BATS_TEST_TMPDIR/state" other="$BATS_TEST_TMPDIR/other" snippet
+  snippet="$(guard_migration_snippet "$state")"
+  mkdir -p "$other" "$state/run"
+  rm -rf "$TEST_SKILL_DIR/run"
+  ln -s "$other" "$TEST_SKILL_DIR/run"
+  run bash -c "$snippet"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected symlink"* ]]
+}
+
+# A STATE that lands inside the project (or inside a source tree) must be refused
+# before anything is created or moved.
+assert_snippet_refuses_state() {
+  local state="$1" expect="${2:-STATE must be outside}" snippet
+  snippet="$(guard_migration_snippet "$state")"
+  mkdir -p "$state" 2>/dev/null || true
+  reviewer_guard_snapshot "$TEST_SKILL_DIR/snip.before"
+  run bash -c "$snippet"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"$expect"* ]]
+  reviewer_guard_snapshot "$TEST_SKILL_DIR/snip.after"
+  cmp "$TEST_SKILL_DIR/snip.before" "$TEST_SKILL_DIR/snip.after"
+  [ -z "$(ls -A "$state" 2>/dev/null)" ]
+}
+
+@test "reviewer guard: the printed migration snippet rejects a STATE inside the project" {
+  assert_snippet_refuses_state "$TEST_SKILL_DIR/state"
+}
+
+@test "reviewer guard: the printed migration snippet rejects a STATE inside a source tree" {
+  assert_snippet_refuses_state "$TEST_SKILL_DIR/run/state"
+  assert_snippet_refuses_state "$TEST_SKILL_DIR/teams/state"
+}
+
+@test "reviewer guard: the printed migration snippet rejects a STATE that does not exist, including one that only reaches the project through .." {
+  local x="$BATS_TEST_TMPDIR/x"
+  mkdir -p "$x/out"
+  local snippet
+  snippet="$(guard_migration_snippet "$x/out/missing/../../../../..$TEST_SKILL_DIR/state")"
+  reviewer_guard_snapshot "$TEST_SKILL_DIR/snip.before"
+  run bash -c "$snippet"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"create STATE first"* ]]
+  reviewer_guard_snapshot "$TEST_SKILL_DIR/snip.after"
+  cmp "$TEST_SKILL_DIR/snip.before" "$TEST_SKILL_DIR/snip.after"
+  [ ! -e "$TEST_SKILL_DIR/state" ]
+}
+
+@test "reviewer guard: the printed migration snippet rejects a STATE that reaches the project through a symlink" {
+  ln -s "$TEST_SKILL_DIR/db" "$BATS_TEST_TMPDIR/alias"
+  assert_snippet_refuses_state "$BATS_TEST_TMPDIR/alias/state"
+}
