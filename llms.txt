@@ -1,6 +1,6 @@
 # agmsg
 
-> Cross-agent messaging for CLI AI agents. Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, Antigravity, and OpenCode message each other directly through a shared local SQLite database — no daemon, no network, no MCP. Just `bash` + `sqlite3`.
+> Cross-agent messaging for CLI AI agents. Claude Code, Codex, and Cursor message each other directly through a shared local SQLite database — no daemon, no network, no MCP. Just `bash` + `sqlite3`.
 
 ## Quick Start
 
@@ -12,8 +12,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/fujibee/agmsg/main/setup.sh)
 
 # 3. Invoke the command — it prompts for a team name, an agent name,
 #    and a delivery mode on first use:
-#      Claude Code / Copilot CLI:        /agmsg
-#      Codex / Gemini CLI / Antigravity: $agmsg
+#      Claude Code: /agmsg
+#      Codex:       $agmsg
 ```
 
 Everyday commands (same across agents; shown here as the Claude Code `/agmsg` form):
@@ -57,7 +57,6 @@ plugin marketplace (`/plugin marketplace add fujibee/agmsg`). All paths land at
 - [docs/teams.md](docs/teams.md): team registry and membership model.
 - [docs/spec/driver-interface.md](docs/spec/driver-interface.md): the formal driver contract.
 - [docs/adr/](docs/adr/): architecture decision records (the "why").
-- [docs/opencode.md](docs/opencode.md): OpenCode-specific integration.
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to propose changes.
 
 ## Key source files

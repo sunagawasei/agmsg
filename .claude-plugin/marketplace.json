@@ -9,7 +9,7 @@
     {
       "name": "agmsg",
       "source": "./",
-      "description": "Cross-agent messaging via SQLite. Send messages between Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, Antigravity, and any other CLI AI agent. No daemon, no network, no dependencies beyond bash and sqlite3."
+      "description": "Cross-agent messaging via SQLite. Send messages between Claude Code, Codex, Cursor, and any other CLI AI agent. No daemon, no network, no dependencies beyond bash and sqlite3."
     }
   ]
 }

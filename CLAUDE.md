@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-agmsg is a cross-agent messaging primitive — CLI AI agents (Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, Antigravity, OpenCode) exchange messages through a shared local SQLite database. No daemon, no network, no broker. The only required dependencies are `bash` and `sqlite3`.
+agmsg is a cross-agent messaging primitive — CLI AI agents (Claude Code, Codex, Cursor) exchange messages through a shared local SQLite database. No daemon, no network, no broker. The only required dependencies are `bash` and `sqlite3`.
 
 ## Commands
 
@@ -34,7 +34,7 @@ agmsg has three orthogonal **axes**, each with exactly one active **driver** at 
 | Axis | What it abstracts | Bundled drivers |
 |---|---|---|
 | **storage** | Where messages and team state live | `sqlite` (default; `jsonl-duckdb` is spec-only — see `docs/spec/`, no bundled implementation) |
-| **agent** | Per-runtime hook formats and settings locations | `scripts/drivers/types/` の10種: `claude-code`, `codex`, `cursor`, `gemini`, `antigravity`, `copilot`, `grok-build`, `hermes`, `opencode`, `agmsg-app` |
+| **agent** | Per-runtime hook formats and settings locations | `scripts/drivers/types/` の3種: `claude-code`, `codex`, `cursor` |
 | **delivery** | How a recipient is notified | `monitor`, `turn`, `both`, `off` |
 
 The three axes are fully orthogonal — any combination is valid.
