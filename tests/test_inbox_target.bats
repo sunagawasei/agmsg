@@ -118,6 +118,7 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 
 @test "role priority: a role lock held by another live session falls back to session-team" {
   enable_st
+  AGMSG_JOIN_SESSION_MARKER=cursor bash "$SCRIPTS/join.sh" "cur-$SID_R" cursor-host cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" projteam reviewer cursor "$TEST_PROJECT" >/dev/null
   agmsg_role_session_record projteam reviewer $SID_R "$TEST_PROJECT" cursor
   # A different, still-live session currently owns the actas lock for this role.
