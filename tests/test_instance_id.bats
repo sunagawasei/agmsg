@@ -416,6 +416,63 @@ gone_pid() {
   printf '%s\n' "$output" | grep -q REACHED-alive || { echo "did not continue past the helper call"; false; }
 }
 
+# --- sourcing on a PATH without dirname ---
+#
+# instance-id.sh locates compat.sh with builtins only. A $(dirname ...) here
+# fails on a PATH that lacks it, and _agmsg_detect_platform is then undefined
+# for _agmsg_pid_alive_local's MSYS branch.
+
+# A PATH holding the tools the liveness check needs, and no dirname.
+_no_dirname_path() {
+  local bin="$BATS_TEST_TMPDIR/nodirname-bin" t
+  mkdir -p "$bin"
+  for t in ps uname awk sed grep tr cat head sleep; do
+    command -v "$t" >/dev/null 2>&1 && ln -sf "$(command -v "$t")" "$bin/$t"
+  done
+  [ ! -e "$bin/dirname" ]
+  printf '%s' "$bin"
+}
+
+@test "instance-id.sh sourced without dirname on PATH still defines _agmsg_detect_platform" {
+  skip_on_windows "POSIX PATH layout"
+  local bin; bin="$(_no_dirname_path)"
+  run env PATH="$bin" "$BASH" -c '
+    . "'"$SKILL_DIR"'/scripts/lib/instance-id.sh"
+    declare -f _agmsg_detect_platform >/dev/null || { echo "detect_platform undefined"; exit 1; }
+    _agmsg_detect_platform && echo "platform=$_agmsg_platform"
+  '
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [[ "$output" == *platform=* ]]
+}
+
+@test "instance-id.sh sourced without dirname on PATH still proves a dead pid dead" {
+  skip_on_windows "POSIX kill path; Windows uses tasklist (#134)"
+  local bin; bin="$(_no_dirname_path)"
+  sh -c 'exit 0' & local gone=$!; wait "$gone" 2>/dev/null
+  run env PATH="$bin" "$BASH" -c '
+    . "'"$SKILL_DIR"'/scripts/lib/instance-id.sh"
+    if _agmsg_pid_alive_local '"$gone"'; then echo alive; exit 1; fi
+    echo dead
+  '
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ "$output" = dead ]
+}
+
+@test "instance-id.sh sourced directly under set -e does not abort, with and without dirname" {
+  skip_on_windows "POSIX PATH layout"
+  local bin; bin="$(_no_dirname_path)"
+  run "$BASH" -c 'set -e; . "'"$SKILL_DIR"'/scripts/lib/instance-id.sh"; echo SOURCED'
+  [ "$status" -eq 0 ] && [ "$output" = SOURCED ] || { echo "$output"; false; }
+  run env PATH="$bin" "$BASH" -c 'set -e; . "'"$SKILL_DIR"'/scripts/lib/instance-id.sh"; echo SOURCED'
+  [ "$status" -eq 0 ] && [ "$output" = SOURCED ] || { echo "$output"; false; }
+}
+
+@test "instance-id.sh sourced by a bare file name (no slash in BASH_SOURCE) finds compat.sh in the cwd" {
+  skip_on_windows "POSIX PATH layout"
+  run "$BASH" -c 'cd "'"$SKILL_DIR"'/scripts/lib" && . ./instance-id.sh && declare -f _agmsg_detect_platform >/dev/null && echo ok'
+  [ "$output" = ok ] || { echo "$output"; false; }
+}
+
 # --- agmsg_normalize_instance_id ---
 
 @test "normalize: a composite token passes through unchanged (idempotent)" {

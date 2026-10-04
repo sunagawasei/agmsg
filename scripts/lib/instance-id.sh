@@ -38,8 +38,15 @@ _AGMSG_INSTANCE_ID_SH=1
 # own (several other libs already source it unconditionally the same way;
 # re-sourcing only resets the cheap, deterministic platform detection, not
 # any state that matters).
+# Located with builtins only: this file is sourced on PATHs without dirname, and
+# a failed source here leaves _agmsg_detect_platform undefined.
+_AGMSG_IID_SELF="${BASH_SOURCE[0]:-$0}"
+case "$_AGMSG_IID_SELF" in
+  */*) _AGMSG_IID_DIR="${_AGMSG_IID_SELF%/*}" ;;
+  *) _AGMSG_IID_DIR="." ;;
+esac
 # shellcheck disable=SC1091
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compat.sh"
+. "$_AGMSG_IID_DIR/compat.sh"
 
 # Cross-platform pid liveness check, and the ONLY one any shipped script should
 # use. A bare `kill -0 "$pid" 2>/dev/null` is not a liveness check: it answers
