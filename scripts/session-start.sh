@@ -65,6 +65,8 @@ source "$SCRIPT_DIR/lib/process-identity.sh"
 source "$SCRIPT_DIR/lib/pending-teardown.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/inflight.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/session-retention.sh"
 # Only DEFINES agmsg_close_inherited_fds; nothing is closed here. The type
 # plug calls it inside a subshell around its own long-lived spawn, so this
 # shell's descriptors are untouched. See lib/close-fds.sh.
@@ -667,9 +669,9 @@ fi
 # session is no longer alive AND whose dir has been untouched past the TTL
 # (delivery.session_team_ttl_days, default 7). A resume re-joins and bumps the
 # mtime, so active/recent sessions are safe, and the liveness check guards
-# in-flight ones. Scratch cwd, pidfiles, placement and logs go too. Messages are
-# deliberately KEPT — rows keyed on the team stay queryable as history and are
-# governed by a separate retention policy, not this hygiene pass.
+# in-flight ones. Scratch cwd, pidfiles, placement and logs go too. The team's
+# messages go separately, once older than delivery.message_retention_days
+# (lib/session-retention.sh), and only for a team marked as a session team.
 if agmsg_session_team_enabled; then
   _ttl="$("$SCRIPT_DIR/config.sh" get delivery.session_team_ttl_days 7 2>/dev/null || echo 7)"
   case "$_ttl" in ''|*[!0-9]*) _ttl=7 ;; esac
@@ -739,15 +741,20 @@ if agmsg_session_team_enabled; then
         "$_ttl_log_team" >&2
       continue
     fi
+    _ttl_had_marker=0
+    [ -f "$(agmsg_retention_marker_path "$_tn")" ] && _ttl_had_marker=1
     rm -rf "$_d" 2>/dev/null || true
+    agmsg_retention_after_dir_reap "$_tn" "$_ttl_had_marker" || true
     rm -rf "$SKILL_DIR/run/codex-$_tn-cwd" 2>/dev/null || true
     rm -f "$SKILL_DIR/run/codex-bridge.$_tn".* 2>/dev/null || true
     rm -rf "$SKILL_DIR/run/claude-code-$_tn-"*-cwd 2>/dev/null || true
     rm -f "$SKILL_DIR/run/claude-code-bridge.$_tn".* 2>/dev/null || true
+    rm -f "$SKILL_DIR/run/cursor-bridge.$_tn".* 2>/dev/null || true
     rm -f "$SKILL_DIR/run/spawn.$_tn"__* 2>/dev/null || true
     rm -f "$SKILL_DIR/run/pending-teardown.$_tn"__* 2>/dev/null || true
     rm -rf "$SKILL_DIR/run/placement.$_tn"__*.lock 2>/dev/null || true
   done
+  agmsg_retention_sweep || true
 fi
 
 # --- Skip directive when a watcher is already alive for this instance. ---

@@ -193,6 +193,10 @@ delivery:
   # session_team: false
   # Days before a dead session's team dir is garbage-collected (default 7):
   # session_team_ttl_days: 7
+  # Days a finished session team's messages are kept (default 7). Only teams
+  # marked as session teams are deleted automatically; see
+  # docs/adr/0005-session-team-message-retention.md.
+  # message_retention_days: 7
 
 drain:
   # Wait for the composite SessionEnd owner PID to disappear before cleanup.
