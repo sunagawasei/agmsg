@@ -84,6 +84,7 @@ SESSION_ID=$(printf '%s' "$INPUT" \
   | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
   | head -1)
 [ -z "$SESSION_ID" ] && SESSION_ID="${GROK_SESSION_ID:-}"
+RAW_SESSION_ID="$SESSION_ID"
 # Normalized to the per-process instance id (#93), which is the token the
 # actas owner file is keyed on.
 [ -n "$SESSION_ID" ] && SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$TYPE")"
@@ -125,12 +126,39 @@ PROJECT="$(agmsg_resolve_project "$PROJECT" "$TYPE")"
 # Consume exact (team, agent) TSV rows instead of independently flattened
 # agent/team lists. For multiple agents, preserve the existing first-agent
 # policy, but subscribe only to that agent's actual team rows.
+# A session-team host's session reads only its own session team: every session
+# of a project registers the same seat in its own team, so the project-wide
+# enumeration below would also subscribe it to (and mark read) the other
+# sessions' teams. lib/inbox-target.sh resolves the session's own team; when it
+# yields none (mode off, no usable id, or a role session) the enumeration below
+# applies unchanged.
+AGENT=""
+TEAM_LIST=()
+IDENTITIES=""
+SESSION_ROUTED=0
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/session-team.sh"
+if [ -n "$RAW_SESSION_ID" ] && agmsg_type_has "$TYPE" session_team yes \
+    && agmsg_session_team_enabled; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/lib/inbox-target.sh"
+  _ci_steam="$(agmsg_session_team_name_from_id "$RAW_SESSION_ID" "$TYPE")"
+  _ci_target="$(agmsg_inbox_target "$TYPE" "$PROJECT" "$RAW_SESSION_ID" 2>/dev/null || true)"
+  if [ -n "$_ci_steam" ] && [ "${_ci_target#*teams=}" != "$_ci_target" ]; then
+    _ci_teams="${_ci_target#*teams=}"; _ci_teams="${_ci_teams%% *}"
+    if [ "$_ci_teams" = "$_ci_steam" ]; then
+      AGENT="${_ci_target#agent=}"; AGENT="${AGENT%% *}"
+      TEAM_LIST=("$_ci_steam")
+      SESSION_ROUTED=1
+    fi
+  fi
+fi
+
+IDENTITIES_VALID=1
+if [ "$SESSION_ROUTED" -ne 1 ]; then
 IDENTITIES=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE")
 [ -n "$IDENTITIES" ] || exit 0
 
-AGENT=""
-TEAM_LIST=()
-IDENTITIES_VALID=1
 while IFS=$'\t' read -r identity_team identity_agent identity_extra; do
   if [ -z "$identity_team" ] || [ -z "$identity_agent" ] || [ -n "$identity_extra" ]; then
     IDENTITIES_VALID=0
@@ -151,6 +179,7 @@ while IFS=$'\t' read -r identity_team identity_agent identity_extra; do
   done
   [ "$team_seen" -eq 1 ] || TEAM_LIST+=("$identity_team")
 done <<< "$IDENTITIES"
+fi
 
 if [ "$IDENTITIES_VALID" -ne 1 ] || [ -z "$AGENT" ] || [ "${#TEAM_LIST[@]}" -eq 0 ]; then
   exit 0

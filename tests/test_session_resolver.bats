@@ -47,17 +47,17 @@ who() {
 
 # --- id normalization --------------------------------------------------------
 
-@test "normalize: a dotted id is accepted only as <bare>.<digits>" {
+@test "normalize: a session id never contains a dot" {
   [ "$(agmsg_session_normalize_sid claude-code abc)" = abc ]
-  [ "$(agmsg_session_normalize_sid claude-code abc.123)" = abc ]
-  for bad in abc.one abc.two abc.1.2 .abc 'a/b' '..' 'a b' "$(printf 'a\nb')" "$(printf 'a%.0s' $(seq 1 129))"; do
+  [ "$(agmsg_session_normalize_sid claude-code sess-X_1)" = sess-X_1 ]
+  for bad in abc.one abc.two abc.1 abc.2 abc.1.2 .abc 'a/b' '..' 'a b' "$(printf 'a\nb')" "$(printf 'a%.0s' $(seq 1 129))"; do
     [ -z "$(agmsg_session_normalize_sid claude-code "$bad")" ]
   done
 }
 
 @test "normalize: a cursor id must be a uuid" {
   [ "$(agmsg_session_normalize_sid cursor "$CUR_A")" = "$CUR_A" ]
-  [ "$(agmsg_session_normalize_sid cursor "$CUR_A.4242")" = "$CUR_A" ]
+  [ -z "$(agmsg_session_normalize_sid cursor "$CUR_A.4242")" ]
   [ -z "$(agmsg_session_normalize_sid cursor sess-X)" ]
   [ -z "$(agmsg_session_normalize_sid cursor "${CUR_A}0")" ]
 }
@@ -291,36 +291,73 @@ start_bridge() {
 @test "provenance: a recycled pid (start token mismatch) authorizes nothing" {
   mk_claude_team parent
   start_bridge worker-sid s-parent
-  sed -i.bak 's/^start=.*/start=proc:1/' "$TEST_SKILL_DIR/run/headless-sid.worker-sid"
+  sed -i.bak 's/^start=.*/start=proc:1/' "$TEST_SKILL_DIR/run/headless-sid.worker-sid.$BRIDGE_PID"
   sendas s-parent CLAUDE_CODE_SESSION_ID=worker-sid
   kill "$BRIDGE_PID" 2>/dev/null || true
   [ "$status" -ne 0 ]
 }
 
-@test "provenance: an old owner's cleanup cannot delete the record a newer owner published" {
+@test "provenance: each owner keeps its own record; a third process's cleanup removes neither" {
   start_bridge worker-sid s-parent
   local first="$BRIDGE_PID"
-  # a second bridge takes over the sid
   start_bridge worker-sid s-parent
   local second="$BRIDGE_PID"
-  # the first one's cleanup runs now: it must leave the second's record alone
+  [ -f "$TEST_SKILL_DIR/run/headless-sid.worker-sid.$first" ]
+  [ -f "$TEST_SKILL_DIR/run/headless-sid.worker-sid.$second" ]
   run bash -c "
     export SKILL_DIR='$TEST_SKILL_DIR'
     source '$SCRIPTS/lib/compat.sh'; source '$SCRIPTS/lib/instance-id.sh'
     source '$SCRIPTS/lib/headless-provenance.sh'
     agmsg_headless_provenance_remove worker-sid
   "
-  [ -f "$TEST_SKILL_DIR/run/headless-sid.worker-sid" ]
-  [ "$(sed -n 's/^pid=//p' "$TEST_SKILL_DIR/run/headless-sid.worker-sid")" = "$second" ]
+  [ -f "$TEST_SKILL_DIR/run/headless-sid.worker-sid.$first" ]
+  [ -f "$TEST_SKILL_DIR/run/headless-sid.worker-sid.$second" ]
   kill "$first" "$second" 2>/dev/null || true
 }
 
-@test "provenance: the record is private and a symlink in its place is not followed" {
+@test "provenance: an owner's own cleanup removes only its record, leaving a newer owner's" {
   start_bridge worker-sid s-parent
-  [ "$(stat -f %Lp "$TEST_SKILL_DIR/run/headless-sid.worker-sid" 2>/dev/null || stat -c %a "$TEST_SKILL_DIR/run/headless-sid.worker-sid")" = 600 ]
+  local first="$BRIDGE_PID"
+  start_bridge worker-sid s-parent
+  local second="$BRIDGE_PID"
+  # emulate the first owner's cleanup: same pid as its record
+  rm -f "$TEST_SKILL_DIR/run/headless-sid.worker-sid.$first"
+  mk_claude_team parent
+  sendas s-parent CLAUDE_CODE_SESSION_ID=worker-sid
+  kill "$first" "$second" 2>/dev/null || true
+  [ "$status" -eq 0 ]
+}
+
+@test "provenance: a record without a start token is never published and never accepted" {
+  run bash -c "
+    export SKILL_DIR='$TEST_SKILL_DIR'
+    source '$SCRIPTS/lib/compat.sh'; source '$SCRIPTS/lib/instance-id.sh'
+    source '$SCRIPTS/lib/headless-provenance.sh'
+    agmsg_pid_start_token() { return 1; }
+    agmsg_headless_provenance_publish worker-sid s-parent
+  "
+  [ "$status" -ne 0 ]
+  ls "$TEST_SKILL_DIR"/run/headless-sid.worker-sid.* 2>/dev/null && return 1
+  mkdir -p "$TEST_SKILL_DIR/run"
+  sleep 30 & local live=$!
+  printf 'team=s-parent\npid=%s\nstart=\n' "$live" > "$TEST_SKILL_DIR/run/headless-sid.worker-sid.$live"
+  run bash -c "
+    export SKILL_DIR='$TEST_SKILL_DIR'
+    source '$SCRIPTS/lib/compat.sh'; source '$SCRIPTS/lib/instance-id.sh'
+    source '$SCRIPTS/lib/headless-provenance.sh'
+    agmsg_headless_provenance_allows worker-sid s-parent
+  "
+  kill "$live" 2>/dev/null || true
+  [ "$status" -ne 0 ]
+}
+
+@test "provenance: the record is private, written through an unpredictable temp, and a symlink in its place is not followed" {
+  start_bridge worker-sid s-parent
+  local rec="$TEST_SKILL_DIR/run/headless-sid.worker-sid.$BRIDGE_PID"
+  [ "$(stat -f %Lp "$rec" 2>/dev/null || stat -c %a "$rec")" = 600 ]
   kill "$BRIDGE_PID" 2>/dev/null || true
-  mv "$TEST_SKILL_DIR/run/headless-sid.worker-sid" "$TEST_SKILL_DIR/run/real"
-  ln -s "$TEST_SKILL_DIR/run/real" "$TEST_SKILL_DIR/run/headless-sid.worker-sid"
+  mv "$rec" "$TEST_SKILL_DIR/run/real"
+  ln -s "$TEST_SKILL_DIR/run/real" "$rec"
   run bash -c "
     export SKILL_DIR='$TEST_SKILL_DIR'
     source '$SCRIPTS/lib/compat.sh'; source '$SCRIPTS/lib/instance-id.sh'
@@ -328,6 +365,21 @@ start_bridge() {
     agmsg_headless_provenance_allows worker-sid s-parent
   "
   [ "$status" -ne 0 ]
+}
+
+@test "provenance: a link planted where the record will land is replaced, never written through" {
+  local victim="$BATS_TEST_TMPDIR/victim"
+  printf 'keep' > "$victim"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  run bash -c "
+    export SKILL_DIR='$TEST_SKILL_DIR'
+    source '$SCRIPTS/lib/compat.sh'; source '$SCRIPTS/lib/instance-id.sh'
+    source '$SCRIPTS/lib/headless-provenance.sh'
+    ln -s '$victim' \"\$SKILL_DIR/run/headless-sid.worker-sid.\$\$\"
+    agmsg_headless_provenance_publish worker-sid s-parent
+  "
+  [ "$status" -eq 0 ]
+  [ "$(cat "$victim")" = keep ]
 }
 
 # --- SessionStart / SessionEnd for a Cursor session --------------------------
@@ -348,6 +400,15 @@ start_bridge() {
   [ "$status" -eq 0 ]
   [ ! -d "$TEST_SKILL_DIR/teams/cur-$CUR_A" ]
   [ ! -d "$TEST_SKILL_DIR/teams/cur-$CUR_B" ]
+}
+
+@test "session-start (cursor): a non-string, null, empty, padded or whitespace alternate id is refused" {
+  for alt in '""' '" "' "\" $CUR_A\"" "\"$CUR_A \"" '5' 'null'; do
+    run env -u CLAUDE_CODE_SESSION_ID bash "$SCRIPTS/session-start.sh" cursor "$PROJ" \
+      <<< "{\"session_id\":\"$CUR_A\",\"conversation_id\":$alt}"
+    [ "$status" -eq 0 ]
+    [ ! -d "$TEST_SKILL_DIR/teams/cur-$CUR_A" ]
+  done
 }
 
 @test "session-start (cursor): a session id that is not a uuid is refused" {
@@ -385,37 +446,6 @@ start_bridge() {
   run bash "$SCRIPTS/watchdog.sh" "cur-$CUR_A"
   [ "$status" -ne 0 ]
   [[ "$output" == *"not a session-team name"* ]]
-}
-
-# --- peer liveness evidence --------------------------------------------------
-
-peers() {
-  bash -c "
-    export SKILL_DIR='$TEST_SKILL_DIR'
-    source '$SCRIPTS/lib/compat.sh'; source '$SCRIPTS/lib/instance-id.sh'
-    source '$SCRIPTS/lib/process-identity.sh'; source '$SCRIPTS/lib/session-liveness.sh'
-    agmsg_session_peers_state '$CUR_A' '${1:-}'
-  " 2>/dev/null
-}
-
-@test "peers: no evidence is none, a live cc-instance is alive, a dead one is dead" {
-  mkdir -p "$TEST_SKILL_DIR/run"
-  [ "$(peers)" = none ]
-  sleep 30 & local live=$!
-  printf '%s.%s\n' "$CUR_A" "$live" > "$TEST_SKILL_DIR/run/cc-instance.$live"
-  [ "$(peers)" = alive ]
-  # the instance asking is excluded from its own evidence
-  [ "$(peers "$CUR_A.$live")" = none ]
-  kill "$live"; wait "$live" 2>/dev/null || true
-  [ "$(peers)" = dead ]
-}
-
-@test "peers: an inject-watch pidfile for a dead pid is dead evidence; an unreadable one is unknown" {
-  mkdir -p "$TEST_SKILL_DIR/run"
-  printf '999999\n' > "$TEST_SKILL_DIR/run/inject-watch.$CUR_A.pid"
-  [ "$(peers)" = dead ]
-  ln -sf /nonexistent "$TEST_SKILL_DIR/run/inject-watch.$CUR_A.4242.pid"
-  [ "$(peers)" = unknown ]
 }
 
 # --- children never inherit a session id ------------------------------------

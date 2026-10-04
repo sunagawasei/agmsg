@@ -71,14 +71,12 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 
 # --- raw session-id handling (agmsg_session_team_name_from_id passthrough) ---
 
-@test "session team name: strips a .<pid> suffix from a composite raw sid" {
+@test "session team name: a raw sid names its team on its own host" {
   enable_st
-  run agmsg_inbox_target cursor "$TEST_PROJECT" "$SID_A.456"
+  run agmsg_inbox_target cursor "$TEST_PROJECT" "$SID_A"
   [ "$status" -eq 0 ]
   [[ "$output" == *"agent=cursor-host teams=cur-$SID_A "* ]]
-  [[ "$output" != *"$SID_A.456"* ]]
-  # The same composite on the Claude Code host keeps its own prefix and seat.
-  run agmsg_inbox_target claude-code "$TEST_PROJECT" "abc123.456"
+  run agmsg_inbox_target claude-code "$TEST_PROJECT" "abc123"
   [ "$status" -eq 0 ]
   [[ "$output" == *"agent=claude teams=s-abc123 "* ]]
 }
@@ -86,7 +84,7 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 @test "session team name: an id that is not a valid session id never reaches a team name" {
   enable_st
   bash "$SCRIPTS/join.sh" projteam alice cursor "$TEST_PROJECT" >/dev/null
-  for bad in 'weird!!id' 'abc.one' 'sess-X' '../x' '.hidden'; do
+  for bad in 'weird!!id' 'abc.one' "$SID_A.456" 'abc.1' 'sess-X' '../x' '.hidden'; do
     run agmsg_inbox_target cursor "$TEST_PROJECT" "$bad"
     [ "$status" -eq 0 ]
     [[ "$output" == *"teams=projteam"* ]]
@@ -295,4 +293,40 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   msg=$(sqlite_mem "SELECT json_extract('$(printf '%s' "$output" | sed "s/'/''/g")', '\$.followup_message');")
   [[ "$msg" == *"carriage"* ]]
   [[ "$msg" == *"return and"* ]]
+}
+
+# --- check-inbox.sh: a session-team host reads only its own session team ---
+
+@test "check-inbox (claude-code, session-team on): reads only its own s-<sid>, never another session's" {
+  enable_st
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  bash "$SCRIPTS/join.sh" s-sess-own claude claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" s-sess-own human  claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" s-sess-other claude claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" s-sess-other human  claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/send.sh" s-sess-own   human claude "for-own"   >/dev/null
+  bash "$SCRIPTS/send.sh" s-sess-other human claude "for-other" >/dev/null
+  run bash -c "echo '{\"session_id\":\"sess-own\"}' | bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT' 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"for-own"* ]]
+  [[ "$output" != *"for-other"* ]]
+  # the other session's message is still unread
+  run bash "$SCRIPTS/inbox.sh" s-sess-other claude --format ids
+  [[ "$output" == *"for-other"* ]]
+}
+
+@test "check-inbox (cursor, session-team on): two sessions of one project each read only their own team" {
+  local other="72a71a78-44ec-43c7-9d92-f2a7a2a24223"
+  enable_st
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  bash "$SCRIPTS/join.sh" "cur-$SID_A" cursor-host cursor "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" "cur-$SID_A" human       cursor "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" "cur-$other" cursor-host cursor "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" "cur-$other" human       cursor "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/send.sh" "cur-$other" human cursor-host "for-other" >/dev/null
+  bash "$SCRIPTS/send.sh" "cur-$SID_A" human cursor-host "for-a" >/dev/null
+  run bash -c "echo '{\"session_id\":\"$SID_A\"}' | bash '$SCRIPTS/check-inbox.sh' cursor '$TEST_PROJECT' 2>/dev/null"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"for-a"* ]]
+  [[ "$output" != *"for-other"* ]]
 }

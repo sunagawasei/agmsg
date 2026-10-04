@@ -32,8 +32,6 @@ source "$SCRIPT_DIR/lib/team-lifecycle.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/pending-teardown.sh"
 # shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/session-liveness.sh"
-# shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/inflight.sh"
 
 duration_config() {
@@ -120,14 +118,6 @@ session_sibling_alive() {
     sid="$(cat "$f" 2>/dev/null || true)"
     [ "${sid%%.*}" = "${SESSION_ID%%.*}" ] && return 0
   done
-  # A host whose sessions may leave no cc-instance (Cursor) also leaves an
-  # inject-watch per instance: anything but dead/none keeps the teardown off.
-  if [ -n "$(_agmsg_st_conf "$TYPE" session_env)" ] && [ "$TYPE" != claude-code ]; then
-    case "$(agmsg_session_peers_state "${SESSION_ID%%.*}" "$INSTANCE_ID" 2>/dev/null || printf unknown)" in
-      dead|none) ;;
-      *) return 0 ;;
-    esac
-  fi
   return 1
 }
 
@@ -297,7 +287,7 @@ cleanup_target_locked() {
     agmsg_team_lifecycle_lock_release "$STEAM"
     return 1
   fi
-  if "$SCRIPT_DIR/despawn.sh" "$STEAM" "$(agmsg_session_seat "$TYPE")" "$name" --force \
+  if "$SCRIPT_DIR/despawn.sh" "$STEAM" claude "$name" --force \
       --expect-record "$record" >/dev/null 2>&1; then
     despawn_rc=0
   else
@@ -370,7 +360,7 @@ notify_drain_timeout() {
   else
     body="[drain-timeout] session-end-worker forced $name (pid $pid) after ${DRAIN_DEADLINE_S}s. Read-but-unanswered rows remain queryable in messages.db; inspect with: SELECT id,from_agent,to_agent,created_at,read_at FROM messages WHERE team='$STEAM' AND to_agent='$name' AND read_at IS NOT NULL ORDER BY id DESC LIMIT 20;"
   fi
-  "$SCRIPT_DIR/send.sh" "$STEAM" session-end-worker "$(agmsg_session_seat "$TYPE")" "$body" --force \
+  "$SCRIPT_DIR/send.sh" "$STEAM" session-end-worker claude "$body" --force \
     >/dev/null 2>&1 || true
 }
 

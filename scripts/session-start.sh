@@ -282,17 +282,21 @@ if _agmsg_session_team_active; then
   # conversation_id next to session_id; some hosts send camelCase). They name
   # the same session or the payload is not trustworthy: a disagreement is
   # refused rather than guessing which one the team should key on.
-  _agmsg_alt_ids="$(printf '%s\n' "
+  # Any of these fields present must be the very same string as session_id:
+  # a different value, a non-string, or a failed query is refused.
+  if ! _agmsg_alt_disagree="$(printf '%s\n' "
     WITH raw(j) AS (SELECT '$_claude_input_sql'),
     valid(j) AS (SELECT j FROM raw WHERE json_valid(j) AND json_type(j) = 'object')
-    SELECT coalesce(json_extract(j, '\$.conversation_id'), ''), coalesce(json_extract(j, '\$.sessionId'), '')
-    FROM valid;" | sqlite3 -init /dev/null -noheader -list -separator ' ' :memory: 2>/dev/null | tr -d '\r')" || _agmsg_alt_ids=""
-  for _agmsg_alt in $_agmsg_alt_ids; do
-    if [ "$_agmsg_alt" != "$_claude_stdin_session_id" ]; then
-      echo "agmsg: refusing $TYPE session-team registration: the payload's session id fields disagree" >&2
-      exit 0
-    fi
-  done
+    SELECT 1 FROM valid
+    WHERE (json_type(j, '\$.conversation_id') IS NOT NULL
+           AND json_extract(j, '\$.conversation_id') IS NOT '$_claude_stdin_session_id')
+       OR (json_type(j, '\$.sessionId') IS NOT NULL
+           AND json_extract(j, '\$.sessionId') IS NOT '$_claude_stdin_session_id');" \
+      | sqlite3 -init /dev/null -noheader -list :memory: 2>/dev/null | tr -d '\r')" \
+      || [ -n "$_agmsg_alt_disagree" ]; then
+    echo "agmsg: refusing $TYPE session-team registration: the payload's session id fields disagree" >&2
+    exit 0
+  fi
   # One id contract for every host and source (lib/session-team.sh): no dotted
   # ids other than a numeric instance suffix, and host-specific id shapes.
   if [ -z "$(agmsg_session_normalize_sid "$TYPE" "$_claude_stdin_session_id")" ]; then

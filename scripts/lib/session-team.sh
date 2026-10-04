@@ -114,36 +114,27 @@ agmsg_session_seat() {
 # --- id validation / team naming -------------------------------------------
 
 # Echo the bare session id for <host> when <sid> is acceptable, else nothing.
-# Acceptable: 1..128 chars of [0-9A-Za-z._-], no leading dot, and either a bare
-# id with no dot at all or an instance-id composite "<bare>.<digits>" (the
-# per-process form session-start derives). Anything else with a dot is refused
-# so "abc.one" and "abc.two" can never collapse into one team. A host that
-# declares session_sid_strict_uuid=yes additionally needs 8-4-4-4-12 hex.
+# Acceptable: 1..128 chars of [0-9A-Za-z_-]. A dot is never accepted, so ids
+# like "abc.1" and "abc.2" can never collapse into one team, and the per-process
+# "<id>.<pid>" instance id (which only agmsg itself derives) is not a session id.
+# A host that declares session_sid_strict_uuid=yes additionally needs 8-4-4-4-12
+# hex.
 agmsg_session_normalize_sid() {
-  local host="$1" sid="${2:-}" bare
+  local host="$1" sid="${2:-}"
   [ -n "$sid" ] || return 0
   [ "${#sid}" -le 128 ] || return 0
-  case "$sid" in .*) return 0 ;; esac
-  if ! (LC_ALL=C; case "$sid" in *[!0-9A-Za-z._-]*) exit 1 ;; esac); then
+  if ! (LC_ALL=C; case "$sid" in *[!0-9A-Za-z_-]*) exit 1 ;; esac); then
     return 0
   fi
-  bare="$sid"
-  case "$sid" in
-    *.*)
-      bare="${sid%.*}"
-      case "${sid##*.}" in ''|*[!0-9]*) return 0 ;; esac
-      case "$bare" in ''|*.*) return 0 ;; esac
-      ;;
-  esac
   if [ "$(_agmsg_st_conf "$host" session_sid_strict_uuid)" = yes ]; then
-    if ! (LC_ALL=C; case "$bare" in
+    if ! (LC_ALL=C; case "$sid" in
             [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) exit 0 ;;
             *) exit 1 ;;
           esac); then
       return 0
     fi
   fi
-  printf '%s' "$bare"
+  printf '%s' "$sid"
 }
 
 # Echo <host>'s team name for a bare session id, or nothing.
@@ -177,7 +168,6 @@ agmsg_session_team_decode() {
     [ -n "$prefix" ] || continue
     case "$team" in "$prefix"?*) ;; *) continue ;; esac
     rest="${team#"$prefix"}"
-    case "$rest" in *.*) continue ;; esac
     [ -n "$(agmsg_session_normalize_sid "$host" "$rest")" ] || continue
     printf '%s %s' "$host" "$rest"
     return 0
@@ -284,9 +274,7 @@ agmsg_session_team_class() {
     [ -n "$prefix" ] || continue
     case "$team" in "$prefix"?*) ;; *) continue ;; esac
     rest="${team#"$prefix"}"
-    # Names carry bare ids: a composite or dotted rest is not a session team.
-    case "$rest" in *.*) continue ;; esac
-    [ -n "$(agmsg_session_normalize_sid "$host" "$rest")" ] || continue
+        [ -n "$(agmsg_session_normalize_sid "$host" "$rest")" ] || continue
     if [ "$(_agmsg_st_conf "$host" session_marker)" != yes ]; then
       printf 'session'; return 0
     fi
