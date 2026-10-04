@@ -889,36 +889,15 @@ if command -v agmsg_session_start_fast_path_ok >/dev/null 2>&1 \
 fi
 agmsg_session_start_common_init "$_fast_path_ok"
 
-# AGMSG_CC_MONITOR_KEEP_ALIVE, default OFF: timeout_ms: 1800000 always stays
-# (the Monitor tool caps every watch there regardless). What differs is
-# whether re-arming on expiry is UNCONDITIONAL or read off the expiry
-# notification itself. Claude Code counts the events on its own side and
-# names that count in the notification -- agmsg never counts it -- so the
-# default case below is worded as a plain word match on that notification
-# ("no events" present or not), never as reading a number: the exact
-# phrasing may drift, and a seat that has to parse a count is a seat this
-# can break by rewording the notification later. Kept word-for-word
-# identical to scripts/delivery.sh's emit_monitor_directive and
-# scripts/drivers/types/claude-code/template.md's actas overlay -- the
-# three surfaces must never disagree with each other.
-REARM_NOTE=""
-if [ -n "${AGMSG_CC_MONITOR_KEEP_ALIVE:-}" ]; then
-  REARM_NOTE="
-This watch expires after at most 30 minutes; when the expiry notice arrives,
-immediately re-arm it by invoking Monitor again with this exact command and
-description — delivery depends on it, since nothing else keeps the stream
-running. Re-arm it silently: no message to the user, no \"re-armed\", no
-acknowledgement, no summary — just invoke Monitor again and continue,
-since announcing it every 30 minutes wastes tokens for no benefit."
-else
-  REARM_NOTE="
-This watch expires after at most 30 minutes.
-If the expiry notification says it delivered no events, do not re-arm it.
-Otherwise (it says it delivered something), re-arm it by invoking Monitor again with this exact command and description.
-Re-arm it silently, when you do: no message to the user, no \"re-armed\", no
-acknowledgement, no summary — just invoke Monitor again and continue, since
-announcing it every 30 minutes wastes tokens for no benefit."
-fi
+# The watch renews itself (scripts/watch.sh, _watch_renew_or_stop): launched
+# with --max-seconds it prints one "re-arm" or "stopping" line a little before
+# Claude Code's 30-minute Monitor cap and exits, so the model does not decide
+# from the expiry notification. timeout_ms: 1800000 stays (without it Monitor
+# falls back to its 5-minute default); AGMSG_CC_MONITOR_KEEP_ALIVE (empty = OFF)
+# is read by the watcher. Word-for-word identical to scripts/delivery.sh.
+REARM_NOTE="
+This watch renews itself. A little before the 30-minute cap it prints one line on its own and exits: on \`agmsg watch: re-arm - ...\`, invoke Monitor again with exactly the command and description that line names (persistent: true, timeout_ms: 1800000), silently — no message to the user, no \"re-armed\", no acknowledgement, no summary, since announcing it every 30 minutes wastes tokens for no benefit; on \`agmsg watch: stopping - ...\`, do not re-arm it. If the watch is instead killed at the cap and no such line arrived (an agmsg install from before this), re-arm it only when the expiry notification says it delivered something."
+WATCH_MAX_ARG="--max-seconds=1790"
 
 # Shell-quote each argv so the host can paste the command into Monitor and run
 # it verbatim. A plain '...' wrap breaks on paths with an apostrophe
@@ -926,7 +905,7 @@ fi
 # safely for shell re-execution (#188). A resumed role uses the 4th <agent>
 # arg instead of the --team suffix below.
 if [ -n "$ROLE_NAME" ]; then
-  WATCH_COMMAND="$(printf '%q %q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE" "$ROLE_NAME")"
+  WATCH_COMMAND="$(printf '%q %q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE" "$ROLE_NAME") $WATCH_MAX_ARG"
 else
   WATCH_COMMAND="$(printf '%q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE")"
   if [ -n "$SESSION_TEAM" ]; then
@@ -935,6 +914,7 @@ else
     # agmsg_session_start_common_init above.
     WATCH_COMMAND="$WATCH_COMMAND $(printf '%q %q %q' "$(agmsg_session_seat "$TYPE")" --team "$SESSION_TEAM")"
   fi
+  WATCH_COMMAND="$WATCH_COMMAND $WATCH_MAX_ARG"
 fi
 
 # --- Type-specific directive emission (Template Method, 2nd extension point). ---

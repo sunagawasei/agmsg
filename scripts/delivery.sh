@@ -560,31 +560,14 @@ EOF
       watch_command="$watch_command $(printf '%q %q %q' "$(agmsg_session_seat "$type")" --team "$session_team")"
     fi
   fi
-  # AGMSG_CC_MONITOR_KEEP_ALIVE, default OFF: timeout_ms: 1800000 always
-  # stays (the Monitor tool caps every watch there regardless). What differs
-  # is whether re-arming on expiry is UNCONDITIONAL or read off the expiry
-  # notification itself. Claude Code counts the events on its own side and
-  # names that count in the notification -- agmsg never counts it -- so the
-  # default case below is worded as a plain word match on that notification
-  # ("no events" present or not), never as reading a number: the exact
-  # phrasing may drift, and a seat that has to parse a count is a seat this
-  # can break by rewording the notification later.
+  watch_command="$watch_command --max-seconds=1790"
+  # The watch renews itself (scripts/watch.sh, _watch_renew_or_stop); see the
+  # same note in scripts/session-start.sh, whose REARM_NOTE this repeats
+  # word for word. timeout_ms: 1800000 stays; AGMSG_CC_MONITOR_KEEP_ALIVE
+  # (empty = OFF) is read by the watcher.
   local rearm_note
-  if [ -n "${AGMSG_CC_MONITOR_KEEP_ALIVE:-}" ]; then
-    rearm_note=" This watch expires after at most 30 minutes; when the expiry
-notice arrives, immediately re-arm it by invoking Monitor again with this
-exact command and description — delivery depends on it, since nothing else
-keeps the stream running. Re-arm it silently: no message to the user, no
-\"re-armed\", no acknowledgement, no summary — just invoke Monitor again and
-continue, since announcing it every 30 minutes wastes tokens for no benefit."
-  else
-    rearm_note=" This watch expires after at most 30 minutes.
-If the expiry notification says it delivered no events, do not re-arm it.
-Otherwise (it says it delivered something), re-arm it by invoking Monitor again with this exact command and description.
-Re-arm it silently, when you do: no message to the user, no \"re-armed\", no
-acknowledgement, no summary — just invoke Monitor again and continue, since
-announcing it every 30 minutes wastes tokens for no benefit."
-  fi
+  rearm_note="
+This watch renews itself. A little before the 30-minute cap it prints one line on its own and exits: on \`agmsg watch: re-arm - ...\`, invoke Monitor again with exactly the command and description that line names (persistent: true, timeout_ms: 1800000), silently — no message to the user, no \"re-armed\", no acknowledgement, no summary, since announcing it every 30 minutes wastes tokens for no benefit; on \`agmsg watch: stopping - ...\`, do not re-arm it. If the watch is instead killed at the cap and no such line arrived (an agmsg install from before this), re-arm it only when the expiry notification says it delivered something."
   cat <<EOF
 
 AGMSG-DIRECTIVE: For this running session, invoke the Monitor tool now with:

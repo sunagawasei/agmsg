@@ -625,55 +625,35 @@ eperm_pid() {
   # the 5-minute default -- timeout_ms is unconditional, present regardless
   # of AGMSG_CC_MONITOR_KEEP_ALIVE below.
   grep -q 'timeout_ms: 1800000' <<<"$output"
-  # AGMSG_CC_MONITOR_KEEP_ALIVE, default OFF: with it unset (the run above),
-  # the directive must carry the CONDITIONAL re-arm wording -- a plain word
-  # match on "no events" in Claude Code's own expiry notification, never a
-  # count to parse (the notification's exact phrasing may drift; #1270's
-  # count only ever appears as Claude Code's own text, agmsg does not count
-  # it). The unconditional wording ("immediately re-arm it") is reserved for
-  # KEEP_ALIVE, checked below.
+  # The watch renews itself: the launch command carries --max-seconds=1790 and
+  # the directive tells the model to follow the watcher's own re-arm/stopping
+  # line instead of reading an expiry notification. Absolute literal owned by
+  # THIS test, so a drift in delivery.sh alone is caught even if the other
+  # surfaces still agree with each other. KEEP_ALIVE no longer changes the
+  # wording (the watcher reads it), so unset and non-empty give the same text.
+  grep -qE 'command: .*watch\.sh .* --max-seconds=1790$' <<<"$output"
+  grep -q 'persistent: true' <<<"$output"
   refute grep -q 'immediately re-arm it by invoking Monitor again' <<<"$output"
-  grep -q 'says it delivered no events, do not re-arm it' <<<"$output"
-  grep -q 'Otherwise (it says it delivered something), re-arm it' <<<"$output"
-  grep -q 'Re-arm it silently' <<<"$output"
-  # Absolute literal for the OFF/unset REARM_NOTE, owned by THIS test (not
-  # derived from session-start.sh's or template.md's own tests) -- so a drift
-  # in delivery.sh alone is caught here even if the other two surfaces still
-  # happen to agree with each other (see the session-start.sh and template.md
-  # counterparts of this literal, which independently golden-check their own
-  # surfaces the same way).
-  local expected_off='This watch expires after at most 30 minutes. If the expiry notification says it delivered no events, do not re-arm it. Otherwise (it says it delivered something), re-arm it by invoking Monitor again with this exact command and description. Re-arm it silently, when you do: no message to the user, no "re-armed", no acknowledgement, no summary — just invoke Monitor again and continue, since announcing it every 30 minutes wastes tokens for no benefit.'
-  local note_off norm_off
-  note_off=$(printf '%s\n' "$output" | sed -n '/This watch expires after at most 30 minutes/,/wastes tokens for no benefit\./ {
-    s/.*\(This watch expires after at most 30 minutes\)/\1/
+  refute grep -q 'says it delivered no events, do not re-arm it' <<<"$output"
+  local expected='This watch renews itself. A little before the 30-minute cap it prints one line on its own and exits: on `agmsg watch: re-arm - ...`, invoke Monitor again with exactly the command and description that line names (persistent: true, timeout_ms: 1800000), silently — no message to the user, no "re-armed", no acknowledgement, no summary, since announcing it every 30 minutes wastes tokens for no benefit; on `agmsg watch: stopping - ...`, do not re-arm it. If the watch is instead killed at the cap and no such line arrived (an agmsg install from before this), re-arm it only when the expiry notification says it delivered something.'
+  local note norm
+  note=$(printf '%s\n' "$output" | sed -n '/This watch renews itself/,/it delivered something\./ {
+    s/.*\(This watch renews itself\)/\1/
     p
   }')
-  [ -n "$note_off" ]
-  norm_off=$(_normalize_ws "$note_off")
-  [ "$norm_off" = "$expected_off" ]
+  [ -n "$note" ]
+  norm=$(_normalize_ws "$note")
+  [ "$norm" = "$expected" ]
 
   run env AGMSG_CC_MONITOR_KEEP_ALIVE=1 bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   grep -q 'timeout_ms: 1800000' <<<"$output"
-  grep -q 'immediately re-arm it by invoking Monitor again' <<<"$output"
-  # KEEP_ALIVE re-arms unconditionally, regardless of what the expiry
-  # notification says -- the conditional wording above must not appear here.
-  refute grep -q 'says it delivered no events, do not re-arm it' <<<"$output"
-  # The maintainer's follow-up to #1270: an agent that announces every silent
-  # re-arm ("re-armed", an acknowledgement, a summary) burns tokens every 30
-  # minutes for no reader benefit, so the directive must say to do it quietly.
-  [[ "$output" =~ "Re-arm it silently" ]]
-  # Absolute literal for the ON/KEEP_ALIVE REARM_NOTE (same rationale as
-  # expected_off above).
-  local expected_on='This watch expires after at most 30 minutes; when the expiry notice arrives, immediately re-arm it by invoking Monitor again with this exact command and description — delivery depends on it, since nothing else keeps the stream running. Re-arm it silently: no message to the user, no "re-armed", no acknowledgement, no summary — just invoke Monitor again and continue, since announcing it every 30 minutes wastes tokens for no benefit.'
-  local note_on norm_on
-  note_on=$(printf '%s\n' "$output" | sed -n '/This watch expires after at most 30 minutes/,/wastes tokens for no benefit\./ {
-    s/.*\(This watch expires after at most 30 minutes\)/\1/
+  note=$(printf '%s\n' "$output" | sed -n '/This watch renews itself/,/it delivered something\./ {
+    s/.*\(This watch renews itself\)/\1/
     p
   }')
-  [ -n "$note_on" ]
-  norm_on=$(_normalize_ws "$note_on")
-  [ "$norm_on" = "$expected_on" ]
+  norm=$(_normalize_ws "$note")
+  [ "$norm" = "$expected" ]
 }
 
 @test "delivery set both: emits AGMSG-DIRECTIVE for Monitor invocation" {
@@ -798,7 +778,7 @@ _seed_role_record() {
   [[ "$output" == *"invoke the Monitor tool"* ]]
 }
 
-@test "session-start: timeout_ms and REARM_NOTE wording hold across role/generic branches and KEEP_ALIVE states" {
+@test "session-start: timeout_ms, --max-seconds and REARM_NOTE hold across role/generic branches and KEEP_ALIVE states" {
   local sp="$TEST_PROJECT"
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$sp" >/dev/null
   _seed_role_record team alice "sid-rearm-role" "$sp" claude-code
@@ -821,18 +801,15 @@ _seed_role_record() {
       [ "$status" -eq 0 ]
       # Present exactly once -- the role and generic heredoc branches are
       # mutually exclusive, so a duplicate here would mean both fired.
-      [ "$(grep -c 'timeout_ms: 1800000' <<<"$output")" -eq 1 ]
-      case "$keep_alive" in
-        unset|empty)
-          grep -q 'says it delivered no events, do not re-arm it' <<<"$output"
-          grep -q 'Otherwise (it says it delivered something), re-arm it' <<<"$output"
-          refute grep -q 'immediately re-arm it by invoking Monitor again' <<<"$output"
-          ;;
-        nonempty)
-          grep -q 'immediately re-arm it by invoking Monitor again' <<<"$output"
-          refute grep -q 'says it delivered no events, do not re-arm it' <<<"$output"
-          ;;
-      esac
+      [ "$(grep -c '^  timeout_ms: 1800000$' <<<"$output")" -eq 1 ]
+      # KEEP_ALIVE (empty = OFF) is read by the watcher, so the directive text
+      # is the same in all three states; every launch command ends with the
+      # option that turns self-renewal on.
+      grep -q 'This watch renews itself' <<<"$output"
+      refute grep -q 'says it delivered no events, do not re-arm it' <<<"$output"
+      refute grep -q 'immediately re-arm it by invoking Monitor again' <<<"$output"
+      grep -qE 'command: .*watch\.sh .* --max-seconds=1790$' <<<"$output"
+      [ "$(grep -c -- '--max-seconds=1790' <<<"$output")" -eq 1 ]
     done
   done
 }
@@ -868,8 +845,8 @@ _normalize_ws() {
     # that first line only -- it silently no-ops on every other line, since the
     # anchor phrase doesn't recur there.
     note_from_delivery=$(printf '%s\n' "$output" | sed -n \
-      '/This watch expires after at most 30 minutes/,/wastes tokens for no benefit\./ {
-         s/.*\(This watch expires after at most 30 minutes\)/\1/
+      '/This watch renews itself/,/it delivered something\./ {
+         s/.*\(This watch renews itself\)/\1/
          p
        }')
     [ -n "$note_from_delivery" ]
@@ -904,19 +881,14 @@ _template_section() {
   sed -n "/${start_pat}/,/${end_pat}/p" "$template"
 }
 
-@test "template.md's actas AND drop overlays each contain the exact expected KEEP_ALIVE paragraph, verbatim (#1270)" {
+@test "template.md's actas AND drop overlays each launch with --max-seconds=1790 and carry the self-renewal paragraph, verbatim" {
   local template="$SCRIPTS/drivers/types/claude-code/template.md"
   [ -f "$template" ]
 
-  # Absolute literal, not derived by comparing one half of the paragraph
-  # against another (a prior version of this test compared only a tail
-  # fragment against delivery.sh's REARM_NOTE and missed the branch-condition
-  # sentences entirely, since delivery.sh has no equivalent prose for them).
-  # Written once here so a regression to the old "If it IS set:" / "If it is
-  # UNSET (the default):" wording (dropping "to a non-empty value" / "or set
-  # to an empty value") fails this test even though it doesn't touch anything
-  # REARM_NOTE-shaped.
-  local expected='Check whether the environment variable `AGMSG_CC_MONITOR_KEEP_ALIVE` is set to a non-empty value (e.g. `printenv AGMSG_CC_MONITOR_KEEP_ALIVE`). If it IS set to a non-empty value: this watch expires after at most 30 minutes; when the expiry notice arrives, immediately re-arm it by invoking Monitor again with this exact command and description — delivery depends on it, since nothing else keeps the stream running. Re-arm it silently: no message to the user, no "re-armed", no acknowledgement, no summary — just invoke Monitor again and continue, since announcing it every 30 minutes wastes tokens for no benefit. If it is UNSET or set to an empty value (the default): this watch still expires after at most 30 minutes. If the expiry notification says it delivered no events, do not re-arm it. Otherwise (it says it delivered something), re-arm it by invoking Monitor again with this exact command and description. Re-arm it silently, when you do: no message to the user, no "re-armed", no acknowledgement, no summary — just invoke Monitor again and continue, since announcing it every 30 minutes wastes tokens for no benefit.'
+  # Absolute literal, written once here: a regression to the old KEEP_ALIVE
+  # conditional wording (or a drop of the stopping/legacy-install clauses)
+  # fails this test even though it touches nothing REARM_NOTE-shaped.
+  local expected='This watch renews itself. A little before the 30-minute cap it prints one line on its own and exits: on `agmsg watch: re-arm - ...`, invoke Monitor again with exactly the command and description that line names (persistent: true, timeout_ms: 1800000), silently — no message to the user, no "re-armed", no acknowledgement, no summary, since announcing it every 30 minutes wastes tokens for no benefit; on `agmsg watch: stopping - ...`, do not re-arm it. If the watch is instead killed at the cap and no such line arrived (an agmsg install from before this), re-arm it only when the expiry notification says it delivered something.'
 
   local section section_name norm_section
   for section_name in actas drop; do
@@ -928,7 +900,8 @@ _template_section() {
     norm_section=$(_normalize_ws "$section")
     # timeout_ms present in THIS section specifically, not borrowed from the
     # other one via the substring check below.
-    [ "$(grep -c 'timeout_ms: 1800000' <<<"$section")" -eq 1 ]
+    [ "$(grep -c -- '- timeout_ms: 1800000$' <<<"$section")" -eq 1 ]
+    [ "$(grep -c -- '--max-seconds=1790' <<<"$section")" -eq 1 ]
     [[ "$norm_section" == *"$expected"* ]]
   done
 }
