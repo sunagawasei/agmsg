@@ -21,6 +21,8 @@ source "$SCRIPT_DIR/lib/session-team.sh"
 source "$SCRIPT_DIR/lib/identity-key.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/type-registry.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/instance-id.sh"
 
 if ! agmsg_is_known_type "$TYPE"; then
   echo "ensure-headless: unknown agent type '$TYPE'" >&2
@@ -69,17 +71,86 @@ fi
 key="$(printf '%s__%s' "$TEAM" "$NAME" | tr -c 'A-Za-z0-9._-' '_')"
 LOCK="$RUN_DIR/ensure-${TYPE}.$key.lock"
 
-# Reclaim a stale lock left by an owner that crashed before spawning. A normal
-# spawn is sub-second; two minutes is a safe floor.
-if [ -d "$LOCK" ] && [ -n "$(find "$LOCK" -maxdepth 0 -mmin +2 -print 2>/dev/null)" ]; then
-  rmdir "$LOCK" 2>/dev/null || true
-fi
+# The lock directory holds one record, owner.<pid>.<nonce>, naming the process
+# that owns it. A lock is taken over only when that process is gone; elapsed
+# time alone never frees it, because a live spawn can run for minutes. The
+# record name is unique per acquisition, so a reaper that judged one owner dead
+# can only remove that owner's record, never a successor's.
+GRACE_MIN=1  # an ownerless or unreadable lock is a crash between mkdir and publish
 
-if ! mkdir "$LOCK" 2>/dev/null; then
+lock_record() {
+  set -- "$LOCK"/owner.*
+  [ -e "$1" ] && [ "$#" -eq 1 ] && printf '%s\n' "$1"
+}
+
+# 0 = the holder is gone and its lock was removed (or already vanished); 1 = held.
+lock_reap_if_gone() {
+  local rec pid tok cur dead=0
+  if [ ! -d "$LOCK" ]; then return 0; fi
+  rec="$(lock_record)" || rec=""
+  if [ -z "$rec" ]; then
+    set -- "$LOCK"/owner.*
+    [ ! -e "$1" ] || return 1
+    [ -n "$(find "$LOCK" -maxdepth 0 -mmin +"$GRACE_MIN" -print 2>/dev/null)" ] || return 1
+    rmdir "$LOCK" 2>/dev/null || true
+    return 0
+  fi
+  pid="$(sed -n 1p "$rec" 2>/dev/null || true)"
+  tok="$(sed -n 2p "$rec" 2>/dev/null || true)"
+  if _agmsg_pid_valid "$pid"; then
+    if ! _agmsg_pid_alive_local "$pid"; then
+      dead=1
+    elif [ -n "$tok" ]; then
+      # Alive pid, different start time: the pid was recycled. No token now
+      # means we cannot tell, which counts as alive.
+      cur="$(agmsg_pid_start_token "$pid" 2>/dev/null || true)"
+      if [ -n "$cur" ] && [ "$cur" != "$tok" ]; then dead=1; fi
+    fi
+  elif [ -n "$(find "$rec" -maxdepth 0 -mmin +"$GRACE_MIN" -print 2>/dev/null)" ]; then
+    dead=1
+  fi
+  [ "$dead" -eq 1 ] || return 1
+  # Re-check that the same record is still the only one, then claim it by name.
+  [ "$(lock_record 2>/dev/null || true)" = "$rec" ] || return 1
+  mv "$rec" "$LOCK/reaped.$$" 2>/dev/null || return 1
+  rm -f "$LOCK/reaped.$$"
+  rmdir "$LOCK" 2>/dev/null || true
+  return 0
+}
+
+OWNER_REC=""
+lock_publish() {
+  local tmp="$RUN_DIR/.owner.$key.$$" tok
+  tok="$(agmsg_pid_start_token "$$" 2>/dev/null || true)"
+  printf '%s\n%s\n' "$$" "$tok" > "$tmp" 2>/dev/null || return 1
+  OWNER_REC="$LOCK/owner.$$.$RANDOM$RANDOM"
+  # mv fails when the directory was removed meanwhile, so a record is never
+  # published into a lock somebody else now owns.
+  mv "$tmp" "$OWNER_REC" 2>/dev/null || { rm -f "$tmp"; OWNER_REC=""; return 1; }
+}
+
+lock_release() {
+  [ -n "$OWNER_REC" ] || return 0
+  if mv "$OWNER_REC" "$LOCK/released.$$" 2>/dev/null; then
+    rm -f "$LOCK/released.$$"
+    rmdir "$LOCK" 2>/dev/null || true
+  fi
+}
+
+acquired=0
+for _try in 1 2 3; do
+  if mkdir "$LOCK" 2>/dev/null; then
+    if lock_publish; then acquired=1; break; fi
+    rmdir "$LOCK" 2>/dev/null || true
+    continue
+  fi
+  lock_reap_if_gone || break
+done
+if [ "$acquired" -ne 1 ]; then
   echo "ensure-${TYPE}: spawn already in flight for '$NAME' in team '$TEAM'"
   exit 0
 fi
-trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+trap lock_release EXIT
 
 # Re-check under the lock: a peer may have spawned between our pgrep and here.
 if pgrep -f "$BRIDGE_SIG" >/dev/null 2>&1; then

@@ -187,6 +187,82 @@ STUB
   grep -q -- "codex codex --team s-sess-STALE --project $PROJ --headless" "$TEST_SKILL_DIR/spawn.args"
 }
 
+# Plant a lock owned by <pid> (token optional), back-dated far past any age limit.
+plant_lock() {
+  local team_sess="$1" pid="$2" tok="${3:-}"
+  PLANTED_LOCK="$TEST_SKILL_DIR/run/ensure-codex.s-${team_sess}__codex.lock"
+  mkdir -p "$PLANTED_LOCK"
+  printf '%s\n%s\n' "$pid" "$tok" > "$PLANTED_LOCK/owner.$pid.1"
+  touch -t 200001010000 "$PLANTED_LOCK/owner.$pid.1" "$PLANTED_LOCK"
+}
+
+@test "ensure-headless: lock of a live owner is kept however old it is" {
+  local stub_bin="$TEST_SKILL_DIR/stub-bin"
+  write_pgrep_stub miss >/dev/null
+  write_spawn_stub 0
+  sleep 30 & local owner=$!
+  plant_lock sess-LIVE "$owner"
+  run env PATH="$stub_bin:$PATH" CLAUDE_CODE_SESSION_ID=sess-LIVE \
+    bash "$SCRIPTS/ensure-headless.sh" codex "$PROJ"
+  kill "$owner" 2>/dev/null || true
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawn already in flight"* ]]
+  [ ! -e "$TEST_SKILL_DIR/spawn.args" ]
+  [ -d "$PLANTED_LOCK" ]
+}
+
+@test "ensure-headless: lock of a dead owner is reclaimed" {
+  local stub_bin="$TEST_SKILL_DIR/stub-bin"
+  write_pgrep_stub miss >/dev/null
+  write_spawn_stub 0
+  sleep 0.1 & local owner=$!
+  wait "$owner"
+  plant_lock sess-DEAD "$owner"
+  # Fresh mtimes: death alone, not age, must free it.
+  touch "$PLANTED_LOCK" "$PLANTED_LOCK"/owner.*
+  run env PATH="$stub_bin:$PATH" CLAUDE_CODE_SESSION_ID=sess-DEAD \
+    bash "$SCRIPTS/ensure-headless.sh" codex "$PROJ"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless codex 'codex'"* ]]
+}
+
+@test "ensure-headless: lock whose pid was recycled is reclaimed" {
+  local stub_bin="$TEST_SKILL_DIR/stub-bin"
+  write_pgrep_stub miss >/dev/null
+  write_spawn_stub 0
+  sleep 30 & local owner=$!
+  plant_lock sess-RECYCLED "$owner" "proc:0-not-this-process"
+  run env PATH="$stub_bin:$PATH" CLAUDE_CODE_SESSION_ID=sess-RECYCLED \
+    bash "$SCRIPTS/ensure-headless.sh" codex "$PROJ"
+  kill "$owner" 2>/dev/null || true
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless codex 'codex'"* ]]
+}
+
+@test "ensure-headless: a fresh unreadable owner record is not reclaimed" {
+  local stub_bin="$TEST_SKILL_DIR/stub-bin"
+  local lock="$TEST_SKILL_DIR/run/ensure-codex.s-sess-JUNK__codex.lock"
+  write_pgrep_stub miss >/dev/null
+  write_spawn_stub 0
+  mkdir -p "$lock"
+  : > "$lock/owner.0.1"
+  run env PATH="$stub_bin:$PATH" CLAUDE_CODE_SESSION_ID=sess-JUNK \
+    bash "$SCRIPTS/ensure-headless.sh" codex "$PROJ"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawn already in flight"* ]]
+  [ -d "$lock" ]
+}
+
+@test "ensure-headless: the lock is removed after the spawn" {
+  local stub_bin="$TEST_SKILL_DIR/stub-bin"
+  write_pgrep_stub miss >/dev/null
+  write_spawn_stub 0
+  run env PATH="$stub_bin:$PATH" CLAUDE_CODE_SESSION_ID=sess-REL \
+    bash "$SCRIPTS/ensure-headless.sh" codex "$PROJ"
+  [ "$status" -eq 0 ]
+  [ ! -e "$TEST_SKILL_DIR/run/ensure-codex.s-sess-REL__codex.lock" ]
+}
+
 @test "ensure-headless: rejects invalid and non-headless types" {
   run bash "$SCRIPTS/ensure-headless.sh" bogus "$PROJ"
   [ "$status" -ne 0 ]
