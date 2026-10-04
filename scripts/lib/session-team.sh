@@ -137,6 +137,35 @@ agmsg_session_normalize_sid() {
   printf '%s' "$sid"
 }
 
+# Echo the session id a hook payload (JSON on $1) carries, or nothing when it is
+# not a JSON object with a top-level string session_id, or when conversation_id /
+# sessionId is present and is not that very string (a different value, a
+# non-string or null). Nothing is echoed for a failed check either, so callers
+# fail closed. The id is not validated here: agmsg_session_normalize_sid does it.
+agmsg_session_payload_id() {
+  local input="${1:-}" lit sid bad
+  lit="$(printf '%s' "$input" | sed "s/'/''/g")" || return 0
+  sid="$(printf '%s\n' "
+    WITH raw(j) AS (SELECT '$lit'),
+    valid(j) AS (SELECT j FROM raw WHERE json_valid(j) AND json_type(j) = 'object')
+    SELECT json_extract(j, '\$.session_id') FROM valid
+    WHERE json_type(j, '\$.session_id') = 'text';" \
+    | sqlite3 -init /dev/null -noheader -list :memory: 2>/dev/null | head -1 | tr -d '\r')" || return 0
+  [ -n "$sid" ] || return 0
+  case "$sid" in *\'*) return 0 ;; esac
+  bad="$(printf '%s\n' "
+    WITH raw(j) AS (SELECT '$lit'),
+    valid(j) AS (SELECT j FROM raw WHERE json_valid(j) AND json_type(j) = 'object')
+    SELECT 1 FROM valid
+    WHERE (json_type(j, '\$.conversation_id') IS NOT NULL
+           AND json_extract(j, '\$.conversation_id') IS NOT '$sid')
+       OR (json_type(j, '\$.sessionId') IS NOT NULL
+           AND json_extract(j, '\$.sessionId') IS NOT '$sid');" \
+    | sqlite3 -init /dev/null -noheader -list :memory: 2>/dev/null)" || return 0
+  [ -z "$bad" ] || return 0
+  printf '%s' "$sid"
+}
+
 # Echo <host>'s team name for a bare session id, or nothing.
 agmsg_session_team_for() {
   local host="$1" bare="$2" prefix

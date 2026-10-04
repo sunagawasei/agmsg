@@ -55,6 +55,7 @@ agmsg_headless_provenance_remove() {
 # token, dead or recycled owner, symlink) is "no".
 agmsg_headless_provenance_allows() {
   local sid="$1" team="$2" prefix f rec rec_team rec_pid rec_start now_start
+  local found="" other=0
   prefix="$(_agmsg_hp_prefix "$sid")" || return 1
   for f in "$prefix"[0-9]*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
@@ -62,14 +63,16 @@ agmsg_headless_provenance_allows() {
     rec_team="$(printf '%s\n' "$rec" | sed -n 's/^team=//p' | head -1)"
     rec_pid="$(printf '%s\n' "$rec" | sed -n 's/^pid=//p' | head -1)"
     rec_start="$(printf '%s\n' "$rec" | sed -n 's/^start=//p' | head -1)"
-    [ -n "$rec_team" ] && [ "$rec_team" = "$team" ] || continue
+    [ -n "$rec_team" ] || continue
     case "$rec_pid" in ''|*[!0-9]*) continue ;; esac
     [ "$f" = "$prefix$rec_pid" ] || continue
     [ -n "$rec_start" ] || continue
     _agmsg_pid_alive "$rec_pid" || continue
     now_start="$(agmsg_pid_start_token "$rec_pid" 2>/dev/null || true)"
     [ -n "$now_start" ] && [ "$now_start" = "$rec_start" ] || continue
-    return 0
+    # A live record for this sid. The sid is bound to ONE team: live records
+    # that name different teams make it ambiguous and authorize nothing.
+    if [ "$rec_team" = "$team" ]; then found=1; else other=1; fi
   done
-  return 1
+  [ -n "$found" ] && [ "$other" -eq 0 ]
 }

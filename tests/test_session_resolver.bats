@@ -328,6 +328,19 @@ start_bridge() {
   [ "$status" -eq 0 ]
 }
 
+@test "provenance: live records of one sid naming different teams are ambiguous and authorize nothing" {
+  mk_claude_team parent; mk_claude_team other
+  start_bridge worker-sid s-parent
+  local first="$BRIDGE_PID"
+  start_bridge worker-sid s-other
+  local second="$BRIDGE_PID"
+  sendas s-parent CLAUDE_CODE_SESSION_ID=worker-sid
+  [ "$status" -ne 0 ]
+  sendas s-other CLAUDE_CODE_SESSION_ID=worker-sid
+  [ "$status" -ne 0 ]
+  kill "$first" "$second" 2>/dev/null || true
+}
+
 @test "provenance: a record without a start token is never published and never accepted" {
   run bash -c "
     export SKILL_DIR='$TEST_SKILL_DIR'
@@ -446,6 +459,78 @@ start_bridge() {
   run bash "$SCRIPTS/watchdog.sh" "cur-$CUR_A"
   [ "$status" -ne 0 ]
   [[ "$output" == *"not a session-team name"* ]]
+}
+
+# --- pending teardown for a cursor session team ------------------------------
+
+@test "pending teardown: a cursor session team's worker is kept while another instance of the session is live" {
+  export SKILL_DIR="$TEST_SKILL_DIR" RUN="$TEST_SKILL_DIR/run"
+  mkdir -p "$RUN"
+  mk_cursor_team "$CUR_A"
+  bash "$SCRIPTS/join.sh" "cur-$CUR_A" worker codex "$PROJ" >/dev/null
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/actas-lock.sh"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/pending-teardown.sh"
+  test_fixture_start_reaped_process sleep 300
+  local bridge_pid="$TEST_REAPED_PID" record
+  record="$(printf 'pid:%s\t%s\tcodex' "$bridge_pid" "$PROJ")"
+  printf '%s\n' "$record" > "$(agmsg_spawn_path "cur-$CUR_A" worker)"
+  printf 'pid=%s\n' "$bridge_pid" > "$RUN/codex-bridge.cur-$CUR_A.worker.meta"
+  test_fixture_start_reaped_process sleep 300
+  local sibling="$TEST_REAPED_PID"
+  printf '%s.%s\n' "$CUR_A" "$sibling" > "$RUN/cc-instance.$sibling"
+  local dead_instance="$CUR_A.2147483647"
+  agmsg_pending_teardown_write "cur-$CUR_A" worker codex test-live-sibling \
+    "$record" verified "$dead_instance" 2147483647 ps:dead-owner "$dead_instance" ""
+  run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"reason=bare-owner-alive"* ]]
+  kill -0 "$bridge_pid"
+  [ -f "$(agmsg_pending_teardown_path "cur-$CUR_A" worker)" ]
+}
+
+# --- check-inbox for a cursor session ------------------------------------------
+
+@test "check-inbox: a team that only shares a cursor session team's name is never read" {
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  # a project team that happens to be named cur-<uuid>, with an unread message for cursor-host
+  bash "$SCRIPTS/join.sh" "cur-$CUR_A" cursor-host cursor "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" "cur-$CUR_A" human cursor "$PROJ" >/dev/null
+  bash "$SCRIPTS/send.sh" "cur-$CUR_A" human cursor-host "must-not-surface" >/dev/null
+  run bash -c "printf '{\"session_id\":\"$CUR_A\"}' | env -u CLAUDE_CODE_SESSION_ID bash '$SCRIPTS/check-inbox.sh' cursor '$PROJ' 2>/dev/null"
+  [ -z "$output" ]
+  run bash "$SCRIPTS/inbox.sh" "cur-$CUR_A" cursor-host --format ids
+  [[ "$output" == *"must-not-surface"* ]]
+}
+
+@test "check-inbox: a payload whose id fields disagree reads no inbox" {
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  mk_cursor_team "$CUR_A"
+  bash "$SCRIPTS/send.sh" "cur-$CUR_A" human cursor-host "must-not-surface" >/dev/null
+  for payload in "{\"session_id\":\"$CUR_A\",\"conversation_id\":\"$CUR_B\"}" \
+                 "{\"session_id\":\"$CUR_A\",\"sessionId\":\"$CUR_B\"}" \
+                 "{\"session_id\":\"$CUR_A\",\"conversation_id\":null}" \
+                 "{\"session_id\":\"$CUR_A\",\"conversation_id\":5}" \
+                 "{\"nested\":{\"session_id\":\"$CUR_A\"}}" \
+                 "not json"; do
+    run bash -c "printf '%s' '$payload' | env -u CLAUDE_CODE_SESSION_ID bash '$SCRIPTS/check-inbox.sh' cursor '$PROJ' 2>/dev/null"
+    [ -z "$output" ]
+  done
+  run bash -c "printf '{\"session_id\":\"$CUR_A\",\"conversation_id\":\"$CUR_A\"}' | env -u CLAUDE_CODE_SESSION_ID bash '$SCRIPTS/check-inbox.sh' cursor '$PROJ' 2>/dev/null"
+  [[ "$output" == *"must-not-surface"* ]]
+}
+
+@test "check-inbox: one session's cooldown does not silence another session's Stop" {
+  local interval=300
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval "$interval" >/dev/null
+  mk_cursor_team "$CUR_A"; mk_cursor_team "$CUR_B"
+  bash "$SCRIPTS/send.sh" "cur-$CUR_A" human cursor-host "for-a" >/dev/null
+  bash "$SCRIPTS/send.sh" "cur-$CUR_B" human cursor-host "for-b" >/dev/null
+  run bash -c "printf '{\"session_id\":\"$CUR_A\"}' | env -u CLAUDE_CODE_SESSION_ID bash '$SCRIPTS/check-inbox.sh' cursor '$PROJ' 2>/dev/null"
+  [[ "$output" == *"for-a"* ]]
+  run bash -c "printf '{\"session_id\":\"$CUR_B\"}' | env -u CLAUDE_CODE_SESSION_ID bash '$SCRIPTS/check-inbox.sh' cursor '$PROJ' 2>/dev/null"
+  [[ "$output" == *"for-b"* ]]
 }
 
 # --- children never inherit a session id ------------------------------------

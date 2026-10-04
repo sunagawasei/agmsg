@@ -138,7 +138,7 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
   bash "$SCRIPTS/join.sh" reviewteam opus-review cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" reviewteam human       cursor "$TEST_PROJECT" >/dev/null
-  bash "$SCRIPTS/join.sh" cur-$SID_A cursor-host cursor "$TEST_PROJECT" >/dev/null
+  AGMSG_JOIN_SESSION_MARKER=cursor bash "$SCRIPTS/join.sh" cur-$SID_A cursor-host cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" cur-$SID_A human  cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/send.sh" reviewteam human opus-review "for-worker" >/dev/null
   bash "$SCRIPTS/send.sh" cur-$SID_A human cursor-host "for-session" >/dev/null
@@ -151,7 +151,7 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 @test "check-inbox (cursor, session-team on): worker registered after the session still reads only its own inbox" {
   enable_st
   bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
-  bash "$SCRIPTS/join.sh" cur-$SID_A cursor-host cursor "$TEST_PROJECT" >/dev/null
+  AGMSG_JOIN_SESSION_MARKER=cursor bash "$SCRIPTS/join.sh" cur-$SID_A cursor-host cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" cur-$SID_A human  cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" reviewteam human       cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" reviewteam opus-review cursor "$TEST_PROJECT" >/dev/null
@@ -319,9 +319,9 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   local other="72a71a78-44ec-43c7-9d92-f2a7a2a24223"
   enable_st
   bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
-  bash "$SCRIPTS/join.sh" "cur-$SID_A" cursor-host cursor "$TEST_PROJECT" >/dev/null
+  AGMSG_JOIN_SESSION_MARKER=cursor bash "$SCRIPTS/join.sh" "cur-$SID_A" cursor-host cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" "cur-$SID_A" human       cursor "$TEST_PROJECT" >/dev/null
-  bash "$SCRIPTS/join.sh" "cur-$other" cursor-host cursor "$TEST_PROJECT" >/dev/null
+  AGMSG_JOIN_SESSION_MARKER=cursor bash "$SCRIPTS/join.sh" "cur-$other" cursor-host cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" "cur-$other" human       cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/send.sh" "cur-$other" human cursor-host "for-other" >/dev/null
   bash "$SCRIPTS/send.sh" "cur-$SID_A" human cursor-host "for-a" >/dev/null

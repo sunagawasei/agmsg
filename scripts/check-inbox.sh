@@ -132,19 +132,27 @@ PROJECT="$(agmsg_resolve_project "$PROJECT" "$TYPE")"
 # sessions' teams. lib/inbox-target.sh resolves the session's own team; when it
 # yields none (mode off, no usable id, or a role session) the enumeration below
 # applies unchanged.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/session-team.sh"
 AGENT=""
 TEAM_LIST=()
 IDENTITIES=""
 SESSION_ROUTED=0
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/session-team.sh"
 if [ -n "$RAW_SESSION_ID" ] && agmsg_type_has "$TYPE" session_team yes \
     && agmsg_session_team_enabled; then
   # shellcheck disable=SC1091
   source "$SCRIPT_DIR/lib/inbox-target.sh"
+  # The id must be the one SessionStart accepts: a payload whose id fields
+  # disagree, or whose id is unusable, reads no inbox at all.
+  RAW_SESSION_ID="$(agmsg_session_payload_id "$INPUT")"
+  [ -n "$RAW_SESSION_ID" ] || exit 0
   _ci_steam="$(agmsg_session_team_name_from_id "$RAW_SESSION_ID" "$TYPE")"
+  [ -n "$_ci_steam" ] || exit 0
+  # A session team that is not trusted (a project team that merely shares the
+  # name, or an unreadable marker) is never read from here.
+  [ "$(agmsg_session_team_class "$_ci_steam")" = session ] || exit 0
   _ci_target="$(agmsg_inbox_target "$TYPE" "$PROJECT" "$RAW_SESSION_ID" 2>/dev/null || true)"
-  if [ -n "$_ci_steam" ] && [ "${_ci_target#*teams=}" != "$_ci_target" ]; then
+  if [ "${_ci_target#*teams=}" != "$_ci_target" ]; then
     _ci_teams="${_ci_target#*teams=}"; _ci_teams="${_ci_teams%% *}"
     if [ "$_ci_teams" = "$_ci_steam" ]; then
       AGENT="${_ci_target#agent=}"; AGENT="${AGENT%% *}"
@@ -154,6 +162,10 @@ if [ -n "$RAW_SESSION_ID" ] && agmsg_type_has "$TYPE" session_team yes \
   fi
 fi
 
+SESSION_HOST_MODE=0
+if agmsg_type_has "$TYPE" session_team yes && agmsg_session_team_enabled; then
+  SESSION_HOST_MODE=1
+fi
 IDENTITIES_VALID=1
 if [ "$SESSION_ROUTED" -ne 1 ]; then
 IDENTITIES=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE")
@@ -163,6 +175,15 @@ while IFS=$'\t' read -r identity_team identity_agent identity_extra; do
   if [ -z "$identity_team" ] || [ -z "$identity_agent" ] || [ -n "$identity_extra" ]; then
     IDENTITIES_VALID=0
     break
+  fi
+
+  # A session-team host never reads another session's team through this
+  # project-wide enumeration (it has no identity of its own here, or it is a
+  # role session): only the teams that are not session teams are candidates.
+  if [ "$SESSION_HOST_MODE" -eq 1 ]; then
+    case "$(agmsg_session_team_class "$identity_team")" in
+      session|unknown) continue ;;
+    esac
   fi
 
   [ -n "$AGENT" ] || AGENT="$identity_agent"
@@ -197,10 +218,15 @@ fi
 # next Stop would exit at the gate without delivering. Its own marker bounds the
 # per-tool-call cost to one read/minute without touching Stop's. (This one value
 # was answering two questions — the same shape reviews keep flagging.)
+# Sessions of one host register the same seat in their own teams, so a
+# session-routed poll keys its cooldown on its team as well: one session's poll
+# must not silence another session's Stop.
+_ci_cool="$AGENT"
+[ "$SESSION_ROUTED" -eq 1 ] && _ci_cool="$AGENT.${TEAM_LIST[0]}"
 if [ "$EVENT" = "PostToolUse" ]; then
-  MARKER="$SKILL_DIR/run/.lastcheck-$AGENT.posttooluse"
+  MARKER="$SKILL_DIR/run/.lastcheck-$_ci_cool.posttooluse"
 else
-  MARKER="$SKILL_DIR/run/.lastcheck-$AGENT"
+  MARKER="$SKILL_DIR/run/.lastcheck-$_ci_cool"
 fi
 
 if [ -f "$MARKER" ]; then
