@@ -796,6 +796,12 @@ _agmsg_placement_claimed_by() {
     esac
     [ "$is_mine" -eq 1 ] && continue
     IFS="$(printf '\t')" read -r first _ < "$f" 2>/dev/null || first=""
+    # A headless worker's record (pid:<n>) names a process, not a pane: it
+    # cannot hold this pane, and treating it as unreadable made every seat
+    # refuse to record its own pane once any headless worker existed.
+    case "$first" in
+      pid:[0-9]*) case "${first#pid:}" in *[!0-9]*) ;; *) [ "${first#pid:}" -gt 0 ] 2>/dev/null && continue ;; esac ;;
+    esac
     # A record whose ref cannot be read as a pane -- empty, unreadable, or an
     # unknown spelling -- cannot be ruled out as THIS pane, so it claims. Naming
     # it lets a person drop it; waving it through is the fail-open this guard
