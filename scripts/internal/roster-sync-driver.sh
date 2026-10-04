@@ -55,7 +55,10 @@ if [ "$ROSTER_SYNC_BUDGET_S" -le 0 ]; then
 fi
 
 
-agmsg_lock_acquire "$team_dir"
+# `unbreakable`: this process starts a writer in the background and holds the lock
+# for it, so its own pid dying does not mean the writer stopped. A later acquirer
+# must not break this lock on that evidence.
+agmsg_lock_acquire "$team_dir" unbreakable
 # agmsg_lock_acquire already installs EXIT cleanup and exit-on-INT/TERM traps.
 # Keep those handlers: replacing them with release-only handlers would let a
 # signal return into this critical section after the lock had been dropped.

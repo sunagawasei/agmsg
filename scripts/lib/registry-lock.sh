@@ -53,53 +53,459 @@ _agmsg_lock_describe_dir() {
   echo "agmsg:   running as: $(id 2>/dev/null || echo 'unknown')" >&2
 }
 
-agmsg_lock_acquire() {
-  local team_dir="$1" lock i=0 max="${AGMSG_LOCK_TRIES:-1000}" err=""
-  local budget="${AGMSG_LOCK_SECONDS:-10}" started elapsed
-  started="$(date +%s)"
-  lock="$team_dir/.config.lock"
-  until err="$(mkdir "$lock" 2>&1)"; do
-    # WHY mkdir failed decides whether waiting can help, and only one reason
-    # ever clears on its own: somebody holds the lock. Everything else -- no
-    # write permission on the team dir, a read-only mount -- is a standing
-    # condition, and spinning ten seconds on it then reporting a timeout
-    # describes contention that never existed.
-    #
-    # That mattered in the field. A second machine, running as a different OS
-    # account, pointed at the first one's store; the team dir was 0755 and
-    # owned by the other user, so mkdir could never succeed. The message named
-    # a lock, so the search went to processes: an unrelated sync engine was
-    # killed, and when it happened again with no engine running and no lock
-    # directory present, the same sentence was still the only evidence. The
-    # `2>/dev/null` had thrown away the one line that said EACCES.
-    #
-    # Decided from the lock's presence rather than from the error text, which
-    # is locale-dependent. Checked in this order because the lock existing is
-    # the common case and settles it: only when it is absent is the question
-    # "can we write here at all". Absent AND writable is a lost race with a
-    # holder that has already released -- genuinely transient, so it spins.
-    if [ ! -d "$lock" ] && [ ! -w "$team_dir" ]; then
-      echo "agmsg: cannot create the registry lock in $team_dir" >&2
-      echo "agmsg: mkdir: $err" >&2
-      echo "agmsg: nothing is holding the lock — this directory cannot be written to, so waiting will not clear it." >&2
-      _agmsg_lock_describe_dir "$team_dir"
+# A seam for the interleavings this file's correctness rests on. Production never
+# overrides it; a test redefines it after sourcing to stop a process at a named
+# point and act as the "other" process there. Without it the races below could
+# only be argued, not exercised.
+_agmsg_lock_test_hook() { :; }
+
+# WHICH PROCESS TABLE A RECORDED PID BELONGS TO.
+#
+# A pid is a number in one process table, and "this pid is not running here" says
+# nothing about a record written by a process in another table. A hostname does
+# not name a table (a shared store is reachable from machines that share one, and
+# HOSTNAME is a variable anyone can set). The record carries a scope instead,
+# and a record is judged only by a process whose scope is IDENTICAL:
+#   Linux  machine-id : boot_id : the pid namespace's identity (readlink of
+#          /proc/self/ns/pid). Containers on one kernel share the first two and
+#          differ in the third; a cloned image shares the first and differs in the
+#          second.
+#   macOS  IOPlatformUUID : kern.bootsessionuuid. macOS has no pid namespaces.
+# Anything that cannot be read, or reads as a placeholder, leaves the scope empty
+# -- and an empty scope is "cannot tell", never "the same". Windows is left empty
+# on purpose: that is the behaviour before this existed, not a regression.
+_AGMSG_LOCK_SCOPE=""
+_AGMSG_LOCK_SCOPE_LOADED=""
+
+_agmsg_lock_valid_id() {   # <value> <length>: lowercase hex, not all zeros
+  local v="$1" n="$2" zeros=""
+  [ "${#v}" -eq "$n" ] || return 1
+  case "$v" in *[!0-9a-f]*) return 1 ;; esac
+  while [ "${#zeros}" -lt "$n" ]; do zeros="${zeros}0"; done
+  [ "$v" != "$zeros" ]
+}
+
+# Sets _AGMSG_LOCK_SCOPE (no subshell, so the answer is cached for the process).
+_agmsg_lock_scope_load() {
+  [ -z "$_AGMSG_LOCK_SCOPE_LOADED" ] || return 0
+  _AGMSG_LOCK_SCOPE_LOADED=1
+  local mid="" boot="" ns="" line
+  case "${OSTYPE:-}" in
+    linux*)
+      { read -r mid < /etc/machine-id; } 2>/dev/null || [ -n "$mid" ] || { read -r mid < /var/lib/dbus/machine-id; } 2>/dev/null || true
+      _agmsg_lock_valid_id "$mid" 32 || return 0
+      { read -r boot < /proc/sys/kernel/random/boot_id; } 2>/dev/null || true
+      [ -n "$boot" ] || return 0
+      command -v readlink >/dev/null 2>&1 || return 0
+      ns="$(readlink /proc/self/ns/pid 2>/dev/null)" || return 0
+      [ -n "$ns" ] || return 0
+      ;;
+    darwin*)
+      command -v ioreg >/dev/null 2>&1 && command -v sysctl >/dev/null 2>&1 || return 0
+      # Read with builtins (one program fewer on every acquire), to the end of
+      # the output so the program has finished before the lock is taken.
+      while IFS= read -r line; do
+        case "$line" in
+          *'"IOPlatformUUID" = "'*)
+            # The first one, as before; the rest is read only so the program ends.
+            if [ -z "$mid" ]; then mid="${line#*\"IOPlatformUUID\" = \"}"; mid="${mid%%\"*}"; fi ;;
+        esac
+      done < <(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null)
+      boot="$(sysctl -n kern.bootsessionuuid 2>/dev/null)" || return 0
+      [ -n "$mid" ] && [ -n "$boot" ] || return 0
+      ns="-"
+      ;;
+    *) return 0 ;;
+  esac
+  # Recorded as a digest, not as the raw identifiers: a machine id is a stable
+  # host identifier, and the record sits in a store other machines can read. The
+  # digest still compares equal exactly when the three parts do. With no hash
+  # tool there is no scope, which is "cannot tell".
+  _AGMSG_LOCK_SCOPE="$(printf 'agmsg-lock-scope:%s:%s:%s' "$mid" "$boot" "$ns" | _agmsg_lock_digest)" || _AGMSG_LOCK_SCOPE=""
+}
+
+_agmsg_lock_digest() {   # stdin -> hex digest, or non-zero when nothing here can hash
+  local h=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    h="$(sha256sum)" || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    h="$(shasum -a 256)" || return 1
+  else
+    return 1
+  fi
+  h="${h%% *}"
+  [ -n "$h" ] || return 1
+  printf '%s' "$h"
+}
+
+# Read a holder record in ONE pass, with builtins only (no process is started:
+# this runs on every failed mkdir of a contended acquire, and a wait that costs
+# forks per spin starves a contender when the machine is busy).
+# Sets _R_TOKEN _R_PID _R_SCOPE _R_BREAK, _R_HASBREAK=1 when a `break` line is
+# present, and _R_DUP=1 when any of those four appears twice -- a record somebody
+# wrote by hand, which is not trusted.
+_agmsg_lock_parse() {   # <file>
+  local line seen=" "
+  _R_TOKEN=""; _R_PID=""; _R_SCOPE=""; _R_BREAK=""; _R_HASBREAK=""; _R_DUP=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "token "*|"pid "*|"scope "*|"break "*)
+        case "$seen" in *" ${line%% *} "*) _R_DUP=1 ;; esac
+        seen="$seen${line%% *} "
+        case "$line" in
+          "token "*) _R_TOKEN="${line#token }" ;;
+          "pid "*) _R_PID="${line#pid }" ;;
+          "scope "*) _R_SCOPE="${line#scope }" ;;
+          "break "*) _R_BREAK="${line#break }"; _R_HASBREAK=1 ;;
+        esac ;;
+    esac
+  done 2>/dev/null < "$1"
+}
+
+# How many holder records the lock directory holds, and which (the last one).
+# A directory is one generation: exactly one `holder.<token>`. Zero is a lock
+# nobody has recorded yet (or whose owner died before it could); more than one is
+# an acquire race caught in the act. Neither is judged.
+_agmsg_lock_holder_scan() {   # <lock> -> _H_COUNT, _H_FILE
+  local f
+  _H_COUNT=0; _H_FILE=""
+  for f in "$1"/holder.*; do
+    [ -f "$f" ] || continue
+    _H_COUNT=$((_H_COUNT + 1)); _H_FILE="$f"
+  done
+}
+
+# A path as ONE shell word, for a command that is meant to be pasted. The store
+# root and the team name can both contain a space or an apostrophe (team names
+# are validated against empty / `.` / `..` / `/` / `\` / a leading `-` / control
+# characters, and nothing else), and a path that splits into several words, or
+# closes its own quote, makes `rm -r` or `rmdir` act on something the operator
+# did not read about. Same scheme as lib/shquote.sh, inline rather than sourced
+# so this library keeps its single-file contract.
+_agmsg_lock_quote() {   # <path>
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# A record, on one line, safe to print. The store can be shared, so a record is
+# written by whoever can reach it, and its fields (the host name is an
+# environment variable) reach the operator's terminal: anything that is not
+# printable ASCII becomes `?`, which is what keeps an escape sequence from being
+# one.
+_agmsg_lock_show() {   # <file>
+  tr '\n' ' ' < "$1" 2>/dev/null | LC_ALL=C tr -c '[:print:]' '?'
+}
+
+# LIVENESS, from the library that already answers this question (#865).
+#
+# `kill -0` on its own reads EPERM as dead, which in a sandbox turns "cannot
+# signal" into "not running" -- and here that would break a lock somebody is
+# holding. `_agmsg_pid_alive_local` treats EPERM as alive, a zombie as gone, and
+# cross-checks with `ps`, and a failed `ps` observation is "cannot tell", not
+# "dead" (#970). Sourced rather than reimplemented.
+#
+# LOADED ON FIRST USE, and located with builtins only. This file is sourced on
+# PATHs that carry almost nothing (`join` is required to work on one, and a test
+# runs a write with `rm` and `dirname` missing), so loading it must not need an
+# external command, and the uncontended path -- which never asks who holds a
+# lock -- must not pay for a library it does not use.
+_AGMSG_LOCK_SELF="${BASH_SOURCE[0]:-$0}"
+case "$_AGMSG_LOCK_SELF" in
+  */*) _AGMSG_LOCK_SELF_DIR="$(cd "${_AGMSG_LOCK_SELF%/*}" 2>/dev/null && pwd)" || _AGMSG_LOCK_SELF_DIR="" ;;
+  *) _AGMSG_LOCK_SELF_DIR="$(pwd)" ;;
+esac
+
+# Returns 0 when the liveness helpers are available, 1 when they could not be
+# loaded -- and then nothing here can ask whether a holder is running, which is
+# "cannot tell", never "dead".
+_agmsg_lock_load_liveness() {
+  if declare -f _agmsg_pid_alive_local >/dev/null 2>&1; then return 0; fi
+  [ -n "$_AGMSG_LOCK_SELF_DIR" ] && [ -f "$_AGMSG_LOCK_SELF_DIR/instance-id.sh" ] || return 1
+  # shellcheck source=instance-id.sh
+  source "$_AGMSG_LOCK_SELF_DIR/instance-id.sh" 2>/dev/null || return 1
+  declare -f _agmsg_pid_alive_local >/dev/null 2>&1
+}
+
+# Is this lock's holder gone? Sets _J_VERDICT, and _J_FILE for a single record.
+#
+#   gone      the one record is well formed, was written in THIS process table,
+#             and its pid is positively not running -- the only verdict that
+#             lets anything be broken
+#   alive     same table, pid running
+#   none      the directory holds no record (not yet written, or its owner died
+#             first): nothing can tell this from a lock taken a moment ago
+#   multi     more than one record: an acquire race caught in the act
+#   unbreakable  pid not running, but the record says its pid is not the whole of
+#             what holds the lock (see agmsg_lock_acquire): reported, never broken
+#   foreign   written in another process table, or this process cannot name its own
+#   noscope / badpid / malformed / noliveness   the record or the check is unusable
+#
+# Everything but `gone` is "cannot tell", and breaking on "cannot tell" takes a
+# live lock away, which is worse than the leak. A recycled pid reads as alive,
+# which is the safe direction.
+_agmsg_lock_judge() {   # <lock>
+  local lock="$1" pid scope token f
+  _J_VERDICT=""; _J_FILE=""
+  _agmsg_lock_holder_scan "$lock"
+  case "$_H_COUNT" in
+    0)
+      # Nothing recorded. An empty directory is a lock nobody has recorded yet;
+      # one with other things in it (what a failed release leaves) is not, and
+      # `rmdir` would not remove it.
+      _J_VERDICT=none
+      for f in "$lock"/* "$lock"/.[!.]* "$lock"/..?*; do
+        if [ -e "$f" ] || [ -L "$f" ]; then _J_VERDICT=nonempty; break; fi
+      done
+      return 1 ;;
+    1) ;;
+    *) _J_VERDICT=multi; return 1 ;;
+  esac
+  _J_FILE="$_H_FILE"
+  _agmsg_lock_load_liveness || { _J_VERDICT=noliveness; return 1; }
+  _agmsg_lock_parse "$_H_FILE"
+  token="$_R_TOKEN"; pid="$_R_PID"; scope="$_R_SCOPE"
+  # A field that appears twice, or a `break` that says anything but `no`, is a
+  # record somebody wrote by hand: not trusted.
+  if [ -n "$_R_DUP" ] || { [ -n "$_R_HASBREAK" ] && [ "$_R_BREAK" != "no" ]; }; then _J_VERDICT=malformed; return 1; fi
+  # The name carries the generation and the content must agree with it.
+  if [ -z "$token" ] || [ "${_H_FILE##*/}" != "holder.$token" ]; then _J_VERDICT=malformed; return 1; fi
+  _agmsg_pid_valid "$pid" 2147483647 || { _J_VERDICT=badpid; return 1; }
+  [ -n "$scope" ] || { _J_VERDICT=noscope; return 1; }
+  _agmsg_lock_scope_load
+  if [ -z "$_AGMSG_LOCK_SCOPE" ] || [ "$scope" != "$_AGMSG_LOCK_SCOPE" ]; then _J_VERDICT=foreign; return 1; fi
+  if _agmsg_pid_alive_local "$pid"; then _J_VERDICT=alive; return 1; fi
+  # Gone, but the holder said its pid is not the whole of what holds the lock.
+  if [ -n "$_R_HASBREAK" ]; then _J_VERDICT=unbreakable; return 1; fi
+  _J_VERDICT=gone
+  return 0
+}
+
+# Break a lock whose recorded holder is gone.
+#
+# THE CLAIM IS A RENAME OF THE RECORD BY ITS EXACT NAME, and the name carries the
+# generation. `mv <lock>/holder.<token>` succeeds only if the directory at that
+# path still holds that very record, so a lock that changed hands between the
+# judgement and the claim is not touched: the rename fails and this returns.
+# Whoever wins the claim is the only process that can remove this generation, and
+# the judgement made before it stands -- the record is a file nobody rewrites, so
+# there is nothing to re-ask. (A re-judgement here could only come out
+# differently by a pid being recycled, and then the record is already staged: it
+# would leave a directory nobody can ever break.)
+#
+# `rmdir` then removes the directory only if it is empty. A successor that has
+# published its own record makes it fail; a successor that has only made the
+# directory sees its publish fail and starts over (see agmsg_lock_acquire).
+_agmsg_lock_break_dead() {
+  local lock="$1" f tok staged
+  _agmsg_lock_judge "$lock" || return 1
+  f="$_J_FILE"; tok="${f##*/holder.}"
+  _agmsg_lock_test_hook break:after-judge "$lock"
+  staged="$lock.dead.$tok.$$"
+  mv "$f" "$staged" 2>/dev/null || return 1
+  _agmsg_lock_test_hook break:after-claim "$lock"
+  if ! rmdir "$lock" 2>/dev/null; then
+    # Not removed (a successor, or something else inside): the lock is still
+    # there and is no longer recorded, which doctor reports.
+    if command -v rm >/dev/null 2>&1; then rm -f "$staged" 2>/dev/null || :; fi
+    return 1
+  fi
+  if command -v rm >/dev/null 2>&1; then rm -f "$staged" 2>/dev/null || :; fi
+  return 0
+}
+
+# Publish this process's record into the directory it just made, and confirm it
+# is the only record there. Returns 0 owned, 1 start over (the directory was not
+# ours after all), 2 cannot publish (reported).
+#
+# The record goes in as `<lock>/holder.<token>`, INSIDE the directory it belongs
+# to. A record beside the directory outlives it: the remedy printed for a failed
+# release deletes the directory and leaves that record, and the next owner then
+# has a fresh directory next to a dead owner's record that a breaker will happily
+# judge and use to remove it. Inside, the record and the directory are one
+# generation -- deleting the directory deletes the record.
+#
+# It is written whole in a private name beside the lock and renamed in, so a
+# reader never sees half a record. The rename fails if the directory is gone, and
+# that is how an owner learns that a breaker removed the still-empty directory it
+# had just made: nothing to rmdir can tell a bare directory from a dead one, so
+# the owner is the one that checks, and starts over.
+#
+# Two acquirers can both end up with a record in one directory (a breaker removes
+# A's bare directory and B makes a new one before A's record lands). Each
+# publishes and then counts: whoever finds more than one backs off completely --
+# removes its own record and the directory if that leaves it empty -- and starts
+# over, so the directory is never left recorded by nobody. The later publisher
+# always sees the earlier one, so at most one of them proceeds.
+_agmsg_lock_publish() {   # <lock> <token> <unbreakable|""> <command> <host>
+  local lock="$1" token="$2" pub body cmd="$4" host="$5"
+  [ -n "$token" ] || return 0   # no entropy: nothing to publish, see the caller
+  pub="$lock.pub.$token"
+  _agmsg_lock_scope_load
+  body="token $token
+pid $$
+command $cmd
+host $host"
+  [ -z "$_AGMSG_LOCK_SCOPE" ] || body="$body
+scope $_AGMSG_LOCK_SCOPE"
+  [ -z "${3:-}" ] || body="$body
+break no"
+  _agmsg_lock_test_hook acquire:after-mkdir "$lock"
+  if ! { printf '%s\n' "$body" > "$pub"; } 2>/dev/null; then
+    _agmsg_lock_abandon "$lock" "$pub"
+    echo "agmsg: could not write this process's holder record beside $lock" >&2
+    return 2
+  fi
+  if ! mv "$pub" "$lock/holder.$token" 2>/dev/null; then
+    if [ ! -d "$lock" ]; then
+      if command -v rm >/dev/null 2>&1; then rm -f "$pub" 2>/dev/null || :; fi
       return 1
     fi
+    _agmsg_lock_abandon "$lock" "$pub"
+    echo "agmsg: could not record this process as the holder of $lock" >&2
+    return 2
+  fi
+  _agmsg_lock_test_hook acquire:after-publish "$lock"
+  _agmsg_lock_holder_scan "$lock"
+  if [ "$_H_COUNT" -ne 1 ] || [ "$_H_FILE" != "$lock/holder.$token" ]; then
+    _agmsg_lock_drop "$lock" quiet || :
+    return 1
+  fi
+  return 0
+}
+
+# A publish that failed with the directory still there: take back the directory
+# this process made (rmdir removes an EMPTY one only) rather than retry against
+# it for the rest of the budget.
+_agmsg_lock_abandon() {   # <lock> <pub>
+  # The directory first: it is the lock, and `rm` is a program other contenders
+  # would wait behind.
+  rmdir "$1" 2>/dev/null || :
+  if command -v rm >/dev/null 2>&1; then rm -f "$2" 2>/dev/null || :; fi
+}
+
+# agmsg_lock_acquire <team_dir> [unbreakable]
+#
+# `unbreakable` marks the record `break no`: a later acquirer never breaks this
+# lock on the strength of the holder's pid being gone, it only reports it. For a
+# holder that hands the critical section to a process that can outlive it (the
+# roster sync driver starts a writer in the background and holds the lock for it):
+# that holder's pid dying does not mean the writer stopped, and a second writer
+# entering beside a live one is worse than the leak.
+# Library-prefixed, because this file is sourced into the caller's shell.
+_agmsg_lock_now() {
+  if [ -n "${SECONDS+x}" ] && [ -n "$SECONDS" ]; then _AGMSG_LOCK_NOW="$SECONDS"; else _AGMSG_LOCK_NOW="$(date +%s)"; fi
+}
+
+agmsg_lock_acquire() {
+  local team_dir="$1" unbreakable="${2:-}" lock i=0 max="${AGMSG_LOCK_TRIES:-1000}" err=""
+  local budget="${AGMSG_LOCK_SECONDS:-10}" started elapsed
+  local nonce token rc attempt=0 cmd host
+  case "$unbreakable" in
+    ''|unbreakable) ;;
+    *) echo "agmsg: agmsg_lock_acquire: unknown option '$unbreakable'" >&2; return 1 ;;
+  esac
+  lock="$team_dir/.config.lock"
+  # EVERYTHING THAT NEEDS A PROCESS IS DONE BEFORE THE LOCK IS TAKEN. The time
+  # between a successful mkdir and the release is serialised across every
+  # contender, and each program started in it is paid by all of them in turn: on
+  # a busy machine a waiter then spends its whole wait budget behind the others'
+  # process spawns. The entropy and the process scope are needed for the record,
+  # not for holding the lock, so they are fetched first.
+  #
+  # Entropy: a pid and a second are not unique across hosts on a shared store
+  # and $RANDOM is 15 bits where it exists at all. FAIL SAFE MEANS NO TOKEN,
+  # not a weak one: with none, this process records nothing, holds the lock,
+  # and refuses to delete anything at release -- the lock leaks, which is the
+  # failure this file chose over taking a live lock away.
+  nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || nonce=""
+  [ -n "$nonce" ] || nonce="${RANDOM:-}${RANDOM:-}${RANDOM:-}"
+  _agmsg_lock_scope_load
+  # The record is a line protocol and these two fields are display text out of the
+  # environment (HOSTNAME is a variable anyone can set; the command is whatever
+  # this was run as). A newline in either would start a line of its own -- a
+  # `break yes` ahead of the real `break no` -- so each is made one printable
+  # line. Fetched here for the same reason as the above: `uname` is a program.
+  cmd="${0##*/}"
+  host="${HOSTNAME:-}"
+  [ -n "$host" ] || host="$(uname -n 2>/dev/null || echo unknown)"
+  cmd="${cmd//[![:print:]]/?}"
+  host="${host//[![:print:]]/?}"
+  # The budget is for WAITING, so it starts after the above: a process that is
+  # slow to start must not spend its wait on starting. The clock is the shell's
+  # own SECONDS (no process per spin), `date` only where that is not available.
+  _agmsg_lock_now; started="$_AGMSG_LOCK_NOW"
+  while :; do
+    if err="$(mkdir "$lock" 2>&1)"; then
+      # THE TOKEN IS THE GENERATION, per lock, not per process. This library's
+      # contract is that a process can hold several locks at once (rename-team
+      # takes two), so a single token would be overwritten by the second acquire.
+      # It names the record inside the directory, and release and break remove
+      # only a record they can name -- so a lock that changed hands is never
+      # removed by someone who held the previous one. One per attempt: a lock
+      # given up and taken again is a new generation.
+      token=""
+      [ -z "$nonce" ] || token="$$.$nonce.$attempt"
+      attempt=$((attempt + 1))
+      # Registered before the record exists, so a signal in between still goes
+      # through release and takes back a directory this process made.
+      [ -z "$token" ] || _agmsg_lock_set_token "$lock" "$token"
+      AGMSG_HELD_LOCKS="${AGMSG_HELD_LOCKS:+$AGMSG_HELD_LOCKS
+}$lock"
+      rc=0
+      _agmsg_lock_publish "$lock" "$token" "$unbreakable" "$cmd" "$host" || rc=$?
+      case "$rc" in
+        0) break ;;
+        2) _agmsg_lock_unhold "$lock"; return 1 ;;
+      esac
+      # 1: not ours after all, and it has been handed back. Start over.
+      _agmsg_lock_unhold "$lock"
+    else
+      # WHY mkdir failed decides whether waiting can help, and only one reason
+      # ever clears on its own: somebody holds the lock. Everything else -- no
+      # write permission on the team dir, a read-only mount -- is a standing
+      # condition, and spinning ten seconds on it then reporting a timeout
+      # describes contention that never existed.
+      #
+      # That mattered in the field. A second machine, running as a different OS
+      # account, pointed at the first one's store; the team dir was 0755 and
+      # owned by the other user, so mkdir could never succeed. The message named
+      # a lock, so the search went to processes: an unrelated sync engine was
+      # killed, and when it happened again with no engine running and no lock
+      # directory present, the same sentence was still the only evidence. The
+      # `2>/dev/null` had thrown away the one line that said EACCES.
+      #
+      # Decided from the lock's presence rather than from the error text, which
+      # is locale-dependent. Absent AND writable is a lost race with a holder
+      # that has already released -- genuinely transient, so it spins.
+      if [ ! -d "$lock" ] && [ ! -w "$team_dir" ]; then
+        echo "agmsg: cannot create the registry lock in $team_dir" >&2
+        echo "agmsg: mkdir: $err" >&2
+        echo "agmsg: nothing is holding the lock — this directory cannot be written to, so waiting will not clear it." >&2
+        _agmsg_lock_describe_dir "$team_dir"
+        return 1
+      fi
+      # IS ANYBODY THERE? Until #865 this loop never asked: a lock whose holder
+      # had been killed waited out its budget and failed, every time, until
+      # somebody removed a directory by hand. `kill -9`, an OOM kill and a
+      # force-quit run no trap, so the lock stays.
+      if _agmsg_lock_break_dead "$lock"; then
+        echo "agmsg: broke a registry lock in $team_dir whose recorded holder is gone" >&2
+        continue
+      fi
+    fi
     i=$((i + 1))
-    elapsed=$(( $(date +%s) - started ))
+    _agmsg_lock_now; elapsed=$(( _AGMSG_LOCK_NOW - started ))
     # Whichever bound arrives first, and the message says which — "1000 tries"
     # and "10 seconds" are different facts about a wait, and an operator
     # deciding whether to retry needs the one that actually stopped it.
     if [ "$elapsed" -ge "$budget" ] || [ "$i" -ge "$max" ]; then
       # ONE PHRASE, then which bound. Callers match on "timed out acquiring
-      # registry lock" — `test_remote.bats` does, with a short attempt budget —
-      # and inventing a second sentence for the attempt ceiling broke them
-      # while telling the operator nothing they could not be told in a clause.
+      # registry lock" — `test_remote.bats` does, with a short attempt budget.
       if [ "$elapsed" -ge "$budget" ]; then
         echo "agmsg: timed out acquiring registry lock for $team_dir after ${elapsed}s" >&2
       else
         echo "agmsg: timed out acquiring registry lock for $team_dir after $i attempts (${elapsed}s)" >&2
       fi
+      _agmsg_lock_explain_timeout "$lock"
       # The reason travels with the timeout too. If the wait was hopeless for
       # a cause this function did not anticipate, the errno is the only thing
       # that will say so.
@@ -108,61 +514,12 @@ agmsg_lock_acquire() {
     fi
     sleep 0.01
   done
-  # WHO HOLDS IT, written the moment it is held (#778).
+  # Idempotent: re-arming the same handlers each acquire is harmless.
   #
-  # A lock directory with nothing in it can say that something is holding it and
-  # nothing about what. When one leaks, the operator's only options are to guess
-  # or to remove it blind — and removing a live lock is worse than the leak. The
-  # pid and the command are what turn "a lock is here" into "this process, and
-  # it is gone".
-  #
-  # Best-effort on purpose: the lock is HELD as of the mkdir above, and a failure
-  # to annotate it must not undo that. An unannotated lock is exactly the lock
-  # this file had before, which is worse than one that names its holder and no
-  # worse than nothing.
-  #
-  # The token is what release checks. A pid is not enough: the directory can be
-  # removed by an operator while this process still believes it holds the lock —
-  # the remedy printed further down tells them to do exactly that — and a second
-  # process can then take the same path. Releasing on "it is mine because I once
-  # took this path" would delete the SUCCESSOR's lock and break the exclusion
-  # this file exists for (raised in review). The token makes "mine" checkable.
-  # PER LOCK, not per process. This library's own contract is that a process can
-  # hold several locks at once — rename-team takes two — so a single global
-  # token is overwritten by the second acquire, and releasing the first then
-  # reads a mismatch, calls it someone else's, and leaks it (raised in review).
-  #
-  # Entropy: a pid and a second are not unique across hosts on a shared store,
-  # and $RANDOM is 15 bits where it exists at all. /dev/urandom is the source
-  # when there is one; the fallbacks degrade toward "cannot prove it is mine",
-  # and an unprovable lock is one this process will refuse to delete rather
-  # than one it deletes on a coincidence.
-  local nonce=""
-  nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
-  [ -n "$nonce" ] || nonce="${RANDOM:-}${RANDOM:-}${RANDOM:-}"
-  # FAIL SAFE MEANS NO TOKEN, not a weak one. With neither /dev/urandom nor
-  # $RANDOM, what is left is host.pid.second — which collides across hosts, and
-  # a collision makes this process delete someone else's successor. That is the
-  # hazard the token exists to close, so the degraded path must not produce a
-  # token at all.
-  #
-  # No token recorded means release finds no match and refuses to remove
-  # anything: the lock leaks, and leaking is the failure this file chose over
-  # taking a live lock away. The claim "it degrades toward not deleting" was
-  # written before this branch existed; it is true now (raised in review).
-  if [ -n "$nonce" ]; then
-    _agmsg_lock_set_token "$lock" "${HOSTNAME:-h}.$$.$(date +%s).$nonce"
-  fi
-  {
-    printf 'token %s\n' "$(_agmsg_lock_get_token "$lock")"
-    printf 'pid %s\n' "$$"
-    printf 'command %s\n' "${0##*/}"
-    printf 'host %s\n' "${HOSTNAME:-$(uname -n 2>/dev/null || echo unknown)}"
-  } > "$lock.holder" 2>/dev/null || true
-  AGMSG_HELD_LOCKS="${AGMSG_HELD_LOCKS:+$AGMSG_HELD_LOCKS
-}$lock"
-  # Idempotent: re-arming the same handlers each acquire is harmless. They release
-  # every held lock, so a crash with one or two locks held leaves no stale lock.
+  # WHAT THEY COVER, AND WHAT THEY DO NOT. These release every lock this process
+  # holds, so an ordinary exit or a Ctrl-C leaves nothing behind. `SIGKILL`, an
+  # OOM kill and the machine going down run no trap, and the lock stays; what
+  # covers that is the staleness check in the loop above, not this.
   # EXIT releases only. INT/TERM release AND exit, so a signal arriving between
   # commands in a critical section can't release the lock and then let the script
   # continue into an unprotected config move/write (matters for 2-lock
@@ -171,6 +528,70 @@ agmsg_lock_acquire() {
   trap 'agmsg_lock_release' EXIT
   trap 'agmsg_lock_release; exit 130' INT
   trap 'agmsg_lock_release; exit 143' TERM
+}
+
+# Forget a lock this process had registered but does not hold.
+_agmsg_lock_unhold() {   # <lock>
+  local kept="" l
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    [ "$l" = "$1" ] || kept="${kept:+$kept
+}$l"
+  done <<EOF
+${AGMSG_HELD_LOCKS:-}
+EOF
+  AGMSG_HELD_LOCKS="$kept"
+  _agmsg_lock_set_token "$1" ""
+}
+
+# WHAT WAS HOLDING IT, in the same breath as the timeout. Since #865 a timeout
+# means one of a few things -- a holder that answered as alive, or a lock this
+# process could not account for and would not break -- and which one decides
+# where the operator looks next. ALIVE AND UNCHECKABLE ARE NOT THE SAME ANSWER:
+# saying the first of a lock nothing could ask about puts the operator back
+# hunting a process on the strength of a sentence that never checked.
+_agmsg_lock_explain_timeout() {   # <lock>
+  local lock="$1" q rec=""
+  [ -d "$lock" ] || return 0
+  _agmsg_lock_judge "$lock" || :
+  [ -z "$_J_FILE" ] || rec="$(_agmsg_lock_show "$_J_FILE")"
+  case "$_J_VERDICT" in
+    alive)
+      echo "agmsg: the lock records: $rec" >&2
+      echo "agmsg: that process answered as alive, so this was contention." >&2 ;;
+    gone)
+      echo "agmsg: the lock records: $rec" >&2
+      echo "agmsg: that process is not running — the lock was being broken as this wait ended." >&2 ;;
+    foreign)
+      echo "agmsg: the lock records: $rec" >&2
+      echo "agmsg: that record was not written on this machine (or not in this process namespace), so nothing here could ask whether it is held." >&2 ;;
+    unbreakable)
+      echo "agmsg: the lock records: $rec" >&2
+      echo "agmsg: that process is not running, but the record marks the lock as not to be broken automatically: it may have started a writer that is still running." >&2
+      echo "agmsg: check that no agmsg sync is running for this team, then remove the directory by hand." >&2 ;;
+    noscope|badpid|malformed|noliveness)
+      echo "agmsg: the lock records: $rec" >&2
+      echo "agmsg: that record cannot be checked here ($_J_VERDICT), so nothing here could ask whether it is held." >&2 ;;
+    nonempty)
+      q="$(_agmsg_lock_quote "$lock")"
+      echo "agmsg: the lock directory holds no holder record but is not empty, so nothing here could ask whether it is held." >&2
+      echo "agmsg: look at what is in it first; if no agmsg command is running for this team, remove it:" >&2
+      echo "agmsg:   ls -la $q" >&2
+      echo "agmsg:   rm -r $q" >&2
+      echo "agmsg: doctor.sh lists such locks." >&2 ;;
+    multi)
+      echo "agmsg: the lock directory holds more than one holder record, so nothing here could tell which one is current." >&2
+      echo "agmsg: doctor.sh lists such locks." >&2 ;;
+    *)
+      # QUOTED, because this line is meant to be pasted: the store root and the
+      # team name can both contain a space. `rmdir` rather than `rm -r`, so the
+      # paste cannot remove anything but an empty lock directory.
+      q="$(_agmsg_lock_quote "$lock")"
+      echo "agmsg: the lock records no holder, so nothing here could ask whether it is held." >&2
+      echo "agmsg: a lock with no holder record is not broken automatically. If no agmsg command is running for this team, remove it:" >&2
+      echo "agmsg:   rmdir $q" >&2
+      echo "agmsg: doctor.sh lists such locks." >&2 ;;
+  esac
 }
 
 # agmsg_lock_release
@@ -232,138 +653,99 @@ EOF
   return 1
 }
 
-_agmsg_lock_drop() {
-  local l="$1" err="" seen="" mine=""
+# Release one lock, and forget its token whatever the outcome: a token that
+# outlives its lock would be read as proof of ownership by the next acquire of
+# the same path, including one that could not make a token of its own.
+_agmsg_lock_drop() {   # <lock> [quiet]
+  local _rc=0
+  _agmsg_lock_drop_one "$@" || _rc=$?
+  _agmsg_lock_set_token "$1" ""
+  return "$_rc"
+}
+
+_agmsg_lock_drop_one() {   # <lock> [quiet]
+  local l="$1" quiet="${2:-}" err="" mine="" staged q
   [ -d "$l" ] || return 0
-  # OWNERSHIP FIRST. The directory being at the path this process locked is not
-  # evidence that it is the same directory: an operator can remove a stuck lock
-  # — the message below tells them to — and another process can take the path
-  # before this one releases. Deleting then would take the exclusion away from
-  # a process that is using it, which is worse than the leak this whole change
-  # is about (raised in review).
-  #
-  # Compared against the token written at acquire, not the pid: a pid recurs.
-  seen="$(sed -n 's/^token //p' "$l.holder" 2>/dev/null | head -1)"
+  # OWNERSHIP FIRST, and it is the token, not the pid (a pid recurs). An empty
+  # token means this process never proved ownership of this path -- the entropy
+  # to make one was missing -- so it refuses rather than guess.
   mine="$(_agmsg_lock_get_token "$l" || printf '')"
-  # An empty recorded token means this process never proved ownership of this
-  # path — refuse rather than guess. Same branch as a genuine mismatch.
-  if [ -z "$mine" ] || [ "$seen" != "$mine" ]; then
-    # Someone else's lock, or one whose holder file could not be written. Either
-    # way this process has no standing to remove it, and saying so is the whole
-    # report — there is nothing here for the operator to fix.
-    if [ -z "$mine" ]; then
-      # This process never recorded a token for this path: either the holder
-      # could not be written, or there was no entropy to make one with. Saying
-      # "another process holds it" would be a claim about someone else that
-      # nothing here supports.
-      echo "agmsg: not releasing $l — this process cannot prove the lock is its own" >&2
-    else
+  if [ -z "$mine" ]; then
+    [ -n "$quiet" ] || echo "agmsg: not releasing $l — this process cannot prove the lock is its own" >&2
+    return 0
+  fi
+  _agmsg_lock_test_hook drop:before-claim "$l"
+  # THE CLAIM IS A RENAME OF THIS PROCESS'S OWN RECORD BY ITS EXACT NAME. The
+  # directory being at the path this process locked is not evidence that it is the
+  # same directory: an operator can remove a stuck lock -- the message below tells
+  # them to -- and another process can take the path before this one releases.
+  # `mv <lock>/holder.<token>` succeeds only if the directory at that path still
+  # holds the record this process published, so it is the ownership check and the
+  # claim in one step: no read-then-act gap for a successor to land in. The staged
+  # name carries the token too (a pid is not unique across hosts on a shared
+  # store, and two releases must not stage onto one name).
+  #
+  # Moving the record OUT is also what lets `rmdir` succeed, since the record
+  # lives inside the directory. `mv` and `rmdir` are both on the minimal PATH this
+  # file is required to work on; `rm` is not, and is used only to tidy the staged
+  # copy afterwards.
+  staged="$l.rel.$mine"
+  if ! mv "$l/holder.$mine" "$staged" 2>/dev/null; then
+    # Not this process's directory any more, or never published. Gone is a
+    # released lock -- nothing to report. A directory with another process's
+    # record is that process's lock, and removing it is exactly what this must
+    # not do. An EMPTY directory is one this process made and could not record
+    # (a signal, a failed publish), or a successor's not yet recorded; removing
+    # it is safe either way, because a directory that is only made and not yet
+    # recorded is found out by its owner when its publish fails.
+    [ -d "$l" ] || return 0
+    _agmsg_lock_holder_scan "$l"
+    if [ "$_H_COUNT" -eq 0 ]; then
+      rmdir "$l" 2>/dev/null || :
+    elif [ -z "$quiet" ]; then
       echo "agmsg: not releasing $l — it is held by another process now" >&2
     fi
     return 0
   fi
-  # The holder is a sibling of the lock directory, not inside it (so the
-  # directory can be rmdir'd without needing it gone first — no `rm` is
-  # needed on the path that just removes an EMPTY directory). That used to
-  # mean removing it only AFTER rmdir succeeded: read nothing, rmdir, then
-  # best-effort `rm -f` the now-orphaned holder file.
-  #
-  # #994: that order raced. Once rmdir succeeds, this process no longer
-  # holds the lock — the path is open, and another process's mkdir can
-  # win it and write ITS OWN holder file before this process reaches its
-  # own `rm -f "$l.holder"`. That call has no way to tell "the stale file
-  # I just orphaned" from "a brand-new holder's file", so it deletes
-  # whichever is there — the new lock survives, with no holder anyone can
-  # ever identify or reclaim, i.e. exactly the leak this file exists to
-  # prevent. Measured live under load (#994): a `rmdir` that returned 0
-  # with no error, immediately followed by a DIFFERENT process's lock
-  # directory sitting there with no `.holder` file next to it at all.
-  #
-  # Fixed by moving OUR OWN holder file out of the way FIRST, while the
-  # directory (and so the exclusion) is still ours — no other process can
-  # succeed at mkdir until AFTER the rmdir below, so there is no window
-  # left in which a stranger's holder file could exist for this step to
-  # hit.
-  #
-  # Staged with `mv`, not read-then-remove-then-restore (review round 2 on
-  # #994): a rename either lands whole or not at all, so there is no step
-  # where the holder is simply gone with nothing recorded to put back if
-  # the next step fails. The read/remove/restore version had exactly that
-  # gap on both ends — a remove that failed but let `rmdir` proceed anyway,
-  # and a restore that failed after `rmdir` itself failed — each reaching
-  # "directory present, holder missing" by a different path than the
-  # original bug. Folding the failure of the initial move into the same
-  # "could not release" report closes both at once: neither one is a
-  # silent `|| true` any more.
-  #
-  # `mv` needs no fallback here the way `rm` did before it: this file's own
-  # minimal-PATH contract (see agmsg_write_atomic above) already requires
-  # `mv` unconditionally — `test_local_team_ids.bats` runs the core join on
-  # a PATH with `mv` but no `rm` at all, which is exactly why the holder
-  # lives beside the directory rather than inside it (a holder INSIDE would
-  # make the directory unremovable there, leaking a lock on every call —
-  # the earlier bug this design already fixed). `rm` is used only for the
-  # final, optional tidy-up of the staged file after a successful release;
-  # its absence there is harmless, not a fallback path.
-  local staged="$l.holder.releasing.$$"
-  local q
-  q="$(printf "'%s'" "$(printf '%s' "$l" | sed "s/'/'\\''/g")")"
-  if ! mv "$l.holder" "$staged" 2>/dev/null; then
-    echo "agmsg: could not release the registry lock at $l" >&2
-    echo "agmsg: could not move $l.holder aside to release it" >&2
-    echo "agmsg: until this directory is removed, commands for this team will wait" >&2
-    echo "agmsg: for a lock nothing holds." >&2
-    echo "agmsg: look at what is in it, then remove the directory:" >&2
-    echo "agmsg:   ls -la $q" >&2
-    echo "agmsg:   rm -r $q" >&2
-    echo "agmsg: nothing but this lock lives in there — it holds no team data." >&2
-    return 1
-  fi
+  _agmsg_lock_test_hook drop:after-claim "$l"
   if err="$(rmdir "$l" 2>&1)"; then
-    # Best-effort: nothing but this staged copy is left to clean up, and
-    # leaving it behind (no `rm`, or a failed `rm`) is inert — it sits
-    # under a name no acquirer ever looks for, so it is not this process's
-    # exit status to carry. `|| :` matters here specifically: callers run
-    # under `set -e`, and this line is the whole statement, not an `if`
-    # condition — an unguarded failing `rm` after a SUCCESSFUL release
-    # would abort the caller right after the lock was correctly let go
-    # (raised in review).
-    if command -v rm >/dev/null 2>&1; then
-      rm -f "$staged" 2>/dev/null || :
-    fi
+    # Best-effort: nothing but the staged copy is left, and it sits under a name
+    # no acquirer looks for. `|| :` matters: callers run under `set -e`, and an
+    # unguarded failing `rm` after a SUCCESSFUL release would abort the caller
+    # right after the lock was correctly let go.
+    if command -v rm >/dev/null 2>&1; then rm -f "$staged" 2>/dev/null || :; fi
     return 0
   fi
-  # rmdir failed: move the staged copy back — one atomic rename, same
-  # guarantee as the stage above — so the message below can still name who
-  # was holding it.
-  if ! mv "$staged" "$l.holder" 2>/dev/null; then
-    echo "agmsg: could not release the registry lock at $l" >&2
-    echo "agmsg: rmdir: $err" >&2
-    echo "agmsg: additionally, could not move the holder back from $staged" >&2
-    echo "agmsg: its content may still be readable there — check before removing the lock." >&2
-    echo "agmsg: until this directory is removed, commands for this team will wait" >&2
-    echo "agmsg: for a lock nothing holds." >&2
-    echo "agmsg: look at what is in it, then remove the directory:" >&2
-    echo "agmsg:   ls -la $q" >&2
-    echo "agmsg:   rm -r $q" >&2
-    echo "agmsg: nothing but this lock lives in there — it holds no team data." >&2
-    return 1
+  # rmdir failed. Gone meanwhile, or a successor's record inside, means this
+  # lock is released and what is there is someone else's.
+  if [ ! -d "$l" ]; then
+    if command -v rm >/dev/null 2>&1; then rm -f "$staged" 2>/dev/null || :; fi
+    return 0
   fi
+  _agmsg_lock_holder_scan "$l"
+  if [ "$_H_COUNT" -gt 0 ]; then
+    if command -v rm >/dev/null 2>&1; then rm -f "$staged" 2>/dev/null || :; fi
+    return 0
+  fi
+  # Something else is in the directory, and that is the leak this file's own
+  # contract promises not to leave. The record is NOT put back: by the time it
+  # could be, the path may belong to a successor, and a record of the previous
+  # generation inside it would wedge that one. Who held the lock is said here,
+  # where it is needed, and the record stays at its staged name.
   echo "agmsg: could not release the registry lock at $l" >&2
   echo "agmsg: rmdir: $err" >&2
+  echo "agmsg: it was held by: $(_agmsg_lock_show "$staged")" >&2
+  echo "agmsg: that record is kept at $staged" >&2
   echo "agmsg: until this directory is removed, commands for this team will wait" >&2
   echo "agmsg: for a lock nothing holds." >&2
   # The remedy has to work for the case that produced it. `rmdir` is what just
-  # failed — printing it back is a route that ends where the operator already
-  # is. Measured: the only reason release gets here with the directory present
-  # is that something is inside it, and that is precisely what rmdir refuses.
-  # QUOTED, because a printed command is meant to be pasted into a shell. The
-  # store root and the team name can both contain a space — team names are
-  # validated against empty / `.` / `..` / `/` / `\` / a leading `-` / control
-  # characters, and nothing else — so an unquoted path becomes several
-  # arguments, and `rm -r` then removes something the operator did not read
-  # about (raised in review). Same scheme as lib/shquote.sh, inline rather than
-  # sourced so this library keeps its single-file contract.
+  # failed -- printing it back is a route that ends where the operator already
+  # is. QUOTED, because a printed command is meant to be pasted into a shell: the
+  # store root and the team name can both contain a space, and an unquoted path
+  # becomes several arguments, and `rm -r` then removes something the operator
+  # did not read about. Same scheme as lib/shquote.sh, inline rather than sourced
+  # so this library keeps its single-file contract.
+  q="$(_agmsg_lock_quote "$l")"
   echo "agmsg: look at what is in it, then remove the directory:" >&2
   echo "agmsg:   ls -la $q" >&2
   echo "agmsg:   rm -r $q" >&2

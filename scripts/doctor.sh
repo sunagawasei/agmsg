@@ -567,6 +567,90 @@ _redact_project() {
   _R_PROJ_K[$n]="$1"; _R_PROJ_V[$n]="<project$((n + 1))>"
   _REDACT_OUT="${_R_PROJ_V[$n]}"
 }
+
+# --- registry locks that cannot be judged (#865) ----------------------------
+#
+# A registry lock (teams/<team>/.config.lock) holds its record INSIDE the
+# directory as holder.<token>. The next command that needs the lock breaks one
+# whose holder is gone, but three kinds stay put and every command for that team
+# then waits out its budget and fails:
+#   no record     nothing to ask about; a lock taken a moment ago looks the same
+#   several       an acquire race caught in the act; nothing says which is current
+#   unjudgeable   a record written in another process table, with no scope, a
+#                 pid that is not a number, or a name and content that disagree
+#   unbreakable   the holder is gone but marked its lock "break no" (the roster
+#                 sync driver, which may have left a writer running)
+#
+# REPORTED, NEVER REMOVED. Removing one safely needs the
+# acquiring side to cooperate: whatever this checks about the directory can stop
+# being true before an rmdir runs, and no age or second look closes that. So
+# doctor finds them and prints what is there; running a rmdir is the operator's
+# call, when every agmsg sync and seat is stopped. Installation-wide.
+LOCKS_STUCK=""   # "<kind><TAB><team dir name>" per line
+
+# Fills LOCKS_STUCK. The three globs are the ones remote.sh doctor uses: `*`
+# skips a leading dot, so `.foo` and `..foo` need their own.
+_doctor_scan_stuck_locks() {
+  local lock name kind clean oddn=0
+  LOCKS_STUCK=""
+  # shellcheck source=lib/registry-lock.sh
+  . "$SCRIPT_DIR/lib/registry-lock.sh"
+  for lock in "$SKILL_DIR"/teams/*/.config.lock "$SKILL_DIR"/teams/.[!.]*/.config.lock "$SKILL_DIR"/teams/..?*/.config.lock; do
+    [ -d "$lock" ] || continue
+    _agmsg_lock_judge "$lock" || :
+    case "$_J_VERDICT" in
+      none|nonempty|multi|foreign|noscope|badpid|malformed|noliveness|unbreakable) kind="$_J_VERDICT" ;;
+      *) continue ;;   # alive: held. gone: the next command breaks it.
+    esac
+    name="${lock%/.config.lock}"; name="${name##*/}"
+    # A directory name is whatever is in the store, not something a CLI validated:
+    # one with a control character (a newline or tab would also break the list
+    # below) is shown with those replaced, and nothing is derived from it.
+    # Only control characters (a newline and a tab included) count: team names may
+    # be any UTF-8, and its bytes are not controls in the C locale.
+    clean="$(printf '%s' "$name" | LC_ALL=C tr '[:cntrl:]' '?')"
+    if [ "$clean" != "$name" ]; then
+      # Numbered, so two different names that print the same (or one that prints
+      # like a valid team's name) stay two rows and two pseudonyms under --redacted.
+      oddn=$((oddn + 1))
+      kind="$kind,oddname"; name="$clean (invalid name #$oddn)"
+    fi
+    LOCKS_STUCK="${LOCKS_STUCK}${kind}"$'\t'"${name}"$'\n'
+  done
+}
+
+# Under --redacted the team name (and the path in the command) is replaced.
+_doctor_print_locks() {
+  local n kind name q
+  [ -n "$LOCKS_STUCK" ] || return 0
+  n="$(printf '%s' "$LOCKS_STUCK" | grep -c . || true)"
+  echo "registry locks nothing here can judge, so nothing will break them ($n):"
+  while IFS=$'\t' read -r kind name; do
+    [ -n "$name" ] || continue
+    if [ "$REDACTED" = 1 ]; then
+      _redact_team "$name"; echo "  team: $_REDACT_OUT  (${kind%,oddname})"
+      continue
+    fi
+    echo "  team: $name  (${kind%,oddname})"
+    case "$kind" in
+      *,oddname)
+        echo "    the directory name has non-printable characters; list the teams/ directory by hand" ;;
+      nonempty)
+        q="$(_agmsg_lock_quote "$SKILL_DIR/teams/$name/.config.lock")"
+        echo "    no holder record, but not empty (look at it first): ls -la $q" ;;
+      none)
+        # QUOTED, because this line is meant to be pasted: the store root and the
+        # team name can both contain a space. `rmdir`, not `rm -r`, so the paste
+        # cannot remove anything but an empty lock directory.
+        q="$(_agmsg_lock_quote "$SKILL_DIR/teams/$name/.config.lock")"
+        echo "    no holder record: rmdir $q" ;;
+      *)
+        echo "    records: $(for f in "$SKILL_DIR/teams/$name/.config.lock"/holder.*; do [ -f "$f" ] && printf '[%s] ' "$(_agmsg_lock_show "$f")"; done)" ;;
+    esac
+  done <<< "$LOCKS_STUCK"
+  echo "  remove one only when every agmsg sync and seat is stopped; a lock taken a moment ago looks the same."
+  echo
+}
 # Plain output shows the owner token IN FULL -- #605 was actually resolved by
 # matching this exact value against a "codex-bridge: resumed thread <uuid>"
 # line in a bridge log, and a shortened token can't be matched that way. This
@@ -961,6 +1045,12 @@ fi
 if [ -n "$ORPHAN_AMBIGUOUS" ]; then
   _warn "run/ holds records for a team that no longer exists that cannot be attributed to one seat (\"__\" inside a name); they are left alone, remove them by hand"
 fi
+# Registry locks nothing can judge (#865): also installation-wide. Nothing else
+# ever breaks one, so a team that keeps timing out on its lock lands here.
+_doctor_scan_stuck_locks
+if [ -n "$LOCKS_STUCK" ]; then
+  _warn "teams/ holds registry lock(s) nothing can judge, and every command for those teams waits on them (see 'registry locks nothing here can judge' above); remove one by hand only when every agmsg sync and seat is stopped"
+fi
 WARN_COUNT="$(printf '%s\n' "$WARNINGS" | grep -c . || true)"
 
 echo "$TEAM_COUNT team(s), $TOTAL_PAIR_COUNT registration(s), $WARN_COUNT warning(s)"
@@ -972,6 +1062,7 @@ fi
 printf '%s' "$REPORT_BLOCKS"
 _doctor_print_pinned
 _doctor_print_orphans
+_doctor_print_locks
 
 if [ -n "$WARNINGS" ]; then
   echo "warnings:"

@@ -771,3 +771,74 @@ _seat_files() {   # <agent> -> how many of the 4 records exist
   run bash "$SCRIPTS/doctor.sh" --yes
   [ "$status" -eq 2 ]
 }
+
+# --- registry locks nothing can judge (#865) --------------------------------
+@test "doctor: reports record-less, multi-record and unjudgeable registry locks, never removes them; a held one is not listed" {
+  local teams="$TEST_SKILL_DIR/teams" scope
+  bash "$SCRIPTS/join.sh" live.part worker claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" multi worker claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" foreign worker claude-code "$PROJ" >/dev/null
+  mkdir "$teams/live.part/.config.lock"                       # no record
+  mkdir "$teams/multi/.config.lock"
+  printf 'token a\npid 1\ncommand t\nhost h\nscope s\n' > "$teams/multi/.config.lock/holder.a"
+  printf 'token b\npid 1\ncommand t\nhost h\nscope s\n' > "$teams/multi/.config.lock/holder.b"
+  mkdir "$teams/foreign/.config.lock"
+  # Not empty and not recorded: `rmdir` would fail, so it is not offered.
+  bash "$SCRIPTS/join.sh" strayed worker claude-code "$PROJ" >/dev/null
+  mkdir "$teams/strayed/.config.lock"; printf 'x\n' > "$teams/strayed/.config.lock/stray"
+  # A directory name with an escape and a newline in it, as a shared store can hold.
+  local odd; odd="$(printf 'odd\033[2J\nteam: forged  (none)')"
+  mkdir -p "$teams/$odd/.config.lock"
+  # Two names that differ only in which control character they hold, and a valid
+  # name that prints the same as both.
+  bash "$SCRIPTS/join.sh" 'bad?x' worker claude-code "$PROJ" >/dev/null
+  mkdir "$teams/bad?x/.config.lock"
+  mkdir -p "$teams/$(printf 'bad\nx')/.config.lock" "$teams/$(printf 'bad\tx')/.config.lock"
+  # Valid UTF-8 team names, two of the same byte length: shown as they are, with
+  # their own diagnosis, and given different pseudonyms when redacted.
+  bash "$SCRIPTS/join.sh" 日本語 worker claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" 中文名 worker claude-code "$PROJ" >/dev/null
+  mkdir "$teams/日本語/.config.lock" "$teams/中文名/.config.lock"
+  # A dead holder that marked its lock "break no" (the roster sync driver).
+  bash "$SCRIPTS/join.sh" nobreak worker claude-code "$PROJ" >/dev/null
+  mkdir "$teams/nobreak/.config.lock"
+
+  printf 'token c\npid 1\ncommand t\nhost h\nscope some-other-process-table\n' > "$teams/foreign/.config.lock/holder.c"
+  # A lock held by a live process of THIS table is a lock doing its job.
+  scope="$(bash -c ". '$SCRIPTS/lib/registry-lock.sh'; _agmsg_lock_scope_load; printf '%s' \"\$_AGMSG_LOCK_SCOPE\"")"
+  mkdir "$teams/team/.config.lock"
+  printf 'token e\npid 999999\ncommand t\nhost h\nscope %s\nbreak no\n' "$scope" > "$teams/nobreak/.config.lock/holder.e"
+  printf 'token d\npid %s\ncommand t\nhost h\nscope %s\n' "$$" "$scope" > "$teams/team/.config.lock/holder.d"
+
+  run bash "$SCRIPTS/doctor.sh"
+  [ "$status" -eq 1 ]
+  grep -qF "registry locks nothing here can judge" <<<"$output"
+  grep -qxF '  team: live.part  (none)' <<<"$output"
+  grep -qF "rmdir '$teams/live.part/.config.lock'" <<<"$output"
+  grep -qxF '  team: multi  (multi)' <<<"$output"
+  grep -qxF '  team: foreign  (foreign)' <<<"$output"
+  grep -qxF '  team: strayed  (nonempty)' <<<"$output"
+  refute grep -qF "rmdir '$teams/strayed/" <<<"$output"
+  [ "$(printf '%s' "$output" | LC_ALL=C tr -cd '\033' | wc -c | tr -d ' ')" = 0 ]
+  refute grep -qxF 'team: forged  (none)' <<<"$output"
+  grep -qF "non-printable characters" <<<"$output"
+  grep -qxF '  team: bad?x  (none)' <<<"$output"
+  [ "$(grep -c '^  team: bad?x (invalid name #' <<<"$output")" = 2 ]
+  grep -qxF '  team: 日本語  (none)' <<<"$output"
+  grep -qF "rmdir '$teams/日本語/.config.lock'" <<<"$output"
+  if [ -n "$scope" ]; then
+    grep -qxF '  team: nobreak  (unbreakable)' <<<"$output"
+  fi
+  if [ -n "$scope" ]; then
+    [ -z "$(grep -E '^  team: team  ' <<<"$output")" ]
+  fi
+
+  run bash "$SCRIPTS/doctor.sh" --redacted
+  refute grep -qF "live.part" <<<"$output"
+  [ "$(grep -cE '^  team: team[0-9]+  \(none\)$' <<<"$output")" -ge 3 ]
+  # bad?x, bad<LF>x and bad<TAB>x are three rows with three pseudonyms.
+  [ "$(grep -cE '^  team: team[0-9]+  \((none|none,oddname)\)$' <<<"$output")" -ge 3 ]
+  [ "$(grep -E '^  team: team[0-9]+  \(none\)$' <<<"$output" | sort -u | wc -l | tr -d ' ')" = "$(grep -cE '^  team: team[0-9]+  \(none\)$' <<<"$output")" ]
+  [ -d "$teams/live.part/.config.lock" ]
+  [ -f "$teams/multi/.config.lock/holder.a" ]
+}
