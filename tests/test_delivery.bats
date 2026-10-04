@@ -177,6 +177,68 @@ release_delayed_watch() {
   [ "${argv[$last_idx]}" = "$weird_project" ]
 }
 
+# The recovery line is pasted into a different shell, so a relative script
+# path and a relative project must come out absolute: run from another cwd
+# that holds a same-named project, it must target only the original one.
+@test "delivery set: the recovery line for a relative script and project is absolute and targets only the original project" {
+  local base="$TEST_PROJECT/rel-base" other="$TEST_PROJECT/other-cwd"
+  mkdir -p "$base/relproj/.codex" "$other/relproj"
+  cp -R "$SCRIPTS/.." "$base/skill"
+  chmod 555 "$base/relproj/.codex"
+  run bash -c 'cd "$1" && bash skill/scripts/delivery.sh set monitor codex relproj' _ "$base"
+  chmod 755 "$base/relproj/.codex"
+  [ "$status" -ne 0 ]
+
+  local recovery_line
+  recovery_line="$(printf '%s\n' "$output" | grep '^  bash ')"
+  [ -n "$recovery_line" ]
+  local -a argv=()
+  eval "argv=(${recovery_line#  bash })"
+  local last_idx=$((${#argv[@]} - 1))
+  [ "${argv[0]}" = "$(cd "$base/skill/scripts" && pwd)/delivery.sh" ]
+  [ "${argv[$last_idx]}" = "$base/relproj" ]
+
+  run bash -c 'cd "$1" && shift && bash "$@"' _ "$other" "${argv[@]}"
+  [ "$status" -eq 0 ]
+  [ -f "$base/relproj/.codex/hooks.json" ]
+  [ ! -e "$other/relproj/.codex" ]
+}
+
+# The mkdir -p refusal (no .codex/ yet, project not writable) is the second
+# path that prints the recovery line; it must fail the same loud way and
+# leave the project untouched.
+@test "delivery set: a refused .codex/ mkdir fails loudly with a runnable recovery line and changes nothing" {
+  local proj="$TEST_PROJECT/ro-proj"
+  mkdir -p "$proj"
+  chmod 555 "$proj"
+  run bash "$SCRIPTS/delivery.sh" set monitor codex "$proj"
+  chmod 755 "$proj"
+  [ "$status" -ne 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "could not create $proj/.codex"
+  printf '%s\n' "$output" | grep -q -F -- "delivery for codex was NOT set up"
+  case "$output" in *"Delivery mode set to"*) return 1 ;; esac
+  [ ! -e "$proj/.codex" ]
+
+  local recovery_line
+  recovery_line="$(printf '%s\n' "$output" | grep '^  bash ')"
+  [ -n "$recovery_line" ]
+  local -a argv=()
+  eval "argv=(${recovery_line#  bash })"
+  local last_idx=$((${#argv[@]} - 1))
+  [ "${argv[$last_idx]}" = "$proj" ]
+}
+
+# A Windows drive or UNC path is already absolute; prefixing $PWD would point
+# the pasted command at a path that does not exist.
+@test "delivery set: the recovery line keeps a Windows drive or UNC path as given" {
+  run bash -c 'source "$1"; _agmsg_print_delivery_recovery monitor codex "C:/work/proj" 2>&1; _agmsg_print_delivery_recovery monitor codex "D:\\work\\proj" 2>&1; _agmsg_print_delivery_recovery monitor codex "\\\\server\\share\\proj" 2>&1' _ <(sed -n '/^_agmsg_shq()/,/^}/p; /^_agmsg_print_delivery_recovery()/,/^}/p' "$SCRIPTS/delivery.sh")
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "'C:/work/proj'"
+  printf '%s\n' "$output" | grep -q -F -- "'D:\\work\\proj'"
+  printf '%s\n' "$output" | grep -q -F -- "'\\\\server\\share\\proj'"
+  case "$output" in *"$PWD/C:"*|*"$PWD/D:"*|*"$PWD/\\"*) return 1 ;; esac
+}
+
 # --- idempotency ---
 
 @test "delivery set monitor: idempotent" {

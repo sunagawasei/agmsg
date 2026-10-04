@@ -100,8 +100,14 @@ _agmsg_shq() {
 # script's own invocation path is guaranteed quote-free either.
 _agmsg_print_delivery_recovery() {
   local mode="$1" type="$2" project="$3"
+  # The line is pasted into another shell whose cwd is unknown, so a relative
+  # script or project would run nothing there, or update a same-named project.
+  case "$project" in
+    /*|\\*|[A-Za-z]:[/\\]*) ;;
+    *) project="$PWD/$project" ;;
+  esac
   echo "agmsg: if this seat is running in a restricted sandbox (e.g. Codex's workspace-write mode keeps .codex/ read-only), run this same command from a normal, unsandboxed shell instead:" >&2
-  echo "  bash $(_agmsg_shq "$0") set $(_agmsg_shq "$mode") $(_agmsg_shq "$type") $(_agmsg_shq "$project")" >&2
+  echo "  bash $(_agmsg_shq "$SCRIPT_DIR/${0##*/}") set $(_agmsg_shq "$mode") $(_agmsg_shq "$type") $(_agmsg_shq "$project")" >&2
 }
 
 # True (0) iff <cli>'s reported version is >= <min>, compared as MAJOR.MINOR.PATCH.
