@@ -76,6 +76,7 @@ who() {
 }
 
 @test "whoami: cursor env only -> cursor session team with the cursor-host seat" {
+  mk_cursor_team "$CUR_A"
   who cursor CURSOR_CONVERSATION_ID="$CUR_A"
   [ "$status" -eq 0 ]
   [[ "$output" == "agent=cursor-host teams=cur-$CUR_A type=cursor "* ]]
@@ -443,6 +444,7 @@ start_bridge() {
 }
 
 @test "session-end (cursor): the tombstone and snapshot are keyed on cur-<uuid>" {
+  mk_cursor_team "$CUR_A"
   mkdir -p "$TEST_SKILL_DIR/run"
   agmsg_test_start_session_owner
   printf '{"session_id":"%s"}' "$CUR_A" | env -u CLAUDE_CODE_SESSION_ID \
@@ -594,6 +596,34 @@ start_bridge() {
   run bash -c "printf '{}' | env -u CLAUDE_CODE_SESSION_ID bash '$SCRIPTS/check-inbox.sh' cursor '$PROJ' 2>/dev/null"
   [[ "$output" == *"project-visible"* ]]
   [[ "$output" != *"session-private"* ]]
+}
+
+# --- every reader of a session's inbox refuses an untrusted session team ---------
+
+@test "inbox-target and whoami: a marker-less cur-<uuid> project team is not this session's inbox or identity" {
+  bash "$SCRIPTS/join.sh" "cur-$CUR_A" cursor-host cursor "$PROJ" >/dev/null
+  SKILL_DIR="$TEST_SKILL_DIR" SCRIPT_DIR="$SCRIPTS" RUN_DIR="$TEST_SKILL_DIR/run" run bash -c "
+    source '$SCRIPTS/lib/inbox-target.sh'
+    agmsg_inbox_target cursor '$PROJ' '$CUR_A'"
+  [ "$status" -eq 0 ]
+  # it falls through to project resolution (the project's own registration), never claiming a session team
+  [[ "$output" != *"agent=cursor-host teams=cur-$CUR_A type=cursor"*"session"* ]]
+  who cursor CURSOR_CONVERSATION_ID="$CUR_A"
+  # the project team is reported as the project's registration, not as a session team identity
+  mk_cursor_team "$CUR_B"
+  who cursor CURSOR_CONVERSATION_ID="$CUR_B"
+  [[ "$output" == "agent=cursor-host teams=cur-$CUR_B type=cursor "* ]]
+}
+
+@test "spawn and ensure-headless are not pointed at a marker-less same-named project team" {
+  bash "$SCRIPTS/join.sh" "cur-$CUR_A" alice cursor "$PROJ" >/dev/null
+  run env -u CLAUDE_CODE_SESSION_ID CURSOR_CONVERSATION_ID="$CUR_A" bash -c "
+    SCRIPT_DIR='$SCRIPTS'; source '$SCRIPTS/lib/session-team.sh'; agmsg_session_team_name"
+  [ -z "$output" ]
+  mk_cursor_team "$CUR_B"
+  run env -u CLAUDE_CODE_SESSION_ID CURSOR_CONVERSATION_ID="$CUR_B" bash -c "
+    SCRIPT_DIR='$SCRIPTS'; source '$SCRIPTS/lib/session-team.sh'; agmsg_session_team_name"
+  [ "$output" = "cur-$CUR_B" ]
 }
 
 # --- children never inherit a session id ------------------------------------

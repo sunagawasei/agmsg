@@ -48,6 +48,9 @@ agmsg_inbox_target() {
   if agmsg_type_has "$type" session_team yes && agmsg_session_team_enabled; then
     local steam
     steam="$(agmsg_session_team_name_from_id "$raw_sid" "$type")"
+    # Only a trusted session team is this session's inbox: a project team that
+    # merely shares the name (no marker), or an unreadable marker, is not.
+    [ -z "$steam" ] || [ "$(agmsg_session_team_class "$steam")" = session ] || steam=""
     if [ -n "$steam" ]; then
       # Role priority: mirrors session-start.sh's resumed-role directive taking
       # precedence over the session-team branch (its role lookup runs first and

@@ -288,7 +288,10 @@ EOF
 # when there is none, it is ambiguous, or mode is off.
 agmsg_session_team_name() {
   agmsg_session_resolve
-  [ "$AGMSG_SESSION_STATE" = ok ] && printf '%s' "$AGMSG_SESSION_TEAM"
+  [ "$AGMSG_SESSION_STATE" = ok ] || return 0
+  # a team that merely shares a marker host's session team name is not one
+  [ "$(agmsg_session_team_class "$AGMSG_SESSION_TEAM")" = session ] || return 0
+  printf '%s' "$AGMSG_SESSION_TEAM"
   return 0
 }
 

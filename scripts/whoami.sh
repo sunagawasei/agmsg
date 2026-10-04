@@ -69,7 +69,8 @@ AGENT_TYPE_SQL=$(printf '%s' "$AGENT_TYPE" | sed "s/'/''/g")
 source "$SCRIPT_DIR/lib/session-team.sh"
 agmsg_session_resolve
 if [ "$AGMSG_SESSION_STATE" = ok ] && [ "$AGMSG_SESSION_HOST" = "$AGENT_TYPE" ] \
-    && [ -n "$AGMSG_SESSION_TEAM" ]; then
+    && [ -n "$AGMSG_SESSION_TEAM" ] \
+    && [ "$(agmsg_session_team_class "$AGMSG_SESSION_TEAM")" = session ]; then
   echo "agent=$(agmsg_session_seat "$AGENT_TYPE") teams=$AGMSG_SESSION_TEAM type=$AGENT_TYPE project=$PROJECT_PATH"
   exit 0
 fi

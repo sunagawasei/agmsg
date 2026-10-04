@@ -73,6 +73,7 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 
 @test "session team name: a raw sid names its team on its own host" {
   enable_st
+  AGMSG_JOIN_SESSION_MARKER=cursor bash "$SCRIPTS/join.sh" "cur-$SID_A" cursor-host cursor "$TEST_PROJECT" >/dev/null
   run agmsg_inbox_target cursor "$TEST_PROJECT" "$SID_A"
   [ "$status" -eq 0 ]
   [[ "$output" == *"agent=cursor-host teams=cur-$SID_A "* ]]
