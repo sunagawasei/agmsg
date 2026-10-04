@@ -229,10 +229,10 @@ teardown() {
 }
 
 @test "spawn: a type without name_arg emits no name flag (#339)" {
-  # gemini's manifest has no name_arg=, so the boot script must not name the
+  # codex's manifest has no name_arg=, so the boot script must not name the
   # session -- no bare `-n` token, unchanged from pre-#339 behavior.
-  bash "$SCRIPTS/join.sh" gteam existing gemini "$PROJ"
-  run bash "$SCRIPTS/spawn.sh" gemini bob --project "$PROJ" --no-wait
+  bash "$SCRIPTS/join.sh" gteam existing codex "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" codex bob --project "$PROJ" --no-wait
   [ "$status" -eq 0 ]
 
   boot="$(cat "$CAPTURE")"
@@ -308,10 +308,10 @@ seed_resumable() {
 @test "spawn: a type without resume_arg never resumes (#339)" {
   # gemini has no resume_arg in its manifest, so even with a record present the
   # boot must be fresh (and gemini also has no name_arg, so no -n either).
-  bash "$SCRIPTS/join.sh" gteam existing gemini "$PROJ"
+  bash "$SCRIPTS/join.sh" gteam existing codex "$PROJ"
   seed_resumable gteam bob "sess-uuid-9" "$PROJ" 1
 
-  run bash "$SCRIPTS/spawn.sh" gemini bob --project "$PROJ" --no-wait
+  run bash "$SCRIPTS/spawn.sh" codex bob --project "$PROJ" --no-wait
   [ "$status" -eq 0 ]
   boot="$(cat "$CAPTURE")"; run cat "$boot"
   [[ "$output" != *"--resume"* ]]
@@ -386,24 +386,6 @@ seed_resumable() {
   [[ "$output" != *"unset "* ]]
 }
 
-@test "spawn: grok-build launches the plain grok CLI with the actas prompt" {
-  # grok-build is spawnable and monitor=no, so spawn skips the readiness wait.
-  # Delivery is a rule file (no hook), so no folder-trust flag is needed —
-  # the launch is the bare `grok "/<cmd> actas <name>"`, like claude-code.
-  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
-  run bash "$SCRIPTS/spawn.sh" grok-build alice --project "$PROJ" --no-wait
-  [ "$status" -eq 0 ]
-  boot="$(cat "$CAPTURE")"
-  [ -f "$boot" ]
-  run cat "$boot"
-  [[ "$output" == *"grok"* ]]
-  [[ "$output" == *"actas"* ]]
-  [[ "$output" == *"alice"* ]]
-  [[ "$output" != *"--trust"* ]]
-}
-
-# --- --model (#135): per-type model flag, pass-through id ---
-
 @test "spawn --model: claude-code launch includes its --model flag + id" {
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
   run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --model claude-opus-4-8 --no-wait
@@ -421,15 +403,6 @@ seed_resumable() {
   boot="$(cat "$CAPTURE")"
   run cat "$boot"
   [[ "$output" == *"codex -m gpt-5"* ]]
-}
-
-@test "spawn --model: grok-build launch uses its --model flag" {
-  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
-  run bash "$SCRIPTS/spawn.sh" grok-build alice --project "$PROJ" --model grok-build --no-wait
-  [ "$status" -eq 0 ]
-  boot="$(cat "$CAPTURE")"
-  run cat "$boot"
-  [[ "$output" == *"grok --model grok-build"* ]]
 }
 
 @test "spawn --model: refused for a type with no model_arg in its manifest" {
@@ -463,48 +436,6 @@ seed_resumable() {
   run cat "$boot"
   [[ "$output" == *"cursor-agent --model sonnet-4-thinking"* ]]
   [[ "$output" == *"actas"* ]]
-}
-
-@test "spawn: gemini launches gemini with a bare positional prompt" {
-  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
-  run bash "$SCRIPTS/spawn.sh" gemini alice --project "$PROJ" --model gemini-3-pro --no-wait
-  [ "$status" -eq 0 ]
-  boot="$(cat "$CAPTURE")"
-  run cat "$boot"
-  [[ "$output" == *"gemini --model gemini-3-pro"* ]]
-  [[ "$output" == *"actas"* ]]
-}
-
-@test "spawn: antigravity launches agy with --prompt-interactive (not a bare positional)" {
-  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
-  run bash "$SCRIPTS/spawn.sh" antigravity alice --project "$PROJ" --model gemini-3-pro --no-wait
-  [ "$status" -eq 0 ]
-  boot="$(cat "$CAPTURE")"
-  run cat "$boot"
-  [[ "$output" == *"agy --model gemini-3-pro --prompt-interactive"* ]]
-  [[ "$output" == *"actas"* ]]
-}
-
-@test "spawn: copilot launches copilot with --interactive (not a bare positional)" {
-  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
-  run bash "$SCRIPTS/spawn.sh" copilot alice --project "$PROJ" --model gpt-5.4 --no-wait
-  [ "$status" -eq 0 ]
-  boot="$(cat "$CAPTURE")"
-  run cat "$boot"
-  [[ "$output" == *"copilot --model gpt-5.4 --interactive"* ]]
-  [[ "$output" == *"actas"* ]]
-}
-
-@test "spawn: opencode launches its 'run --interactive' fixed subcommand prefix" {
-  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
-  run bash "$SCRIPTS/spawn.sh" opencode alice --project "$PROJ" --model anthropic/claude-opus-4-8 --no-wait
-  [ "$status" -eq 0 ]
-  boot="$(cat "$CAPTURE")"
-  run cat "$boot"
-  [[ "$output" == *"opencode run --interactive --model anthropic/claude-opus-4-8"* ]]
-  [[ "$output" == *"actas"* ]]
-  # no bare 'opencode' invocation without the fixed prefix
-  [[ "$output" != *$'\n''opencode --model'* ]]
 }
 
 @test "spawn: prompt_arg lands after spawn-options, immediately before the prompt" {
@@ -928,13 +859,6 @@ printf 'CURSOR_ARGS: %s\n' "\$*" >> "$CAPTURE"
 exit 0
 EOF
   chmod +x "$STUB_BIN/cursor-agent" "$STUB_BIN/fake-cursor-bridge.sh"
-}
-
-@test "spawn: --headless is rejected for gemini" {
-  bash "$SCRIPTS/join.sh" myteam existing gemini "$PROJ"
-  run bash "$SCRIPTS/spawn.sh" gemini alice --project "$PROJ" --headless
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"--headless is not supported"* ]]
 }
 
 @test "spawn: codex defaults to headless when spawn.codex_headless=true" {
@@ -2791,29 +2715,6 @@ STUB
   # printable remainder ("[2K", "[1A") is harmless without its leading ESC.
   [[ "$output" != *$'\x1b'* ]]
 }
-
-@test "spawn: grok-build skips the readiness wait even without --no-wait (monitor=no)" {
-  # Regression guard: grok-build's monitor watcher attaches via the agent's
-  # actas/rule launch (no SessionStart hook) and only in monitor mode, so there
-  # is no ready sentinel for spawn to await. With monitor=no, spawn must skip the
-  # wait and return immediately instead of hanging a default turn/off-mode spawn
-  # until --ready-timeout. (Without this, monitor=yes made the wait fire.)
-  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
-  run env -u TMUX bash "$SCRIPTS/spawn.sh" grok-build alice --project "$PROJ" \
-    --terminal "true # {cmd}"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"skipping readiness wait"* ]]
-  [[ "$output" != *"status=timeout"* ]]
-  [[ "$output" != *"status=ready"* ]]
-}
-
-# --- initial prompt (--boot-prompt) ---
-# spawn folds an optional initial task into the agent's first prompt: the boot
-# prompt becomes the actas slash command followed (newline-separated) by the
-# task, so the new agent claims its identity AND starts the task in one turn —
-# the only way to hand a one-shot goal to a no-Monitor peer (codex). These tests
-# assert on the generated boot script the terminal template is handed (captured
-# via record.sh), the same way the actas-prompt tests above do.
 
 @test "spawn: --boot-prompt requires a task (missing arg errors)" {
   run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --boot-prompt

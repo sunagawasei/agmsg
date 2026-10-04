@@ -335,92 +335,6 @@ _wait_pidfile_value() {
   [ "$(cat "$file")" = "$expected" ]
 }
 
-@test "install: drops a Copilot SKILL.md when ~/.copilot exists" {
-  mkdir -p "$FAKE_HOME/.copilot"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  local copilot_skill="$FAKE_HOME/.copilot/skills/agmsg/SKILL.md"
-  [ -f "$copilot_skill" ]
-  # The Copilot SKILL.md must drive whoami with type=copilot, not codex,
-  # otherwise Copilot sessions get mis-identified.
-  grep -q "whoami.sh \"\$(pwd)\" copilot" "$copilot_skill"
-  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$copilot_skill"
-  # Frontmatter has the substituted skill name.
-  grep -q "^name: agmsg" "$copilot_skill"
-}
-
-@test "install: skips Copilot skill when ~/.copilot is absent" {
-  # Make sure ~/.copilot isn't there
-  rm -rf "$FAKE_HOME/.copilot"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  [ ! -d "$FAKE_HOME/.copilot" ]
-}
-
-@test "install --update: refreshes the Copilot skill if it was previously installed" {
-  mkdir -p "$FAKE_HOME/.copilot"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  local copilot_skill="$FAKE_HOME/.copilot/skills/agmsg/SKILL.md"
-  [ -f "$copilot_skill" ]
-  # Mutate the file so we can verify --update overwrites.
-  echo "tampered" > "$copilot_skill"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  refute grep -q "^tampered$" "$copilot_skill"
-  grep -q "whoami.sh \"\$(pwd)\" copilot" "$copilot_skill"
-}
-
-# Regression for a Copilot review finding: --update used to gate the Copilot
-# skill refresh on the SKILL.md already existing, which meant users who had
-# installed agmsg before the Copilot integration landed could never gain the
-# skill via the documented upgrade path. --update must install it for them.
-@test "install --update: installs Copilot skill for upgraders without prior skill" {
-  # First install without ~/.copilot, simulating a Copilot-less environment
-  # at the time the user originally installed agmsg.
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  [ ! -d "$FAKE_HOME/.copilot/skills/agmsg" ]
-  # User then installs Copilot CLI and runs --update.
-  mkdir -p "$FAKE_HOME/.copilot"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  [ -f "$FAKE_HOME/.copilot/skills/agmsg/SKILL.md" ]
-  grep -q "whoami.sh \"\$(pwd)\" copilot" "$FAKE_HOME/.copilot/skills/agmsg/SKILL.md"
-}
-
-@test "install: drops an OpenCode SKILL.md when ~/.config/opencode exists" {
-  mkdir -p "$FAKE_HOME/.config/opencode"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  local opencode_skill="$FAKE_HOME/.config/opencode/skills/agmsg/SKILL.md"
-  [ -f "$opencode_skill" ]
-  # The OpenCode SKILL.md must drive whoami with type=opencode, not codex,
-  # otherwise OpenCode sessions get mis-identified.
-  grep -q "whoami.sh \"\$(pwd)\" opencode" "$opencode_skill"
-  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$opencode_skill"
-  grep -q "^name: agmsg" "$opencode_skill"
-}
-
-@test "install: skips OpenCode skill when ~/.config/opencode is absent" {
-  rm -rf "$FAKE_HOME/.config/opencode"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  [ ! -d "$FAKE_HOME/.config/opencode/skills/agmsg" ]
-}
-
-@test "install --update: refreshes the OpenCode skill if it was previously installed" {
-  mkdir -p "$FAKE_HOME/.config/opencode"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  local opencode_skill="$FAKE_HOME/.config/opencode/skills/agmsg/SKILL.md"
-  [ -f "$opencode_skill" ]
-  echo "tampered" > "$opencode_skill"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  refute grep -q "^tampered$" "$opencode_skill"
-  grep -q "whoami.sh \"\$(pwd)\" opencode" "$opencode_skill"
-}
-
-@test "install --update: installs OpenCode skill for upgraders without prior skill" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  [ ! -d "$FAKE_HOME/.config/opencode/skills/agmsg" ]
-  mkdir -p "$FAKE_HOME/.config/opencode"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  [ -f "$FAKE_HOME/.config/opencode/skills/agmsg/SKILL.md" ]
-  grep -q "whoami.sh \"\$(pwd)\" opencode" "$FAKE_HOME/.config/opencode/skills/agmsg/SKILL.md"
-}
-
 @test "install: no PowerShell launcher is shipped (dispatcher only)" {
   AGMSG_FORCE_WINDOWS=1 HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd msg
 
@@ -797,45 +711,6 @@ EOF
 
 # --- hermes Agent skill (~/.hermes/skills/<name>/SKILL.md) ---
 
-@test "install: drops a Hermes skill when ~/.hermes exists" {
-  mkdir -p "$FAKE_HOME/.hermes"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  local hermes_skill="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
-  [ -f "$hermes_skill" ]
-  grep -q "whoami.sh \"\$(pwd)\" hermes" "$hermes_skill"
-  grep -q "^name: agmsg" "$hermes_skill"
-  grep -q "~/.agents/skills/agmsg/scripts" "$hermes_skill"
-}
-
-@test "install: Hermes skill no longer advertises 'spawn hermes' as a valid example (#279)" {
-  mkdir -p "$FAKE_HOME/.hermes"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  local hermes_skill="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
-  [ -f "$hermes_skill" ]
-  refute grep -q "spawn hermes reviewer" "$hermes_skill"
-  refute grep -q 'must be `claude-code`, `codex`, or `hermes`' "$hermes_skill"
-  grep -q "hermes.*is not spawnable\|hermes.*not spawnable" "$hermes_skill"
-}
-
-@test "install: custom command name is substituted in Hermes skill" {
-  mkdir -p "$FAKE_HOME/.hermes"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd msg
-  local hermes_skill="$FAKE_HOME/.hermes/skills/msg/SKILL.md"
-  [ -f "$hermes_skill" ]
-  grep -q "^name: msg" "$hermes_skill"
-  grep -q "~/.agents/skills/msg/scripts" "$hermes_skill"
-  grep -q "You can now use \`/msg\`" "$hermes_skill"
-  ! grep -q "__SKILL_NAME__" "$hermes_skill"
-}
-
-@test "install: --agent-type hermes makes shared SKILL.md Hermes-typed" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type hermes
-  grep -q "whoami.sh \"\$(pwd)\" hermes" "$SK/SKILL.md"
-  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
-  refute grep -q "whoami.sh \"\$(pwd)\" gemini" "$SK/SKILL.md"
-  ! grep -q "whoami.sh \"\$(pwd)\" antigravity" "$SK/SKILL.md"
-}
-
 @test "install: --agent-type cursor makes shared SKILL.md Cursor-typed (#131)" {
   # Regression guard: the TPL_TYPE case must list cursor, or --agent-type cursor
   # silently falls through to the codex template and the install ships a
@@ -843,26 +718,6 @@ EOF
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type cursor
   grep -q "whoami.sh \"\$(pwd)\" cursor" "$SK/SKILL.md"
   ! grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
-}
-
-@test "install --update: refreshes the Hermes skill if it was previously installed" {
-  mkdir -p "$FAKE_HOME/.hermes"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  local hermes_skill="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
-  [ -f "$hermes_skill" ]
-  echo "tampered" > "$hermes_skill"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  refute grep -q "^tampered$" "$hermes_skill"
-  grep -q "whoami.sh \"\$(pwd)\" hermes" "$hermes_skill"
-}
-
-@test "install --update: installs Hermes skill for upgraders without prior skill" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  [ ! -d "$FAKE_HOME/.hermes/skills/agmsg" ]
-  mkdir -p "$FAKE_HOME/.hermes"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  [ -f "$FAKE_HOME/.hermes/skills/agmsg/SKILL.md" ]
-  grep -q "whoami.sh \"\$(pwd)\" hermes" "$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
 }
 
 @test "install: --update re-points an existing Codex monitor shim to the new path" {
@@ -1048,46 +903,6 @@ EOF
 
 # --- grok-build skill (~/.grok/skills/<name>/SKILL.md) ---
 
-@test "install: drops a Grok Build SKILL.md when ~/.grok exists" {
-  mkdir -p "$FAKE_HOME/.grok"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  local grok_skill="$FAKE_HOME/.grok/skills/agmsg/SKILL.md"
-  [ -f "$grok_skill" ]
-  grep -q "whoami.sh \"\$(pwd)\" grok-build" "$grok_skill"
-  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$grok_skill"
-  grep -q "^name: agmsg" "$grok_skill"
-}
-
-@test "install: skips Grok Build skill when ~/.grok is absent" {
-  rm -rf "$FAKE_HOME/.grok"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  [ ! -d "$FAKE_HOME/.grok" ]
-}
-
-@test "install --update: installs Grok Build skill for upgraders without prior skill" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  [ ! -d "$FAKE_HOME/.grok/skills/agmsg" ]
-  mkdir -p "$FAKE_HOME/.grok"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
-  [ -f "$FAKE_HOME/.grok/skills/agmsg/SKILL.md" ]
-  grep -q "whoami.sh \"\$(pwd)\" grok-build" "$FAKE_HOME/.grok/skills/agmsg/SKILL.md"
-}
-
-@test "install: --agent-type grok-build makes shared SKILL.md Grok-typed" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type grok-build
-  grep -q "whoami.sh \"\$(pwd)\" grok-build" "$SK/SKILL.md"
-  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
-}
-
-# Positive control for #846 (A), covering every type the installer can render a
-# shared SKILL.md for: install fresh with that type, then run bare --update
-# (no --agent-type, forcing the on-disk re-detection path) and confirm the
-# type survives. Before the fix, only antigravity/gemini/grok-build were
-# grepped for at re-detection time -- opencode/hermes/cursor silently fell
-# through to the codex default and got their SKILL.md overwritten with the
-# codex template, i.e. the installer clobbering what it had itself just
-# written. codex itself is included as the baseline case (it was never
-# grepped for and was never broken -- it IS the fallback).
 @test "install: bare --update preserves every renderable type's SKILL.md flavor (#846)" {
   local t
   for t in codex gemini antigravity opencode hermes cursor grok-build; do

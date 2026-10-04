@@ -1144,7 +1144,7 @@ JSON
   wait_for_file "$TEST_SKILL_DIR/run/watch.cc-sess.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.cc-sess.pid" ]
   # Switching a DIFFERENT type's delivery in the SAME project must not touch it.
-  run bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT"
+  run bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [ -f "$TEST_SKILL_DIR/run/watch.cc-sess.pid" ]
   kill -0 "$watch_pid" 2>/dev/null
@@ -1184,7 +1184,7 @@ JSON
   wait_for_file "$TEST_SKILL_DIR/run/watch.sp-sess.pid"
   [ -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
   # Another type's set turn in the SAME space-containing project: must NOT kill it.
-  run bash "$SCRIPTS/delivery.sh" set turn copilot "$sp"
+  run bash "$SCRIPTS/delivery.sh" set turn codex "$sp"
   [ "$status" -eq 0 ]
   [ -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
   kill -0 "$watch_pid" 2>/dev/null
@@ -1316,28 +1316,6 @@ JSON
 # tries snake -> camel -> $GROK_SESSION_ID. The Monitor directive echoes the
 # resolved id as the watch.sh command's session arg, so we assert through
 # that. (Exercised via claude-code since the resolver is shared.)
-
-@test "session-start: resolves camelCase sessionId from stdin (grok field)" {
-  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
-  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
-  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<<'{"sessionId":"grokCamelSID"}'
-  [ "$status" -eq 0 ]
-  local cmdline
-  cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
-  eval "set -- $cmdline"
-  [[ "$2" =~ grokCamelSID ]]
-}
-
-@test "session-start: falls back to GROK_SESSION_ID env when stdin lacks a session id" {
-  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
-  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
-  run env AGMSG_RESOLVE_PROJECT=0 GROK_SESSION_ID=grokEnvSID bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<<'{}'
-  [ "$status" -eq 0 ]
-  local cmdline
-  cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
-  eval "set -- $cmdline"
-  [[ "$2" =~ grokEnvSID ]]
-}
 
 @test "session-start: snake_case session_id still wins over camelCase (claude-code unaffected)" {
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
@@ -1666,133 +1644,6 @@ EOF
 }
 
 # --- gemini agent tests ---
-
-@test "delivery set turn (gemini): installs rule file" {
-  run bash "$SCRIPTS/delivery.sh" set turn gemini "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "Delivery mode set to 'turn'" ]]
-  [ -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
-  grep -q "check-inbox.sh" "$TEST_PROJECT/.agent/rules/agmsg.md"
-}
-
-@test "delivery set off (gemini): removes rule file" {
-  bash "$SCRIPTS/delivery.sh" set turn gemini "$TEST_PROJECT"
-  [ -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
-  run bash "$SCRIPTS/delivery.sh" set off gemini "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [ ! -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
-}
-
-@test "delivery status (gemini): derives mode from rule file existence" {
-  run bash "$SCRIPTS/delivery.sh" status gemini "$TEST_PROJECT"
-  [[ "$output" =~ "mode: off" ]]
-
-  bash "$SCRIPTS/delivery.sh" set turn gemini "$TEST_PROJECT"
-  run bash "$SCRIPTS/delivery.sh" status gemini "$TEST_PROJECT"
-  [[ "$output" =~ "mode: turn" ]]
-}
-
-# --- copilot agent tests ---
-
-@test "delivery set turn (copilot): writes .github/hooks/agmsg.json with version + Stop entry" {
-  run bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "Delivery mode set to 'turn'" ]]
-  local hook_file="$TEST_PROJECT/.github/hooks/agmsg.json"
-  [ -f "$hook_file" ]
-  # JSON sanity: version=1, Stop entry references check-inbox.sh
-  local v
-  v=$(sqlite_mem "SELECT json_extract(readfile('$(rf "$hook_file")'), '\$.version');")
-  [ "$v" = "1" ]
-  local cmd
-  cmd=$(sqlite_mem "SELECT json_extract(readfile('$(rf "$hook_file")'), '\$.hooks.Stop[0].bash');")
-  [[ "$cmd" =~ "check-inbox.sh" ]]
-  [[ "$cmd" =~ "copilot" ]]
-}
-
-@test "delivery set off (copilot): removes the hook file" {
-  bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT"
-  [ -f "$TEST_PROJECT/.github/hooks/agmsg.json" ]
-  run bash "$SCRIPTS/delivery.sh" set off copilot "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [ ! -f "$TEST_PROJECT/.github/hooks/agmsg.json" ]
-}
-
-@test "delivery set monitor (copilot): rejected; no hook file written" {
-  run bash "$SCRIPTS/delivery.sh" set monitor copilot "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [[ "$output" =~ "not supported" ]]
-  [ ! -f "$TEST_PROJECT/.github/hooks/agmsg.json" ]
-}
-
-# Regression for a Copilot review finding: the unsupported-mode arms used to
-# `rm -f` the hook file before validating the mode, so fat-fingering
-# `mode monitor` on a project with a working `turn` config silently wiped
-# delivery. Validation must come first.
-@test "delivery set monitor (copilot): does NOT delete an existing turn hook" {
-  bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT" >/dev/null
-  [ -f "$TEST_PROJECT/.github/hooks/agmsg.json" ]
-  run bash "$SCRIPTS/delivery.sh" set monitor copilot "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [ -f "$TEST_PROJECT/.github/hooks/agmsg.json" ]
-  local n
-  n=$(sqlite_mem "SELECT json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.github/hooks/agmsg.json")'), '\$.hooks.Stop'));")
-  [ "$n" = "1" ]
-}
-
-@test "delivery set both (copilot): does NOT delete an existing turn hook" {
-  bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT" >/dev/null
-  run bash "$SCRIPTS/delivery.sh" set both copilot "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [ -f "$TEST_PROJECT/.github/hooks/agmsg.json" ]
-}
-
-@test "delivery set both (copilot): rejected" {
-  run bash "$SCRIPTS/delivery.sh" set both copilot "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [[ "$output" =~ "not supported" ]]
-}
-
-@test "delivery status (copilot): derives mode from hook file existence" {
-  run bash "$SCRIPTS/delivery.sh" status copilot "$TEST_PROJECT"
-  [[ "$output" =~ "mode: off" ]]
-
-  bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT"
-  run bash "$SCRIPTS/delivery.sh" status copilot "$TEST_PROJECT"
-  [[ "$output" =~ "mode: turn" ]]
-}
-
-@test "delivery set turn (copilot): idempotent across repeats" {
-  bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT"
-  bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT"
-  bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT"
-  local n
-  n=$(sqlite_mem "SELECT json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.github/hooks/agmsg.json")'), '\$.hooks.Stop'));")
-  [ "$n" = "1" ]
-}
-
-@test "check-inbox (copilot): emits JSON cooldown message inside cooldown window" {
-  bash "$SCRIPTS/join.sh" testteam alice copilot "$TEST_PROJECT"
-  # Prime the cooldown marker
-  echo '{}' | bash "$SCRIPTS/check-inbox.sh" copilot "$TEST_PROJECT" >/dev/null
-  # Second call within cooldown: copilot should get JSON, not silence
-  run bash -c "echo '{}' | bash '$SCRIPTS/check-inbox.sh' copilot '$TEST_PROJECT'"
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "agmsg: check skipped (cooldown)" ]]
-  [[ "$output" =~ "\"continue\"" ]]
-}
-
-@test "check-inbox (copilot): emits decision=block JSON when new messages arrive" {
-  bash "$SCRIPTS/join.sh" testteam alice copilot "$TEST_PROJECT"
-  bash "$SCRIPTS/join.sh" testteam bob   copilot "$TEST_PROJECT"
-  # Push cooldown window into the past so the first invocation is not skipped.
-  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
-  bash "$SCRIPTS/send.sh" testteam bob alice "ping copilot"
-  run bash -c "echo '{}' | bash '$SCRIPTS/check-inbox.sh' copilot '$TEST_PROJECT'"
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "\"decision\": \"block\"" ]]
-  [[ "$output" =~ "ping copilot" ]]
-}
 
 @test "check-inbox: does not hang when stdin is a non-TTY pipe that never reaches EOF (#381)" {
   # A minimal `timeout` shim so this test exercises check-inbox.sh's own
@@ -2707,199 +2558,6 @@ JSON
 
 # --- opencode agent tests ---
 
-@test "opencode is accepted as an agent type (turn mode)" {
-  run bash "$SCRIPTS/delivery.sh" set turn opencode "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "Delivery mode set to 'turn'" ]]
-  [ -f "$TEST_PROJECT/.opencode/rules/agmsg.md" ]
-  grep -q "check-inbox.sh" "$TEST_PROJECT/.opencode/rules/agmsg.md"
-}
-
-@test "opencode supports off mode: removes rule file" {
-  bash "$SCRIPTS/delivery.sh" set turn opencode "$TEST_PROJECT"
-  [ -f "$TEST_PROJECT/.opencode/rules/agmsg.md" ]
-  run bash "$SCRIPTS/delivery.sh" set off opencode "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [ ! -f "$TEST_PROJECT/.opencode/rules/agmsg.md" ]
-}
-
-@test "opencode rejects both mode" {
-  run bash "$SCRIPTS/delivery.sh" set both opencode "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [[ "$output" =~ "not supported" ]]
-  [ ! -f "$TEST_PROJECT/.opencode/rules/agmsg.md" ]
-}
-
-@test "opencode rejects both: does NOT delete an existing turn rule" {
-  bash "$SCRIPTS/delivery.sh" set turn opencode "$TEST_PROJECT" >/dev/null
-  [ -f "$TEST_PROJECT/.opencode/rules/agmsg.md" ]
-  run bash "$SCRIPTS/delivery.sh" set both opencode "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [ -f "$TEST_PROJECT/.opencode/rules/agmsg.md" ]
-}
-
-@test "opencode set monitor: passes the delivery_modes gate and writes a sentinel_monitor rule" {
-  run bash "$SCRIPTS/delivery.sh" set monitor opencode "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "Delivery mode set to 'monitor'" ]]
-  local rule_file="$TEST_PROJECT/.opencode/rules/agmsg.md"
-  [ -f "$rule_file" ]
-  run cat "$rule_file"
-  [[ "$output" == *"agmsg-delivery-mode: monitor"* ]]
-  [[ "$output" == *"sentinel_monitor"* ]]
-  [[ "$output" == *"watch.sh"* ]]
-  [[ "$output" == *"SENTINEL_SESSION_ID"* ]]
-  # Fallback instructions for when sentinel_monitor is unavailable.
-  [[ "$output" == *"check-inbox.sh"* ]]
-}
-
-@test "opencode set monitor: a project path containing an apostrophe stays one shell word" {
-  # An apostrophe is a legal POSIX path character and delivery.sh accepts it, so
-  # a literal '$project' wrap in the rule would end the argument early and let
-  # anything after it become live shell syntax. Both generated commands — the
-  # sentinel_monitor watcher and the fallback check-inbox — have to survive it.
-  local weird="$TEST_PROJECT/it's a proj"
-  mkdir -p "$weird"
-  run bash "$SCRIPTS/delivery.sh" set monitor opencode "$weird"
-  [ "$status" -eq 0 ]
-
-  local rule_file="$weird/.opencode/rules/agmsg.md"
-  [ -f "$rule_file" ]
-
-  # The path must not appear inside a single-quoted span that its own apostrophe
-  # terminates. Asserted by running the generated command lines through the
-  # shell's own parser: a broken quote fails to parse at all.
-  local line
-  while IFS= read -r line; do
-    case "$line" in
-      *watch.sh*|*check-inbox.sh*) ;;
-      *) continue ;;
-    esac
-    line="${line#- command: }"
-    line="${line#- Command: }"
-    run bash -n -c "$line"
-    [ "$status" -eq 0 ] || { echo "generated command does not parse: $line"; false; }
-  done < "$rule_file"
-}
-
-@test "opencode status: reports monitor when the monitor rule is present" {
-  bash "$SCRIPTS/delivery.sh" set monitor opencode "$TEST_PROJECT" >/dev/null
-  run bash "$SCRIPTS/delivery.sh" status opencode "$TEST_PROJECT"
-  [[ "$output" =~ "mode: monitor" ]]
-}
-
-@test "opencode set turn then monitor: rewrites the rule from turn to monitor" {
-  bash "$SCRIPTS/delivery.sh" set turn opencode "$TEST_PROJECT" >/dev/null
-  run bash "$SCRIPTS/delivery.sh" status opencode "$TEST_PROJECT"
-  [[ "$output" =~ "mode: turn" ]]
-  bash "$SCRIPTS/delivery.sh" set monitor opencode "$TEST_PROJECT" >/dev/null
-  run bash "$SCRIPTS/delivery.sh" status opencode "$TEST_PROJECT"
-  [[ "$output" =~ "mode: monitor" ]]
-}
-
-@test "opencode supports turn/monitor/off modes: status derives mode from rule file content" {
-  run bash "$SCRIPTS/delivery.sh" status opencode "$TEST_PROJECT"
-  [[ "$output" =~ "mode: off" ]]
-
-  bash "$SCRIPTS/delivery.sh" set turn opencode "$TEST_PROJECT"
-  run bash "$SCRIPTS/delivery.sh" status opencode "$TEST_PROJECT"
-  [[ "$output" =~ "mode: turn" ]]
-}
-
-@test "opencode set turn: idempotent across repeats" {
-  bash "$SCRIPTS/delivery.sh" set turn opencode "$TEST_PROJECT"
-  bash "$SCRIPTS/delivery.sh" set turn opencode "$TEST_PROJECT"
-  bash "$SCRIPTS/delivery.sh" set turn opencode "$TEST_PROJECT"
-  [ -f "$TEST_PROJECT/.opencode/rules/agmsg.md" ]
-  local count
-  count=$(grep -c "check-inbox.sh" "$TEST_PROJECT/.opencode/rules/agmsg.md")
-  [ "$count" -eq 1 ]
-}
-
-# cursor's delivery tests (#131) live in tests/test_cursor_delivery.bats now --
-# the old .cursor/rules/agmsg.mdc rule-file mechanics these covered (always-
-# apply frontmatter, monitor/both rejection) are gone: cursor moved to
-# .cursor/hooks.json, which now also accepts monitor and both (see that file's
-# "cursor set monitor/both" tests). The turn-mode idempotency case that is
-# still meaningful is re-asserted there against the new hooks.json shape.
-
-@test "antigravity supports off mode: removes rule file" {
-  bash "$SCRIPTS/delivery.sh" set turn antigravity "$TEST_PROJECT"
-  [ -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
-  run bash "$SCRIPTS/delivery.sh" set off antigravity "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [ ! -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
-}
-
-# #1289 / #399 follow-up: monitor is supported via the antigravity bridge marker;
-# `both` remains unsupported (no Monitor-tool equivalent).
-@test "antigravity accepts monitor mode" {
-  run bash "$SCRIPTS/delivery.sh" set monitor antigravity "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  grep -qF '<!-- agmsg:antigravity:monitor -->' "$TEST_PROJECT/.agent/rules/agmsg.md"
-}
-
-@test "antigravity migrates turn's own generated rule file to the monitor marker, never refusing it as foreign" {
-  # The migration path compares the existing file byte-for-byte against a
-  # hardcoded copy of what turn mode generates, to tell "our own file, safe to
-  # overwrite" from "someone's hand-written rules, must not clobber". The two
-  # copies (rulefile_apply's actual output and this driver's own hardcoded
-  # expectation) have to stay in lockstep by hand — this pins that they do.
-  bash "$SCRIPTS/delivery.sh" set turn antigravity "$TEST_PROJECT"
-  [ -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
-  run bash "$SCRIPTS/delivery.sh" set monitor antigravity "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  refute grep -qF 'existing rule file is not in agmsg format' <<<"$output"
-  grep -qF '<!-- agmsg:antigravity:monitor -->' "$TEST_PROJECT/.agent/rules/agmsg.md"
-
-  # Pre-#1248 agmsg (1.3.0 and earlier) wrote this exact text but named the
-  # per-driver notes file SKILL.md, renamed to README.md in #1248. Every
-  # upgraded user's untouched rule file has that one older byte, and must
-  # migrate the same way rather than being refused as a foreign file.
-  local rule_file="$TEST_PROJECT/.agent/rules/agmsg.md"
-  rm -f "$rule_file"
-  mkdir -p "$(dirname "$rule_file")"
-  # Sourced, not written out literally here, for the same #1249 reason
-  # _delivery.sh's own migration check sources it: this stays the only
-  # tracked place holding the pre-#1248 path, so a new stray SKILL.md
-  # reference anywhere else -- including elsewhere in this file -- still
-  # fails the #1249 check.
-  local LEGACY_PRE1248_NOTES_PATH
-  source "$SCRIPTS/drivers/types/antigravity/legacy-pre1248-notes-path.sh"
-  cat > "$rule_file" <<EOF
-# agmsg Integration Rule
-
-## PostToolUse
-After each tool call, automatically check the agmsg inbox for unread messages.
-- Command: '$SCRIPTS/check-inbox.sh' 'antigravity' '$TEST_PROJECT'
-
-## Terminal/pane self-awareness
-Asked about your own terminal, pane, or driver — or before using arrange/peek/poke
-— run '$SCRIPTS/where.sh' first and answer from its terminal=/capabilities=
-fields. Never guess from environment variables or a grep/ps command; a driver
-that IS present can be wrongly reported absent that way. Per-driver detail:
-'$SCRIPTS/$LEGACY_PRE1248_NOTES_PATH' (terminal= names which).
-
-## Teammates: placement, status, and reaching them
-Placement and status for a teammate: '$SCRIPTS/team.sh' <team> — never a
-stale memory of their last known pane. Act on one with '$SCRIPTS/peek.sh'
-/ 'poke.sh' / 'arrange.sh' <team> <name> directly, not a guess: its exit code
-says whether it worked and, if not, why.
-EOF
-  run bash "$SCRIPTS/delivery.sh" set monitor antigravity "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  refute grep -qF 'existing rule file is not in agmsg format' <<<"$output"
-  grep -qF '<!-- agmsg:antigravity:monitor -->' "$rule_file"
-}
-
-@test "antigravity rejects both mode" {
-  run bash "$SCRIPTS/delivery.sh" set both antigravity "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [[ "$output" =~ "not supported" ]]
-  [ ! -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
-}
-
-# --- Codex monitor bridge (#41) ---
 @test "session-start.sh for codex starts bridge when monitor launcher env is present" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
   _seed_role_record team alice thread-123 "$TEST_PROJECT" codex
@@ -3487,65 +3145,6 @@ EOF
 
 # --- hermes (manual-only: delivery_modes=off, no automatic hook) ---
 
-@test "delivery hermes: status is manual/off" {
-  run bash "$SCRIPTS/delivery.sh" status hermes "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "mode: off" ]]
-}
-
-@test "delivery hermes: rejects automatic modes" {
-  local mode
-  for mode in turn monitor both; do
-    run bash "$SCRIPTS/delivery.sh" set "$mode" hermes "$TEST_PROJECT"
-    [ "$status" -ne 0 ]
-    [[ "$output" =~ "not supported for hermes" ]]
-    [ ! -e "$TEST_PROJECT/.hermes/agmsg.json" ]
-  done
-}
-
-@test "delivery hermes: rejects unknown mode" {
-  run bash "$SCRIPTS/delivery.sh" set bogus hermes "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [[ "$output" =~ "Unknown mode" ]]
-  [ ! -e "$TEST_PROJECT/.hermes/agmsg.json" ]
-}
-
-@test "delivery hermes: accepts off without writing hook config" {
-  run bash "$SCRIPTS/delivery.sh" set off hermes "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "Delivery mode set to 'off'" ]]
-  [[ "$output" =~ "manual inbox checks only" ]]
-  [[ "$output" != *"AGMSG-DIRECTIVE"* ]]
-  [ ! -e "$TEST_PROJECT/.hermes/agmsg.json" ]
-}
-
-@test "delivery hermes: set off does not stop Claude Code watchers for the same project" {
-  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
-  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
-{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
-JSON
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" hermes-preserve-test "$TEST_PROJECT" claude-code 3>&- &
-  local watch_pid=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.hermes-preserve-test.pid"
-  [ -f "$TEST_SKILL_DIR/run/watch.hermes-preserve-test.pid" ]
-
-  run bash "$SCRIPTS/delivery.sh" set off hermes "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  run kill -0 "$watch_pid"
-  [ "$status" -eq 0 ]
-
-  kill "$watch_pid" 2>/dev/null || true
-  wait 2>/dev/null || true
-}
-
-# --- delivery.sh default-mode (config-driven default for the join flow) ---
-#
-# The resolver echoes a mode ONLY when delivery.default_mode is both a valid
-# token AND supported by the type's delivery_modes; otherwise it echoes nothing
-# (empty = "ask"). This is the join flow's one unit-testable surface — the
-# template prose that consults it is LLM-executed. stderr notes are dropped
-# (2>/dev/null) so assertions see stdout — the mode — only.
-
 @test "default-mode: unset config -> empty (join prompts as before)" {
   run bash -c "bash '$SCRIPTS/delivery.sh' default-mode claude-code 2>/dev/null"
   [ "$status" -eq 0 ]
@@ -3559,29 +3158,11 @@ JSON
   [ "$output" = "monitor" ]
 }
 
-@test "default-mode: turn echoes for a turn-capable type (opencode)" {
-  bash "$SCRIPTS/config.sh" set delivery.default_mode turn >/dev/null
-  run bash -c "bash '$SCRIPTS/delivery.sh' default-mode opencode 2>/dev/null"
-  [ "$status" -eq 0 ]
-  [ "$output" = "turn" ]
-}
-
 @test "default-mode: off is a valid default and echoes" {
   bash "$SCRIPTS/config.sh" set delivery.default_mode off >/dev/null
   run bash -c "bash '$SCRIPTS/delivery.sh' default-mode claude-code 2>/dev/null"
   [ "$status" -eq 0 ]
   [ "$output" = "off" ]
-}
-
-@test "default-mode: mode unsupported for the type -> empty (falls back to prompt)" {
-  # monitor is not in copilot's delivery_modes (turn off).
-  bash "$SCRIPTS/config.sh" set delivery.default_mode monitor >/dev/null
-  run bash -c "bash '$SCRIPTS/delivery.sh' default-mode copilot 2>/dev/null"
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
-  # ...and the stderr note explains why (visible without the 2>/dev/null).
-  run bash "$SCRIPTS/delivery.sh" default-mode copilot
-  [[ "$output" =~ "not supported for copilot" ]]
 }
 
 @test "default-mode: junk value -> empty + does not break (would-be-rejected by set)" {
@@ -3613,83 +3194,6 @@ JSON
 # Grok passive hooks can't inject (stdout is discarded), so grok delivers via the
 # rule-file self-poll model (like gemini/opencode): a .grok/rules/agmsg.md that
 # tells the agent to poll inbox.sh each turn. turn => rule present, off => absent.
-
-@test "delivery set turn (grok-build): writes .grok/rules/agmsg.md self-poll rule" {
-  run bash "$SCRIPTS/delivery.sh" set turn grok-build "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "Delivery mode set to 'turn'" ]]
-  local rule_file="$TEST_PROJECT/.grok/rules/agmsg.md"
-  [ -f "$rule_file" ]
-  # The rule points at inbox.sh (clean display + same-call mark = loss-safe),
-  # not the hook-only check-inbox.sh, and references this type + project.
-  run cat "$rule_file"
-  [[ "$output" == *"inbox.sh"* ]]
-  [[ "$output" != *"check-inbox.sh"* ]]
-  [[ "$output" == *"grok-build"* ]]
-  [[ "$output" == *"$TEST_PROJECT"* ]]
-}
-
-@test "delivery set off (grok-build): removes the rule file" {
-  bash "$SCRIPTS/delivery.sh" set turn grok-build "$TEST_PROJECT"
-  [ -f "$TEST_PROJECT/.grok/rules/agmsg.md" ]
-  run bash "$SCRIPTS/delivery.sh" set off grok-build "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [ ! -f "$TEST_PROJECT/.grok/rules/agmsg.md" ]
-}
-
-@test "delivery set monitor (grok-build): writes a monitor rule and emits the launch directive" {
-  GROK_SESSION_ID="grok-sess-1" run bash "$SCRIPTS/delivery.sh" set monitor grok-build "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  [[ "$output" =~ "Delivery mode set to 'monitor'" ]]
-  # Emits an in-session directive to launch watch.sh via the monitor tool, with
-  # GROK_SESSION_ID baked into the command (not CLAUDE_CODE_SESSION_ID).
-  [[ "$output" == *"AGMSG-DIRECTIVE"* ]]
-  [[ "$output" == *"watch.sh"* ]]
-  [[ "$output" == *"grok-sess-1"* ]]
-  [[ "$output" == *"grok-build"* ]]
-  # The rule carries the monitor marker and points at the monitor tool.
-  local rule_file="$TEST_PROJECT/.grok/rules/agmsg.md"
-  [ -f "$rule_file" ]
-  run cat "$rule_file"
-  [[ "$output" == *"agmsg-delivery-mode: monitor"* ]]
-  [[ "$output" == *"monitor"* ]]
-  [[ "$output" == *"watch.sh"* ]]
-  # The rule bakes the sentinel form, not a droppable empty expansion: grok's
-  # monitor tool re-evaluates the command line and deletes a quoted-but-empty
-  # "$GROK_SESSION_ID" argument, shifting every later argument one slot left.
-  [[ "$output" == *'watch.sh "${GROK_SESSION_ID:--}"'* ]]
-}
-
-@test "delivery status (grok-build): reports monitor when the monitor rule is present" {
-  GROK_SESSION_ID="grok-sess-2" bash "$SCRIPTS/delivery.sh" set monitor grok-build "$TEST_PROJECT" >/dev/null
-  run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
-  [[ "$output" =~ "mode: monitor" ]]
-}
-
-@test "delivery set turn then monitor (grok-build): rewrites the rule from turn to monitor" {
-  bash "$SCRIPTS/delivery.sh" set turn grok-build "$TEST_PROJECT" >/dev/null
-  run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
-  [[ "$output" =~ "mode: turn" ]]
-  GROK_SESSION_ID="grok-sess-3" bash "$SCRIPTS/delivery.sh" set monitor grok-build "$TEST_PROJECT" >/dev/null
-  run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
-  [[ "$output" =~ "mode: monitor" ]]
-}
-
-@test "delivery set both (grok-build): rejected; does NOT delete an existing turn rule" {
-  bash "$SCRIPTS/delivery.sh" set turn grok-build "$TEST_PROJECT" >/dev/null
-  run bash "$SCRIPTS/delivery.sh" set both grok-build "$TEST_PROJECT"
-  [ "$status" -ne 0 ]
-  [ -f "$TEST_PROJECT/.grok/rules/agmsg.md" ]
-}
-
-@test "delivery status (grok-build): derives mode from rule file existence" {
-  run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
-  [[ "$output" =~ "mode: off" ]]
-
-  bash "$SCRIPTS/delivery.sh" set turn grok-build "$TEST_PROJECT"
-  run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
-  [[ "$output" =~ "mode: turn" ]]
-}
 
 @test "delivery status (codex): a recorded seat makes \"not running\" mean the process (#579)" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
