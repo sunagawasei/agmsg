@@ -639,3 +639,23 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   grep -q '^herdr \[pane\] \[get\] \[w1:pB\]' "$ARGV_LOG"
   refute grep -q '\[pane\] \[list\]' "$ARGV_LOG"
 }
+
+@test "a headless worker's pid: record does not claim this seat's pane (#1114 placement guard)" {
+  _install_fake_tmux; _under_tmux /tmp/s 4242 %3
+  printf 'pid:91297\t/tmp/p\tcodex\n' >"$SKILL_DIR/run/spawn.other__codex"
+  run agmsg_self_name_on_action team alice
+  [ "$status" -eq 0 ]
+  refute grep -q 'already recorded as' <<<"$output"
+  [ "$(_placement team alice)" = 'tmux:/tmp/s:%3' ]
+}
+
+@test "a malformed pid: record (non-numeric, trailing junk, zero) still claims the pane (#1114 placement guard)" {
+  _install_fake_tmux; _under_tmux /tmp/s 4242 %3
+  local bad
+  for bad in pid:abc pid:123x pid:0 pid:00; do
+    printf '%s\t/tmp/p\tcodex\n' "$bad" >"$SKILL_DIR/run/spawn.other__codex"
+    run agmsg_self_name_on_action team alice
+    grep -q 'already recorded as other__codex' <<<"$output"
+    [ -z "$(_placement team alice)" ]
+  done
+}
