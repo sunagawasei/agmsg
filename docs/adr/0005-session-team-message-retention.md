@@ -27,3 +27,5 @@ Status: Accepted
 - The marker is written after a successful join of a dir this SessionStart saw absent. A project team created under the same name between that check and the join would be marked too; closing that needs an atomic create-if-absent in `join.sh`.
 - The TTL GC removes the team dir and bridge artifacts outside the team's lifecycle lock (unchanged). Only the row delete is serialized with SessionStart, so a resume racing the dir removal can still lose its dir; the rows are protected by the re-check under the lock.
 - With a non-sqlite storage driver retention is off and only the sweep's skip is visible.
+- A tombstone is dropped when an unmarked dir of the same name is seen or reaped, so a later project team of that name is not taken for the old session team. A project team created and removed between two SessionStarts leaves the old tombstone valid.
+- `gc-session-orphans.sh --apply` deletes a team only when no row is inside the window at delete time; a row that arrives after the dry-run check makes it skip the team.

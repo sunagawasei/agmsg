@@ -53,8 +53,10 @@ while IFS= read -r team; do
     echo "would delete $team ($rows rows)"
     continue
   fi
-  if out="$(agmsg_retention_reap_team "$team")"; then
+  if out="$(agmsg_retention_reap_team "$team" strict)" && [ "$(agmsg_retention_remaining "$team")" = 0 ]; then
     deleted=$((deleted + 1)); echo "deleted $team ($rows rows)"
+  elif [ -z "${out:-}" ] || [ "$out" = deleted ]; then
+    echo "skip   $team (new rows arrived)"
   else
     echo "skip   $team ($out)"
   fi

@@ -79,14 +79,20 @@ agmsg_retention_remaining() {
 # rows). Rows are selected by team AND age, evaluated by sqlite, so a row
 # inserted after the caller's checks is not touched. Returns non-zero on error.
 agmsg_retention_delete_rows() {
-  local team="$1" days="$2" tl db
+  local team="$1" days="$2" strict="${3:-}" tl db cut guard_e="" guard_m=""
   case "$days" in ''|*[!0-9]*) return 1 ;; esac
   tl="$(agmsg_sqlesc "$team")"; db="$(agmsg_db_path)"
+  cut="strftime('%Y-%m-%dT%H:%M:%SZ','now','-$days days')"
+  # strict: delete nothing when the team has any row inside the window.
+  if [ "$strict" = strict ]; then
+    guard_e="AND NOT EXISTS (SELECT 1 FROM events WHERE team='$tl' AND at >= $cut) AND NOT EXISTS (SELECT 1 FROM messages WHERE team='$tl' AND created_at >= $cut)"
+    guard_m="$guard_e"
+  fi
   agmsg_sqlite "$db" <<SQL >/dev/null 2>&1
 .bail on
 BEGIN IMMEDIATE;
-DELETE FROM events WHERE team='$tl' AND at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-$days days');
-DELETE FROM messages WHERE team='$tl' AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-$days days');
+DELETE FROM events WHERE team='$tl' AND at < $cut $guard_e;
+DELETE FROM messages WHERE team='$tl' AND created_at < $cut $guard_m;
 DELETE FROM read_cursors WHERE team='$tl'
   AND NOT EXISTS (SELECT 1 FROM events WHERE team='$tl');
 COMMIT;
@@ -97,9 +103,9 @@ SQL
 # SessionStart takes before publishing cc-instance. A resume that starts after
 # our veto check therefore either waits, or finds the dir back / owner alive on
 # the re-check below. Echo a short outcome; return 0 when rows were handled.
-# $2 is "dir-reaped" (called right after the TTL rm) or "tombstone" (sweep).
+# $2 = strict: delete only when no row is inside the window (manual apply).
 agmsg_retention_reap_team() {
-  local team="$1" days reason
+  local team="$1" strict="${2:-}" days reason
   agmsg_retention_supported || { printf 'unsupported-storage'; return 1; }
   days="$(agmsg_retention_days)"
   agmsg_team_lifecycle_lock_acquire "$team" "${AGMSG_LIFECYCLE_LOCK_TIMEOUT:-10}" \
@@ -108,7 +114,7 @@ agmsg_retention_reap_team() {
     agmsg_team_lifecycle_lock_release "$team"
     printf '%s' "$reason"; return 1
   fi
-  if agmsg_retention_delete_rows "$team" "$days"; then
+  if agmsg_retention_delete_rows "$team" "$days" "$strict"; then
     agmsg_team_lifecycle_lock_release "$team"
     printf 'deleted'; return 0
   fi
@@ -120,7 +126,11 @@ agmsg_retention_reap_team() {
 # carried the session-team marker before it was removed.
 agmsg_retention_after_dir_reap() {
   local team="$1" had_marker="$2" tomb
-  [ "$had_marker" = 1 ] || return 0
+  if [ "$had_marker" != 1 ]; then
+    # An unmarked dir of this name is a different generation than any tombstone.
+    rm -f "$(agmsg_retention_tombstone_path "$team")" 2>/dev/null || true
+    return 0
+  fi
   [ ! -d "$SKILL_DIR/teams/$team" ] || return 0   # rm failed: keep the rows
   tomb="$(agmsg_retention_tombstone_path "$team")"
   : >"$tomb" 2>/dev/null || return 0
@@ -137,6 +147,12 @@ agmsg_retention_sweep() {
   for tomb in "$RUN_DIR"/session-tombstone.s-*; do
     [ -f "$tomb" ] || continue
     team="${tomb##*/session-tombstone.}"
+    # A live dir without a marker is a newer team of the same name (a project
+    # team): the tombstone belongs to the previous generation and proves nothing.
+    if [ -d "$SKILL_DIR/teams/$team" ] && [ ! -f "$(agmsg_retention_marker_path "$team")" ]; then
+      rm -f "$tomb" 2>/dev/null || true
+      continue
+    fi
     agmsg_retention_reap_team "$team" >/dev/null || continue
     left="$(agmsg_retention_remaining "$team")"
     [ "$left" = 0 ] || continue

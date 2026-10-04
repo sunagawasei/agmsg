@@ -256,3 +256,23 @@ veto_case() {   # <kind>
   [ "$(rows s-11111111-2222-3333-4444-555555555555)" != 0 ]
   [ "$(rows s-99999999-2222-3333-4444-555555555555)" != 0 ]
 }
+
+@test "a tombstone does not authorise deleting a newer project team of the same name" {
+  seed_rows s-JJJ-1 30
+  : > "$TEST_SKILL_DIR/run/session-tombstone.s-JJJ-1"
+  make_team s-JJJ-1
+  run run_session_start
+  [ ! -f "$TEST_SKILL_DIR/run/session-tombstone.s-JJJ-1" ]
+  rm -rf "$TEST_SKILL_DIR/teams/s-JJJ-1"
+  run run_session_start
+  [ "$(rows s-JJJ-1)" != 0 ]
+}
+
+@test "strict delete keeps every row when one is inside the window" {
+  seed_rows s-kkkkkkkk-bbbb-cccc-dddd-eeeeeeeeeeee 30
+  bash "$SCRIPTS/send.sh" s-kkkkkkkk-bbbb-cccc-dddd-eeeeeeeeeeee a b fresh --force >/dev/null
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"; source "$SCRIPTS/lib/session-retention.sh"
+  agmsg_retention_delete_rows s-kkkkkkkk-bbbb-cccc-dddd-eeeeeeeeeeee 7 strict
+  [ "$(rows s-kkkkkkkk-bbbb-cccc-dddd-eeeeeeeeeeee)" = 4 ]
+}
