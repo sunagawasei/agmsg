@@ -48,6 +48,12 @@ else
   BODY="${1:?Missing message body (or pass --stdin to read it from stdin)}"
   shift
 fi
+# One rule for both body sources: a body with nothing but whitespace is refused,
+# so an empty heredoc or a failed pipe cannot deliver a blank message.
+case "$BODY" in
+  *[![:space:]]*) ;;
+  *) echo "send: refusing an empty message body (nothing but whitespace)" >&2; exit 1 ;;
+esac
 
 WAIT=0
 FORCE=0
@@ -161,7 +167,10 @@ fi
 # storage_send re-inits its schema idempotently before writing, which subsumes the
 # #114 concurrent first-write race the old path retried around (a process seeing
 # the DB file before the table exists just creates it).
-SENT_EVENT_ID="$(storage_send "$TEAM" "$FROM" "$TO" "$BODY")"
+if ! SENT_EVENT_ID="$(storage_send "$TEAM" "$FROM" "$TO" "$BODY")" || [ -z "$SENT_EVENT_ID" ]; then
+  echo "send: could not confirm the message to $TO in team $TEAM was stored (the storage driver reported a failure; its own error, if any, is above). Check history before resending." >&2
+  exit 1
+fi
 
 echo "Sent to $TO in team $TEAM"
 

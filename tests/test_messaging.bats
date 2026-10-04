@@ -271,6 +271,34 @@ EOF
   [[ "$output" == *'line two with "quotes"'* ]]
 }
 
+# #27: an empty --stdin used to be stored while an empty 4th arg was refused.
+# Both sources now share one rule: a whitespace-only body is refused, unstored.
+@test "send: an empty or whitespace-only body is refused from --stdin and from the 4th arg (#27)" {
+  run bash -c 'printf "" | bash "$1/send.sh" testteam alice bob --stdin' _ "$SCRIPTS"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"refusing an empty message body"* ]]
+  run bash -c 'printf "\n\n" | bash "$1/send.sh" testteam alice bob --stdin' _ "$SCRIPTS"
+  [ "$status" -ne 0 ]
+  run bash "$SCRIPTS/send.sh" testteam alice bob "$(printf ' \n\t')"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"refusing an empty message body"* ]]
+  run bash "$SCRIPTS/history.sh" testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "No message history" ]]
+}
+
+# #50: a failed storage write used to end the script with a bare exit 1.
+# A read-only database makes the real driver's write fail.
+@test "send: a failed storage write names the failure and exits non-zero (#50)" {
+  bash "$SCRIPTS/send.sh" testteam alice bob "warm-up creates the db"
+  local db_dir; db_dir="$(bash -c '. "$1/lib/storage.sh"; agmsg_storage_dir' _ "$SCRIPTS")"
+  chmod 555 "$db_dir"; chmod 444 "$db_dir"/messages.db* 2>/dev/null || true
+  run bash "$SCRIPTS/send.sh" testteam alice bob "hello"
+  chmod 755 "$db_dir"; chmod 644 "$db_dir"/messages.db* 2>/dev/null || true
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"could not confirm the message"* ]]
+}
+
 @test "inbox: --format ids prints id-tagged rows and does NOT mark read" {
   bash "$SCRIPTS/send.sh" testteam alice bob "first"
   bash "$SCRIPTS/send.sh" testteam alice bob "second"
