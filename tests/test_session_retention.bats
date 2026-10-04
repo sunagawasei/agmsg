@@ -170,7 +170,7 @@ veto_case() {   # <kind>
   run run_session_start
   [ "$status" -eq 0 ]
   [ "$(rows "$team")" != 0 ]
-  kill "${VETO_PID:-0}" 2>/dev/null || true
+  if [ -n "${VETO_PID:-}" ]; then kill "$VETO_PID" 2>/dev/null || true; fi
 }
 
 @test "veto live-bridge: the dir and the rows stay" { veto_case live-bridge; }
