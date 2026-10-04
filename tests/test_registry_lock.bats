@@ -135,6 +135,34 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   [ ! -d "$TEAM_DIR/.config.lock" ]
 }
 
+@test "lock: after a failed release, the printed remedy lets the next acquire succeed (#778, #1445)" {
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR" || exit 1
+    printf "x\n" > "$TEAM_DIR/.config.lock/stray"
+    agmsg_lock_release
+  '
+  grep -q "could not release the registry lock" <<<"$output"
+  local remedy
+  remedy="$(grep -oE 'rm -r .*' <<<"$output" | tail -1)"
+  [ -n "$remedy" ]
+  # Until the remedy runs the lock is still held: a second acquirer cannot take it.
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" AGMSG_LOCK_SECONDS=1 AGMSG_LOCK_TRIES=5 bash -c '
+    . "$LOCKLIB"; agmsg_lock_acquire "$TEAM_DIR"
+  '
+  [ "$status" -ne 0 ]
+  run bash -c "$remedy"
+  [ "$status" -eq 0 ]
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR" || exit 1
+    agmsg_lock_release
+  '
+  [ "$status" -eq 0 ]
+  [ ! -d "$TEAM_DIR/.config.lock" ]
+  [ ! -e "$TEAM_DIR/.config.lock.holder" ]
+}
+
 @test "lock: releasing a lock that is already gone stays quiet (#778)" {
   # The other half of the same distinction. A lock that is already released is
   # not an event, and reporting it would train the operator to ignore the line
