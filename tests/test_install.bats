@@ -709,7 +709,6 @@ EOF
 }
 
 
-# --- hermes Agent skill (~/.hermes/skills/<name>/SKILL.md) ---
 
 @test "install: --agent-type cursor makes shared SKILL.md Cursor-typed (#131)" {
   # Regression guard: the TPL_TYPE case must list cursor, or --agent-type cursor

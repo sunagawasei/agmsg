@@ -57,7 +57,7 @@ fi
 exit 0
 CODEX_STUB
   # Other types need only a trivial success stub.
-  for bin in grok hermes cursor-agent gemini agy copilot opencode; do
+  for bin in cursor-agent; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/$bin"
     chmod +x "$STUB_BIN/$bin"
   done
@@ -306,8 +306,8 @@ seed_resumable() {
 }
 
 @test "spawn: a type without resume_arg never resumes (#339)" {
-  # gemini has no resume_arg in its manifest, so even with a record present the
-  # boot must be fresh (and gemini also has no name_arg, so no -n either).
+  # codex has no resume_arg in its manifest, so even with a record present the
+  # boot must be fresh (and codex also has no name_arg, so no -n either).
   bash "$SCRIPTS/join.sh" gteam existing codex "$PROJ"
   seed_resumable gteam bob "sess-uuid-9" "$PROJ" 1
 
@@ -410,7 +410,7 @@ seed_resumable() {
   [[ "$output" != *"--model"* ]]
 }
 
-# --- newly spawnable types (#277): cursor, gemini, antigravity, copilot, opencode ---
+# --- newly spawnable types (#277): cursor ---
 
 @test "spawn: cursor launches cursor-agent with a bare positional prompt" {
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
@@ -420,21 +420,6 @@ seed_resumable() {
   run cat "$boot"
   [[ "$output" == *"cursor-agent --model sonnet-4-thinking"* ]]
   [[ "$output" == *"actas"* ]]
-}
-
-@test "spawn: prompt_arg lands after spawn-options, immediately before the prompt" {
-  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
-  local opts="$TEST_SKILL_DIR/spawn_options.yaml"
-  cat > "$opts" <<'YAML'
-antigravity:
-  --sandbox: true
-YAML
-  run env AGMSG_SPAWN_OPTIONS_FILE="$opts" \
-    bash "$SCRIPTS/spawn.sh" antigravity alice --project "$PROJ" --no-wait
-  [ "$status" -eq 0 ]
-  boot="$(cat "$CAPTURE")"
-  run cat "$boot"
-  [[ "$output" == *"agy --sandbox --prompt-interactive"* ]]
 }
 
 # --- spawn options (#273): per-type extra CLI args from a YAML file ---

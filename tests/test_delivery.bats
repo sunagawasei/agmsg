@@ -1643,7 +1643,6 @@ EOF
   grep -q -- "--thread thread-sym" "$log"
 }
 
-# --- gemini agent tests ---
 
 @test "check-inbox: does not hang when stdin is a non-TTY pipe that never reaches EOF (#381)" {
   # A minimal `timeout` shim so this test exercises check-inbox.sh's own
@@ -2556,7 +2555,6 @@ JSON
   [ "$allow_len" = "600" ]
 }
 
-# --- opencode agent tests ---
 
 @test "session-start.sh for codex starts bridge when monitor launcher env is present" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
