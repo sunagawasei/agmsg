@@ -544,7 +544,7 @@ agmsg_codex_reviewer_network_config() {
 
 # Fail closed unless this codex build enforces the allowlist. A build that
 # ignores network_proxy must not launch a reviewer with unrestricted egress.
-# Headless review then uses another reviewer, such as grok-review.
+# Headless review then uses a different reviewer.
 agmsg_codex_reviewer_assert_network() {
   local codex_bin="$1" cwd="$2" fs="$3" net_c="$4" out rc=0
   out="$("$codex_bin" sandbox --enable network_proxy -P agmsg-reviewer -C "$cwd" \

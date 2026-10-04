@@ -1,6 +1,6 @@
 ---
 name: agmsg
-description: Cross-agent messaging via SQLite. Send messages between Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, and other agents. No daemon, no network, no dependencies beyond bash and sqlite3.
+description: Cross-agent messaging via SQLite. Send messages between Claude Code, Codex, Cursor, and other agents. No daemon, no network, no dependencies beyond bash and sqlite3.
 ---
 
 # Agent Messaging
@@ -36,7 +36,7 @@ After this runs once, `~/.agents/skills/agmsg/` is populated and you can skip St
 
 ```bash
 ~/.agents/skills/agmsg/scripts/whoami.sh "$(pwd)" <type>
-# type: claude-code, codex, gemini, antigravity, copilot
+# type: claude-code, codex, cursor
 # Returns: agent=... / multiple=true ... / suggest=true ... / not_joined=true ...
 ```
 
@@ -76,10 +76,6 @@ Do NOT manually edit config files. Always use join.sh. If the name was recently 
 # on Claude Code this holds the turn open so the terminal stays "running" while
 # waiting. Defaults: --timeout 300 --interval 2.
 ~/.agents/skills/agmsg/scripts/send.sh <team> <from_agent> <to_agent> "<message>" --wait [--timeout <sec>] [--interval <sec>]
-# High-level verb (same thing via the dispatcher / `agmsg` CLI): `send` = one-way,
-# `ask` = request/reply (= send + --wait). Trailing --timeout/--interval are options;
-# a flag inside the message is kept verbatim, and `--` forces the rest to be body.
-~/.agents/skills/agmsg/scripts/windows/dispatch.sh --team <team> --agent <from_agent> -- ask <to_agent> "<message>" [--timeout <sec>] [--interval <sec>]
 
 # Message history
 ~/.agents/skills/agmsg/scripts/history.sh <team> [agent_id] [limit]
