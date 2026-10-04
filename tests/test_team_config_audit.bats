@@ -78,7 +78,7 @@ audit_fields() {
   agmsg_team_config_audit team join alice newest
 
   [ "$(wc -l < "$log" | tr -d ' ')" -eq 5000 ]
-  ! grep -q $'seed-1$' "$log"
+  refute grep -q $'seed-1$' "$log"
   grep -q $'newest$' "$log"
 }
 

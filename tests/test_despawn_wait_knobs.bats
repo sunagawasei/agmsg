@@ -143,7 +143,7 @@ register_graceful_fixture() {
   [ "$status" -eq 0 ]
   [ "$(wc -l < "$WAIT_SLEEP_LOG" | tr -d ' ')" -eq 2 ]
   [ "$(sort -u "$WAIT_SLEEP_LOG")" = 0.01 ]
-  ! kill -0 "$TEST_SUBJECT_PID" 2>/dev/null
+  refute kill -0 "$TEST_SUBJECT_PID" 2>/dev/null
   TEST_SUBJECT_PID=""
 
   : > "$WAIT_SLEEP_LOG"
@@ -155,7 +155,7 @@ register_graceful_fixture() {
   [ "$status" -eq 0 ]
   [ "$(wc -l < "$WAIT_SLEEP_LOG" | tr -d ' ')" -eq 5 ]
   [ "$(sort -u "$WAIT_SLEEP_LOG")" = 0.01 ]
-  ! kill -0 "$TEST_SUBJECT_PID" 2>/dev/null
+  refute kill -0 "$TEST_SUBJECT_PID" 2>/dev/null
   TEST_SUBJECT_PID=""
 }
 
@@ -263,6 +263,6 @@ STUB
   [ "$status" -eq 0 ]
   [[ "$output" == *"status=forced name=default-five team=slow-team"* ]]
   [ "$elapsed" -ge 5 ]
-  ! kill -0 "$TEST_SUBJECT_PID" 2>/dev/null
+  refute kill -0 "$TEST_SUBJECT_PID" 2>/dev/null
   TEST_SUBJECT_PID=""
 }

@@ -430,7 +430,7 @@ WRAPPER
   send_to_worker alice "probe-shaped omission"
   run bridge
   [ "$status" -eq 0 ]
-  ! grep -Fq 'ARG=--disallowedTools' "$CAPTURE/args.2"
+  refute grep -Fq 'ARG=--disallowedTools' "$CAPTURE/args.2"
   ! grep -Fq 'ARG=Edit,Write,NotebookEdit' "$CAPTURE/args.2"
 }
 
@@ -444,7 +444,7 @@ WRAPPER
   [ "$status" -eq 0 ]
   grep -Fxq 'ARG=--resume' "$CAPTURE/args.2"
   grep -Fxq 'ARG=00000000-0000-4000-8000-000000000001' "$CAPTURE/args.2"
-  ! grep -Fxq 'ARG=--session-id' "$CAPTURE/args.2"
+  refute grep -Fxq 'ARG=--session-id' "$CAPTURE/args.2"
   [ "$(cat "$(session_file)")" = "00000000-0000-4000-8000-000000000001" ]
 }
 
@@ -572,14 +572,14 @@ WRAPPER
   [ "$status" -eq 0 ]
   [ "$(wc -c < "$CAPTURE/prompt.1" | tr -d ' ')" -le 1048576 ]
   grep -q 'FIRST:' "$CAPTURE/prompt.1"
-  ! grep -q 'SECOND:' "$CAPTURE/prompt.1"
+  refute grep -q 'SECOND:' "$CAPTURE/prompt.1"
   [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE to_agent='worker' AND read_at IS NULL AND body LIKE 'SECOND:%';")" -eq 1 ]
 
   run bridge
   [ "$status" -eq 0 ]
   [ "$(wc -c < "$CAPTURE/prompt.2" | tr -d ' ')" -le 1048576 ]
   grep -q 'SECOND:' "$CAPTURE/prompt.2"
-  ! grep -q 'FIRST:' "$CAPTURE/prompt.2"
+  refute grep -q 'FIRST:' "$CAPTURE/prompt.2"
   [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE to_agent='worker' AND read_at IS NULL;")" -eq 0 ]
   [ "$(cat "$CAPTURE/call-count")" -eq 2 ]
 }
@@ -608,8 +608,8 @@ WRAPPER
 
   [ "$(cat "$CAPTURE/call-count")" -eq 1 ]
   grep -q 'FITS:' "$CAPTURE/prompt.1"
-  ! grep -q 'POISON:' "$CAPTURE/prompt.1"
-  ! grep -q 'DEFER:' "$CAPTURE/prompt.1"
+  refute grep -q 'POISON:' "$CAPTURE/prompt.1"
+  refute grep -q 'DEFER:' "$CAPTURE/prompt.1"
   grep -Fxq 'unread_at_cli=1' "$CAPTURE/env.1"
   [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE id=$poison_id AND read_at IS NOT NULL;")" -eq 1 ]
   [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE id=$fits_id AND read_at IS NOT NULL;")" -eq 1 ]

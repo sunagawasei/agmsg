@@ -343,7 +343,7 @@ STUB
 
   WATCHDOG_MODE=record-change run_watchdog
   [ "$status" -eq 0 ]
-  ! grep -q '^spawn:' "$WATCHDOG_CALLS"
+  refute grep -q '^spawn:' "$WATCHDOG_CALLS"
   [ ! -e "$RUN/watchdog.$TEAM.worker-record-change.intent" ]
 
   : >"$WATCHDOG_CALLS"
@@ -353,7 +353,7 @@ STUB
     "$(agmsg_spawn_path "$TEAM" worker-tombstone)"
   WATCHDOG_MODE=delete-intent run_watchdog
   [ "$status" -eq 0 ]
-  ! grep -q '^spawn:' "$WATCHDOG_CALLS"
+  refute grep -q '^spawn:' "$WATCHDOG_CALLS"
   [ ! -e "$RUN/watchdog.$TEAM.worker-delete-intent.intent" ]
   [ ! -e "$safe_record" ]
 
@@ -361,7 +361,7 @@ STUB
   write_record worker-tombstone 999999
   WATCHDOG_MODE=tombstone run_watchdog
   [ "$status" -eq 0 ]
-  ! grep -q '^spawn:' "$WATCHDOG_CALLS"
+  refute grep -q '^spawn:' "$WATCHDOG_CALLS"
   [ -e "$RUN/watchdog.$TEAM.tombstone" ]
   [ ! -e "$RUN/watchdog.$TEAM.worker-tombstone.intent" ]
 }
@@ -639,7 +639,7 @@ STUB
   run_watchdog
   [ "$status" -eq 0 ]
   [ "$output" = "watchdog: respawned worker (reason=dead)" ]
-  ! grep -q '^despawn:' "$WATCHDOG_CALLS"
+  refute grep -q '^despawn:' "$WATCHDOG_CALLS"
   grep -q '^spawn:worker$' "$WATCHDOG_CALLS"
 }
 
@@ -656,7 +656,7 @@ STUB
   [ "$output" = $'watchdog: despawn incomplete s-A11CE-001/aaa (status=17)\nwatchdog: respawned zzz (reason=dead)' ]
   grep -q '^despawn:aaa$' "$WATCHDOG_CALLS"
   grep -q '^despawn:zzz$' "$WATCHDOG_CALLS"
-  ! grep -q '^spawn:aaa$' "$WATCHDOG_CALLS"
+  refute grep -q '^spawn:aaa$' "$WATCHDOG_CALLS"
   grep -q '^spawn:zzz$' "$WATCHDOG_CALLS"
   [ -f "$RUN/watchdog.$TEAM.aaa.intent" ]
   [ -f "$(agmsg_spawn_path "$TEAM" aaa)" ]
@@ -679,7 +679,7 @@ STUB
   [ "$(cat "$last")" = 1000 ]
   [ -f "$record" ]
   [ -f "$intent" ]
-  ! grep -q '^spawn:' "$WATCHDOG_CALLS"
+  refute grep -q '^spawn:' "$WATCHDOG_CALLS"
 
   : > "$WATCHDOG_CALLS"
   run_watchdog
@@ -723,8 +723,8 @@ STUB
   run_watchdog
   [ "$status" -eq 0 ]
   grep -q '^spawn:worker$' "$WATCHDOG_CALLS"
-  ! grep -q 'outsider' "$WATCHDOG_CALLS"
-  ! grep -q 'ghost' "$WATCHDOG_CALLS"
+  refute grep -q 'outsider' "$WATCHDOG_CALLS"
+  refute grep -q 'ghost' "$WATCHDOG_CALLS"
   [ -f "$RUN/spawn.${other}__outsider" ]
   [ -f "$RUN/spawn.${TEAM}__ghost" ]
 }
@@ -832,8 +832,8 @@ STUB
   [ "$status" -eq 0 ]
   [ "$output" = "watchdog: despawn incomplete $TEAM/aaa (status=124)" ]
   [ -f "$RUN/watchdog.$TEAM.aaa.intent" ]
-  ! grep -q '^spawn:' "$WATCHDOG_CALLS"
-  ! grep -q '^despawn:zzz$' "$WATCHDOG_CALLS"
+  refute grep -q '^spawn:' "$WATCHDOG_CALLS"
+  refute grep -q '^despawn:zzz$' "$WATCHDOG_CALLS"
   read -r parent child <"$RUN/despawn-timeout.pids"
   wait_for_pid_exit "$parent"
   wait_for_pid_exit "$child"
@@ -867,7 +867,7 @@ STUB
   WATCHDOG_MODE=ok run_watchdog
   [ "$status" -eq 0 ]
   [ "$output" = "watchdog: respawned worker (reason=dead)" ]
-  ! grep -q '^despawn:' "$WATCHDOG_CALLS"
+  refute grep -q '^despawn:' "$WATCHDOG_CALLS"
   grep -q '^spawn:worker$' "$WATCHDOG_CALLS"
 }
 

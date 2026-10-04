@@ -141,10 +141,10 @@ teardown() {
   [ "$status" -eq 1 ]
   [ "$output" = "wait: timeout after 1s waiting for condition command" ]
   grep -q '^empty$' "$PORT_READINESS_TRACE"
-  ! grep -q '^ready$' "$PORT_READINESS_TRACE"
+  refute grep -q '^ready$' "$PORT_READINESS_TRACE"
 
   printf '12x' > "$portf"
-  ! port_file_is_ready "$portf"
+  refute port_file_is_ready "$portf"
   grep -q '^invalid$' "$PORT_READINESS_TRACE"
 
   : > "$release"

@@ -186,7 +186,7 @@ turns_run() {  # number of -p cursor turns the stub has recorded so far
   run bash "$SCRIPTS/inbox.sh" team cur --format ids
   [ -z "$output" ]
   # a normal (non-fallback) turn never forces --model (global config inheritance)
-  ! grep -q -- "--model" "$FAKE_CURSOR_LOG"
+  refute grep -q -- "--model" "$FAKE_CURSOR_LOG"
   grep -q -- "--output-format stream-json" "$FAKE_CURSOR_LOG"
 }
 
@@ -217,7 +217,7 @@ turns_run() {  # number of -p cursor turns the stub has recorded so far
   bash "$SCRIPTS/send.sh" team alice cur "hi" >/dev/null
   bridge
   grep -q -- "--trust" "$FAKE_CURSOR_LOG"
-  ! grep -q -- "--force" "$FAKE_CURSOR_LOG"
+  refute grep -q -- "--force" "$FAKE_CURSOR_LOG"
   ! grep -q -- "--yolo" "$FAKE_CURSOR_LOG"
 }
 
@@ -511,7 +511,7 @@ STUB
   bridge
   [ "$status" -eq 0 ]
   # no fallback attempt at all — dead-letter fires on the first terminal failure
-  ! grep -q -- "--model" "$FAKE_CURSOR_LOG"
+  refute grep -q -- "--model" "$FAKE_CURSOR_LOG"
   run bash "$SCRIPTS/inbox.sh" team alice --format ids
   [[ "$output" == *"[bridge-error]"* ]]
   run bash "$SCRIPTS/inbox.sh" team cur --format ids
@@ -525,7 +525,7 @@ STUB
   bridge --fallback-model configured-model --no-fallback
   [ "$status" -eq 0 ]
   [ "$(turns_run)" -eq 1 ]
-  ! grep -q -- "--model configured-model" "$FAKE_CURSOR_LOG"
+  refute grep -q -- "--model configured-model" "$FAKE_CURSOR_LOG"
   ! grep -q -- "--model env-model" "$FAKE_CURSOR_LOG"
 }
 
@@ -558,7 +558,7 @@ STUB
   [[ "$output" == *"pinned transient"* ]]
   bridge --model grok-4.6
   [ "$(turns_run)" -eq 2 ]
-  ! grep -q -- "--model composer-2.5" "$FAKE_CURSOR_LOG"
+  refute grep -q -- "--model composer-2.5" "$FAKE_CURSOR_LOG"
   run bash "$SCRIPTS/inbox.sh" team alice --format ids
   [[ "$output" == *"2 consecutive failures"* ]]
 }
@@ -677,7 +677,7 @@ STUB
   [ "$status" -eq 0 ]
   local log="$TEST_SKILL_DIR/run/cursor-bridge.team.cur.log"
   [ "$(grep -c -- "model-audit" "$log")" -eq 1 ]
-  ! grep -q '^FORGED' "$log"
+  refute grep -q '^FORGED' "$log"
   run grep $'\x1b' "$log"
   [ "$status" -ne 0 ]
   local audit_line
@@ -814,9 +814,9 @@ STUB
   [ "$(awk 'NF { n++ } END { print n+0 }' "$outfile")" -eq 2 ]
   grep -q '"type":"system"' "$outfile"
   grep -q '"type":"result"' "$outfile"
-  ! grep -q '"type":"user"' "$outfile"
-  ! grep -q '"type":"thinking"' "$outfile"
-  ! grep -q '"type":"assistant"' "$outfile"
+  refute grep -q '"type":"user"' "$outfile"
+  refute grep -q '"type":"thinking"' "$outfile"
+  refute grep -q '"type":"assistant"' "$outfile"
   [ ! -e "$outfile.stream" ]
   kill "$bridge_pid" 2>/dev/null || true
   wait "$bridge_pid" 2>/dev/null || true
@@ -862,7 +862,7 @@ bridge_ro() {  # run the bridge for cur, READ-ONLY, one drain; $1 = optional add
   bash "$SCRIPTS/send.sh" team alice cur "review" >/dev/null
   bridge_ro
   grep -q -- "--trust" "$FAKE_CURSOR_LOG"
-  ! grep -q -- "--force" "$FAKE_CURSOR_LOG"
+  refute grep -q -- "--force" "$FAKE_CURSOR_LOG"
   ! grep -q -- "--yolo" "$FAKE_CURSOR_LOG"
 }
 
@@ -870,7 +870,7 @@ bridge_ro() {  # run the bridge for cur, READ-ONLY, one drain; $1 = optional add
   bash "$SCRIPTS/send.sh" team alice cur "review" >/dev/null
   bridge
   [ "$status" -eq 0 ]
-  ! grep -q -- "--workspace" "$FAKE_CURSOR_LOG"
+  refute grep -q -- "--workspace" "$FAKE_CURSOR_LOG"
   # reply still delivered the legacy way
   run bash "$SCRIPTS/inbox.sh" team alice --format ids
   [[ "$output" == *"STUB_REPLY"* ]]

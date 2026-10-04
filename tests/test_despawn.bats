@@ -178,7 +178,7 @@ _read_at_for_body() {
   run bash "$SCRIPTS/despawn.sh" team leader rev    # graceful → auto-promotes to force
   [ "$status" -eq 0 ]
   [[ "$output" == *"status=forced"* ]]
-  ! kill -0 "$dummy" 2>/dev/null                    # bridge stand-in was killed
+  refute kill -0 "$dummy" 2>/dev/null                    # bridge stand-in was killed
   [ ! -f "$RUN/spawn.team__rev" ]                   # placement record cleaned
   kill "$dummy" 2>/dev/null || true; wait "$dummy" 2>/dev/null || true
 }

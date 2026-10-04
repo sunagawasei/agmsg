@@ -155,7 +155,7 @@ assert_claude_artifacts_absent() {
   [ -e "$(agmsg_spawn_path "$TEAM" "$sibling")" ]
   [ -f "$RUN/claude-code-bridge.$TEAM.$sibling.role" ]
   run bash "$SCRIPTS/identities.sh" "$PROJ" claude-code
-  ! printf '%s\n' "$output" | grep -Fxq "$TEAM"$'\t'"$name"
+  refute grep -Fxq "$TEAM"$'\t'"$name" <<<"$output"
   printf '%s\n' "$output" | grep -Fxq "$TEAM"$'\t'"$sibling"
 }
 
@@ -185,7 +185,7 @@ assert_claude_artifacts_absent() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"status=forced"* ]]
   run bash "$SCRIPTS/identities.sh" "$scratch" claude-code
-  ! printf '%s\n' "$output" | grep -Fxq "$TEAM"$'\t'"$name"
+  refute grep -Fxq "$TEAM"$'\t'"$name" <<<"$output"
   run bash "$SCRIPTS/identities.sh" "$PROJ" claude-code
   printf '%s\n' "$output" | grep -Fxq "$TEAM"$'\t'"$name"
   test_fixture_cleanup
@@ -255,8 +255,8 @@ EOF
   assert_fake_not_signaled "$pid_wrong_bridge"
   [ ! -e "$(agmsg_spawn_path "$TEAM" "$wrong_bridge")" ]
   [ ! -e "$RUN/claude-code-bridge.$TEAM.$wrong_bridge.role" ]
-  ! bash "$SCRIPTS/identities.sh" "$PROJ" claude-code \
-    | grep -Fxq "$TEAM"$'\t'"$wrong_bridge"
+  run bash "$SCRIPTS/identities.sh" "$PROJ" claude-code
+  refute grep -Fxq "$TEAM"$'\t'"$wrong_bridge" <<<"$output"
 
   run env PATH="$ps_stub:$PATH" FAKE_PS_PID="$pid_key_suffix" FAKE_PS_ARGS="$cmd_key_suffix" \
     BASH_ENV="$FAKE_KILL_ENV" \
@@ -308,8 +308,8 @@ EOF
   [ ! -e "$RUN/claude-code-bridge.$TEAM.$name.role" ]
   [ ! -e "$RUN/claude-code-bridge.$TEAM.$name.failstate" ]
   [ ! -e "$RUN/claude-code-bridge.$TEAM.$name.outbound.1" ]
-  ! bash "$SCRIPTS/identities.sh" "$PROJ" claude-code \
-    | grep -Fxq "$TEAM"$'\t'"$name"
+  run bash "$SCRIPTS/identities.sh" "$PROJ" claude-code
+  refute grep -Fxq "$TEAM"$'\t'"$name" <<<"$output"
 }
 
 @test "despawn expect-record mismatch is per-worker no-op and matching snapshot tears down" {

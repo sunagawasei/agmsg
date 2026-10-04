@@ -1046,7 +1046,7 @@ JSON
   wait_for_file "$AGMSG_TEST_WATCH_TERM_FILE"
   [ -f "$RUN/watch.$session.pid" ]
   sleep 0.2
-  ! grep -q 'Killed' "$RUN/stop.out"
+  refute grep -q 'Killed' "$RUN/stop.out"
 
   release_delayed_watch
   wait "$stop_pid"
@@ -1094,7 +1094,7 @@ JSON
   [[ "$output" == *"Killed 0 watch"* ]]
   [[ "$output" == *"already streaming"* ]]
   [[ "$output" == *"TERM sent, lease release not confirmed within 5s"* ]]
-  ! [[ "$output" == *"invoke the Monitor tool"* ]]
+  refute grep -qF -- "invoke the Monitor tool" <<<"$output"
   [ -f "$AGMSG_TEST_WATCH_TERM_FILE" ]
   [ -f "$RUN/watch.$session.pid" ]
   generation="$(sed -n 's/^generation=//p' "$RUN/watch.$session.owner")"
@@ -1128,7 +1128,7 @@ JSON
 
   release_delayed_watch
   [ ! -f "$RUN/watch.$session.pid" ]
-  ! [[ "$output" == *"invoke the Monitor tool"* ]]
+  refute grep -qF -- "invoke the Monitor tool" <<<"$output"
 
   run bash "$SCRIPTS/delivery.sh" restart claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
@@ -1960,7 +1960,7 @@ _cursor_ready_path() {
 
   run kill -0 "$pid"
   [ "$status" -eq 0 ]
-  ! grep -q "is STUCK" "$out"
+  refute grep -q "is STUCK" "$out"
   [ "$(grep -c "cursor-once" "$out")" -eq 1 ]
   # `run` so a failed/empty read (status!=0, output="") cannot slip past a bare
   # `!= "0"` string comparison as a false pass (codex review finding).
@@ -2014,7 +2014,7 @@ sys.stdout.write(\"line-one-with-'quotes'\r\nline-two-with-a-tab\there\r\n\" + (
 
   run kill -0 "$pid"
   [ "$status" -eq 0 ]
-  ! grep -q "is STUCK" "$out"
+  refute grep -q "is STUCK" "$out"
   [ "$(grep -c "line-one-with-'quotes'" "$out")" -eq 1 ]
   grep -qF 'line-two-with-a-tab\there' "$out"   # CR stripped, LF/tab preserved as literal \n / \t
   [ "$(grep -F "line-one-with-'quotes'" "$out" | wc -c | tr -d ' ')" -gt 5000 ]

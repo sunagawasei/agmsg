@@ -1967,7 +1967,7 @@ JS
   }
   _policy_log "$home_u" "$base/untrusted.log"
   _policy_log "$home_t" "$base/trusted.log"
-  ! grep -q 'marker.rules' "$base/untrusted.log"
+  refute grep -q 'marker.rules' "$base/untrusted.log"
   grep -q 'marker.rules' "$base/trusted.log"
 }
 
