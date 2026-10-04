@@ -39,15 +39,13 @@ ORIG_ARGS=("$@")
 #   - Writes a pidfile at ~/.agents/agmsg/run/watch.<session_id>.pid and
 #     removes it on EXIT / SIGTERM / SIGINT.
 
-# session_id is normally baked into the launch command (CLAUDE_CODE_SESSION_ID /
-# GROK_SESSION_ID). An empty first arg is tolerated and resolved below (after the
+# session_id is normally baked into the launch command (CLAUDE_CODE_SESSION_ID). An empty first arg is tolerated and resolved below (after the
 # libs are sourced) rather than failing hard, so a runtime that cannot bake one
-# in — notably Grok Build's `monitor` tool, where "$GROK_SESSION_ID" expands to
-# empty — still starts the watcher. A literal `-` first arg is the caller-side
+# in still starts the watcher. A literal `-` first arg is the caller-side
 # sentinel for the same "no session id" case: some launcher shells re-evaluate
 # the command line and DROP a quoted-but-empty argument entirely (shifting every
 # later argument one slot left), so command templates pass
-# "${GROK_SESSION_ID:--}" and `-` is folded into the empty-arg path here.
+# "${CLAUDE_CODE_SESSION_ID:--}" and `-` is folded into the empty-arg path here.
 # project_path and agent_type are required. [--team <team>] pins the
 # subscription to one team for session-team mode.
 ARG_COUNT=$#
@@ -120,7 +118,7 @@ source "$SCRIPT_DIR/lib/watch-stuck-map.sh"
 # error message.
 case "$AGENT_TYPE" in
   */*|*..*)
-    echo "ERROR: invalid agent type '$AGENT_TYPE' (type names never contain '/' or '..'). Arguments may have shifted: a caller shell can drop an empty session_id argument entirely. Pass the sentinel '-' (e.g. \"\${GROK_SESSION_ID:--}\") instead of an empty string."
+    echo "ERROR: invalid agent type '$AGENT_TYPE' (type names never contain '/' or '..'). Arguments may have shifted: a caller shell can drop an empty session_id argument entirely. Pass the sentinel '-' (e.g. \"\${CLAUDE_CODE_SESSION_ID:--}\") instead of an empty string."
     exit 1
     ;;
 esac
@@ -128,33 +126,15 @@ if [ ! -f "$SCRIPT_DIR/drivers/types/$AGENT_TYPE/type.conf" ]; then
   # shellcheck disable=SC1091
   source "$SCRIPT_DIR/lib/type-registry.sh"
   if ! agmsg_type_dir "$AGENT_TYPE" >/dev/null 2>&1; then
-    echo "ERROR: unknown agent type '$AGENT_TYPE' (supported: $(agmsg_known_types | sort -u | paste -sd, - | sed 's/,/, /g')). Arguments may have shifted: a caller shell can drop an empty session_id argument entirely. Pass the sentinel '-' (e.g. \"\${GROK_SESSION_ID:--}\") instead of an empty string."
+    echo "ERROR: unknown agent type '$AGENT_TYPE' (supported: $(agmsg_known_types | sort -u | paste -sd, - | sed 's/,/, /g')). Arguments may have shifted: a caller shell can drop an empty session_id argument entirely. Pass the sentinel '-' (e.g. \"\${CLAUDE_CODE_SESSION_ID:--}\") instead of an empty string."
     exit 1
   fi
 fi
 
-# Resolve a session id when the launcher could not bake one in (empty first arg).
-# Grok Build's `monitor` tool runs the watcher with $GROK_SESSION_ID unset, so
-# neither the env var nor the instance-id ppid walk (it keys on the claude/codex
-# agent binaries) yields grok's session. Bind to a composite "<session_id>.<grok
-# _pid>" instead — keyed this way the watermark/pidfile are stable across watcher
-# relaunches (no replay gap) and liveness-gated on the grok pid, so the watcher
-# self-exits once grok dies rather than lingering as a bare-id orphan (#245).
-# agmsg_grok_instance_id handles both `grok --resume <id>` and a fresh `grok`
-# (no --resume). Fall back to a throwaway id only if no live grok is found, so the
-# watcher still starts (#238). Uses the raw project path the watcher was launched
-# with, before agmsg_resolve_project rewrites it, to match grok's session dir.
+# Resolve a session id when the launcher could not bake one in (empty first arg):
+# fall back to a throwaway id so the watcher still starts.
 if [ -z "$SESSION_ID" ]; then
-  case "$AGENT_TYPE" in
-    grok-build)
-      SESSION_ID="$(agmsg_grok_instance_id "$PROJECT_PATH" 2>/dev/null || true)"
-      # A fresh grok watcher reaps bare-id grok watchers left behind by older
-      # (pre-composite) versions whose grok has since exited (#245). Specific-PID
-      # kill only — never a pattern kill.
-      agmsg_reap_orphan_grok_watchers "$PROJECT_PATH" "$$" 2>/dev/null || true
-      ;;
-  esac
-  [ -z "$SESSION_ID" ] && SESSION_ID="agmsg-$(compat_uuidgen | tr 'A-Z' 'a-z')"
+  SESSION_ID="agmsg-$(compat_uuidgen | tr 'A-Z' 'a-z')"
 fi
 
 # Resolve the session's real project root (see #92). The actas/drop/ensure-

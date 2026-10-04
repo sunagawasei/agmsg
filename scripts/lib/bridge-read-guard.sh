@@ -12,26 +12,11 @@ _agmsg_bridge_guard_path() {
     "$(_actas_lock_encode "$team")" "$(_actas_lock_encode "$agent")"
 }
 
-_agmsg_bridge_guard_legacy_path() {
-  local team="$1" agent="$2"
-  printf '%s/run/antigravity-reservation.%s__%s.json' "$_AGMSG_BRIDGE_SKILL_DIR" \
-    "$(_actas_lock_encode "$team")" "$(_actas_lock_encode "$agent")"
-}
-
 _agmsg_bridge_guard_reservation() {
-  local neutral legacy
+  local neutral
   neutral="$(_agmsg_bridge_guard_path "$1" "$2")" || return 2
-  legacy="$(_agmsg_bridge_guard_legacy_path "$1" "$2")" || return 2
-  if [ -e "$neutral" ] && [ -e "$legacy" ]; then
-    printf 'agmsg: both read reservation formats exist for %s/%s; refusing to resolve one\n' "$1" "$2" >&2
-    return 2
-  fi
   if [ -e "$neutral" ]; then
     printf '%s\n' "$neutral"
-    return 0
-  fi
-  if [ -e "$legacy" ]; then
-    printf '%s\n' "$legacy"
     return 0
   fi
   return 1
@@ -40,12 +25,7 @@ _agmsg_bridge_guard_reservation() {
 _agmsg_bridge_guard_type() {
   local reservation="$1" type rc
   type="$(node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if(!Object.prototype.hasOwnProperty.call(r,"type")) process.exit(3); if(typeof r.type!=="string") process.exit(4); process.stdout.write(r.type)' "$reservation" 2>/dev/null)" || {
-    rc=$?
-    if [ "$rc" -eq 3 ] && [[ "$(basename "$reservation")" == antigravity-reservation.*.json ]]; then
-      type=antigravity
-    else
-      return 1
-    fi
+    return 1
   }
   case "$type" in
     ''|*[!A-Za-z0-9_-]*) return 1 ;;

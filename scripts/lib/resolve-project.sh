@@ -315,9 +315,9 @@ _agmsg_type_detect_proc() {
 # the matcher below already tries "<bin>-*" for every entry it is given.
 #
 # The case arms are the fallback for a type whose manifest carries no detect_proc
-# (antigravity, copilot, hermes) or whose manifest cannot be found at all.
+# (none of the bundled types today) or whose manifest cannot be found at all.
 # Reaching them used to be routine rather than exceptional: every type without
-# an arm — cursor, grok-build, hermes — matched against "claude codex gemini",
+# an arm matched against "claude codex",
 # so agmsg_pid_is_agent accepted an enclosing Claude Code process as, say, a
 # cursor agent. agmsg_resolve_project step 1 then read THAT session's project
 # marker, and a cursor member's project resolved to the project of whoever was
@@ -326,10 +326,9 @@ _agmsg_type_detect_proc() {
 # the roster.
 #
 # Names must also be type-distinctive: do not add `agent` to any arm below.
-# Homebrew grok-build and the Cursor CLI installer both use that basename
-# (#856), and matching it would attach the wrong pid (#93) -- the alias is an
-# intentional miss, on the manifest side too (grok-build's detect_proc lists
-# `grok`, not `agent`).
+# the Cursor CLI installer uses that basename (#856), and matching it would
+# attach the wrong pid (#93) -- the alias is an intentional miss, on the
+# manifest side too.
 #
 # Memoized per type: agmsg_pid_is_agent runs inside agmsg_agent_pid's ppid walk
 # (up to 20 hops), and a manifest read per hop is a filesystem scan per hop.
@@ -378,7 +377,7 @@ _agmsg_agent_binaries() {
     # sanitized with `${type//[^A-Za-z0-9]/_}`, which is lossy and NOT
     # collision-free ('foo-bar' and 'foo_bar' produced the same key) --
     # measured. Every existing and plausible type name is [a-z0-9-]
-    # (claude-code, grok-build, agmsg-app, ...); nothing in this tree
+    # (claude-code, codex, cursor, ...); nothing in this tree
     # validates or rejects any other character in a type name, but nothing
     # uses one either, so there is no third character to give the same
     # treatment. AGMSG_PLUGIN_DIRS no longer participates in this key at
@@ -405,12 +404,7 @@ _agmsg_agent_binaries() {
     case "$type" in
       claude-code) out="claude" ;;
       codex)       out="codex" ;;
-      gemini)      out="gemini" ;;
-      antigravity) out="antigravity" ;;
-      copilot)     out="copilot" ;;
-      opencode)    out="opencode" ;;
-      grok-build)  out="grok" ;;
-      *)           out="claude codex gemini" ;;
+      *)           out="claude codex" ;;
     esac
   fi
   [ "$cacheable" -eq 1 ] && printf -v "$cache_var" '%s' "$out"
