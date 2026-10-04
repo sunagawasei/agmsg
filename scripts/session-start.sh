@@ -278,6 +278,27 @@ if _agmsg_session_team_active; then
     echo "agmsg: refusing Claude Code session-team registration: stdin must contain a non-empty top-level string session_id" >&2
     exit 0
   fi
+  # The same payload may carry the id under other field names (Cursor sends
+  # conversation_id next to session_id; some hosts send camelCase). They name
+  # the same session or the payload is not trustworthy: a disagreement is
+  # refused rather than guessing which one the team should key on.
+  _agmsg_alt_ids="$(printf '%s\n' "
+    WITH raw(j) AS (SELECT '$_claude_input_sql'),
+    valid(j) AS (SELECT j FROM raw WHERE json_valid(j) AND json_type(j) = 'object')
+    SELECT coalesce(json_extract(j, '\$.conversation_id'), ''), coalesce(json_extract(j, '\$.sessionId'), '')
+    FROM valid;" | sqlite3 -init /dev/null -noheader -list -separator ' ' :memory: 2>/dev/null | tr -d '\r')" || _agmsg_alt_ids=""
+  for _agmsg_alt in $_agmsg_alt_ids; do
+    if [ "$_agmsg_alt" != "$_claude_stdin_session_id" ]; then
+      echo "agmsg: refusing $TYPE session-team registration: the payload's session id fields disagree" >&2
+      exit 0
+    fi
+  done
+  # One id contract for every host and source (lib/session-team.sh): no dotted
+  # ids other than a numeric instance suffix, and host-specific id shapes.
+  if [ -z "$(agmsg_session_normalize_sid "$TYPE" "$_claude_stdin_session_id")" ]; then
+    echo "agmsg: refusing $TYPE session-team registration: session_id is not an acceptable id for this host" >&2
+    exit 0
+  fi
   SESSION_ID="$_claude_stdin_session_id"
 fi
 
@@ -289,7 +310,7 @@ fi
 # non-capable-type paths never reach the gate and keep their legacy rules
 # below.
 SESSION_TEAM=""
-_agmsg_session_team_active && SESSION_TEAM="$(agmsg_session_team_name_from_id "$SESSION_ID")"
+_agmsg_session_team_active && SESSION_TEAM="$(agmsg_session_team_name_from_id "$SESSION_ID" "$TYPE")"
 
 # SessionEnd publishes an intentional-teardown tombstone before detaching its
 # worker. Clear only this session's marker on its next start; other session
@@ -398,7 +419,7 @@ agmsg_session_start_common_init() {
         && [ "$(cat "$RUN_DIR/cc-instance.$_fp_cc_pid" 2>/dev/null || true)" = "$_fp_iid" ] \
         && _agmsg_session_start_watcher_alive "$_fp_iid" "$_fp_project" "$TYPE" \
         && { [ -z "$SESSION_TEAM" ] \
-             || printf '%s\n' "$PAIRS" | grep -Fxq "$(printf '%s\t%s' "$SESSION_TEAM" claude)" \
+             || printf '%s\n' "$PAIRS" | grep -Fxq "$(printf '%s\t%s' "$SESSION_TEAM" "$(agmsg_session_seat "$TYPE")")" \
              || _agmsg_session_start_role_registered "$SESSION_ID"; }; then
       CC_PID="$_fp_cc_pid"
       INSTANCE_ID="$_fp_iid"
@@ -541,7 +562,7 @@ if [ -n "$CC_PID" ]; then
   # Serialize publication with SessionEnd's final sibling check and teardown.
   # Failing closed is safer than publishing outside the lock: an unlocked write
   # could arrive after the worker's sibling check and before its force action.
-  _lifecycle_team="s-${SESSION_ID%%.*}"
+  _lifecycle_team="$(agmsg_session_hook_team "$TYPE" "$SESSION_ID")"
   if ! agmsg_team_lifecycle_lock_acquire "$_lifecycle_team" \
       "${AGMSG_LIFECYCLE_LOCK_TIMEOUT:-10}"; then
     echo "agmsg: could not serialize SessionStart registration for $_lifecycle_team" >&2
@@ -781,7 +802,18 @@ WATCH="$SKILL_DIR/scripts/watch.sh"
     # team, so the monitor stream carries only this session's traffic — no
     # cross-session crosstalk. Idempotent; opt out of #92 pwd-rewrite so the
     # registration pins exactly this project.
-    AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$SESSION_TEAM" claude "$TYPE" "$PROJECT" >/dev/null 2>&1 || true
+    if agmsg_session_needs_marker "$TYPE"; then
+      # Fail closed: a name collision with an existing project team (or any
+      # join failure) must not leave this session connected to the project's
+      # inbox, nor register it into that team.
+      if ! AGMSG_JOIN_SESSION_MARKER="$TYPE" AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" \
+          "$SESSION_TEAM" "$(agmsg_session_seat "$TYPE")" "$TYPE" "$PROJECT" >/dev/null 2>&1; then
+        echo "agmsg: refusing $TYPE session-team registration: team '$SESSION_TEAM' could not be created as a session team" >&2
+        exit 0
+      fi
+    else
+      AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$SESSION_TEAM" "$(agmsg_session_seat "$TYPE")" "$TYPE" "$PROJECT" >/dev/null 2>&1 || true
+    fi
   fi
 }
 
@@ -897,7 +929,7 @@ else
     # The extra argv are %q-quoted too so they paste into Monitor verbatim
     # (#188). The join itself already happened inside
     # agmsg_session_start_common_init above.
-    WATCH_COMMAND="$WATCH_COMMAND $(printf '%q %q %q' claude --team "$SESSION_TEAM")"
+    WATCH_COMMAND="$WATCH_COMMAND $(printf '%q %q %q' "$(agmsg_session_seat "$TYPE")" --team "$SESSION_TEAM")"
   fi
 fi
 

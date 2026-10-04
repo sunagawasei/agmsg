@@ -765,18 +765,28 @@ STUB
   [[ "$output" == *"refusing Claude Code session-team registration"* ]]
 }
 
-@test "session-start: snake_case wins over camelCase and inherited env" {
+@test "session-start: a payload whose session_id and sessionId disagree is refused, not guessed" {
   enable_st
   run env CLAUDE_CODE_SESSION_ID=sess-ENV \
     bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" \
     <<< '{"session_id":"sess-REAL","sessionId":"cursorCamel"}'
   [ "$status" -eq 0 ]
-  [ -d "$TEST_SKILL_DIR/teams/s-sess-REAL" ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-sess-REAL" ]
   [ ! -d "$TEST_SKILL_DIR/teams/s-sess-ENV" ]
   [ ! -d "$TEST_SKILL_DIR/teams/s-cursorCamel" ]
+  [[ "$output" == *"session id fields disagree"* ]]
+}
+
+@test "session-start: snake_case and camelCase naming the same id register once, env ignored" {
+  enable_st
+  run env CLAUDE_CODE_SESSION_ID=sess-ENV \
+    bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" \
+    <<< '{"session_id":"sess-REAL","sessionId":"sess-REAL"}'
+  [ "$status" -eq 0 ]
+  [ -d "$TEST_SKILL_DIR/teams/s-sess-REAL" ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-sess-ENV" ]
   [[ "$output" == *"--team s-sess-REAL"* ]]
   [[ "$output" != *"sess-ENV"* ]]
-  [[ "$output" != *"cursorCamel"* ]]
 }
 
 @test "session-start: rejected payload skips hygiene for stale pidfiles and actas locks" {

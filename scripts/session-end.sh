@@ -103,7 +103,10 @@ fi
 # that agmsg_spawn_path writes, strip only that known prefix, then decode the
 # remaining worker name. One temp file keeps the detached argv small even when
 # several headless workers belong to the session.
-STEAM="s-${SESSION_ID%%.*}"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/session-team.sh"
+STEAM="$(agmsg_session_hook_team "$TYPE" "$SESSION_ID")"
+[ -n "$STEAM" ] || exit 0
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 SNAPSHOT_PATH="$(mktemp "$RUN_DIR/.session-end-snapshot.XXXXXX" 2>/dev/null || true)"
 if [ -n "$SNAPSHOT_PATH" ]; then

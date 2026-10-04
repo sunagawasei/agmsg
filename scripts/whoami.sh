@@ -58,20 +58,20 @@ source "$SCRIPT_DIR/lib/storage.sh"
 PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
 AGENT_TYPE_SQL=$(printf '%s' "$AGENT_TYPE" | sed "s/'/''/g")
 
-# Session-team mode: a Claude session's identity is fixed to its own team
-# (s-<bare-session-uuid>), resolved from the environment rather than the
+# Session-team mode: a session's identity is fixed to its own team, resolved from
+# the environment by the shared resolver (lib/session-team.sh) rather than the
 # project->team registration. This is the single source of truth for "current
 # team" in that mode and sidesteps the multi-team ambiguity a shared project dir
-# would otherwise produce. Only claude-code carries CLAUDE_CODE_SESSION_ID, so
-# this never fires for codex/other types.
+# would otherwise produce. It only applies when the resolved host is the type
+# being asked about: a Cursor session never answers as claude-code (or the
+# reverse), and an ambiguous caller falls through to project resolution.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/session-team.sh"
-if [ "$AGENT_TYPE" = "claude-code" ]; then
-  _steam="$(agmsg_session_team_name)"
-  if [ -n "$_steam" ]; then
-    echo "agent=claude teams=$_steam type=claude-code project=$PROJECT_PATH"
-    exit 0
-  fi
+agmsg_session_resolve
+if [ "$AGMSG_SESSION_STATE" = ok ] && [ "$AGMSG_SESSION_HOST" = "$AGENT_TYPE" ] \
+    && [ -n "$AGMSG_SESSION_TEAM" ]; then
+  echo "agent=$(agmsg_session_seat "$AGENT_TYPE") teams=$AGMSG_SESSION_TEAM type=$AGENT_TYPE project=$PROJECT_PATH"
+  exit 0
 fi
 
 if [ ! -d "$TEAMS_DIR" ]; then

@@ -67,6 +67,34 @@ TEAM_CONFIG="$TEAMS_DIR/$TEAM/config.json"
 mkdir -p "$TEAMS_DIR/$TEAM"
 agmsg_lock_acquire "$TEAMS_DIR/$TEAM" || exit 1
 
+# --- Session-team marker (host-neutral session teams) ---
+# A session team whose prefix is not reserved against project team names is
+# trusted only with teams/<team>/.session-team naming its host
+# (lib/session-team.sh). session-start asks for it with
+# AGMSG_JOIN_SESSION_MARKER=<host>. The marker is written only for a team that
+# has no config yet, inside this same lock, and BEFORE the config: a config
+# without a marker is an existing project team that happens to share the name,
+# and is refused rather than silently converted. A crash between the two writes
+# leaves a marker-only team, which the next join completes.
+if [ -n "${AGMSG_JOIN_SESSION_MARKER:-}" ]; then
+  SESSION_MARKER="$TEAMS_DIR/$TEAM/.session-team"
+  if [ -L "$SESSION_MARKER" ]; then
+    echo "Error: team '$TEAM' has a symlinked session marker; refusing." >&2
+    exit 1
+  elif [ -f "$SESSION_MARKER" ]; then
+    if [ "$(cat "$SESSION_MARKER" 2>/dev/null || true)" != "$AGMSG_JOIN_SESSION_MARKER" ]; then
+      echo "Error: team '$TEAM' is marked as a session team of another host; refusing." >&2
+      exit 1
+    fi
+  elif [ -e "$TEAM_CONFIG" ]; then
+    echo "Error: team '$TEAM' already exists as a project team; refusing to turn it into a $AGMSG_JOIN_SESSION_MARKER session team." >&2
+    exit 1
+  else
+    agmsg_write_atomic "$SESSION_MARKER" "$AGMSG_JOIN_SESSION_MARKER" \
+      || { echo "Error: could not write the session marker for team '$TEAM'." >&2; exit 1; }
+  fi
+fi
+
 # --- Ensure team config exists ---
 if [ ! -f "$TEAM_CONFIG" ]; then
   INITIAL_CONFIG=$(printf '{\n  "name": "%s",\n  "agents": {},\n  "created_at": "%s"\n}' \

@@ -98,22 +98,57 @@ agmsg_self_name_on_action "$TEAM" "$FROM" || true
 agmsg_storage_load
 DB="$(agmsg_db_path)"
 
-# A Claude session must not accidentally address another session's private
-# team. Project teams remain unrestricted; explicit cross-team work has an
-# opt-in escape hatch.
-if [ "${AGMSG_ALLOW_CROSS_TEAM:-0}" != 1 ] \
-    && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
-  case "$TEAM" in
-    s-*)
-      # shellcheck disable=SC1091
-      source "$SCRIPT_DIR/lib/session-team.sh"
-      EXPECT_TEAM="$(agmsg_session_team_name 2>/dev/null || true)"
-      if [ -n "$EXPECT_TEAM" ] && [ "$TEAM" != "$EXPECT_TEAM" ]; then
-        echo "send: refusing cross-session send — '$TEAM' is another session's private team; this session's own team is '$EXPECT_TEAM'. Use \$TEAM from whoami.sh; set AGMSG_ALLOW_CROSS_TEAM=1 to override." >&2
-        exit 1
+# A session must not accidentally address another session's private team.
+# Project teams remain unrestricted; explicit cross-team work has an opt-in
+# escape hatch. "Who is calling" comes from the shared resolver
+# (lib/session-team.sh): a caller with no session identity (a bridge process,
+# a plain shell) is not guarded; an ambiguous one (two hosts' session ids, or
+# an unusable one) may not address any session team. A headless worker resumed
+# by its bridge inherits its OWN session id, so it is allowed to address the
+# team its bridge serves, proven by the bridge's provenance record rather than
+# by anything in the env (lib/headless-provenance.sh).
+# This is an accidental-isolation guard, not an authentication boundary.
+if [ "${AGMSG_ALLOW_CROSS_TEAM:-0}" != 1 ]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/lib/session-team.sh"
+  if agmsg_session_team_enabled; then
+    SKILL_DIR="${SKILL_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/lib/instance-id.sh"
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/lib/headless-provenance.sh"
+    _send_hp_ok=0
+    if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+      _send_hp_sid="$(agmsg_session_normalize_sid claude-code "$CLAUDE_CODE_SESSION_ID")"
+      if [ -n "$_send_hp_sid" ] && agmsg_headless_provenance_allows "$_send_hp_sid" "$TEAM"; then
+        _send_hp_ok=1
       fi
-      ;;
-  esac
+    fi
+    if [ "$_send_hp_ok" -ne 1 ]; then
+      agmsg_session_resolve
+      if [ "$AGMSG_SESSION_STATE" != none ]; then
+        _send_class="$(agmsg_session_team_class "$TEAM")"
+        _send_refuse=0
+        case "$_send_class" in
+          project) ;;
+          session)
+            if [ "$AGMSG_SESSION_STATE" != ok ] || [ "$TEAM" != "$AGMSG_SESSION_TEAM" ]; then
+              _send_refuse=1
+            fi
+            ;;
+          *) _send_refuse=1 ;;
+        esac
+        if [ "$_send_refuse" -eq 1 ]; then
+          if [ "$AGMSG_SESSION_STATE" = ok ]; then
+            echo "send: refusing cross-session send — '$TEAM' is another session's private team; this session's own team is '$AGMSG_SESSION_TEAM'. Use \$TEAM from whoami.sh; set AGMSG_ALLOW_CROSS_TEAM=1 to override." >&2
+          else
+            echo "send: refusing send to session team '$TEAM' — this caller's session identity is ambiguous or unusable. Use \$TEAM from whoami.sh; set AGMSG_ALLOW_CROSS_TEAM=1 to override." >&2
+          fi
+          exit 1
+        fi
+      fi
+    fi
+  fi
 fi
 
 # Keep the full-schema bootstrap (registry + storage tables) for a first-ever

@@ -1042,6 +1042,7 @@ agmsg_claude_prepare_child_env() {
   export TMPDIR="$child_tmp"
   export AGMSG_RESOLVE_PROJECT=0
   unset CLAUDE_CODE_SESSION_ID CLAUDECODE CLAUDE_CODE_CHILD_SESSION
+  agmsg_session_unset_env
   # Do not let caller-controlled non-interactive shell startup/wrapper state
   # pre-execute or redirect a probe/bridge Bash command.
   unset BASH_ENV ENV PROMPT_COMMAND CDPATH ZDOTDIR CLAUDE_ENV_FILE

@@ -355,6 +355,10 @@ fi
 # of the fix. `spawn_unset_env=` lists only vars that are safe (and necessary) to
 # drop on spawn; unset (the default) strips nothing.
 SPAWN_UNSET_VARS="$(agmsg_type_get "$AGENT_TYPE" spawn_unset_env)"
+# Whatever the type, the child must not inherit the spawning session's own id
+# from ANY host (a Cursor session spawning claude-code would otherwise hand it
+# CURSOR_CONVERSATION_ID): the session env names come from each type's manifest.
+SPAWN_UNSET_VARS="$(printf '%s %s' "$SPAWN_UNSET_VARS" "$(agmsg_session_env_names | tr '\n' ' ')" | sed 's/^ *//; s/ *$//')"
 
 # Extra CLI args for this type from the spawn options file (opt-in, see
 # scripts/lib/spawn-options.sh). Read line-by-line — never word-split — so a

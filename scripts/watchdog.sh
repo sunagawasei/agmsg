@@ -20,14 +20,16 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
 
 # Validate the caller-controlled team before it participates in any path.
-# Session teams are the path-safe `s-<bare-session-id>` namespace; ordinary
+# Session teams are the path-safe `<host prefix><bare-session-id>` namespaces (s-<id> for Claude Code, a marked cur-<uuid> for Cursor); ordinary
 # project teams are explicitly outside this watchdog's scope.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/validate.sh"
 agmsg_validate_team_name "$TEAM" || exit 1
-case "$TEAM" in
-  s-?*) ;;
-  *) die "'$TEAM' is not a session-team name (expected s-<session-id>)" ;;
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/session-team.sh"
+case "$(agmsg_session_team_class "$TEAM")" in
+  session) ;;
+  *) die "'$TEAM' is not a session-team name (expected <prefix><session-id>, e.g. s-<session-id>)" ;;
 esac
 
 mkdir -p "$RUN_DIR" 2>/dev/null || die "cannot create run directory"

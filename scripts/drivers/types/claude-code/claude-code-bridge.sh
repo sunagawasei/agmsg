@@ -105,6 +105,8 @@ source "$SCRIPTS_DIR/lib/validate.sh"
 # shellcheck disable=SC1091
 source "$SCRIPTS_DIR/lib/process-identity.sh"
 # shellcheck disable=SC1091
+source "$SCRIPTS_DIR/lib/headless-provenance.sh"
+# shellcheck disable=SC1091
 source "$SCRIPTS_DIR/lib/inflight.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/_delivery.sh"
@@ -153,6 +155,9 @@ fi
 CLAUDE_CONFIG_DIR="$SKILL_DIR/db/claude-worker-home"
 export CLAUDE_CONFIG_DIR
 unset CLAUDE_CODE_SESSION_ID CLAUDECODE CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_PROJECT_DIR_NAME
+# shellcheck disable=SC1091
+source "$SCRIPTS_DIR/lib/session-team.sh"
+SCRIPT_DIR="$SCRIPTS_DIR" agmsg_session_unset_env
 mkdir -p "$CLAUDE_CONFIG_DIR" "$WORK_DIR" 2>/dev/null \
   || { echo "claude-code-bridge: cannot create worker config/cwd" >&2; exit 1; }
 cd "$WORK_DIR" \
@@ -830,7 +835,20 @@ capture_watermark_or_fail() {
   printf '%s' "$value"
 }
 
+# Publish the worker's own session id as bound to this bridge's team for the
+# duration of one claude turn, so the worker's send.sh (which sees that id in
+# its env on a --resume turn) may reply to the team it serves
+# (lib/headless-provenance.sh). Removed only if this process still owns it.
 run_cli_attempt() {
+  local rc=0
+  agmsg_headless_provenance_publish "$2" "$TEAM" \
+    || log "could not publish the headless provenance record for the worker session"
+  run_cli_attempt_inner "$@" || rc=$?
+  agmsg_headless_provenance_remove "$2" || true
+  return "$rc"
+}
+
+run_cli_attempt_inner() {
   local mode="$1" sid="$2" watermark rc=0 outbound_rc
   local args=(-p --output-format "$OUTPUT_FORMAT")
   [ -n "$MODEL" ] && args+=(--model "$MODEL")

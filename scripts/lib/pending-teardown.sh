@@ -14,6 +14,10 @@ _agmsg_pending_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_agmsg_pending_lib_dir/actas-lock.sh"
 # shellcheck disable=SC1091
 . "$_agmsg_pending_lib_dir/type-registry.sh"
+# shellcheck disable=SC1091
+. "$_agmsg_pending_lib_dir/session-team.sh"
+# shellcheck disable=SC1091
+. "$_agmsg_pending_lib_dir/session-liveness.sh"
 if ! command -v agmsg_team_lifecycle_lock_acquire >/dev/null 2>&1; then
   # shellcheck disable=SC1091
   . "$_agmsg_pending_lib_dir/team-lifecycle.sh"
@@ -282,7 +286,7 @@ _agmsg_pending_bridge_generation() {
 
 agmsg_pending_teardown_recover_one() {
   local path="$1" despawn="$2" read_rc=0 current_start="" current record_path
-  local recovery_reason=owner-dead owner_method current_method bare_sid
+  local recovery_reason=owner-dead owner_method current_method bare_sid peer_host
   local log_team log_worker lock_timeout lock_acquired=0
   local despawn_rc=0 bridge_rc=0 extra="" enc_only enc_skip pending_snapshot=""
   local -a despawn_args
@@ -438,14 +442,31 @@ agmsg_pending_teardown_recover_one() {
   # dead bare check by itself never authorizes teardown. Recheck under the
   # team lifecycle lock so a resume's cc-instance publish cannot land between
   # the veto and despawn.
-  case "$AGMSG_PENDING_TEAM" in
-    s-?*)
-      bare_sid="${AGMSG_PENDING_TEAM#s-}"
+  # The host is decoded from the team name: Claude Code sessions are judged by
+  # their cc-instance record as before; another host's session (Cursor) by the
+  # evidence lib/session-liveness.sh reads, where anything but dead/none keeps
+  # the worker.
+  peer_host=""; bare_sid=""
+  IFS=' ' read -r peer_host bare_sid <<EOF2
+$(agmsg_session_team_decode "$AGMSG_PENDING_TEAM")
+EOF2
+  case "$peer_host" in
+    claude-code)
       if agmsg_instance_alive "$bare_sid" 2>/dev/null; then
         _agmsg_pending_unlock
         _agmsg_pending_retain "" "" "" bare-owner-alive
         return 0
       fi
+      ;;
+    ?*)
+      case "$(agmsg_session_peers_state "$bare_sid" 2>/dev/null || printf unknown)" in
+        dead|none) ;;
+        *)
+          _agmsg_pending_unlock
+          _agmsg_pending_retain "" "" "" bare-owner-alive
+          return 0
+          ;;
+      esac
       ;;
   esac
 
@@ -472,7 +493,7 @@ agmsg_pending_teardown_recover_one() {
     return 0
   fi
 
-  despawn_args=("$despawn" "$AGMSG_PENDING_TEAM" claude "$AGMSG_PENDING_WORKER" \
+  despawn_args=("$despawn" "$AGMSG_PENDING_TEAM" "$(agmsg_session_seat "${peer_host:-claude-code}")" "$AGMSG_PENDING_WORKER" \
     --force --expect-record "$AGMSG_PENDING_RECORD" \
     --expect-bridge-start "$AGMSG_PENDING_BRIDGE_START")
   despawn_rc=0

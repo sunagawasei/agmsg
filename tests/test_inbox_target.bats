@@ -14,6 +14,11 @@
 
 load test_helper
 
+# Cursor session ids are uuids and their session teams are cur-<uuid> with the
+# cursor-host seat (a Cursor session is not a Claude Code session).
+SID_A="5bd60f15-0cd3-42d5-b5f2-d53c81336167"
+SID_R="9f1c2e3a-7b4d-4c5e-8a6f-0123456789ab"
+
 setup() {
   setup_test_env
   export SKILL_DIR="$TEST_SKILL_DIR"
@@ -68,17 +73,26 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 
 @test "session team name: strips a .<pid> suffix from a composite raw sid" {
   enable_st
-  run agmsg_inbox_target cursor "$TEST_PROJECT" "abc123.456"
+  run agmsg_inbox_target cursor "$TEST_PROJECT" "$SID_A.456"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"teams=s-abc123 "* ]]
-  [[ "$output" != *"s-abc123.456"* ]]
+  [[ "$output" == *"agent=cursor-host teams=cur-$SID_A "* ]]
+  [[ "$output" != *"$SID_A.456"* ]]
+  # The same composite on the Claude Code host keeps its own prefix and seat.
+  run agmsg_inbox_target claude-code "$TEST_PROJECT" "abc123.456"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"agent=claude teams=s-abc123 "* ]]
 }
 
-@test "session team name: an unusual but non-empty raw sid passes through unchanged" {
+@test "session team name: an id that is not a valid session id never reaches a team name" {
   enable_st
-  run agmsg_inbox_target cursor "$TEST_PROJECT" 'weird!!id'
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"teams=s-weird!!id"* ]]
+  bash "$SCRIPTS/join.sh" projteam alice cursor "$TEST_PROJECT" >/dev/null
+  for bad in 'weird!!id' 'abc.one' 'sess-X' '../x' '.hidden'; do
+    run agmsg_inbox_target cursor "$TEST_PROJECT" "$bad"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"teams=projteam"* ]]
+    [[ "$output" != *"teams=cur-"* ]]
+    [[ "$output" != *"teams=s-"* ]]
+  done
 }
 
 @test "session team name: an empty raw sid falls back to project-team resolution" {
@@ -95,8 +109,8 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 @test "role priority: an active actas role wins over session-team routing" {
   enable_st
   bash "$SCRIPTS/join.sh" projteam reviewer cursor "$TEST_PROJECT" >/dev/null
-  agmsg_role_session_record projteam reviewer sess-R "$TEST_PROJECT" cursor
-  run agmsg_inbox_target cursor "$TEST_PROJECT" "sess-R"
+  agmsg_role_session_record projteam reviewer $SID_R "$TEST_PROJECT" cursor
+  run agmsg_inbox_target cursor "$TEST_PROJECT" "$SID_R"
   [ "$status" -eq 0 ]
   [[ "$output" == *"agent=reviewer"* ]]
   [[ "$output" == *"teams=projteam"* ]]
@@ -106,14 +120,14 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 @test "role priority: a role lock held by another live session falls back to session-team" {
   enable_st
   bash "$SCRIPTS/join.sh" projteam reviewer cursor "$TEST_PROJECT" >/dev/null
-  agmsg_role_session_record projteam reviewer sess-R "$TEST_PROJECT" cursor
+  agmsg_role_session_record projteam reviewer $SID_R "$TEST_PROJECT" cursor
   # A different, still-live session currently owns the actas lock for this role.
   echo "other-live-sid" > "$RUN_DIR/cc-instance.$$"
   echo "other-live-sid" > "$(actas_lock_path projteam reviewer)"
-  run agmsg_inbox_target cursor "$TEST_PROJECT" "sess-R"
+  run agmsg_inbox_target cursor "$TEST_PROJECT" "$SID_R"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"agent=claude"* ]]
-  [[ "$output" == *"teams=s-sess-R"* ]]
+  [[ "$output" == *"agent=cursor-host"* ]]
+  [[ "$output" == *"teams=cur-$SID_R"* ]]
 }
 
 # --- end-to-end: registration order must not perturb session-team routing ---
@@ -126,11 +140,11 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
   bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
   bash "$SCRIPTS/join.sh" reviewteam opus-review cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" reviewteam human       cursor "$TEST_PROJECT" >/dev/null
-  bash "$SCRIPTS/join.sh" s-sess-A claude cursor "$TEST_PROJECT" >/dev/null
-  bash "$SCRIPTS/join.sh" s-sess-A human  cursor "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" cur-$SID_A cursor-host cursor "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" cur-$SID_A human  cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/send.sh" reviewteam human opus-review "for-worker" >/dev/null
-  bash "$SCRIPTS/send.sh" s-sess-A human claude "for-session" >/dev/null
-  run bash -c "echo '{\"session_id\":\"sess-A\"}' | bash '$SCRIPTS/check-inbox.sh' cursor '$TEST_PROJECT'"
+  bash "$SCRIPTS/send.sh" cur-$SID_A human cursor-host "for-session" >/dev/null
+  run bash -c "echo '{\"session_id\":\"$SID_A\"}' | bash '$SCRIPTS/check-inbox.sh' cursor '$TEST_PROJECT'"
   [ "$status" -eq 0 ]
   [[ "$output" == *"for-session"* ]]
   [[ "$output" != *"for-worker"* ]]
@@ -139,13 +153,13 @@ enable_st() { bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/nul
 @test "check-inbox (cursor, session-team on): worker registered after the session still reads only its own inbox" {
   enable_st
   bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
-  bash "$SCRIPTS/join.sh" s-sess-A claude cursor "$TEST_PROJECT" >/dev/null
-  bash "$SCRIPTS/join.sh" s-sess-A human  cursor "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" cur-$SID_A cursor-host cursor "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" cur-$SID_A human  cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" reviewteam human       cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/join.sh" reviewteam opus-review cursor "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/send.sh" reviewteam human opus-review "for-worker" >/dev/null
-  bash "$SCRIPTS/send.sh" s-sess-A human claude "for-session" >/dev/null
-  run bash -c "echo '{\"session_id\":\"sess-A\"}' | bash '$SCRIPTS/check-inbox.sh' cursor '$TEST_PROJECT'"
+  bash "$SCRIPTS/send.sh" cur-$SID_A human cursor-host "for-session" >/dev/null
+  run bash -c "echo '{\"session_id\":\"$SID_A\"}' | bash '$SCRIPTS/check-inbox.sh' cursor '$TEST_PROJECT'"
   [ "$status" -eq 0 ]
   [[ "$output" == *"for-session"* ]]
   [[ "$output" != *"for-worker"* ]]

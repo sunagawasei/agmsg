@@ -68,6 +68,19 @@ if [ -f "$NEW_DIR/config.json" ]; then
   exit 1
 fi
 
+# A host session team (teams/<team>/.session-team, see lib/session-team.sh) is
+# named by its session id: renaming it would orphan the id's team, and renaming
+# onto a name that already carries a marker would hand that session a team with
+# someone else's config. Both are refused (re-checked under the locks below).
+_agmsg_rename_session_marker() {
+  [ -e "$OLD_DIR/.session-team" ] || [ -L "$OLD_DIR/.session-team" ] \
+    || [ -e "$NEW_DIR/.session-team" ] || [ -L "$NEW_DIR/.session-team" ]
+}
+if _agmsg_rename_session_marker; then
+  echo "Cannot rename: '$OLD_TEAM' or '$NEW_TEAM' is a host session team (it is named by its session id)." >&2
+  exit 1
+fi
+
 # Serialize against concurrent join/leave/reset/rename on BOTH the source and the
 # target team (#141). A per-team lock can't reserve a not-yet-existent target by
 # name, so we create the target dir and hold its lock too — a concurrent join to
@@ -79,6 +92,11 @@ LOCK_A=$(printf '%s\n%s\n' "$OLD_DIR" "$NEW_DIR" | LC_ALL=C sort | sed -n 1p)
 LOCK_B=$(printf '%s\n%s\n' "$OLD_DIR" "$NEW_DIR" | LC_ALL=C sort | sed -n 2p)
 agmsg_lock_acquire "$LOCK_A" || exit 1
 agmsg_lock_acquire "$LOCK_B" || exit 1
+
+if _agmsg_rename_session_marker; then
+  echo "Cannot rename: '$OLD_TEAM' or '$NEW_TEAM' is a host session team (it is named by its session id)." >&2
+  exit 1
+fi
 
 # Authoritative target check now that the target is locked: if it became a real
 # team between the pre-check and the lock, abort.

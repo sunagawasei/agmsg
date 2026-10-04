@@ -47,7 +47,7 @@ agmsg_inbox_target() {
   # delivery.session_team=false.
   if agmsg_type_has "$type" session_team yes && agmsg_session_team_enabled; then
     local steam
-    steam="$(agmsg_session_team_name_from_id "$raw_sid")"
+    steam="$(agmsg_session_team_name_from_id "$raw_sid" "$type")"
     if [ -n "$steam" ]; then
       # Role priority: mirrors session-start.sh's resumed-role directive taking
       # precedence over the session-team branch (its role lookup runs first and
@@ -83,7 +83,7 @@ agmsg_inbox_target() {
           esac
         fi
       fi
-      printf 'agent=claude teams=%s type=%s project=%s\n' "$steam" "$type" "$project"
+      printf 'agent=%s teams=%s type=%s project=%s\n' "$(agmsg_session_seat "$type")" "$steam" "$type" "$project"
       return 0
     fi
     # steam empty (no usable session id) -- fall through to project-team below.

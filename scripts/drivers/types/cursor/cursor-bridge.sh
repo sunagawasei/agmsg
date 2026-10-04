@@ -229,6 +229,11 @@ SCRIPTS_DIR="$SKILL_DIR/scripts"
 RUN_DIR="$SKILL_DIR/run"
 # shellcheck disable=SC1091
 source "$SCRIPTS_DIR/lib/storage.sh"
+# A bridge is a worker, not a host session: it must not carry the id of the
+# session that started it into the send.sh calls it makes.
+# shellcheck disable=SC1091
+source "$SCRIPTS_DIR/lib/session-team.sh"
+SCRIPT_DIR="$SCRIPTS_DIR" agmsg_session_unset_env
 # shellcheck disable=SC1091
 source "$SCRIPTS_DIR/lib/process-identity.sh"
 # Defense-in-depth (the parent _spawn.sh validates too): TEAM/NAME compose the

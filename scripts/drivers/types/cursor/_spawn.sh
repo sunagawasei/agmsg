@@ -105,6 +105,8 @@ agmsg_spawn_headless() {
   # --workspace, not cwd, so a headless cursor run with --workspace "$PROJECT"
   # would otherwise trigger the project's own .cursor/hooks.json.
   export AGMSG_CURSOR_BRIDGE=1
+  # The worker must not inherit the starting session's id from any host.
+  agmsg_session_unset_env
 
   local run_dir="$SKILL_DIR/run"
   mkdir -p "$run_dir"
