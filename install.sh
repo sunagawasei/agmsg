@@ -91,19 +91,19 @@ agmsg_source_version() {
 CMD_NAME=""
 UPDATE_ONLY=false
 INTERACTIVE=true
-AGENT_TYPE=""  # claude-code, codex, gemini, antigravity — passed via --agent-type, or empty for auto/default
+AGENT_TYPE=""  # claude-code, codex, cursor — passed via --agent-type, or empty for auto/default
 
 # Types the installer renders their OWN shared SKILL.md for (their template.md
-# differs from codex's). Everything else -- codex itself, plus claude-code and
-# copilot, which keep separate dedicated copies elsewhere -- gets the codex-
+# differs from codex's). Everything else -- codex itself, plus claude-code,
+# which keeps a separate dedicated copy elsewhere -- gets the codex-
 # typed shared SKILL.md. One list, read by three call sites below (fresh
 # install's template pick, --update's template pick, and --update's type
 # re-detection from the SKILL.md already on disk): before #846, the third site
-# hardcoded its own, narrower copy of this same set (missing opencode/hermes/
-# cursor) that had already drifted from the other two -- re-detecting one of
+# hardcoded its own, narrower copy of this same set (missing cursor) that had
+# already drifted from the other two -- re-detecting one of
 # those three types as "codex" and then, via the template pick, overwriting
 # the SKILL.md the installer itself had written with the wrong flavor.
-AGMSG_SHARED_SKILL_TPL_TYPES="gemini antigravity opencode hermes cursor grok-build"
+AGMSG_SHARED_SKILL_TPL_TYPES="cursor"
 
 # Put <src> at <dest>, then remove any leftover <src>. The arm is chosen by
 # <dest>, so the fix's scope matches the defect's (#747):
@@ -227,43 +227,6 @@ install_windows_helpers() {
   fi
 }
 
-install_antigravity_tui_shim() {
-  local source target target_dir owner expected_owner tmp quoted_source
-  source="$1"
-  target="$AGENTS_DIR/bin/agy-tui"
-  target_dir="$(dirname "$target")"
-  owner="# agmsg-shim-owner: $source"
-  expected_owner=""
-  mkdir -p "$target_dir"
-  if [ -e "$target" ] || [ -L "$target" ]; then
-    expected_owner="$(grep '^# agmsg-shim-owner: ' "$target" 2>/dev/null || true)"
-    if ! grep -q '^# agmsg Antigravity TUI launcher shim$' "$target" 2>/dev/null; then
-      echo "  ~ left existing ~/.agents/bin/agy-tui untouched"
-      return 0
-    fi
-    if [ "$expected_owner" != "$owner" ]; then
-      echo "  ~ left ~/.agents/bin/agy-tui owned by a different or legacy install untouched"
-      return 0
-    fi
-  fi
-  printf -v quoted_source '%q' "$source"
-  tmp="$(mktemp "$target_dir/.agy-tui.XXXXXX")"
-  {
-    printf '%s\n' '#!/usr/bin/env bash'
-    printf '%s\n' 'set -euo pipefail'
-    printf '%s\n' '# agmsg Antigravity TUI launcher shim'
-    printf '%s\n' "$owner"
-    printf 'exec bash %s "$@"\n' "$quoted_source"
-  } >"$tmp"
-  chmod +x "$tmp"
-  mv "$tmp" "$target"
-  if [ -n "$expected_owner" ]; then
-    echo "  + refreshed Antigravity TUI shim (~/.agents/bin/agy-tui)"
-  else
-    echo "  + installed Antigravity TUI shim (~/.agents/bin/agy-tui)"
-  fi
-}
-
 # --- Parse args ---
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -275,8 +238,8 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Options:"
       echo "  --cmd <name>      Command & skill folder name (default: agmsg)"
-      echo "                    Claude Code: /<cmd>, Codex/Gemini/Antigravity: \$<cmd>"
-      echo "  --agent-type <t>  Agent type: claude-code, codex, gemini, antigravity, opencode, hermes, cursor, grok-build"
+      echo "                    Claude Code: /<cmd>, Codex: \$<cmd>"
+      echo "  --agent-type <t>  Agent type: claude-code, codex, cursor"
       echo "                    Selects which template becomes SKILL.md (matches the"
       echo "                    <type> arg passed to join.sh / whoami.sh)"
       echo "  --update          Update skill scripts only (preserve DB and teams)"
@@ -289,6 +252,14 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
+
+# Fail early with a clear message for types this fork no longer ships.
+if [ -n "$AGENT_TYPE" ]; then
+  case "$AGENT_TYPE" in
+    claude-code|codex|cursor) ;;
+    *) echo "  ! Unsupported --agent-type '$AGENT_TYPE'. Supported: claude-code, codex, cursor." >&2; exit 1 ;;
+  esac
+fi
 
 # Force non-interactive when stdin is not a terminal. Without this, the
 # command-name prompt below would call `read -r` on whatever stream is wired
@@ -387,7 +358,7 @@ if [ "$UPDATE_ONLY" = true ]; then
     unset _agmsg_t
   fi
   # The shared SKILL.md uses the codex template by default; the types in
-  # AGMSG_SHARED_SKILL_TPL_TYPES get their own. (claude-code and copilot reuse
+  # AGMSG_SHARED_SKILL_TPL_TYPES get their own. (claude-code reuses
   # the codex-typed shared SKILL.md; their dedicated copies are dropped
   # separately below.)
   TPL_TYPE="codex"
@@ -415,10 +386,6 @@ if [ "$UPDATE_ONLY" = true ]; then
     rm -f "$SKILL_DIR/scripts/drivers/terminals/$_agmsg_builtin_driver/SKILL.md"
   done
   unset _agmsg_builtin_driver
-  # The Antigravity resume helper moved under its type directory. A plain
-  # recursive copy cannot remove the old top-level file, so delete this one
-  # known agmsg-owned path during --update; do not sweep user scripts.
-  rm -f "$SKILL_DIR/scripts/antigravity-resume.sh"
   # rearm.sh shipped in 1.3.1 and is removed again in 1.3.2 (#1321): a
   # dedicated re-arm command is gone in favor of the same procedure done
   # through poke.sh, described in natural language in each type's own
@@ -429,7 +396,6 @@ if [ "$UPDATE_ONLY" = true ]; then
   # post-install. A plain cp — not cp -R --delete — preserves any plugins the
   # user dropped in and their db/trusted-plugins opt-ins.
   mkdir -p "$SKILL_DIR/plugins"
-  cp "$SCRIPT_DIR/plugins/README.md" "$SKILL_DIR/plugins/README.md" 2>/dev/null || true
   # Ensure the spawn-roles dir exists on update too. Role files there are user data
   # (gitignored, never shipped), so this only guarantees the directory — it never
   # creates or overwrites a role file.
@@ -444,39 +410,10 @@ if [ "$UPDATE_ONLY" = true ]; then
   if [ -d "$CC_COMMANDS_DIR" ] && [ -f "$CC_COMMANDS_DIR/$SKILL_NAME.md" ]; then
     sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path claude-code)" > "$CC_COMMANDS_DIR/$SKILL_NAME.md"
   fi
-  # Refresh / install the Copilot CLI skill (Copilot reads SKILL.md from its
-  # own skills dir; the shared ~/.agents/skills/<name>/SKILL.md is
-  # Codex-typed and would mis-identify the agent as codex when invoked from
-  # Copilot). Same condition as the fresh-install path so users upgrading
-  # from a pre-Copilot release via --update also gain the skill.
-  COPILOT_SKILL_DIR="$HOME/.copilot/skills/$SKILL_NAME"
-  if [ -d "$HOME/.copilot" ]; then
-    mkdir -p "$COPILOT_SKILL_DIR"
-    sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path copilot)" > "$COPILOT_SKILL_DIR/SKILL.md"
-  fi
-  # Refresh / install the OpenCode skill (same reasoning as Copilot above).
-  OPENCODE_SKILL_DIR="$HOME/.config/opencode/skills/$SKILL_NAME"
-  if [ -d "$HOME/.config/opencode" ]; then
-    mkdir -p "$OPENCODE_SKILL_DIR"
-    sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path opencode)" > "$OPENCODE_SKILL_DIR/SKILL.md"
-  fi
-  # Refresh / install the Hermes Agent skill (same reasoning as Copilot above).
-  HERMES_SKILL_DIR="$HOME/.hermes/skills/$SKILL_NAME"
-  if [ -d "$HOME/.hermes" ]; then
-    mkdir -p "$HERMES_SKILL_DIR"
-    sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path hermes)" > "$HERMES_SKILL_DIR/SKILL.md"
-  fi
-  # Refresh / install the Grok Build skill (same reasoning as Copilot above).
-  GROK_SKILL_DIR="$HOME/.grok/skills/$SKILL_NAME"
-  if [ -d "$HOME/.grok" ]; then
-    mkdir -p "$GROK_SKILL_DIR"
-    sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path grok-build)" > "$GROK_SKILL_DIR/SKILL.md"
-  fi
   cp "$SCRIPT_DIR/openai.yaml" "$SKILL_DIR/agents/openai.yaml" 2>/dev/null || true
   chmod +x "$SKILL_DIR/scripts/"*.sh
   # Per-type folded runtime scripts (codex-*.sh, cursor-bridge.sh, watch-once.sh …).
   chmod +x "$SKILL_DIR/scripts/drivers/types/"*/*.sh 2>/dev/null || true
-  install_antigravity_tui_shim "$SKILL_DIR/scripts/drivers/types/antigravity/agy-tui.sh"
   # Refresh the Codex monitor shim (~/.agents/bin/codex) if it's ours. --update
   # cp's the new codex-shim-install.sh but does not re-run it, so a shim from an
   # older install keeps its stale baked exec path after the
@@ -574,7 +511,6 @@ cp -R "$SCRIPT_DIR/scripts/." "$SKILL_DIR/scripts/"
 # post-install. A plain cp — not cp -R --delete — preserves any plugins the user
 # dropped in and their db/trusted-plugins opt-ins.
 mkdir -p "$SKILL_DIR/plugins"
-cp "$SCRIPT_DIR/plugins/README.md" "$SKILL_DIR/plugins/README.md" 2>/dev/null || true
 # Ship uninstall.sh alongside the skill itself — npx/curl installs fetch a
 # temp checkout that gets deleted right after install, so without this copy
 # those users would have no local uninstaller to run later (only a manual
@@ -585,7 +521,6 @@ cp "$SCRIPT_DIR/openai.yaml" "$SKILL_DIR/agents/openai.yaml" 2>/dev/null || true
 chmod +x "$SKILL_DIR/scripts/"*.sh
 # Per-type folded runtime scripts (codex-*.sh, cursor-bridge.sh, watch-once.sh …).
 chmod +x "$SKILL_DIR/scripts/drivers/types/"*/*.sh 2>/dev/null || true
-install_antigravity_tui_shim "$SKILL_DIR/scripts/drivers/types/antigravity/agy-tui.sh"
 # Re-point an existing Codex monitor shim at the new path on a reinstall over an
 # older layout (no-op when no agmsg shim is present). See the --update block
 # above. NOT forced (#553): unlike --update, a fresh install here gives no
@@ -640,54 +575,6 @@ if [ -d "$HOME/.claude" ]; then
   echo "  + installed /$CMD_NAME command to ~/.claude/commands/"
 fi
 
-# --- Install Copilot CLI skill ---
-# Copilot loads SKILL.md from ~/.copilot/skills/<name>/. The shared
-# ~/.agents/skills/<name>/SKILL.md is Codex-typed (whoami ... codex) and
-# would mis-identify a Copilot session — keep the Copilot copy separate.
-COPILOT_SKILL_DIR="$HOME/.copilot/skills/$CMD_NAME"
-if [ -d "$HOME/.copilot" ]; then
-  mkdir -p "$COPILOT_SKILL_DIR"
-  sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path copilot)" > "$COPILOT_SKILL_DIR/SKILL.md"
-  echo "  + installed /$CMD_NAME skill to ~/.copilot/skills/"
-fi
-
-# --- Install OpenCode skill ---
-# OpenCode reads skills from ~/.config/opencode/skills/<name>/SKILL.md as its
-# global config path. The shared ~/.agents/skills/<name>/SKILL.md is
-# Codex-typed and would mis-identify an OpenCode session — keep the OpenCode
-# copy separate, same pattern as Copilot.
-OPENCODE_SKILL_DIR="$HOME/.config/opencode/skills/$CMD_NAME"
-if [ -d "$HOME/.config/opencode" ]; then
-  mkdir -p "$OPENCODE_SKILL_DIR"
-  sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path opencode)" > "$OPENCODE_SKILL_DIR/SKILL.md"
-  echo "  + installed \$$CMD_NAME skill to ~/.config/opencode/skills/"
-fi
-
-# --- Install Hermes Agent skill ---
-# Hermes reads skills from ~/.hermes/skills/<name>/SKILL.md. Runtime scripts and
-# the shared SQLite store stay in ~/.agents/skills/<name>/ so Hermes shares the
-# same message floor as the other agents. Hermes has no automatic delivery hook
-# (manual inbox checks only), but the skill itself installs the same way.
-HERMES_SKILL_DIR="$HOME/.hermes/skills/$CMD_NAME"
-if [ -d "$HOME/.hermes" ]; then
-  mkdir -p "$HERMES_SKILL_DIR"
-  sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path hermes)" > "$HERMES_SKILL_DIR/SKILL.md"
-  echo "  + installed /$CMD_NAME skill to ~/.hermes/skills/"
-fi
-
-# --- Install Grok Build skill ---
-# Grok Build reads skills from ~/.grok/skills/<name>/SKILL.md (it also accepts
-# the cross-vendor ~/.agents/skills/ fallback, but the shared SKILL.md is
-# Codex-typed and would mis-identify a Grok session — keep the Grok copy
-# separate, same pattern as Copilot). Delivery (turn) registers a Stop hook under
-# ~/.grok/hooks/ via `delivery.sh set` per project.
-GROK_SKILL_DIR="$HOME/.grok/skills/$CMD_NAME"
-if [ -d "$HOME/.grok" ]; then
-  mkdir -p "$GROK_SKILL_DIR"
-  sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path grok-build)" > "$GROK_SKILL_DIR/SKILL.md"
-  echo "  + installed /$CMD_NAME skill to ~/.grok/skills/"
-fi
-
 # Codex sandbox writable_roots are configured by configure_codex_sandbox() at
 # the "Done" step below — the single source of truth for db/, teams/, and run/.
 # (A legacy inline copy used to run here too, which double-mutated the array and
@@ -699,14 +586,10 @@ echo ""
 echo "  ✓ Installed to ~/.agents/skills/$CMD_NAME/ (version $INSTALLED_VERSION)"
 echo ""
 echo "  Next steps:"
-echo "    1. Restart your agent (Claude Code / Codex / Gemini CLI / Antigravity / OpenCode) to pick up the new skill"
+echo "    1. Restart your agent (Claude Code / Codex / Cursor) to pick up the new skill"
 echo "    2. Run the command to join a team:"
 echo "       Claude Code:  /$CMD_NAME"
 echo "       Codex:        \$$CMD_NAME"
-echo "       Gemini CLI:   \$$CMD_NAME"
-echo "       Antigravity:  \$$CMD_NAME"
-echo "       Copilot CLI:  /$CMD_NAME"
-echo "       OpenCode:     \$$CMD_NAME"
 echo "       It will prompt for team name and agent name on first run."
 echo ""
 echo "  Docs: https://agmsg.cc/"
