@@ -231,12 +231,29 @@ plant_lock() {
   write_pgrep_stub miss >/dev/null
   write_spawn_stub 0
   sleep 30 & local owner=$!
-  plant_lock sess-RECYCLED "$owner" "proc:0-not-this-process"
+  # Same acquisition method as the live token, different start time.
+  local live_tok
+  live_tok="$(SKILL_DIR="$TEST_SKILL_DIR" bash -c 'source "$1"; agmsg_pid_start_token "$2"' _ "$SCRIPTS/lib/instance-id.sh" "$owner")"
+  plant_lock sess-RECYCLED "$owner" "${live_tok}-old"
   run env PATH="$stub_bin:$PATH" CLAUDE_CODE_SESSION_ID=sess-RECYCLED \
     bash "$SCRIPTS/ensure-headless.sh" codex "$PROJ"
   kill "$owner" 2>/dev/null || true
   [ "$status" -eq 0 ]
   [[ "$output" == *"spawned headless codex 'codex'"* ]]
+}
+
+@test "ensure-headless: a start token from another method does not mark a live owner recycled" {
+  local stub_bin="$TEST_SKILL_DIR/stub-bin"
+  write_pgrep_stub miss >/dev/null
+  write_spawn_stub 0
+  sleep 30 & local owner=$!
+  plant_lock sess-METHOD "$owner" "windows:1"
+  run env PATH="$stub_bin:$PATH" CLAUDE_CODE_SESSION_ID=sess-METHOD \
+    bash "$SCRIPTS/ensure-headless.sh" codex "$PROJ"
+  kill "$owner" 2>/dev/null || true
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawn already in flight"* ]]
+  [ ! -e "$TEST_SKILL_DIR/spawn.args" ]
 }
 
 @test "ensure-headless: a fresh unreadable owner record is not reclaimed" {

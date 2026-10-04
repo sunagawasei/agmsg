@@ -103,8 +103,11 @@ lock_reap_if_gone() {
     elif [ -n "$tok" ]; then
       # Alive pid, different start time: the pid was recycled. No token now
       # means we cannot tell, which counts as alive.
+      # Tokens from different acquisition methods (proc: vs ps:) are not
+      # comparable, so only a same-method mismatch proves a recycled pid.
       cur="$(agmsg_pid_start_token "$pid" 2>/dev/null || true)"
-      if [ -n "$cur" ] && [ "$cur" != "$tok" ]; then dead=1; fi
+      if [ -n "$cur" ] && [ "$(agmsg_pid_start_token_method "$cur")" = "$(agmsg_pid_start_token_method "$tok" 2>/dev/null || true)" ] \
+        && [ "$cur" != "$tok" ]; then dead=1; fi
     fi
   elif [ -n "$(find "$rec" -maxdepth 0 -mmin +"$GRACE_MIN" -print 2>/dev/null)" ]; then
     dead=1
@@ -124,10 +127,18 @@ lock_publish() {
   tok="$(agmsg_pid_start_token "$$" 2>/dev/null || true)"
   printf '%s\n%s\n' "$$" "$tok" > "$tmp" 2>/dev/null || return 1
   OWNER_REC="$LOCK/owner.$$.$RANDOM$RANDOM"
-  # mv fails when the directory was removed meanwhile, so a record is never
-  # published into a lock somebody else now owns.
+  # mv fails when the directory was removed meanwhile. If it was removed and
+  # recreated by another owner first, the record landed in their directory:
+  # the directory's inode no longer matches the one we created, so withdraw.
   mv "$tmp" "$OWNER_REC" 2>/dev/null || { rm -f "$tmp"; OWNER_REC=""; return 1; }
+  if [ "$(lock_dir_id)" != "$1" ]; then
+    rm -f "$OWNER_REC"
+    OWNER_REC=""
+    return 1
+  fi
 }
+
+lock_dir_id() { ls -di "$LOCK" 2>/dev/null | awk '{print $1}'; }
 
 lock_release() {
   [ -n "$OWNER_REC" ] || return 0
@@ -140,8 +151,7 @@ lock_release() {
 acquired=0
 for _try in 1 2 3; do
   if mkdir "$LOCK" 2>/dev/null; then
-    if lock_publish; then acquired=1; break; fi
-    rmdir "$LOCK" 2>/dev/null || true
+    if lock_publish "$(lock_dir_id)"; then acquired=1; break; fi
     continue
   fi
   lock_reap_if_gone || break
