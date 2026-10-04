@@ -1221,7 +1221,9 @@ _watch_renew_or_stop() {
       cmd="$cmd $(printf '%q' "$arg")"
     done
     desc="agmsg inbox stream"
-    [ -n "$ACTIVE_NAME" ] && desc="$desc (acting as $ACTIVE_NAME)"
+    # A session-team watcher (--team) is not an actas one: its launch
+    # description is the plain one, so the re-arm line must repeat that.
+    [ -n "$ACTIVE_NAME" ] && [ -z "$TEAM_PIN" ] && desc="$desc (acting as $ACTIVE_NAME)"
     watch_report "re-arm - this watch is about to reach the host's time cap; invoke the Monitor tool again with command: $cmd description: $desc persistent: true timeout_ms: 1800000"
   else
     watch_report "stopping - no messages were delivered in the last ${elapsed}s, so this watch is not re-armed (set AGMSG_CC_MONITOR_KEEP_ALIVE to keep it running)"

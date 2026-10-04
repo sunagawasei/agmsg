@@ -759,10 +759,12 @@ _seed_role_record() {
   [ "$status" -eq 0 ]
   [[ "$output" != *"resumed role"* ]]
   [[ "$output" == *"invoke the Monitor tool"* ]]
-  # Generic directive: watch.sh has no 4th (role) arg.
+  # Generic directive: watch.sh has no 4th (role) arg; the last arg is the
+  # option that turns self-renewal on.
   local cmdline; cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
   eval "set -- $cmdline"
-  [ "$#" -eq 4 ]
+  [ "$#" -eq 5 ]
+  [ "$5" = "--max-seconds=1790" ]
 }
 
 @test "session-start: a record for a role not registered here is ignored (#339)" {
