@@ -30,3 +30,5 @@ Status: Accepted
 - With a non-sqlite storage driver retention is off and only the sweep's skip is visible.
 - A tombstone is dropped when an unmarked dir of the same name is seen or reaped, so a later project team of that name is not taken for the old session team. A project team created and removed between two SessionStarts leaves the old tombstone valid.
 - `gc-session-orphans.sh --apply` deletes a team only when no row is inside the window at delete time; a row that arrives after the dry-run check makes it skip the team.
+- Retention covers `s-<uuid>` teams only. A `cur-<uuid>` team gets the marker but is not collected by the TTL GC or the sweep.
+- Failure handling is fail-closed: when a tombstone cannot be removed, the unmarked dir is kept; when a tombstone cannot be created, the dir's rows are kept; when the lifecycle lock times out, nothing is removed.

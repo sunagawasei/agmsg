@@ -333,3 +333,15 @@ SH
   [ ! -f "$TEST_SKILL_DIR/run/session-tombstone.s-MMM-1" ]
   [ "$(rows s-MMM-1)" != 0 ]
 }
+
+@test "an unmarked dir stays when its stale tombstone cannot be removed" {
+  seed_rows s-NNN-1 30
+  : > "$TEST_SKILL_DIR/run/session-tombstone.s-NNN-1"
+  make_team s-NNN-1
+  mkdir "$TEST_SKILL_DIR/shim"
+  printf '#!/bin/sh\ncase "$*" in *session-tombstone.s-NNN-1*) exit 1 ;; esac\nexec /bin/rm "$@"\n' > "$TEST_SKILL_DIR/shim/rm"
+  chmod +x "$TEST_SKILL_DIR/shim/rm"
+  PATH="$TEST_SKILL_DIR/shim:$PATH" run run_session_start
+  [ -d "$TEST_SKILL_DIR/teams/s-NNN-1" ]
+  [ "$(rows s-NNN-1)" != 0 ]
+}

@@ -139,13 +139,24 @@ agmsg_retention_reap_team() {
 # TTL GC for a dir without the marker. Any tombstone of this name belongs to an
 # earlier generation: drop it and remove the dir under the lifecycle lock, so a
 # sweep either finishes before (and sees the dir) or starts after both are done.
-# On lock timeout the dir is kept (return 1) and retried at the next SessionStart.
+# On lock timeout, or when the tombstone cannot be removed, the dir is kept
+# (return 1) and retried at the next SessionStart.
 agmsg_retention_reap_unmarked_dir() {
   local team="$1" dir="$2"
   agmsg_team_lifecycle_lock_acquire "$team" "${AGMSG_LIFECYCLE_LOCK_TIMEOUT:-10}" || return 1
-  rm -f "$(agmsg_retention_tombstone_path "$team")" 2>/dev/null || true
-  rm -rf "$dir" 2>/dev/null || true
+  local tomb rc=0
+  tomb="$(agmsg_retention_tombstone_path "$team")"
+  rm -f "$tomb" 2>/dev/null || true
+  # A tombstone that could not be dropped would still authorise the sweep once
+  # the dir is gone: keep the dir.
+  if [ -e "$tomb" ] || [ -L "$tomb" ]; then
+    rc=1
+  else
+    rm -rf "$dir" 2>/dev/null || true
+    [ ! -d "$dir" ] || rc=1
+  fi
   agmsg_team_lifecycle_lock_release "$team"
+  return "$rc"
 }
 
 # Called by the TTL GC right after `rm -rf teams/<team>`. $2 = 1 when the dir
