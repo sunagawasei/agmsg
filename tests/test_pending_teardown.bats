@@ -270,6 +270,22 @@ setup_clear_fixture() {
   [ -f "$PENDING" ]
 }
 
+@test "SessionEnd /clear: a symlink to the old instance after the supersede is not a resume and keeps the work pending" {
+  setup_clear_fixture
+  printf '%s\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  printf '%s\n' "$OWNER_INSTANCE" > "$BATS_TEST_TMPDIR/old-instance"
+  agmsg_team_lifecycle_lock_acquire "$STEAM" 5
+  run_composite_worker >/dev/null 2>&1 &
+  local worker_pid=$!
+  sleep 0.5
+  rm -f "$RUN/cc-instance.$OWNER_PID"
+  ln -s "$BATS_TEST_TMPDIR/old-instance" "$RUN/cc-instance.$OWNER_PID"
+  agmsg_team_lifecycle_lock_release "$STEAM"
+  wait "$worker_pid"
+  kill -0 "$BRIDGE_PID" 2>/dev/null
+  [ -f "$PENDING" ]
+}
+
 @test "SessionEnd owner exit during grace continues normal teardown" {
   start_owner 0.3
   start_bridge
