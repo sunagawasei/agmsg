@@ -257,3 +257,68 @@ YAML
   before_input=$(grep -n -- "--initial-input" "$boot" | head -1 | cut -d: -f1)
   [ "$before_flag" -lt "$before_input" ]
 }
+
+# --- hand-written type lists must match the manifests ------------------------
+# The generated SKILL.md (per-type template.md), spawn.sh's usage header and the
+# repo-root SKILL.md name types by hand. Derive the sets from type.conf and fail
+# when a list drifts. REPO is the checkout, not the copied TEST_SKILL_DIR.
+
+_types_with() {  # <key>: sorted type names whose manifest sets key=yes
+  local key="$1" t
+  for t in $(env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_known_types | sort -u"); do
+    if [ "$(env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_type_get '$t' '$key'")" = yes ]; then
+      echo "$t"
+    fi
+  done | paste -sd, -
+}
+
+# Extract the `a`, `b`, `c` names from the first match of <sed -n expr> in <file>
+# as a sorted comma list; fail when nothing matched (a vanished list must not pass).
+_listed_types() {
+  local file="$1" expr="$2" got
+  got="$(sed -n "$expr" "$file" | head -n1 | grep -o '`[a-z-]*`' | tr -d '`' | sort -u | paste -sd, -)"
+  [ -n "$got" ] || { echo "no type list matched in $file ($expr)" >&2; return 1; }
+  printf '%s' "$got"
+}
+
+@test "type lists: spawn sections of codex and claude-code templates name every spawnable type" {
+  local want; want="$(_types_with spawnable)"
+  [ "$want" = "claude-code,codex,cursor" ]
+  for t in codex claude-code; do
+    run _listed_types "$TYPES/$t/template.md" 's/.*list them; currently \(`[^)]*\)).*/\1/p'
+    [ "$status" -eq 0 ]
+    [ "$output" = "$want" ]
+  done
+}
+
+@test "type lists: template headless-capable lists name every headless=yes type" {
+  local want; want="$(_types_with headless)"
+  for t in codex claude-code; do
+    run _listed_types "$TYPES/$t/template.md" 's/.*headless-capable types (\(`[^)]*\)).*/\1/p'
+    [ "$status" -eq 0 ]
+    [ "$output" = "$want" ]
+  done
+}
+
+@test "type lists: spawn.sh and root SKILL.md --headless and --interactive headers each name every headless=yes type" {
+  local want f flag
+  want="$(_types_with headless)"
+  for f in "$BATS_TEST_DIRNAME/../scripts/spawn.sh" "$BATS_TEST_DIRNAME/../SKILL.md"; do
+    for flag in headless interactive; do
+      run bash -c "grep -m1 -E -- '^#   --$flag ' '$f' | grep -o '([a-z/-]*[;)]' | tr -d '();' | tr '/' '\n' | sort -u | paste -sd, -"
+      [ "$status" -eq 0 ]
+      [ -n "$output" ]
+      [ "$output" = "$want" ]
+    done
+  done
+}
+
+@test "type lists: whoami.sh and root SKILL.md type: lines name every known type" {
+  local want f
+  want="$(env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_known_types | sort -u | paste -sd, -")"
+  for f in "$BATS_TEST_DIRNAME/../scripts/whoami.sh" "$BATS_TEST_DIRNAME/../SKILL.md"; do
+    run bash -c "grep -m1 -E '^# +type: ' '$f' | sed 's/^# *type: *//' | tr -d ' ' "
+    [ "$status" -eq 0 ]
+    [ "$output" = "$want" ]
+  done
+}

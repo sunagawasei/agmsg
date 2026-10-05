@@ -204,7 +204,7 @@ codex:
   --dangerously-skip-permissions: false  # `false`の値はフラグ自体を出力しない
 ```
 
-3種類のエージェントタイプすべてがspawn可能 — `claude-code`、`codex`、`cursor`。macOSが主なターゲットで、LinuxとWindowsはベストエフォート（ターミナルが未対応の場合はissueまたはPRを歓迎）。ヘッドレス環境 — tmuxもなく使えるターミナルもない — はエージェントCLIがインタラクティブなターミナルを必要とするためエラーになる。
+3種類のエージェントタイプすべてがspawn可能 — `claude-code`、`codex`、`cursor`。macOSが主なターゲットで、LinuxとWindowsはベストエフォート（ターミナルが未対応の場合はissueまたはPRを歓迎）。tmuxもなく使えるターミナルもない環境では、エージェントCLIがインタラクティブなターミナルを必要とするため通常のspawnはエラーになる。`--headless`(3タイプすべて)はターミナルを必要としない。
 
 ### spawnしたエージェントを終了する（`despawn`）
 

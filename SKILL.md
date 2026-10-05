@@ -165,7 +165,7 @@ Do NOT manually edit config files. Always use join.sh. If the name was recently 
 # without losing it to the agent's cold start. Spawnable types are registry-driven
 # (manifest `spawnable=yes` or a `spawn=` launcher; run `spawn.sh` with no args to
 # list them). macOS primary, Linux/Windows best-effort. Non-tmux + no usable terminal (headless)
-# errors out.
+# errors out for an interactive spawn; `--headless` needs no terminal.
 #   --project <path>     project to launch in (default: $PWD)
 #   --team <team>        team to join into (default: auto-resolved from project)
 #   --window             new tmux window instead of splitting the current one
@@ -184,16 +184,18 @@ Do NOT manually edit config files. Always use join.sh. If the name was recently 
 #                        in its first turn. The only way to give a one-shot goal
 #                        to a codex peer (no Monitor → a post-spawn send to its
 #                        idle session is never noticed).
-#   --headless           (codex/cursor; types with `headless=yes`) run a no-terminal
+#   --headless           (claude-code/codex/cursor; types with `headless=yes`) run a no-terminal
 #                        bridge worker instead of a TUI. codex: scratch cwd under
 #                        `run/`, optional `--reviewer` for repo read-only or
 #                        `--implementer` for repo WRITABLE (mutually exclusive).
+#                        claude-code: scratch cwd; the repo is added read-only
+#                        (`--reviewer`) or writable (`--implementer`).
 #                        cursor: always a read-only reviewer in `--project`.
-#                        Tear down with `despawn --force` (neither has a Monitor
+#                        Tear down with `despawn --force` (none has a Monitor
 #                        watcher).
-#   --interactive        (codex/cursor; alias --no-headless) force the non-headless
+#   --interactive        (claude-code/codex/cursor; alias --no-headless) force the non-headless
 #                        path even when the type's headless default is on (config
-#                        spawn.codex_headless / spawn.cursor_headless).
+#                        spawn.claude_headless / spawn.codex_headless / spawn.cursor_headless).
 ~/.agents/skills/agmsg/scripts/spawn.sh <agent-type> <name> [options]
 
 # Tear down a spawned member — the inverse of spawn.

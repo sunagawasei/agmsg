@@ -997,6 +997,45 @@ STUB
   [[ "$output" == *"--no-fallback"* ]]
 }
 
+@test "spawn: cursor config turn timeout is passed to the bridge as --turn-timeout" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.cursor_turn_timeout.cur 900
+  _make_fake_cursor_headless
+
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" == *"--turn-timeout 900"* ]]
+}
+
+@test "spawn: cursor without a turn timeout config leaves --turn-timeout to the bridge" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  _make_fake_cursor_headless
+
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" != *"--turn-timeout"* ]]
+}
+
+@test "spawn: cursor invalid turn timeout config is ignored with a warning" {
+  bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.cursor_turn_timeout.cur 0003
+  _make_fake_cursor_headless
+
+  run env AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" cursor cur --team myteam --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ignoring invalid cursor turn timeout"* ]]
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  [[ "$output" != *"--turn-timeout"* ]]
+}
+
 @test "spawn: cursor pipe-separated model label is one argv to the bridge" {
   bash "$SCRIPTS/join.sh" myteam existing cursor "$PROJ"
   bash "$SCRIPTS/config.sh" set spawn.cursor_model.cur grok-4.6

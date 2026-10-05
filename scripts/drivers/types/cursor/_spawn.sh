@@ -132,6 +132,18 @@ agmsg_spawn_headless() {
   fi
   [ -n "$pinned_model" ] || pinned_model="$configured_model"
 
+  # Per-worker turn hard wall. Same validation as the codex/claude-code keys
+  # (positive integer, no leading zero, <=6 digits); an invalid value is ignored
+  # so the bridge falls back to AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT, then 180.
+  local turn_timeout=""
+  turn_timeout="$("$SCRIPT_DIR/config.sh" get "spawn.cursor_turn_timeout.$NAME" "" 2>/dev/null || true)"
+  case "$turn_timeout" in
+    '') ;;
+    *[!0-9]*|0*|[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*)
+      echo "spawn: ignoring invalid cursor turn timeout '$(agmsg_cursor_sanitize_for_log "$turn_timeout")' (must be a positive integer of at most 6 digits, in seconds)" >&2
+      turn_timeout="" ;;
+  esac
+
   if [ -n "$pinned_model" ] && ! agmsg_cursor_safe_model_id "$pinned_model"; then
     die "spawn: unsafe cursor model id '$(agmsg_cursor_sanitize_for_log "$pinned_model")' (must match ^[A-Za-z0-9._-]+$ and not start with '-')"
   fi
@@ -258,6 +270,7 @@ agmsg_spawn_headless() {
   [ "$readonly_on" = 1 ] && extra_args+=(--readonly)
   [ -n "$pinned_model" ] && extra_args+=(--model "$pinned_model")
   [ -n "$model_label" ] && extra_args+=(--model-label "$model_label")
+  [ -n "$turn_timeout" ] && extra_args+=(--turn-timeout "$turn_timeout")
   # Resolve fallback policy to explicit bridge argv. Config wins over the env;
   # an explicitly-empty env and the pinned/no-override default become the
   # flag --no-fallback (never a sentinel model id such as "none"). With no pin

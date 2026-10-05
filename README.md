@@ -209,7 +209,7 @@ codex:
   --dangerously-skip-permissions: false  # a `false` value suppresses the flag entirely
 ```
 
-All three agent types are spawnable — `claude-code`, `codex`, `cursor`. macOS is the primary target; Linux and Windows are best-effort (please open an issue/PR if your terminal isn't handled). Headless environments — no tmux **and** no usable terminal — error out, since the agent CLIs need an interactive terminal.
+All three agent types are spawnable — `claude-code`, `codex`, `cursor`. macOS is the primary target; Linux and Windows are best-effort (please open an issue/PR if your terminal isn't handled). Without tmux **and** a usable terminal, an interactive spawn errors out since the agent CLIs need an interactive terminal; `--headless` (all three types) needs no terminal.
 
 ### Tear down a spawned agent (`despawn`)
 

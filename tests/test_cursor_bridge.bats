@@ -414,6 +414,44 @@ STUB
   [ -z "$output" ]
 }
 
+@test "cursor-bridge: --turn-timeout takes precedence over an invalid env value" {
+  export AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT=abc
+  bash "$SCRIPTS/send.sh" team alice cur "hello" >/dev/null
+  bridge --turn-timeout 60
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/inbox.sh" team alice --format ids
+  [ -n "$output" ]
+}
+
+@test "cursor-bridge: a non-numeric --turn-timeout is rejected" {
+  bridge --turn-timeout abc
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--turn-timeout must be a whole number"* ]]
+}
+
+@test "cursor-bridge: an invalid env turn timeout is rejected when --turn-timeout is absent" {
+  export AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT=abc
+  bridge
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT must be a whole number"* ]]
+}
+
+@test "cursor-bridge: --turn-timeout cuts a hung turn short of a longer env timeout" {
+  export FAKE_CURSOR_MODE=hang
+  export AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT=100
+  bash "$SCRIPTS/send.sh" team alice cur "will hang" >/dev/null
+  local start=$SECONDS
+  bridge --turn-timeout 2
+  # --once handles a failed turn internally, so a non-zero status is a startup failure
+  [ "$status" -eq 0 ]
+  # env=100 would let the 30s hang run to its end; the flag must kill it first
+  [ $((SECONDS - start)) -ge 2 ]
+  [ $((SECONDS - start)) -lt 20 ]
+  grep -q -- "--output-format stream-json" "$FAKE_CURSOR_LOG"
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [ -n "$output" ]
+}
+
 @test "cursor-bridge: a non-zero cursor exit is a failure even with valid JSON" {
   export FAKE_CURSOR_MODE=exitnonzero
   bash "$SCRIPTS/send.sh" team alice cur "leaky" >/dev/null

@@ -45,24 +45,29 @@ set -euo pipefail
 #                      as the agent is launched (fire-and-forget)
 #   --ready-timeout N  seconds to wait for readiness before giving up
 #                      (default 90; on timeout, prints status=timeout, exit 3)
-#   --headless         (codex/cursor; types with `headless=yes`) run a no-terminal
+#   --headless         (claude-code/codex/cursor; types with `headless=yes`) run a no-terminal
 #                      bridge worker instead of opening a TUI — the agent talks over
 #                      the agmsg bus with no window. codex: neutral scratch cwd under
 #                      run/ (read anywhere, write only agmsg's db/teams/run), or the
 #                      repo read-only with --reviewer; --project selects the
-#                      team/subscription. cursor: always a read-only reviewer in
-#                      --project. Tear down with `despawn --force`.
-#   --interactive      (codex/cursor; alias --no-headless) force the non-headless
+#                      team/subscription. claude-code: neutral scratch cwd; the
+#                      repo is added read-only (--reviewer) or writable (--implementer).
+#                      cursor: always a read-only reviewer in --project. Tear down
+#                      with `despawn --force`.
+#   --interactive      (claude-code/codex/cursor; alias --no-headless) force the non-headless
 #                      path even when the type's headless default is on (config
-#                      spawn.codex_headless / spawn.cursor_headless).
-#   --reviewer         (headless codex only) cwd = the target repo (so codex can
+#                      spawn.claude_headless / spawn.codex_headless / spawn.cursor_headless).
+#   --reviewer         (headless codex) cwd = the target repo (so codex can
 #                      autonomously explore it) under a permission profile that
 #                      grants the repo READ-only and confines writes to agmsg's
 #                      own db/teams/run — a persistent repo reviewer that cannot
 #                      modify the repo. --no-reviewer forces it off. Defaults from
 #                      config spawn.codex_reviewer. Without it, headless codex sits
 #                      in a neutral scratch cwd (read-anywhere, write only agmsg).
-#   --implementer      (headless codex only) cwd = the target repo, workspace-write
+#                      claude-code keeps its scratch cwd: --reviewer adds the repo
+#                      read-only, --implementer adds it writable (defaults from
+#                      spawn.claude_reviewer / spawn.claude_implementer.<name>).
+#   --implementer      (headless codex) cwd = the target repo, workspace-write
 #                      — the repo is WRITABLE, for implementation work delegated to
 #                      codex. --no-implementer forces it off. Mutually exclusive
 #                      with --reviewer. Defaults from config
@@ -96,7 +101,8 @@ set -euo pipefail
 # macOS is the primary target, Linux and
 # Windows are best-effort (no guarantee — please open an issue/PR if a given
 # terminal does not work). Headless environments (no tmux and no usable
-# terminal) error out, because the agent CLIs need an interactive terminal.
+# terminal) error out for an interactive spawn, because the agent CLIs need an
+# interactive terminal; a `--headless` spawn needs no terminal.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"  # actas-lock.sh requires SKILL_DIR

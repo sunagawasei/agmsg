@@ -57,6 +57,20 @@ for pinned workers because an implicit fallback would break the meaning of a
 model pin. An exact model-label mismatch is terminal: the generated answer is
 discarded and the input is immediately dead-lettered without a fallback turn.
 
+**Turn timeout** (hard wall for one cursor turn; first hit wins):
+
+1. config `spawn.cursor_turn_timeout.<name>=<seconds>` — positive integer, no
+   leading zero, at most 6 digits; anything else is ignored with a warning.
+   Spawn passes it to the bridge as `--turn-timeout`.
+2. env `AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT` (`0` disables the wall).
+3. the default, 180 seconds.
+
+180 seconds is too short for a max-thinking review turn:
+
+```sh
+agmsg config set spawn.cursor_turn_timeout.wall 900
+```
+
 Model and fallback ids must be non-empty ASCII values matching
 `^[A-Za-z0-9._-]+$` and must not start with `-`. Spawn rejects malformed values
 before `create-chat`. Character-valid unknown ids pass spawn because agmsg does
@@ -111,6 +125,18 @@ silently resolve to the wrong config line. For a name outside that charset,
 `spawn.codex_model.<name>`/`spawn.codex_effort.<name>` are skipped entirely
 (a warning is printed, the spawn still proceeds) — use `--model` instead,
 which has no such restriction and works for any name.
+
+**Client name.** Some limited-preview models (for example `gpt-5.6-sol`) are
+served only to a first-party client name; with the bridge's default name
+(`agmsg-codex-bridge`) the app-server rejects the thread with a 400. For such a
+worker, set:
+
+```sh
+agmsg config set spawn.codex_client_name.codex codex_cli
+```
+
+The key is optional and per worker (same name charset rule as above); unset
+keeps the bridge's default name, so other models are unaffected.
 
 ## How it works
 

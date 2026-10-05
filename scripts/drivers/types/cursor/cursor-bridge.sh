@@ -85,6 +85,8 @@ Headless read-only Cursor reviewer worker for agmsg.
                      approvalMode:"unrestricted" lets a --trust cursor write/shell.
   --add-dirs-file <path>  newline-listed extra readable directories (the asking
                      Claude session's /add-dir roots) to advertise in the prompt.
+  --turn-timeout <seconds>  per-turn hard wall for this worker; overrides
+                     AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT (default 180; 0 disables).
   --once             drain the inbox a single time, then exit (for tests).
   --help             show this help.
 
@@ -106,7 +108,7 @@ EOF
 PROJECT="" TEAM="" NAME="" CHAT_ID=""
 INTERVAL="${AGMSG_CURSOR_BRIDGE_INTERVAL:-2}"
 ONCE=0
-TURN_TIMEOUT="${AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT:-180}"
+TURN_TIMEOUT=""        # --turn-timeout; empty falls through to the env, then 180
 READONLY=0          # --readonly: enforce read-only via a scratch-cwd .cursor/cli.json
 ADD_DIRS_FILE=""    # --add-dirs-file: newline-listed extra readable dirs to advertise
 ROLE_FILE=""        # --role-file: standing role prompt prepended to each turn (empty = generic reviewer intro)
@@ -131,6 +133,7 @@ while [ "$#" -gt 0 ]; do
     --add-dirs-file) ADD_DIRS_FILE="${2:?--add-dirs-file needs a path}"; shift 2 ;;
     --role-file) ROLE_FILE="${2:?--role-file needs a path}"; shift 2 ;;
     --identity-key) shift 2 ;;   # opaque dup-detection marker (spawn-side only); bridge ignores it
+    --turn-timeout) TURN_TIMEOUT="${2:?--turn-timeout needs seconds}"; shift 2 ;;
     --once)    ONCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "cursor-bridge: unknown option: $1" >&2; exit 1 ;;
@@ -144,7 +147,12 @@ done
 [ -d "$PROJECT" ] || { echo "cursor-bridge: project path is not a directory: $PROJECT" >&2; exit 1; }
 case "$INTERVAL" in ''|*[!0-9]*) echo "cursor-bridge: --interval must be a whole number of seconds" >&2; exit 1 ;; esac
 [ "$INTERVAL" -gt 0 ] || INTERVAL=1
-case "$TURN_TIMEOUT" in ''|*[!0-9]*) echo "cursor-bridge: AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT must be a whole number of seconds" >&2; exit 1 ;; esac
+if [ -n "$TURN_TIMEOUT" ]; then
+  case "$TURN_TIMEOUT" in *[!0-9]*) echo "cursor-bridge: --turn-timeout must be a whole number of seconds" >&2; exit 1 ;; esac
+else
+  TURN_TIMEOUT="${AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT:-180}"
+  case "$TURN_TIMEOUT" in ''|*[!0-9]*) echo "cursor-bridge: AGMSG_CURSOR_BRIDGE_TURN_TIMEOUT must be a whole number of seconds" >&2; exit 1 ;; esac
+fi
 MAX_CONSEC_FAILURES="${AGMSG_CURSOR_BRIDGE_MAX_CONSEC_FAILURES:-10}"
 case "$MAX_CONSEC_FAILURES" in ''|*[!0-9]*) echo "cursor-bridge: AGMSG_CURSOR_BRIDGE_MAX_CONSEC_FAILURES must be a whole number" >&2; exit 1 ;; esac
 
