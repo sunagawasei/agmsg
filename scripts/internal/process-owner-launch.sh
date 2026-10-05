@@ -101,6 +101,8 @@ internal_publish_degraded() {
   local allow_missing_replace="$8"
   local owner claim owner_tmp pid_tmp current current_generation companion tmp value
   local -a companions companion_paths companion_tmps
+  companion_paths=()
+  companion_tmps=()
   shift 8
   companions=("$@")
   case "$parent_pid" in ''|*[!0-9]*) return 64 ;; esac
