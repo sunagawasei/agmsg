@@ -1511,7 +1511,7 @@ _roster_state_digest() {
   # to exist so this cannot pass by finding nothing.
   local sh="$SCRIPTS/internal/roster-sync-driver.sh" check_at lock_at
   check_at="$(grep -n 'AGMSG_ROSTER_SYNC_TIMEOUT_S must be a positive' "$sh" | head -1 | cut -d: -f1)"
-  lock_at="$(grep -n '^agmsg_lock_acquire "\$team_dir"$' "$sh" | head -1 | cut -d: -f1)"
+  lock_at="$(grep -n '^agmsg_lock_acquire "\$team_dir" writers$' "$sh" | head -1 | cut -d: -f1)"
   [ -n "$check_at" ]
   [ -n "$lock_at" ]
   [ "$check_at" -lt "$lock_at" ]
@@ -1555,4 +1555,176 @@ _roster_state_digest() {
   # Someone else's lock is still theirs.
   [ -d "$team_dir/.config.lock" ]
   rmdir "$team_dir/.config.lock"
+}
+
+# --- the driver's lock is broken once nothing it started can still be writing (#53) ---
+#
+# The driver is killed with SIGKILL (no trap runs) at three points, and a second
+# process asks for the same lock. Every wait below is on a file the process under
+# test writes, never on a delay.
+
+# Succeeds when a short acquire of <team_dir>'s lock gets it; its stderr is the output.
+_try_lock() {
+  run env AGMSG_LOCK_SECONDS=1 AGMSG_LOCK_TRIES=3 LOCKLIB="$SCRIPTS/lib/registry-lock.sh" \
+    TEAM_DIR="$1" bash -c '. "$LOCKLIB"; agmsg_lock_acquire "$TEAM_DIR"'
+}
+
+_glob_exists() { local f; for f in $1; do [ -e "$f" ] && return 0; done; return 1; }
+
+# A shim `mv` that stops on a rename whose destination matches <pattern> until a file
+# appears, so a test can kill the driver while a rename it started is still running.
+_shim_blocking_mv() {   # <pattern>
+  local dir="$TEST_SKILL_DIR/shim-mv"
+  mkdir -p "$dir"
+  cat > "$dir/mv" <<EOS
+#!/bin/sh
+for a; do last=\$a; done
+case "\$last" in
+  $1) : > "\$MV_BLOCKED"; while [ ! -e "\$MV_RELEASE" ]; do sleep 0.05; done
+     /bin/mv "\$@"; rc=\$?; : > "\$MV_DONE"; exit \$rc ;;
+esac
+exec /bin/mv "\$@"
+EOS
+  chmod +x "$dir/mv"
+  printf '%s' "$dir"
+}
+
+_slow_node() {   # <path>: records its pid, then runs until TERM
+  cat > "$1" <<'EOS'
+#!/usr/bin/env bash
+printf '%s\n' "$$" > "$AGMSG_TEST_CHILD_PID"
+trap 'exit 0' TERM INT HUP
+while :; do sleep 0.2; done
+EOS
+  chmod +x "$1"
+}
+
+@test "a killed driver's lock is kept while its roster child runs, and broken once it has exited (#53)" {
+  skip_on_windows "POSIX signal delivery is not supported by this test"
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local team_dir="$TEST_SKILL_DIR/teams/demo" lock child_pid driver_pid fake
+  lock="$team_dir/.config.lock"
+  fake="$TEST_SKILL_DIR/fake-node-slow"
+  _slow_node "$fake"
+  AGMSG_TEST_CHILD_PID="$TEST_SKILL_DIR/child.pid" AGMSG_SYNC_NODE_BIN="$fake" \
+    bash "$SCRIPTS/internal/roster-sync-driver.sh" reconcile demo \
+      018f3f7e-0000-7000-8000-000000000001 \
+      018f3f7e-0000-7000-8000-000000000002 1 \
+      </dev/null >/dev/null 2>&1 &
+  driver_pid=$!
+  wait_for_file "$TEST_SKILL_DIR/child.pid"
+  child_pid="$(cat "$TEST_SKILL_DIR/child.pid")"
+  # Both the wrapper and node are recorded, and nothing is pending any more.
+  _wait_poll "$_WAIT_TIMEOUT" "$_WAIT_INTERVAL" "writer files" _glob_exists "$lock/writer.*.$child_pid"
+  _wait_poll "$_WAIT_TIMEOUT" "$_WAIT_INTERVAL" "pending files gone" \
+    bash -c '! ls "$1"/pending.* >/dev/null 2>&1' _ "$lock"
+  [ "$(ls "$lock" | grep -c '^writer\.')" -eq 2 ]
+
+  kill -9 "$driver_pid"
+  wait "$driver_pid" 2>/dev/null || true
+
+  _try_lock "$team_dir"
+  [ "$status" -ne 0 ]
+  refute grep -qF "broke a registry lock" <<<"$output"
+  [ -d "$lock" ]
+
+  kill -TERM "$child_pid"
+  _wait_poll "$_WAIT_TIMEOUT" "$_WAIT_INTERVAL" "the lock to be taken over" bash -c '
+    AGMSG_LOCK_SECONDS=1 AGMSG_LOCK_TRIES=3 . "$1"; agmsg_lock_acquire "$2" 2>/dev/null' _ \
+    "$SCRIPTS/lib/registry-lock.sh" "$team_dir"
+  [ ! -d "$lock" ]
+}
+
+@test "a driver killed while a rename it started is still running keeps its lock (#53)" {
+  skip_on_windows "POSIX signal delivery is not supported by this test"
+  # The rename is a separate process that outlives the driver, and nothing else
+  # records it, so the pending file is what keeps a second writer out: first for the
+  # roster journal made before the child starts, then for the projection after it.
+  local where team_dir lock driver_pid fake shim
+  for where in journal config; do
+    rm -rf "$TEST_SKILL_DIR/teams/demo"
+    team_dir="$TEST_SKILL_DIR/teams/demo"; lock="$team_dir/.config.lock"
+    mkdir -p "$team_dir"
+    printf '%s\n' '{"name":"demo","team_id":"018f3f7e-0000-7000-8000-000000000001","agents":{"alice":{"member_id":"018f3f7e-0000-7000-8000-0000000000aa","registrations":[]}}}' \
+      > "$team_dir/config.json"
+    if [ "$where" = config ]; then
+      ( source "$SCRIPTS/lib/roster-journal.sh"; agmsg_roster_ensure "$team_dir" "$team_dir/config.json" )
+      [ -f "$team_dir/roster.jsonl" ]
+    fi
+    fake="$TEST_SKILL_DIR/fake-node-quick"
+    printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake"; chmod +x "$fake"
+    if [ "$where" = journal ]; then
+      shim="$(_shim_blocking_mv '*/roster.jsonl')"
+    else
+      shim="$(_shim_blocking_mv '*/config.json')"
+    fi
+    MV_BLOCKED="$TEST_SKILL_DIR/$where.blocked" MV_RELEASE="$TEST_SKILL_DIR/$where.release" \
+      MV_DONE="$TEST_SKILL_DIR/$where.done" \
+      PATH="$shim:$PATH" AGMSG_SYNC_NODE_BIN="$fake" \
+      bash "$SCRIPTS/internal/roster-sync-driver.sh" reconcile demo \
+        018f3f7e-0000-7000-8000-000000000001 \
+        018f3f7e-0000-7000-8000-000000000002 1 \
+        </dev/null >/dev/null 2>&1 &
+    driver_pid=$!
+    wait_for_file "$TEST_SKILL_DIR/$where.blocked"
+    kill -9 "$driver_pid"
+    wait "$driver_pid" 2>/dev/null || true
+    _glob_exists "$lock/pending.*"
+    _try_lock "$team_dir"
+    [ "$status" -ne 0 ]
+    refute grep -qF "broke a registry lock" <<<"$output"
+    # The rename the driver started finishes before the next case reuses the team.
+    : > "$TEST_SKILL_DIR/$where.release"
+    wait_for_file "$TEST_SKILL_DIR/$where.done"
+  done
+}
+
+@test "a driver that finishes leaves no lock directory and no writer files behind (#53)" {
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local team_dir="$TEST_SKILL_DIR/teams/demo" fake="$TEST_SKILL_DIR/fake-node-quick"
+  printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake"; chmod +x "$fake"
+  run env AGMSG_SYNC_NODE_BIN="$fake" \
+    bash "$SCRIPTS/internal/roster-sync-driver.sh" reconcile demo \
+      018f3f7e-0000-7000-8000-000000000001 \
+      018f3f7e-0000-7000-8000-000000000002 1 </dev/null
+  [ "$status" -eq 0 ]
+  [ ! -e "$team_dir/.config.lock" ]
+}
+
+# The fixture's own copy of the lock library, with the pending record failing for
+# <name> (the driver's source of it runs after any environment could define it).
+_fail_pending_for() {   # <name>
+  cat >> "$SCRIPTS/lib/registry-lock.sh" <<EOS
+
+eval "\$(declare -f agmsg_lock_pending_begin | sed '1s/.*/_orig_pending_begin () /')"
+agmsg_lock_pending_begin() {
+  [ "\$2" != "$1" ] || return 1
+  _orig_pending_begin "\$@"
+}
+EOS
+}
+
+@test "a driver that cannot record what it would start starts nothing and releases the lock (#53)" {
+  skip_on_windows "POSIX signal delivery is not supported by this test"
+  local what team_dir ran fake
+  for what in driver wrapper project; do
+    rm -rf "$TEST_SKILL_DIR/teams/demo" "$TEST_SKILL_DIR/ran" "$TEST_SKILL_DIR/scripts"
+    mkdir -p "$TEST_SKILL_DIR/scripts"
+    cp -R "$BATS_TEST_DIRNAME"/../scripts/. "$TEST_SKILL_DIR/scripts/"
+    bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+    team_dir="$TEST_SKILL_DIR/teams/demo"; ran="$TEST_SKILL_DIR/ran"
+    fake="$TEST_SKILL_DIR/fake-node-records"
+    printf '%s\n' '#!/bin/sh' 'printf ran > "$AGMSG_TEST_RAN"' 'exit 0' > "$fake"; chmod +x "$fake"
+    _fail_pending_for "$what"
+    run env AGMSG_TEST_RAN="$ran" AGMSG_SYNC_NODE_BIN="$fake" \
+      bash "$SCRIPTS/internal/roster-sync-driver.sh" reconcile demo \
+        018f3f7e-0000-7000-8000-000000000001 \
+        018f3f7e-0000-7000-8000-000000000002 1 </dev/null
+    [ "$status" -eq 20 ]
+    grep -q "cannot record" <<<"$output"
+    if [ "$what" = driver ]; then [ ! -e "$ran" ]; fi
+    if [ "$what" = wrapper ]; then [ ! -e "$ran" ]; fi
+    if [ "$what" = project ]; then [ -e "$ran" ]; fi
+    [ ! -e "$team_dir/.config.lock" ]
+  done
 }

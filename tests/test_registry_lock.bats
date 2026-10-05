@@ -796,8 +796,8 @@ dead_pid() { sleep 0 & local p=$!; wait "$p" 2>/dev/null || true; printf '%s' "$
   [ -f "$lock/holder.t1" ]
 }
 
-@test "roster-sync-driver takes its lock as unbreakable (#865)" {
-  grep -qE '^agmsg_lock_acquire "\$team_dir" unbreakable$' "$SCRIPTS/internal/roster-sync-driver.sh"
+@test "roster-sync-driver takes its lock as writers (#53)" {
+  grep -qE '^agmsg_lock_acquire "\$team_dir" writers$' "$SCRIPTS/internal/roster-sync-driver.sh"
 }
 
 @test "lock: a newline in the host name or command cannot add a field to the record, and a doubled or odd break field is not trusted (#865)" {
@@ -1025,4 +1025,208 @@ IOEOF
   [ -n "$(grep -E '^rmdir .*\.config\.lock$' "$log")" ]
   # Up to the rmdir that frees the directory, only the lock's own programs ran.
   [ -z "$(sed -n '/^mkdir .*\.config\.lock$/,/^rmdir .*\.config\.lock$/p' "$log" | grep -Ev '^(mkdir|mv|rmdir) ' || true)" ]
+}
+
+# --- `break writers`: a holder that started writers and recorded them (#53) -----
+#
+# The directory holds, under the record's token, `pending.<token>.<name>` (before
+# something that can outlive the holder is started, removed once its pid is
+# recorded) and `writer.<token>.<pid>`. The lock is gone only when the holder and
+# every recorded writer are dead and nothing is pending.
+
+# A `break writers` lock held by a dead pid, token t1. Echoes nothing.
+mkwriterslock() {   # <live pid to record as holder | "">
+  local lock="$TEAM_DIR/.config.lock" holder="${1:-$(dead_pid)}"
+  mkholder "$lock" t1 "$holder" "$SCOPE"
+  printf 'break writers\n' >> "$lock/holder.t1"
+}
+
+# The verdict the judge gives the lock, one word.
+wverdict() {
+  run env LOCKLIB="$LOCKLIB" LOCK="$TEAM_DIR/.config.lock" PRE="${PRE:-}" bash -c '
+    . "$LOCKLIB"
+    _agmsg_lock_scope_load() { _AGMSG_LOCK_SCOPE_LOADED=1; _AGMSG_LOCK_SCOPE=m1:b1:n1; }
+    eval "$PRE"
+    _agmsg_lock_judge "$LOCK" && echo "gone" || echo "$_J_VERDICT"
+  '
+}
+
+@test "writers: a dead holder with no writer evidence is gone (#53)" {
+  mkwriterslock
+  wverdict
+  [ "$output" = gone ]
+}
+
+@test "writers: a pending file keeps the lock, whether the writer was ever started or not (#53)" {
+  local lock="$TEAM_DIR/.config.lock"
+  mkwriterslock
+  : > "$lock/pending.t1.driver"
+  wverdict
+  [ "$output" = unbreakable ]
+}
+
+@test "writers: a running recorded writer keeps the lock, and its death releases it (#53)" {
+  local lock="$TEAM_DIR/.config.lock" live
+  mkwriterslock
+  sleep 30 &
+  live=$!
+  : > "$lock/writer.t1.$live"
+  wverdict
+  [ "$output" = writer-alive ]
+  kill "$live"; wait "$live" 2>/dev/null || true
+  wverdict
+  [ "$output" = gone ]
+}
+
+@test "writers: a recorded wrapper that died with its own pending file still keeps the lock (#53)" {
+  local lock="$TEAM_DIR/.config.lock"
+  mkwriterslock
+  : > "$lock/writer.t1.$(dead_pid)"
+  : > "$lock/pending.t1.wrapper"
+  wverdict
+  [ "$output" = unbreakable ]
+}
+
+@test "writers: a writer file whose name is not a pid is not trusted (#53)" {
+  local lock="$TEAM_DIR/.config.lock"
+  mkwriterslock
+  : > "$lock/writer.t1.abc"
+  wverdict
+  [ "$output" = malformed ]
+}
+
+@test "writers: a live holder is alive, and another generation's files are not this record's evidence (#53)" {
+  local lock="$TEAM_DIR/.config.lock" live
+  sleep 30 &
+  live=$!
+  mkwriterslock "$live"
+  wverdict
+  [ "$output" = alive ]
+  kill "$live"; wait "$live" 2>/dev/null || true
+  mkwriterslock
+  : > "$lock/pending.t0.driver"
+  : > "$lock/writer.t0.$$"
+  wverdict
+  [ "$output" = gone ]
+}
+
+@test "writers: a writer recorded after the first look is found by the second (#53)" {
+  # The first look sees only the wrapper, dead. Between the looks the wrapper
+  # (alive during the first) records the node it started and exits.
+  local lock="$TEAM_DIR/.config.lock" live
+  mkwriterslock
+  sleep 30 &
+  live=$!
+  : > "$lock/writer.t1.$(dead_pid)"
+  PRE='_agmsg_lock_test_hook() { [ "$1" = judge:after-writers ] || return 0; : > "$2/writer.t1.'"$live"'"; }' wverdict
+  kill "$live"; wait "$live" 2>/dev/null || true
+  [ "$output" = writer-alive ]
+}
+
+@test "writers: a pending file made after the first look is found by the second (#53)" {
+  local lock="$TEAM_DIR/.config.lock"
+  mkwriterslock
+  : > "$lock/writer.t1.$(dead_pid)"
+  PRE='_agmsg_lock_test_hook() { [ "$1" = judge:after-writers ] || return 0; : > "$2/pending.t1.wrapper"; }' wverdict
+  [ "$output" = unbreakable ]
+}
+
+@test "writers: breaking a gone lock removes its evidence and the directory (#53)" {
+  local lock="$TEAM_DIR/.config.lock"
+  mkwriterslock
+  : > "$lock/writer.t1.$(dead_pid)"
+  run env LOCKLIB="$LOCKLIB" LOCK="$lock" bash -c '
+    . "$LOCKLIB"
+    _agmsg_lock_scope_load() { _AGMSG_LOCK_SCOPE_LOADED=1; _AGMSG_LOCK_SCOPE=m1:b1:n1; }
+    _agmsg_lock_break_dead "$LOCK"
+  '
+  [ "$status" -eq 0 ]
+  [ ! -e "$lock" ]
+}
+
+@test "writers: a break whose directory is replaced after the claim leaves the successor's evidence (#53)" {
+  local lock="$TEAM_DIR/.config.lock"
+  mkwriterslock
+  : > "$lock/writer.t1.$(dead_pid)"
+  run env LOCKLIB="$LOCKLIB" LOCK="$lock" bash -c '
+    . "$LOCKLIB"
+    _agmsg_lock_scope_load() { _AGMSG_LOCK_SCOPE_LOADED=1; _AGMSG_LOCK_SCOPE=m1:b1:n1; }
+    _agmsg_lock_test_hook() {
+      [ "$1" = break:after-claim ] || return 0
+      rm -r "$2"; mkdir "$2"
+      printf "token t2\npid 1\n" > "$2/holder.t2"
+      : > "$2/pending.t2.driver"; : > "$2/writer.t2.1"
+    }
+    _agmsg_lock_break_dead "$LOCK" && exit 3
+    [ -f "$LOCK/pending.t2.driver" ] && [ -f "$LOCK/writer.t2.1" ] && [ -f "$LOCK/holder.t2" ]
+  '
+  [ "$status" -eq 0 ]
+}
+
+@test "writers: without rm a lock with evidence is neither claimed nor released (#53)" {
+  local lock="$TEAM_DIR/.config.lock"
+  mkwriterslock
+  : > "$lock/writer.t1.$(dead_pid)"
+  run env LOCKLIB="$LOCKLIB" LOCK="$lock" bash -c '
+    . "$LOCKLIB"
+    _agmsg_lock_scope_load() { _AGMSG_LOCK_SCOPE_LOADED=1; _AGMSG_LOCK_SCOPE=m1:b1:n1; }
+    command() { if [ "${1:-}" = -v ] && [ "${2:-}" = rm ]; then return 1; fi; builtin command "$@"; }
+    _agmsg_lock_break_dead "$LOCK" && exit 3
+    [ -f "$LOCK/holder.t1" ]
+  '
+  [ "$status" -eq 0 ]
+  rm -r "$lock"
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR" writers || exit 1
+    agmsg_lock_writer_record "$TEAM_DIR" 4242 || exit 2
+    command() { if [ "${1:-}" = -v ] && [ "${2:-}" = rm ]; then return 1; fi; builtin command "$@"; }
+    agmsg_lock_release
+    ls "$TEAM_DIR"/.config.lock/holder.* >/dev/null
+  '
+  [ "$status" -eq 0 ]
+  grep -qF "no rm to remove them" <<<"$output"
+}
+
+@test "writers: a release removes the holder's evidence and the directory (#53)" {
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR" writers || exit 1
+    agmsg_lock_pending_begin "$TEAM_DIR" driver || exit 2
+    agmsg_lock_writer_record "$TEAM_DIR" 4242 || exit 3
+    agmsg_lock_release || exit 4
+    [ ! -e "$TEAM_DIR/.config.lock" ]
+  '
+  [ "$status" -eq 0 ]
+  refute grep -q "could not release" <<<"$output"
+}
+
+@test "writers: recording fails without a held lock, and ending a pending file never fails (#53)" {
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_pending_begin "$TEAM_DIR" driver && exit 1
+    agmsg_lock_writer_record "$TEAM_DIR" 4242 && exit 2
+    agmsg_lock_acquire "$TEAM_DIR" writers || exit 3
+    agmsg_lock_pending_begin "$TEAM_DIR" driver || exit 4
+    command() { if [ "${1:-}" = -v ] && [ "${2:-}" = rm ]; then return 1; fi; builtin command "$@"; }
+    agmsg_lock_pending_end "$TEAM_DIR" driver || exit 5
+    ls "$TEAM_DIR"/.config.lock/pending.* >/dev/null
+  '
+  [ "$status" -eq 0 ]
+}
+
+@test "writers: an acquirer breaks a lock whose holder and writers are gone, and waits behind a running writer (#53)" {
+  local lock="$TEAM_DIR/.config.lock" live
+  mkwriterslock
+  sleep 30 &
+  live=$!
+  : > "$lock/writer.t1.$live"
+  PRE="$SCOPE_PRE" acquire
+  [ "$status" -ne 0 ]
+  refute grep -qF "broke a registry lock" <<<"$output"
+  grep -qF "a writer it started is" <<<"$output"
+  kill "$live"; wait "$live" 2>/dev/null || true
+  PRE="$SCOPE_PRE" acquire
+  [ "$status" -eq 0 ]
+  grep -qF "broke a registry lock" <<<"$output"
 }

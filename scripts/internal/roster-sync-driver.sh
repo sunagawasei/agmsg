@@ -55,14 +55,28 @@ if [ "$ROSTER_SYNC_BUDGET_S" -le 0 ]; then
 fi
 
 
-# `unbreakable`: this process starts a writer in the background and holds the lock
+# `writers`: this process starts a writer in the background and holds the lock
 # for it, so its own pid dying does not mean the writer stopped. A later acquirer
-# must not break this lock on that evidence.
-agmsg_lock_acquire "$team_dir" unbreakable
+# breaks this lock only once the writers recorded below are gone and nothing is
+# pending (see agmsg_lock_acquire).
+agmsg_lock_acquire "$team_dir" writers
 # agmsg_lock_acquire already installs EXIT cleanup and exit-on-INT/TERM traps.
 # Keep those handlers: replacing them with release-only handlers would let a
 # signal return into this critical section after the lock had been dropped.
 trap 'agmsg_lock_release; exit 129' HUP
+
+# Whatever this process starts under the lock and may leave running is recorded
+# before it starts. If the record cannot be made nothing is started: a lock that
+# a later acquirer cannot judge is worse than a refused sync.
+_roster_pending_or_refuse() {   # <name>
+  agmsg_lock_pending_begin "$team_dir" "$1" && return 0
+  agmsg_lock_release
+  echo "agmsg: roster sync $operation failed for team '$team': cannot record the process this sync would start inside $team_dir/.config.lock (is the filesystem full or read-only?); refusing rather than leaving a lock nothing can judge." >&2
+  exit 20
+}
+# The journal and config writes below are separate `mv` processes, which this
+# process dying leaves running; the file stays until the lock is released.
+_roster_pending_or_refuse driver
 agmsg_roster_ensure "$team_dir" "$config"
 
 node_bin="${AGMSG_SYNC_NODE_BIN:-${AGMSG_NODE:-node}}"
@@ -322,9 +336,19 @@ if [ "$_roster_wait" != "none" ]; then
     # accepts an `exec` inside a branch that never runs, or after the spawn it
     # was supposed to cover. Redundancy is the cheaper mistake, and the same
     # belt-and-braces pattern is already in `scripts/lib/sync-autostart.sh`.
+    # Recorded before node starts, and its pid after: a wrapper killed in between
+    # leaves the file, which keeps the lock. A failed record starts no node.
+    if ! agmsg_lock_pending_begin "$team_dir" wrapper; then
+      echo "agmsg: roster sync $operation failed for team '$team': cannot record the roster child inside $team_dir/.config.lock; it was not started." >&2
+      printf '%s\n' 20 > "$_roster_sentinel"
+      exit 20
+    fi
     "$node_bin" "$SCRIPT_DIR/roster-sync.mjs" "$operation" "$config" \
       "$server" "$remote" "$protocol" "$@" <&9 9<&- 3>&- 4>&- &
     _rs_node=$!
+    if agmsg_lock_writer_record "$team_dir" "$_rs_node"; then
+      agmsg_lock_pending_end "$team_dir" wrapper
+    fi
     # THE WRAPPER'S OWN COPY, AND IT IS A THIRD ONE. Introducing this shell to
     # carry the pid put a process between the driver and node that inherits
     # fd 9 and was closing it nowhere — so the caller's stdin was held for the
@@ -346,6 +370,9 @@ if [ "$_roster_wait" != "none" ]; then
     printf '%s\n' "$_rs_rc" > "$_roster_sentinel"
   } 3>&- 4>&- 8> "$_roster_write_target" &
   _roster_child=$!
+  if agmsg_lock_writer_record "$team_dir" "$_roster_child"; then
+    agmsg_lock_pending_end "$team_dir" driver
+  fi
   # BOTH COPIES GO. `<&9` duplicates the caller's stdin onto fd 0 and leaves
   # fd 9 open beside it, so node would hold that stream twice and this shell
   # would hold it until its own exit — the same "a child keeps the caller's
@@ -621,6 +648,8 @@ if [ "$_roster_wait" != "none" ]; then
   fi
 fi
 
+# Held until the lock is released: the projection is written by a `mv` too.
+_roster_pending_or_refuse project
 case "$operation" in
   reconcile|apply) agmsg_roster_project_config "$team_dir" "$config" ;;
 esac

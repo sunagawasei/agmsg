@@ -578,8 +578,9 @@ _redact_project() {
 #   several       an acquire race caught in the act; nothing says which is current
 #   unjudgeable   a record written in another process table, with no scope, a
 #                 pid that is not a number, or a name and content that disagree
-#   unbreakable   the holder is gone but marked its lock "break no" (the roster
-#                 sync driver, which may have left a writer running)
+#   unbreakable   the holder is gone but marked its lock "break no", or left a
+#                 pending file (the roster sync driver, which may have left a
+#                 writer running that nothing recorded)
 #
 # REPORTED, NEVER REMOVED. Removing one safely needs the
 # acquiring side to cooperate: whatever this checks about the directory can stop

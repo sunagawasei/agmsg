@@ -225,6 +225,46 @@ _agmsg_lock_load_liveness() {
   declare -f _agmsg_pid_alive_local >/dev/null 2>&1
 }
 
+# `break writers`: the holder is gone, so ask about what it started. The holder
+# records, inside the lock directory and under its own token, a `pending.<token>.<name>`
+# file BEFORE it does anything that can leave a process running past its own death,
+# and a `writer.<token>.<pid>` file once it knows that process's pid; the
+# `pending` file is removed only after the pid is recorded. So at any moment after
+# the holder (and each recorded writer) is dead, the files say the whole truth:
+#
+#   a pending file    a process may exist that nobody recorded -- cannot tell
+#   writer files      every one of them has to be dead
+#
+# THE ORDER IS THE PROOF. The writers are checked first, then the directory is
+# read AGAIN: a process that is dead cannot add a file, so once every recorded
+# writer has been seen dead the second read is final for it. A writer or pending
+# file that shows up only in the second read belongs to a process that was alive
+# during the first, and is reported rather than guessed at (the caller asks again).
+# Files of another generation (another token) are not this record's evidence.
+# Builtins only: this runs on every failed mkdir of a contended acquire.
+_agmsg_lock_writers_judge() {   # <lock> <token>
+  local lock="$1" token="$2" f pid seen=" "
+  for f in "$lock"/writer."$token".*; do
+    [ -e "$f" ] || continue
+    pid="${f##*.}"
+    _agmsg_pid_valid "$pid" 2147483647 || { _J_VERDICT=malformed; return 1; }
+    _J_EVID=1
+    if _agmsg_pid_alive_local "$pid"; then _J_VERDICT=writer-alive; return 1; fi
+    seen="$seen$pid "
+  done
+  _agmsg_lock_test_hook judge:after-writers "$lock"
+  for f in "$lock"/pending."$token".*; do
+    [ -e "$f" ] || continue
+    _J_VERDICT=unbreakable; return 1
+  done
+  for f in "$lock"/writer."$token".*; do
+    [ -e "$f" ] || continue
+    pid="${f##*.}"
+    case "$seen" in *" $pid "*) ;; *) _J_VERDICT=writer-alive; return 1 ;; esac
+  done
+  return 0
+}
+
 # Is this lock's holder gone? Sets _J_VERDICT, and _J_FILE for a single record.
 #
 #   gone      the one record is well formed, was written in THIS process table,
@@ -235,7 +275,11 @@ _agmsg_lock_load_liveness() {
 #             first): nothing can tell this from a lock taken a moment ago
 #   multi     more than one record: an acquire race caught in the act
 #   unbreakable  pid not running, but the record says its pid is not the whole of
-#             what holds the lock (see agmsg_lock_acquire): reported, never broken
+#             what holds the lock (see agmsg_lock_acquire): reported, never broken.
+#             For `break writers` it means a writer may exist that nobody has
+#             recorded yet (a `pending` file is still in the directory)
+#   writer-alive  `break writers`: the holder is gone, but a writer it recorded is
+#             still running
 #   foreign   written in another process table, or this process cannot name its own
 #   noscope / badpid / malformed / noliveness   the record or the check is unusable
 #
@@ -244,7 +288,7 @@ _agmsg_lock_load_liveness() {
 # which is the safe direction.
 _agmsg_lock_judge() {   # <lock>
   local lock="$1" pid scope token f
-  _J_VERDICT=""; _J_FILE=""
+  _J_VERDICT=""; _J_FILE=""; _J_EVID=""
   _agmsg_lock_holder_scan "$lock"
   case "$_H_COUNT" in
     0)
@@ -265,7 +309,7 @@ _agmsg_lock_judge() {   # <lock>
   token="$_R_TOKEN"; pid="$_R_PID"; scope="$_R_SCOPE"
   # A field that appears twice, or a `break` that says anything but `no`, is a
   # record somebody wrote by hand: not trusted.
-  if [ -n "$_R_DUP" ] || { [ -n "$_R_HASBREAK" ] && [ "$_R_BREAK" != "no" ]; }; then _J_VERDICT=malformed; return 1; fi
+  if [ -n "$_R_DUP" ] || { [ -n "$_R_HASBREAK" ] && [ "$_R_BREAK" != "no" ] && [ "$_R_BREAK" != "writers" ]; }; then _J_VERDICT=malformed; return 1; fi
   # The name carries the generation and the content must agree with it.
   if [ -z "$token" ] || [ "${_H_FILE##*/}" != "holder.$token" ]; then _J_VERDICT=malformed; return 1; fi
   _agmsg_pid_valid "$pid" 2147483647 || { _J_VERDICT=badpid; return 1; }
@@ -274,8 +318,67 @@ _agmsg_lock_judge() {   # <lock>
   if [ -z "$_AGMSG_LOCK_SCOPE" ] || [ "$scope" != "$_AGMSG_LOCK_SCOPE" ]; then _J_VERDICT=foreign; return 1; fi
   if _agmsg_pid_alive_local "$pid"; then _J_VERDICT=alive; return 1; fi
   # Gone, but the holder said its pid is not the whole of what holds the lock.
-  if [ -n "$_R_HASBREAK" ]; then _J_VERDICT=unbreakable; return 1; fi
+  if [ -n "$_R_HASBREAK" ]; then
+    if [ "$_R_BREAK" = writers ]; then
+      _agmsg_lock_writers_judge "$lock" "$token" || return 1
+    else
+      _J_VERDICT=unbreakable; return 1
+    fi
+  fi
   _J_VERDICT=gone
+  return 0
+}
+
+# Remove the writer evidence of ONE generation (see _agmsg_lock_writers_judge).
+# Called only after the record of that generation has been claimed, and only for
+# its token: a successor's files carry another token and are not matched.
+_agmsg_lock_evidence_clear() {   # <lock> <token>
+  # A lock that never recorded a writer pays nothing: no process is started on its
+  # way out (a test holds the release path to mkdir, mv and rmdir).
+  _agmsg_lock_evidence_present "$1" "$2" || return 0
+  command -v rm >/dev/null 2>&1 || return 0
+  rm -f "$1"/pending."$2".* "$1"/writer."$2".* 2>/dev/null || :
+}
+
+# Is there evidence of this generation in the directory?
+_agmsg_lock_evidence_present() {   # <lock> <token>
+  local f
+  for f in "$1"/pending."$2".* "$1"/writer."$2".*; do
+    [ -e "$f" ] && return 0
+  done
+  return 1
+}
+
+# For a holder that started `break writers`: files kept inside its own lock
+# directory, under its token, that let a later acquirer tell whether anything it
+# started is still running. See _agmsg_lock_writers_judge for how they are read.
+#
+#   agmsg_lock_pending_begin <team_dir> <name>   before starting something that can
+#                              outlive this process; returns 1 when it could not be
+#                              recorded -- then start nothing
+#   agmsg_lock_writer_record <team_dir> <pid>    once the pid of what was started
+#                              is known; returns 1 when it could not be recorded
+#   agmsg_lock_pending_end <team_dir> <name>     after the pid is recorded. Never
+#                              fails: a pending file that stays only keeps the lock
+#                              (the safe direction), and a caller under `set -e`
+#                              must not be ended by it with a writer running
+_agmsg_lock_evidence_token() {   # <team_dir>
+  _EV_LOCK="$1/.config.lock"
+  _EV_TOKEN="$(_agmsg_lock_get_token "$_EV_LOCK" || printf '')"
+  [ -n "$_EV_TOKEN" ]
+}
+agmsg_lock_pending_begin() {
+  _agmsg_lock_evidence_token "$1" || return 1
+  { : > "$_EV_LOCK/pending.$_EV_TOKEN.$2"; } 2>/dev/null
+}
+agmsg_lock_writer_record() {
+  _agmsg_lock_evidence_token "$1" || return 1
+  { : > "$_EV_LOCK/writer.$_EV_TOKEN.$2"; } 2>/dev/null
+}
+agmsg_lock_pending_end() {
+  _agmsg_lock_evidence_token "$1" || return 0
+  command -v rm >/dev/null 2>&1 || return 0
+  rm -f "$_EV_LOCK/pending.$_EV_TOKEN.$2" 2>/dev/null || :
   return 0
 }
 
@@ -298,10 +401,14 @@ _agmsg_lock_break_dead() {
   local lock="$1" f tok staged
   _agmsg_lock_judge "$lock" || return 1
   f="$_J_FILE"; tok="${f##*/holder.}"
+  # The recorded writers' files have to be removed before the directory can go,
+  # and that needs `rm`: without it, leave the lock as it is rather than claim it.
+  if [ -n "$_J_EVID" ] && ! command -v rm >/dev/null 2>&1; then return 1; fi
   _agmsg_lock_test_hook break:after-judge "$lock"
   staged="$lock.dead.$tok.$$"
   mv "$f" "$staged" 2>/dev/null || return 1
   _agmsg_lock_test_hook break:after-claim "$lock"
+  _agmsg_lock_evidence_clear "$lock" "$tok"
   if ! rmdir "$lock" 2>/dev/null; then
     # Not removed (a successor, or something else inside): the lock is still
     # there and is no longer recorded, which doctor reports.
@@ -335,7 +442,7 @@ _agmsg_lock_break_dead() {
 # removes its own record and the directory if that leaves it empty -- and starts
 # over, so the directory is never left recorded by nobody. The later publisher
 # always sees the earlier one, so at most one of them proceeds.
-_agmsg_lock_publish() {   # <lock> <token> <unbreakable|""> <command> <host>
+_agmsg_lock_publish() {   # <lock> <token> <unbreakable|writers|""> <command> <host>
   local lock="$1" token="$2" pub body cmd="$4" host="$5"
   [ -n "$token" ] || return 0   # no entropy: nothing to publish, see the caller
   pub="$lock.pub.$token"
@@ -346,8 +453,13 @@ command $cmd
 host $host"
   [ -z "$_AGMSG_LOCK_SCOPE" ] || body="$body
 scope $_AGMSG_LOCK_SCOPE"
-  [ -z "${3:-}" ] || body="$body
-break no"
+  case "${3:-}" in
+    '') ;;
+    writers) body="$body
+break writers" ;;
+    *) body="$body
+break no" ;;
+  esac
   _agmsg_lock_test_hook acquire:after-mkdir "$lock"
   if ! { printf '%s\n' "$body" > "$pub"; } 2>/dev/null; then
     _agmsg_lock_abandon "$lock" "$pub"
@@ -382,7 +494,12 @@ _agmsg_lock_abandon() {   # <lock> <pub>
   if command -v rm >/dev/null 2>&1; then rm -f "$2" 2>/dev/null || :; fi
 }
 
-# agmsg_lock_acquire <team_dir> [unbreakable]
+# agmsg_lock_acquire <team_dir> [unbreakable|writers]
+#
+# `writers` marks the record `break writers`: the holder starts writers that can
+# outlive it and records them (agmsg_lock_pending_begin and the two after it), and
+# a later acquirer breaks the lock once the holder and every recorded writer are
+# gone and nothing is pending.
 #
 # `unbreakable` marks the record `break no`: a later acquirer never breaks this
 # lock on the strength of the holder's pid being gone, it only reports it. For a
@@ -425,7 +542,7 @@ _AGMSG_LOCK_ATTEMPT=0
 # <held> 1 registers the lock in AGMSG_HELD_LOCKS, so the registry lock's
 # EXIT/INT/TERM handlers release it. 0 leaves release to the caller
 # (_agmsg_lock_drop), for a caller that owns its own traps.
-_agmsg_lock_try() {   # <lock> <unbreakable|""> <held 0|1>
+_agmsg_lock_try() {   # <lock> <unbreakable|writers|""> <held 0|1>
   local lock="$1" unbreakable="$2" held="$3" token="" rc=0
   _LK_ERR=""
   if ! _LK_ERR="$(mkdir "$lock" 2>&1)"; then return 3; fi
@@ -460,7 +577,7 @@ agmsg_lock_acquire() {
   local budget="${AGMSG_LOCK_SECONDS:-10}" started elapsed
   local rc
   case "$unbreakable" in
-    ''|unbreakable) ;;
+    ''|unbreakable|writers) ;;
     *) echo "agmsg: agmsg_lock_acquire: unknown option '$unbreakable'" >&2; return 1 ;;
   esac
   lock="$team_dir/.config.lock"
@@ -600,6 +717,9 @@ _agmsg_lock_explain_timeout() {   # <lock>
     foreign)
       echo "agmsg: the lock records: $rec" >&2
       echo "agmsg: that record was not written on this machine (or not in this process namespace), so nothing here could ask whether it is held." >&2 ;;
+    writer-alive)
+      echo "agmsg: the lock records: $rec" >&2
+      echo "agmsg: that process is not running, but a writer it started is, so this was contention." >&2 ;;
     unbreakable)
       echo "agmsg: the lock records: $rec" >&2
       echo "agmsg: that process is not running, but the record marks the lock as not to be broken automatically: it may have started a writer that is still running." >&2
@@ -709,6 +829,12 @@ _agmsg_lock_drop_one() {   # <lock> [quiet]
     [ -n "$quiet" ] || echo "agmsg: not releasing $l — this process cannot prove the lock is its own" >&2
     return 0
   fi
+  # The evidence of this generation has to be removed before the directory can
+  # go, and that needs `rm`: without it the holder record stays, and so does the lock.
+  if ! command -v rm >/dev/null 2>&1 && _agmsg_lock_evidence_present "$l" "$mine"; then
+    [ -n "$quiet" ] || echo "agmsg: not releasing $l — it holds writer files and there is no rm to remove them" >&2
+    return 1
+  fi
   _agmsg_lock_test_hook drop:before-claim "$l"
   # THE CLAIM IS A RENAME OF THIS PROCESS'S OWN RECORD BY ITS EXACT NAME. The
   # directory being at the path this process locked is not evidence that it is the
@@ -743,6 +869,7 @@ _agmsg_lock_drop_one() {   # <lock> [quiet]
     return 0
   fi
   _agmsg_lock_test_hook drop:after-claim "$l"
+  _agmsg_lock_evidence_clear "$l" "$mine"
   if err="$(rmdir "$l" 2>&1)"; then
     # Best-effort: nothing but the staged copy is left, and it sits under a name
     # no acquirer looks for. `|| :` matters: callers run under `set -e`, and an
