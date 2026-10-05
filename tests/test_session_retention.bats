@@ -276,3 +276,36 @@ veto_case() {   # <kind>
   agmsg_retention_delete_rows s-kkkkkkkk-bbbb-cccc-dddd-eeeeeeeeeeee 7 strict
   [ "$(rows s-kkkkkkkk-bbbb-cccc-dddd-eeeeeeeeeeee)" = 4 ]
 }
+
+@test "gc-session-orphans --dry-run does not touch inflight records" {
+  local t=s-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee rec
+  seed_rows "$t" 30
+  rec="$TEST_SKILL_DIR/run/inflight-record.$(_actas_lock_encode "$t")=x"
+  printf 'garbage\n' > "$rec"
+  run bash "$SCRIPTS/gc-session-orphans.sh" --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skip   $t (live-inflight)"* ]]
+  [ -f "$rec" ]
+  [ "$(rows "$t")" != 0 ]
+}
+
+@test "a reap whose tombstone vanished before the lock keeps the rows" {
+  seed_rows s-KKK-1 30
+  run bash -c '
+    set -e
+    SCRIPT_DIR="$1"; SKILL_DIR="$2"; RUN_DIR="$2/run"
+    for l in compat actas-lock storage team-lifecycle instance-id process-identity pending-teardown inflight session-retention; do source "$SCRIPT_DIR/lib/$l.sh"; done
+    agmsg_retention_reap_team s-KKK-1 || true
+  ' _ "$SCRIPTS" "$TEST_SKILL_DIR"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *proof-gone* ]]
+  [ "$(rows s-KKK-1)" != 0 ]
+}
+
+@test "join marks the team only when it creates config.json" {
+  AGMSG_JOIN_MARK_SESSION_TEAM=1 AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" s-LLL-1 claude claude-code "$PROJ" >/dev/null
+  [ -f "$TEST_SKILL_DIR/teams/s-LLL-1/session-team" ]
+  make_team s-LLL-2
+  AGMSG_JOIN_MARK_SESSION_TEAM=1 AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" s-LLL-2 claude claude-code "$PROJ" >/dev/null
+  [ ! -f "$TEST_SKILL_DIR/teams/s-LLL-2/session-team" ]
+}

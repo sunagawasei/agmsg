@@ -813,17 +813,20 @@ WATCH="$SKILL_DIR/scripts/watch.sh"
     # team, so the monitor stream carries only this session's traffic — no
     # cross-session crosstalk. Idempotent; opt out of #92 pwd-rewrite so the
     # registration pins exactly this project.
+    # join.sh also marks the team for message retention, but only when it
+    # creates config.json itself, so a project team named like a session team
+    # stays out of retention.
     if agmsg_session_needs_marker "$TYPE"; then
       # Fail closed: a name collision with an existing project team (or any
       # join failure) must not leave this session connected to the project's
       # inbox, nor register it into that team.
-      if ! AGMSG_JOIN_SESSION_MARKER="$TYPE" AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" \
+      if ! AGMSG_JOIN_MARK_SESSION_TEAM=1 AGMSG_JOIN_SESSION_MARKER="$TYPE" AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" \
           "$SESSION_TEAM" "$(agmsg_session_seat "$TYPE")" "$TYPE" "$PROJECT" >/dev/null 2>&1; then
         echo "agmsg: refusing $TYPE session-team registration: team '$SESSION_TEAM' could not be created as a session team" >&2
         exit 0
       fi
     else
-      AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$SESSION_TEAM" "$(agmsg_session_seat "$TYPE")" "$TYPE" "$PROJECT" >/dev/null 2>&1 || true
+      AGMSG_JOIN_MARK_SESSION_TEAM=1 AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$SESSION_TEAM" "$(agmsg_session_seat "$TYPE")" "$TYPE" "$PROJECT" >/dev/null 2>&1 || true
     fi
   fi
 }

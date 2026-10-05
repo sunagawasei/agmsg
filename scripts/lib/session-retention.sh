@@ -29,9 +29,11 @@ agmsg_retention_tombstone_path() { printf '%s/run/session-tombstone.%s' "$SKILL_
 
 # Echo the reason and return 0 when the team must keep its rows. Same four
 # vetoes as the TTL dir GC in session-start.sh (test_session_retention.bats
-# pins that both agree), plus: the dir exists again.
+# pins that both agree), plus: the dir exists again. $2 = readonly: replace the
+# inflight reap (which deletes dead records and sends bridge-error/outbox
+# messages) by "any inflight record vetoes", for dry-runs.
 agmsg_retention_veto() {
-  local team="$1" rec line placement pid live_pid="" unverified=0 log_team
+  local team="$1" readonly="${2:-}" rec line placement pid live_pid="" unverified=0 log_team
   log_team="$(agmsg_pending_log_sanitize "$team")"
   if [ -d "$SKILL_DIR/teams/$team" ]; then
     printf 'dir-exists'; return 0
@@ -60,7 +62,12 @@ agmsg_retention_veto() {
   done
   if [ -n "$live_pid" ]; then printf 'live-bridge'; return 0; fi
   if [ "$unverified" -eq 1 ]; then printf 'unverified-placement'; return 0; fi
-  if ! agmsg_inflight_gc_team "$team" 2>/dev/null; then
+  if [ "$readonly" = readonly ]; then
+    for rec in "$RUN_DIR/inflight-record.$(_actas_lock_encode "$team")="*; do
+      [ -f "$rec" ] || continue
+      printf 'live-inflight'; return 0
+    done
+  elif ! agmsg_inflight_gc_team "$team" 2>/dev/null; then
     printf 'live-inflight'; return 0
   fi
   : "$log_team"
@@ -114,6 +121,13 @@ agmsg_retention_reap_team() {
     agmsg_team_lifecycle_lock_release "$team"
     printf '%s' "$reason"; return 1
   fi
+  # The proof is re-read under the lock: a tombstone invalidated after the
+  # caller looked (a newer project team of this name was reaped) must not
+  # authorise this delete. Strict (manual) mode does not rely on a tombstone.
+  if [ "$strict" != strict ] && [ ! -f "$(agmsg_retention_tombstone_path "$team")" ]; then
+    agmsg_team_lifecycle_lock_release "$team"
+    printf 'proof-gone'; return 1
+  fi
   if agmsg_retention_delete_rows "$team" "$days" "$strict"; then
     agmsg_team_lifecycle_lock_release "$team"
     printf 'deleted'; return 0
@@ -128,7 +142,14 @@ agmsg_retention_after_dir_reap() {
   local team="$1" had_marker="$2" tomb
   if [ "$had_marker" != 1 ]; then
     # An unmarked dir of this name is a different generation than any tombstone.
-    rm -f "$(agmsg_retention_tombstone_path "$team")" 2>/dev/null || true
+    # Taken under the lifecycle lock so a reap that already re-read the proof
+    # finishes first; on lock timeout dropping the proof is still the safe side.
+    if agmsg_team_lifecycle_lock_acquire "$team" "${AGMSG_LIFECYCLE_LOCK_TIMEOUT:-10}"; then
+      rm -f "$(agmsg_retention_tombstone_path "$team")" 2>/dev/null || true
+      agmsg_team_lifecycle_lock_release "$team"
+    else
+      rm -f "$(agmsg_retention_tombstone_path "$team")" 2>/dev/null || true
+    fi
     return 0
   fi
   [ ! -d "$SKILL_DIR/teams/$team" ] || return 0   # rm failed: keep the rows

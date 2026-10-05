@@ -43,7 +43,8 @@ while IFS= read -r team; do
   # A row newer than the window means the team is not (yet) abandoned.
   fresh="$(agmsg_sqlite "$db" "SELECT (SELECT COUNT(*) FROM events WHERE team='$tl' AND at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-$days days')) + (SELECT COUNT(*) FROM messages WHERE team='$tl' AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-$days days'));" | tr -d '\r')"
   [ "$fresh" = 0 ] || continue
-  if reason="$(agmsg_retention_veto "$team")"; then
+  if [ "$MODE" = dry-run ]; then vmode=readonly; else vmode=; fi
+  if reason="$(agmsg_retention_veto "$team" $vmode)"; then
     echo "skip   $team ($reason)"
     continue
   fi

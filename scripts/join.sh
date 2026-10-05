@@ -100,6 +100,11 @@ if [ ! -f "$TEAM_CONFIG" ]; then
   INITIAL_CONFIG=$(printf '{\n  "name": "%s",\n  "agents": {},\n  "created_at": "%s"\n}' \
     "$TEAM" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
   agmsg_write_atomic "$TEAM_CONFIG" "$INITIAL_CONFIG"
+  # Only the join that creates config.json (under the lock) may claim the team
+  # as a session team for message retention; a later joiner never does.
+  if [ "${AGMSG_JOIN_MARK_SESSION_TEAM:-}" = 1 ]; then
+    : >"$TEAMS_DIR/$TEAM/session-team" 2>/dev/null || true
+  fi
   echo "Created team: $TEAM"
 fi
 
