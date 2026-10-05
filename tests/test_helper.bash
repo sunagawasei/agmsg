@@ -36,6 +36,195 @@ unset CLAUDE_CONFIG_DIR
 unset AGMSG_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
 export AGMSG_SELF_NAME=off
 
+# --- per-test watchdog (#61) -------------------------------------------------
+#
+# bats 1.12 has no per-test timeout: one hung test stalls the whole shard until
+# the CI job cap, and the tests after it report nothing. setup_test_env starts a
+# detached watchdog; when its deadline passes it makes the OWNER (the
+# bats-exec-test process running this test) fail, so bats prints `not ok` and
+# moves on.
+#
+# Order matters. The owner is STOPped first so it cannot fork more; its
+# descendants are then frozen to a fixed point (a running child can still fork),
+# TERMed+CONTinued, and KILLed after a grace; only then is the owner itself
+# TERMed. Killing the owner alone is not enough: a grandchild under `run` keeps
+# the output pipe open and bats waits for it (measured: 25s grandchild, 25s wait).
+#
+# The watchdog is double-forked so it is not a job of the test shell (a bare
+# `wait` in a test must not wait for it), closes every inherited descriptor
+# (tests/test_close_fds.bats: a long-lived holder stalls bats), and uses
+# absolute ps/sleep so a fake on the test's PATH cannot disturb it. It exits
+# when the owner dies or TEST_SKILL_DIR disappears, so no stop call is needed.
+# Descendants are only found while still attached to the owner; processes seen
+# by the periodic scan are tracked by pid+start time so a recycled pid is never
+# signalled (the check and the kill are still two steps: a pid recycled inside
+# that gap with the same start second and name is a residual race). Detached
+# holders never seen in a scan are out of scope.
+
+_agmsg_wd_timeout() {
+  local t tag secs="${AGMSG_TEST_TIMEOUT:-180}"
+  for tag in ${BATS_TEST_TAGS[@]+"${BATS_TEST_TAGS[@]}"}; do
+    case "$tag" in timeout:*) secs="${tag#timeout:}" ;; esac
+  done
+  case "$secs" in ''|*[!0-9]*) secs=0 ;; esac
+  echo "$secs"
+}
+
+# Prints the pids of $1's descendants. The watchdog is double-forked, so it is
+# never among them.
+_agmsg_wd_desc() {
+  "$_WD_PS" -A -o pid= -o ppid= 2>/dev/null | awk -v root="$1" '
+    { n++; p[n] = $1; q[n] = $2 }
+    END {
+      want[root] = 1
+      do {
+        ch = 0
+        for (i = 1; i <= n; i++)
+          if (!(p[i] in want) && (q[i] in want)) { want[p[i]] = 1; print p[i]; ch = 1 }
+      } while (ch)
+    }'
+}
+
+_agmsg_wd_ident() { "$_WD_PS" -o lstart= -o comm= -p "$1" 2>/dev/null; }
+
+# Signal a pid only while it is still the process first recorded for it.
+_agmsg_wd_signal() {
+  local sig="$1" pid="$2" ident="$3"
+  [ -n "$ident" ] && [ "$(_agmsg_wd_ident "$pid")" = "$ident" ] || return 0
+  builtin kill "-$sig" "$pid" 2>/dev/null || true
+}
+
+# Records descendants in _wd_seen as "pid|ident" lines (keyed by pid AND ident,
+# so a recycled pid is a new entry). With "stop", also STOPs each one once; the
+# STOP is re-checked against the recorded identity and undone if the pid changed
+# hands in between. Sets _wd_changed=1 if anything was new.
+_agmsg_wd_scan() {
+  local owner="$1" mode="${2:-}" pid ident
+  _wd_changed=0
+  for pid in $(_agmsg_wd_desc "$owner"); do
+    ident="$(_agmsg_wd_ident "$pid")"
+    [ -n "$ident" ] || continue
+    case "$_wd_seen" in
+      *"
+$pid|$ident"*) ;;
+      *)
+        _wd_seen="$_wd_seen
+$pid|$ident"
+        _wd_changed=1
+        ;;
+    esac
+    if [ "$mode" = stop ]; then
+      case "$_wd_stopped" in
+        *"
+$pid|$ident"*) ;;
+        *)
+          _wd_stopped="$_wd_stopped
+$pid|$ident"
+          _wd_changed=1
+          _agmsg_wd_signal STOP "$pid" "$ident"
+          [ "$(_agmsg_wd_ident "$pid")" = "$ident" ] || builtin kill -CONT "$pid" 2>/dev/null
+          ;;
+      esac
+    fi
+  done
+}
+
+_agmsg_wd_each_seen() {
+  local sig="$1" line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    _agmsg_wd_signal "$sig" "${line%%|*}" "${line#*|}"
+  done <<EOF
+$_wd_seen
+EOF
+}
+
+_agmsg_wd_fire() {
+  local owner="$1" owner_ident="$2" i
+  # The pid may have been recycled since setup; do nothing then.
+  [ "$(_agmsg_wd_ident "$owner")" = "$owner_ident" ] || return 0
+  _agmsg_wd_signal STOP "$owner" "$owner_ident"
+  [ "$(_agmsg_wd_ident "$owner")" = "$owner_ident" ] || { builtin kill -CONT "$owner" 2>/dev/null; return 0; }
+  _wd_stopped=""
+  i=0
+  _wd_changed=1
+  while [ "$_wd_changed" -eq 1 ] && [ "$i" -lt 20 ]; do
+    _agmsg_wd_scan "$owner" stop
+    i=$((i + 1))
+  done
+  _agmsg_wd_each_seen TERM
+  _agmsg_wd_each_seen CONT
+  # Grace: a TERM handler may fork; keep catching new descendants.
+  i=0
+  while [ "$i" -lt 6 ]; do
+    "$_WD_SLEEP" 0.5
+    _agmsg_wd_scan "$owner"
+    if [ "$_wd_changed" -eq 1 ]; then _agmsg_wd_each_seen TERM; fi
+    i=$((i + 1))
+  done
+  # Freeze again before KILL: a handler that keeps forking would otherwise
+  # leave a descendant that is not in the KILL set.
+  _wd_stopped=""
+  i=0
+  _wd_changed=1
+  while [ "$_wd_changed" -eq 1 ] && [ "$i" -lt 20 ]; do
+    _agmsg_wd_scan "$owner" stop
+    i=$((i + 1))
+  done
+  _agmsg_wd_each_seen KILL
+  # TERM while still stopped, so it is pending before the owner runs again and
+  # cannot interleave with the owner reporting the dead child on its own.
+  _agmsg_wd_signal TERM "$owner" "$owner_ident"
+  _agmsg_wd_signal CONT "$owner" "$owner_ident"
+  i=0
+  while [ "$i" -lt 10 ] && builtin kill -0 "$owner" 2>/dev/null; do
+    "$_WD_SLEEP" 0.3
+    i=$((i + 1))
+  done
+  _agmsg_wd_signal KILL "$owner" "$owner_ident"
+}
+
+_agmsg_wd_body() {
+  local owner="$1" secs="$2" dir="$3" name="$4" owner_ident tick=0
+  trap - ERR EXIT DEBUG RETURN
+  set +e +E +T +u
+  agmsg_close_inherited_fds
+  SECONDS=0
+  _wd_seen=""
+  owner_ident="$(_agmsg_wd_ident "$owner")"
+  while [ "$SECONDS" -lt "$secs" ]; do
+    "$_WD_SLEEP" 1
+    builtin kill -0 "$owner" 2>/dev/null || return 0
+    [ -d "$dir" ] || return 0
+    tick=$((tick + 1))
+    if [ $((tick % 5)) -eq 0 ]; then _agmsg_wd_scan "$owner"; fi
+  done
+  [ -n "${AGMSG_TEST_TIMEOUT_LOG:-}" ] &&
+    echo "test timeout after ${secs}s: $name" >> "$AGMSG_TEST_TIMEOUT_LOG" 2>/dev/null
+  _agmsg_wd_fire "$owner" "$owner_ident"
+  _agmsg_wd_reap_dir "$dir"
+}
+
+_agmsg_wd_reap_dir() {
+  local dir="$1"
+  [ -d "$dir" ] || return 0
+  TEST_SKILL_DIR="$dir" _reap_test_skill_dir_procs || true
+  rm -rf "$dir" 2>/dev/null || true
+}
+
+_agmsg_wd_start() {
+  local secs dir="$1"
+  case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; esac
+  secs="$(_agmsg_wd_timeout)"
+  [ "$secs" -gt 0 ] || return 0
+  _WD_PS="$(PATH=/bin:/usr/bin:/usr/sbin:/sbin command -v ps)" || return 0
+  _WD_SLEEP="$(PATH=/bin:/usr/bin command -v sleep)" || return 0
+  # Command substitution + `&` reparents the watchdog to init; its own stdout
+  # is /dev/null so the substitution does not wait for it.
+  : "$( { _agmsg_wd_body "$$" "$secs" "$dir" "${BATS_TEST_FILENAME##*/}: ${BATS_TEST_NAME:-?}" \
+           </dev/null >/dev/null 2>&1 & } 2>/dev/null )"
+}
+
 setup_test_env() {
   # A test never inherits the developer's terminal. The terminal drivers
   # identify "this pane" from the environment (tmux: $TMUX/$TMUX_PANE; herdr:
@@ -50,6 +239,9 @@ setup_test_env() {
   unset AGMSG_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
   local source_test_dir="${AGMSG_TEST_SOURCE_TEST_DIR:-$BATS_TEST_DIRNAME}"
   export TEST_SKILL_DIR="$(mktemp -d)"
+  # shellcheck disable=SC1091
+  source "$source_test_dir/../scripts/lib/close-fds.sh"
+  _agmsg_wd_start "$TEST_SKILL_DIR"
   mkdir -p "$TEST_SKILL_DIR"/{scripts,db,teams}
   test_fixture_registry_init "$TEST_SKILL_DIR"
 

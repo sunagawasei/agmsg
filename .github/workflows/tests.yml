@@ -327,10 +327,15 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         env:
           SHARD: ${{ matrix.shard }}
+          AGMSG_TEST_TIMEOUT: "180"
+          AGMSG_TEST_TIMEOUT_LOG: ${{ runner.temp }}/bats-test-timeouts.log
         run: |
           set +e
           .github/scripts/run-bats-timed.sh shard-files.txt "$RUNNER_TEMP/bats-timings.tsv"
           status=$?
+          if [ -s "$AGMSG_TEST_TIMEOUT_LOG" ]; then
+            echo "::warning title=bats tests killed by the per-test watchdog::$(tr '\n' ';' < "$AGMSG_TEST_TIMEOUT_LOG")"
+          fi
           : > "$RUNNER_TEMP/bats-done"
           exit $status
 
