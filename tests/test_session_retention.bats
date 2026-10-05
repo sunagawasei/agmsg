@@ -152,6 +152,9 @@ veto_case() {   # <kind>
     unverified-placement)
       printf 'pid:not-a-number\t%s\tcodex\n' "$PROJ" > "$TEST_SKILL_DIR/run/spawn.${team}__w"
       ;;
+    unverified-leading-zero)
+      printf 'pid:007\t%s\tcodex\n' "$PROJ" > "$TEST_SKILL_DIR/run/spawn.${team}__w"
+      ;;
     bare-owner-alive)
       sleep 300 & VETO_PID=$!
       printf '%s\n' "${team#s-}" > "$TEST_SKILL_DIR/run/cc-instance.$VETO_PID"
@@ -175,6 +178,7 @@ veto_case() {   # <kind>
 
 @test "veto live-bridge: the dir and the rows stay" { veto_case live-bridge; }
 @test "veto unverified-placement: the dir and the rows stay" { veto_case unverified-placement; }
+@test "veto unverified-leading-zero: the dir and the rows stay" { veto_case unverified-leading-zero; }
 @test "veto bare-owner-alive: the dir and the rows stay" { veto_case bare-owner-alive; }
 
 @test "a live cursor bridge with no team dir keeps the rows" {

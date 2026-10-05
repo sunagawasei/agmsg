@@ -27,6 +27,16 @@ agmsg_retention_supported() {
 agmsg_retention_marker_path()    { printf '%s/teams/%s/session-team' "$SKILL_DIR" "$1"; }
 agmsg_retention_tombstone_path() { printf '%s/run/session-tombstone.%s' "$SKILL_DIR" "$1"; }
 
+# Liveness of a spawn record's bridge pid, which a spawn shell minted ($!), so
+# the local check applies (the native one asks tasklist under Git Bash and calls
+# a live bridge dead). Prints alive|dead|unknown; an invalid value (leading zero,
+# overflow) is unknown, never dead, so a damaged record cannot grant a reap.
+agmsg_session_bridge_pid_state() {
+  local pid="${1:-}"
+  _agmsg_pid_valid "$pid" 2147483647 || { printf 'unknown'; return 0; }
+  if _agmsg_pid_alive_local "$pid"; then printf 'alive'; else printf 'dead'; fi
+}
+
 # Echo the reason and return 0 when the team must keep its rows. Same four
 # vetoes as the TTL dir GC in session-start.sh (test_session_retention.bats
 # pins that both agree), plus: the dir exists again. $2 = readonly: replace the
@@ -44,14 +54,17 @@ agmsg_retention_veto() {
   for rec in "$RUN_DIR/spawn.${team}__"*; do
     [ -f "$rec" ] || continue
     line=""
+    [ -r "$rec" ] || { unverified=1; break; }
     IFS= read -r line <"$rec" 2>/dev/null || true
     placement="${line%%$'\t'*}"
     case "$placement" in
       pid:*)
         pid="${placement#pid:}"
-        case "$pid" in ''|*[!0-9]*) unverified=1; break ;; esac
-        if ! [ "$pid" -gt 0 ] 2>/dev/null; then unverified=1; break; fi
-        if _agmsg_pid_alive "$pid"; then live_pid="$pid"; break; fi
+        case "$(agmsg_session_bridge_pid_state "$pid")" in
+          alive) live_pid="$pid"; break ;;
+          dead) ;;
+          *) unverified=1; break ;;
+        esac
         ;;
       %*|@*|herdr:*) ;;
       *)

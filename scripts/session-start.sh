@@ -691,25 +691,17 @@ if agmsg_session_team_enabled; then
     for _ttl_rec in "$RUN_DIR/spawn.${_tn}__"*; do
       [ -f "$_ttl_rec" ] || continue
       _ttl_line=""
+      [ -r "$_ttl_rec" ] || { _ttl_unverified_placement=1; break; }
       IFS= read -r _ttl_line <"$_ttl_rec" 2>/dev/null || true
       _ttl_placement="${_ttl_line%%$'\t'*}"
       case "$_ttl_placement" in
         pid:*)
           _ttl_pid="${_ttl_placement#pid:}"
-          case "$_ttl_pid" in
-            ''|*[!0-9]*)
-              _ttl_unverified_placement=1
-              break
-              ;;
+          case "$(agmsg_session_bridge_pid_state "$_ttl_pid")" in
+            alive) _ttl_live_bridge_pid="$_ttl_pid"; break ;;
+            dead) ;;
+            *) _ttl_unverified_placement=1; break ;;
           esac
-          if ! [ "$_ttl_pid" -gt 0 ] 2>/dev/null; then
-            _ttl_unverified_placement=1
-            break
-          fi
-          if _agmsg_pid_alive "$_ttl_pid"; then
-            _ttl_live_bridge_pid="$_ttl_pid"
-            break
-          fi
           ;;
         %*|@*|herdr:*) ;;
         *)

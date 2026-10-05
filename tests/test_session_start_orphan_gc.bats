@@ -361,7 +361,7 @@ EOF
   enable_session_team
 
   local kind team rec
-  for kind in abc zero; do
+  for kind in abc zero leading overflow; do
     team="s-DEAD10$kind"
     mkdir -p "$TEST_SKILL_DIR/teams/$team"
     printf '{"name":"%s","agents":{}}\n' "$team" \
@@ -370,6 +370,8 @@ EOF
     case "$kind" in
       abc) printf 'pid:abc\t%s\tcodex\n' "$PROJ" > "$rec" ;;
       zero) printf 'pid:0\t%s\tcodex\n' "$PROJ" > "$rec" ;;
+      leading) printf 'pid:007\t%s\tcodex\n' "$PROJ" > "$rec" ;;
+      overflow) printf 'pid:99999999999\t%s\tcodex\n' "$PROJ" > "$rec" ;;
     esac
     printf '%s\n' "$kind" > "$TEST_SKILL_DIR/teams/$team/artifact"
     touch -t 202501010000 \
@@ -378,12 +380,32 @@ EOF
 
   run run_session_start
   [ "$status" -eq 0 ]
-  for kind in abc zero; do
+  for kind in abc zero leading overflow; do
     team="s-DEAD10$kind"
     [ -f "$TEST_SKILL_DIR/teams/$team/artifact" ]
     [ -f "$(agmsg_spawn_path "$team" worker)" ]
     [[ "$output" == *"session-team TTL GC skipped team=$team reason=unverified-placement"* ]]
   done
+}
+
+@test "session-start TTL GC keeps a team whose spawn record cannot be read" {
+  enable_session_team
+  [ "$(id -u)" -ne 0 ] || skip "root reads every file"
+
+  local team=s-DEAD10unread rec
+  mkdir -p "$TEST_SKILL_DIR/teams/$team"
+  printf '{"name":"%s","agents":{}}\n' "$team" > "$TEST_SKILL_DIR/teams/$team/config.json"
+  rec="$(agmsg_spawn_path "$team" worker)"
+  printf 'pid:1\t%s\tcodex\n' "$PROJ" > "$rec"
+  chmod 000 "$rec"
+  : > "$TEST_SKILL_DIR/teams/$team/artifact"
+  touch -t 202501010000 "$TEST_SKILL_DIR/teams/$team" "$TEST_SKILL_DIR/teams/$team/config.json"
+
+  run run_session_start
+  chmod 600 "$rec"
+  [ "$status" -eq 0 ]
+  [ -f "$TEST_SKILL_DIR/teams/$team/artifact" ]
+  [[ "$output" == *"session-team TTL GC skipped team=$team reason=unverified-placement"* ]]
 }
 
 @test "session-start TTL GC keeps a team with live inflight even without a spawn record" {
