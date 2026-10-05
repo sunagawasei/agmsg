@@ -11,7 +11,7 @@
 # pattern (see its header for the #95/#143/#162 history that pattern fixes).
 #
 # Sourced by delivery.sh's agmsg_delivery_load_plug, so SKILL_DIR, SKILL_NAME,
-# resolve_hooks_file, _agmsg_shq, sql_readfile_path, agmsg_sqlite_mem, and
+# resolve_hooks_file, _agmsg_shq, agmsg_sql_readfile_path, agmsg_sqlite_mem, and
 # prune_empty_hooks_file (shape-agnostic — it only inspects the `.hooks` object
 # itself) are already in scope.
 
@@ -26,10 +26,10 @@ _CURSOR_OWNED_PREFIX="$(printf '%s' "$SKILL_DIR/scripts/" | sed "s/'/''/g")"
 # still matches on the name; that is upstream behaviour left untouched here.
 _cursor_strip_event() {
   local path="$1" event="$2" sql_path
-  sql_path=$(sql_readfile_path "$path")
+  sql_path=$(agmsg_sql_readfile_path "$path")
   local tmp tmp_sql
   tmp=$(mktemp "${TMPDIR:-/tmp}/agmsg.XXXXXX")
-  tmp_sql=$(sql_readfile_path "$tmp")
+  tmp_sql=$(agmsg_sql_readfile_path "$tmp")
   local wrote
   wrote=$(agmsg_sqlite_mem "
     WITH src AS (SELECT readfile('$sql_path') AS j),
@@ -56,14 +56,14 @@ _cursor_strip_event() {
 # <path>, creating the arrays/objects as needed.
 _cursor_add_event() {
   local path="$1" event="$2" cmd="$3" sql_path
-  sql_path=$(sql_readfile_path "$path")
+  sql_path=$(agmsg_sql_readfile_path "$path")
   local cmd_lit
   cmd_lit=$(printf '%s' "$cmd" | sed "s/'/''/g")
   local entry_sql="json_object('command','$cmd_lit')"
 
   local tmp tmp_sql
   tmp=$(mktemp "${TMPDIR:-/tmp}/agmsg.XXXXXX")
-  tmp_sql=$(sql_readfile_path "$tmp")
+  tmp_sql=$(agmsg_sql_readfile_path "$tmp")
   local wrote
   wrote=$(agmsg_sqlite_mem "
     WITH base AS (
@@ -93,10 +93,10 @@ _cursor_add_event() {
 # reading it sees the config-format version its hooks.json docs describe.
 _cursor_ensure_version() {
   local path="$1" sql_path
-  sql_path=$(sql_readfile_path "$path")
+  sql_path=$(agmsg_sql_readfile_path "$path")
   local tmp tmp_sql
   tmp=$(mktemp "${TMPDIR:-/tmp}/agmsg.XXXXXX")
-  tmp_sql=$(sql_readfile_path "$tmp")
+  tmp_sql=$(agmsg_sql_readfile_path "$tmp")
   local wrote
   wrote=$(agmsg_sqlite_mem "
     WITH src AS (SELECT readfile('$sql_path') AS j),
@@ -204,7 +204,7 @@ agmsg_delivery_status() {
   local has_ss=0 has_st=0
   if [ -f "$hf" ]; then
     local sql_hf
-    sql_hf=$(sql_readfile_path "$hf")
+    sql_hf=$(agmsg_sql_readfile_path "$hf")
     has_ss=$(agmsg_sqlite_mem "
       SELECT EXISTS(
         SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.sessionStart')) AS s
@@ -225,7 +225,7 @@ agmsg_delivery_status() {
 
   if [ -f "$hf" ]; then
     local sql_hf count
-    sql_hf=$(sql_readfile_path "$hf")
+    sql_hf=$(agmsg_sql_readfile_path "$hf")
     echo "hooks file: $hf"
     count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hf'), '\$.hooks.sessionStart'));" 2>/dev/null || echo 0)
     case "$count" in ''|*[!0-9]*) count=0 ;; esac
