@@ -502,6 +502,18 @@ apply_settings() {
 
 CODEX_MONITOR_DOC_URL="https://github.com/fujibee/agmsg/blob/main/docs/codex-monitor-beta.md"
 
+# Prints the pid of the watcher keyed on session id $1 when its pidfile names a
+# live process. _agmsg_pid_alive_local is EPERM-aware: a sandbox-unsignalable
+# watcher is still alive, so callers must not re-emit and spawn a duplicate.
+_live_watcher_pid() {
+  local pidfile="$RUN_DIR/watch.$1.pid" pid
+  [ -f "$pidfile" ] || return 0
+  pid=$(cat "$pidfile" 2>/dev/null || true)
+  if [ -n "$pid" ] && _agmsg_pid_alive_local "$pid"; then echo "$pid"; fi
+  return 0
+}
+
+# $3 = restart: do_restart has just tried to kill the watcher.
 emit_monitor_directive() {
   local type="$1"
   local project="$2"
@@ -528,20 +540,27 @@ emit_monitor_directive() {
   # Skip the directive when this CC session already has a live watcher —
   # invoking Monitor again would just spawn a duplicate and orphan the
   # previous watcher process.
-  local pidfile="$RUN_DIR/watch.$session_id.pid"
-  if [ -f "$pidfile" ]; then
-    local existing
-    existing=$(cat "$pidfile" 2>/dev/null || true)
-    # _agmsg_pid_alive_local: EPERM-aware, so a sandbox-unsignalable watcher is
-    # still alive, so we must not re-emit and spawn a duplicate.
-    if [ -n "$existing" ] && _agmsg_pid_alive_local "$existing"; then
+  local existing
+  existing="$(_live_watcher_pid "$session_id")"
+  if [ -n "$existing" ]; then
+    if [ "${3:-}" = restart ]; then
+      # Suppressing is still right (no duplicate), but "no action needed" would
+      # strand the session once this watcher, which restart could not confirm
+      # gone, exits.
+      cat <<EOF
+
+A watch.sh (pid $existing) is still alive, so no new watcher was started. After
+it has exited, run this again to start one:
+  $(printf '%q %q %q %q %q' bash "$SKILL_DIR/scripts/delivery.sh" restart "$type" "$project")
+EOF
+    else
       cat <<EOF
 
 A watch.sh is already streaming into this session (pid $existing). No
 action needed — the existing watcher is the active one.
 EOF
-      return 0
     fi
+    return 0
   fi
 
   # Shell-quote each argv (printf %q) so a paste-and-run host shell keeps paths
@@ -588,13 +607,15 @@ EOF
 }
 
 emit_stop_directive() {
-  cat <<'EOF'
+  # $1 = pending: restart left this session's watcher alive, so no stop is claimed.
+  local tail_sentence="Existing watch.sh processes were sent a stop signal by this command."
+  [ "${1:-}" = pending ] && tail_sentence="A watch.sh was still alive when this command finished waiting."
+  cat <<EOF
 
 AGMSG-DIRECTIVE: If you know of an agmsg watch Monitor task running in this
 session (listed by TaskList with a description that starts with "agmsg inbox
 stream", or the task_id returned by your own Monitor call), stop it with
-TaskStop; do not guess a task_id. Existing watch.sh processes have already been
-killed by this command.
+TaskStop; do not guess a task_id. $tail_sentence
 EOF
 }
 
@@ -1089,8 +1110,13 @@ do_restart() {
   inject_killed=$(kill_inject_watchers "$PROJECT" "$TYPE")
   echo "Killed $killed watch process(es), $inject_killed inject watcher(s)."
   if [ -n "$TYPE" ] && [ -n "$PROJECT" ]; then
-    emit_stop_directive
-    emit_monitor_directive "$TYPE" "$PROJECT"
+    local pending=""
+    if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] \
+        && [ -n "$(_live_watcher_pid "$(agmsg_normalize_instance_id "$CLAUDE_CODE_SESSION_ID" "$TYPE")")" ]; then
+      pending=pending
+    fi
+    emit_stop_directive "$pending"
+    emit_monitor_directive "$TYPE" "$PROJECT" restart
   else
     emit_stop_directive
     cat <<'EOF'

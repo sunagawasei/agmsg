@@ -1075,7 +1075,10 @@ JSON
   elapsed=$((SECONDS - started))
   [ "$status" -eq 0 ]
   [[ "$output" == *"Killed 0 watch"* ]]
-  [[ "$output" == *"already streaming"* ]]
+  [[ "$output" == *"still alive, so no new watcher was started"* ]]
+  [[ "$output" == *"delivery.sh restart claude-code "* ]]
+  [[ "$output" != *"No action needed"* ]]
+  [[ "$output" != *"sent a stop signal"* ]]
   [[ "$output" == *"TERM sent, lease release not confirmed within 5s"* ]]
   refute grep -qF -- "invoke the Monitor tool" <<<"$output"
   [ -f "$AGMSG_TEST_WATCH_TERM_FILE" ]
@@ -1102,7 +1105,10 @@ JSON
   run bash "$SCRIPTS/delivery.sh" restart claude-code "$TEST_PROJECT"
   elapsed=$((SECONDS - started))
   [ "$status" -eq 0 ]
-  [[ "$output" == *"already streaming"* ]]
+  [[ "$output" == *"still alive, so no new watcher was started"* ]]
+  [[ "$output" == *"delivery.sh restart claude-code "* ]]
+  [[ "$output" != *"No action needed"* ]]
+  [[ "$output" != *"sent a stop signal"* ]]
   [[ "$output" == *"TERM sent, lease release not confirmed within 5s"* ]]
   [ -f "$AGMSG_TEST_WATCH_TERM_FILE" ]
   [ -f "$RUN/watch.$session.pid" ]
@@ -1124,6 +1130,7 @@ JSON
 @test "delivery restart with args: emits both stop and start directives" {
   run bash "$SCRIPTS/delivery.sh" restart claude-code "$TEST_PROJECT"
   [[ "$output" =~ "Killed" ]]
+  [[ "$output" =~ "sent a stop signal" ]]
   [[ "$output" =~ "TaskStop" ]]
   [[ "$output" =~ "invoke the Monitor tool" ]]
 }
