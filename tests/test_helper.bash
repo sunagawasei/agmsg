@@ -347,7 +347,7 @@ test_fixture_start_reaped_process() {
     printf "%s\n" "$child" > "$pidfile"
     wait "$child"
     exit $?
-  ' _ "$pidfile" "$AGMSG_TEST_FIXTURE_SIGNATURE" "$@" &
+  ' _ "$pidfile" "$AGMSG_TEST_FIXTURE_SIGNATURE" "$@" 3>&- &
   supervisor=$!
   _test_fixture_register_pid "$supervisor" || return
   wait_for_file "$pidfile" || return

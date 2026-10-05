@@ -248,8 +248,8 @@ start_bridge() {
     source '$SCRIPTS/lib/compat.sh'; source '$SCRIPTS/lib/instance-id.sh'
     source '$SCRIPTS/lib/headless-provenance.sh'
     agmsg_headless_provenance_publish '$sid' '$team' && echo published
-    sleep 60
-  " > "$BATS_TEST_TMPDIR/bridge.$sid.out" 2>&1 &
+    exec sleep 60
+  " > "$BATS_TEST_TMPDIR/bridge.$sid.out" 2>&1 3>&- &
   BRIDGE_PID=$!
   wait_until 10 grep -q published "$BATS_TEST_TMPDIR/bridge.$sid.out"
 }
@@ -368,7 +368,7 @@ start_bridge() {
 @test "provenance: the record is private, written through an unpredictable temp, and a symlink in its place is not followed" {
   start_bridge worker-sid s-parent
   local rec="$TEST_SKILL_DIR/run/headless-sid.worker-sid.$BRIDGE_PID"
-  [ "$(stat -f %Lp "$rec" 2>/dev/null || stat -c %a "$rec")" = 600 ]
+  [ "$(stat -c %a "$rec" 2>/dev/null || stat -f %Lp "$rec")" = 600 ]
   kill "$BRIDGE_PID" 2>/dev/null || true
   mv "$rec" "$TEST_SKILL_DIR/run/real"
   ln -s "$TEST_SKILL_DIR/run/real" "$rec"
