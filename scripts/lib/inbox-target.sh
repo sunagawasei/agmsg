@@ -94,5 +94,24 @@ agmsg_inbox_target() {
     # No usable session id, or no trusted session team -- project-team below.
   fi
 
-  "$SCRIPT_DIR/whoami.sh" "$project" "$type"
+  local who
+  who="$("$SCRIPT_DIR/whoami.sh" "$project" "$type")" || return $?
+  if agmsg_type_has "$type" session_team yes && agmsg_session_team_enabled; then
+    # whoami lists every registration of the project; with session teams on, the
+    # ones that are another session's (or unreadable) must not become this
+    # caller's inbox.
+    local line teams t kept=""
+    line="$(printf '%s\n' "$who" | head -1)"
+    teams="$(printf '%s\n' "$line" | sed -n 's/.* teams=\([^ ]*\).*/\1/p')"
+    if [ -n "$teams" ]; then
+      local IFS=,
+      for t in $teams; do
+        [ "$(agmsg_session_team_class "$t")" = project ] && kept="${kept:+$kept,}$t"
+      done
+      unset IFS
+      [ -n "$kept" ] || return 1
+      who="${line/ teams=$teams/ teams=$kept}"
+    fi
+  fi
+  printf '%s\n' "$who"
 }

@@ -631,6 +631,20 @@ start_bridge() {
   [[ "$output" == "agent=cursor-host teams=cur-$CUR_B type=cursor "* ]]
 }
 
+@test "inbox-target: a session without a trusted team is never pointed at another session's team" {
+  mk_cursor_team "$CUR_B"
+  # CUR_A has no team at all; project resolution alone would list CUR_B's registration
+  SKILL_DIR="$TEST_SKILL_DIR" SCRIPT_DIR="$SCRIPTS" RUN_DIR="$TEST_SKILL_DIR/run" run bash -c "
+    source '$SCRIPTS/lib/inbox-target.sh'
+    agmsg_inbox_target cursor '$PROJ' '$CUR_A'"
+  [[ "$output" != *"cur-$CUR_B"* ]]
+  # no session id at all: same
+  SKILL_DIR="$TEST_SKILL_DIR" SCRIPT_DIR="$SCRIPTS" RUN_DIR="$TEST_SKILL_DIR/run" run bash -c "
+    source '$SCRIPTS/lib/inbox-target.sh'
+    agmsg_inbox_target cursor '$PROJ' ''"
+  [[ "$output" != *"cur-$CUR_B"* ]]
+}
+
 @test "spawn and ensure-headless are not pointed at a marker-less same-named project team" {
   bash "$SCRIPTS/join.sh" "cur-$CUR_A" alice cursor "$PROJ" >/dev/null
   run env -u CLAUDE_CODE_SESSION_ID CURSOR_CONVERSATION_ID="$CUR_A" bash -c "
