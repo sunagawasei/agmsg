@@ -15,7 +15,7 @@ agmsg_claude_render_settings_json() {
   local -a allow_rules=("Bash(*)")
   local -a deny_rules=()
   agmsg_claude_set_write_roots "$storage_dir" "$child_tmp" "$scratch"
-  local -a allow_write_candidates=("${AGMSG_CLAUDE_WRITE_ROOTS[@]}")
+  local -a allow_write_candidates=(${AGMSG_CLAUDE_WRITE_ROOTS[@]+"${AGMSG_CLAUDE_WRITE_ROOTS[@]}"})
   local -a deny_write=()
   local -a allow_read_candidates=(
     "$scratch" "$SKILL_DIR" "/tmp" "/bin" "/usr/bin" "/usr/lib"
@@ -32,7 +32,7 @@ agmsg_claude_render_settings_json() {
   mkdir -p "$worker_home" || return 1
   physical="$(agmsg_claude_physical_path "$worker_home")"
   if [ -n "$physical" ] && [ "$physical" != "$worker_home" ]; then
-    agmsg_claude_path_in_list "$physical" "${worker_home_candidates[@]}" \
+    agmsg_claude_path_in_list "$physical" ${worker_home_candidates[@]+"${worker_home_candidates[@]}"} \
       || worker_home_candidates+=("$physical")
   fi
 
@@ -57,7 +57,7 @@ agmsg_claude_render_settings_json() {
       deny_rules+=("Read(//**/*credentials*/**)")
       deny_rules+=("$(agmsg_claude_tool_rule Read "$worker_home/projects")")
       deny_rules+=("$(agmsg_claude_exact_tool_rule Read "$sentinel")")
-      for path in "${inherited[@]}"; do
+      for path in ${inherited[@]+"${inherited[@]}"}; do
         [ -n "$path" ] || continue
         allow_read_candidates+=("$path")
         allow_rules+=("$(agmsg_claude_tool_rule Read "$path")")
@@ -73,59 +73,59 @@ agmsg_claude_render_settings_json() {
 
   # The worker home can contain authentication state. Protect every layout at
   # both the built-in tool layer and the Bash filesystem sandbox layer.
-  for path in "${worker_home_candidates[@]}"; do
+  for path in ${worker_home_candidates[@]+"${worker_home_candidates[@]}"}; do
     rule="$(agmsg_claude_tool_rule Read "$path")"
-    agmsg_claude_path_in_list "$rule" "${deny_rules[@]}" \
+    agmsg_claude_path_in_list "$rule" ${deny_rules[@]+"${deny_rules[@]}"} \
       || deny_rules+=("$rule")
     rule="$(agmsg_claude_tool_rule Edit "$path")"
-    agmsg_claude_path_in_list "$rule" "${deny_rules[@]}" \
+    agmsg_claude_path_in_list "$rule" ${deny_rules[@]+"${deny_rules[@]}"} \
       || deny_rules+=("$rule")
-    agmsg_claude_path_in_list "$path" "${deny_read[@]}" \
+    agmsg_claude_path_in_list "$path" ${deny_read[@]+"${deny_read[@]}"} \
       || deny_read+=("$path")
-    agmsg_claude_path_in_list "$path" "${deny_write[@]}" \
+    agmsg_claude_path_in_list "$path" ${deny_write[@]+"${deny_write[@]}"} \
       || deny_write+=("$path")
   done
 
   # Seatbelt evaluates resolved filesystem paths, so retain each logical root
   # first and add its physical alias under the same permission.
-  for path in "${allow_write_candidates[@]}"; do
+  for path in ${allow_write_candidates[@]+"${allow_write_candidates[@]}"}; do
     [ -n "$path" ] || continue
-    agmsg_claude_path_in_list "$path" "${allow_write[@]}" \
+    agmsg_claude_path_in_list "$path" ${allow_write[@]+"${allow_write[@]}"} \
       || allow_write+=("$path")
     physical="$(agmsg_claude_physical_path "$path")"
     if [ -n "$physical" ] && [ "$physical" != "$path" ]; then
-      agmsg_claude_path_in_list "$physical" "${allow_write[@]}" \
+      agmsg_claude_path_in_list "$physical" ${allow_write[@]+"${allow_write[@]}"} \
         || allow_write+=("$physical")
     fi
   done
-  for path in "${allow_read_candidates[@]}"; do
+  for path in ${allow_read_candidates[@]+"${allow_read_candidates[@]}"}; do
     [ -n "$path" ] || continue
-    agmsg_claude_path_in_list "$path" "${allow_read[@]}" \
+    agmsg_claude_path_in_list "$path" ${allow_read[@]+"${allow_read[@]}"} \
       || allow_read+=("$path")
     physical="$(agmsg_claude_physical_path "$path")"
     if [ -n "$physical" ] && [ "$physical" != "$path" ]; then
-      agmsg_claude_path_in_list "$physical" "${allow_read[@]}" \
+      agmsg_claude_path_in_list "$physical" ${allow_read[@]+"${allow_read[@]}"} \
         || allow_read+=("$physical")
     fi
   done
 
   printf '{\n  "permissions": {\n    "allow": '
-  agmsg_claude_emit_json_array "${allow_rules[@]}"
+  agmsg_claude_emit_json_array ${allow_rules[@]+"${allow_rules[@]}"}
   printf ',\n    "deny": '
-  agmsg_claude_emit_json_array "${deny_rules[@]}"
+  agmsg_claude_emit_json_array ${deny_rules[@]+"${deny_rules[@]}"}
   printf '\n  },\n  "sandbox": {\n'
   printf '    "enabled": true,\n'
   printf '    "autoAllowBashIfSandboxed": true,\n'
   printf '    "failIfUnavailable": true,\n'
   printf '    "allowUnsandboxedCommands": false,\n'
   printf '    "filesystem": {\n      "allowWrite": '
-  agmsg_claude_emit_json_array "${allow_write[@]}"
+  agmsg_claude_emit_json_array ${allow_write[@]+"${allow_write[@]}"}
   printf ',\n      "denyWrite": '
-  agmsg_claude_emit_json_array "${deny_write[@]}"
+  agmsg_claude_emit_json_array ${deny_write[@]+"${deny_write[@]}"}
   printf ',\n      "allowRead": '
-  agmsg_claude_emit_json_array "${allow_read[@]}"
+  agmsg_claude_emit_json_array ${allow_read[@]+"${allow_read[@]}"}
   printf ',\n      "denyRead": '
-  agmsg_claude_emit_json_array "${deny_read[@]}"
+  agmsg_claude_emit_json_array ${deny_read[@]+"${deny_read[@]}"}
   printf '\n    }\n  }\n}\n'
 }
 
