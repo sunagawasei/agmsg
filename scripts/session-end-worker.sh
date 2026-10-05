@@ -58,6 +58,7 @@ case "$LIFECYCLE_LOCK_TIMEOUT" in ''|*[!0-9]*) LIFECYCLE_LOCK_TIMEOUT=10 ;; esac
 DRAIN_NONCE=""
 DRAIN_FENCE="$(agmsg_drain_fence_path "$STEAM")"
 DRAIN_ABORTED=0
+OWNER_SUPERSEDED=0
 
 # Retry teardown left by earlier SessionEnd/watchdog races. A bare instance
 # cannot publish cc-instance, so it cannot veto recovery for its own team.
@@ -109,6 +110,11 @@ trap 'DRAIN_ABORTED=1; exit 0' HUP INT TERM
 
 session_sibling_alive() {
   local self_pid="" f pid sid
+  # A /clear teardown is authorized only while the owner's cc-instance still
+  # names another instance; a resume back to this sid must abort it.
+  if [ "${OWNER_SUPERSEDED:-0}" -eq 1 ] && ! owner_instance_superseded; then
+    return 0
+  fi
   agmsg_instance_is_composite "$INSTANCE_ID" && self_pid="${INSTANCE_ID##*.}"
   for f in "$RUN_DIR"/cc-instance.*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
@@ -368,6 +374,9 @@ notify_drain_timeout() {
 cleanup_session_artifacts() {
   local f state
   rm -f "$RUN_DIR/watch.$INSTANCE_ID.watermark" 2>/dev/null || true
+  # The new instance on this PID may be claiming locks right now, and the read
+  # then rm below is not atomic with that; its SessionStart GC reclaims ours.
+  [ "${OWNER_SUPERSEDED:-0}" -eq 1 ] && return 0
   for f in "$RUN_DIR"/cc-instance.*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     state="$(cat "$f" 2>/dev/null || true)"
@@ -391,9 +400,37 @@ owner_process_same_generation() {
   [ "$current_start" = "$OWNER_START" ]
 }
 
+# Unlike owner_process_same_generation, unknown start tokens do not count as
+# proof here: a reap decision needs the generation positively matched.
+owner_generation_verified() {
+  local current_start owner_method current_method
+  [ -n "$OWNER_START" ] || return 1
+  current_start="$(agmsg_pid_start_token "$OWNER_PID" 2>/dev/null)" || return 1
+  owner_method="$(agmsg_pid_start_token_method "$OWNER_START" 2>/dev/null || true)"
+  current_method="$(agmsg_pid_start_token_method "$current_start" 2>/dev/null || true)"
+  [ -n "$owner_method" ] && [ "$owner_method" = "$current_method" ] \
+    && [ "$current_start" = "$OWNER_START" ]
+}
+
+# /clear keeps the claude PID and SessionStart republishes cc-instance.<pid>
+# with the new session's instance. Succeeds only when that record is a
+# well-formed instance of this PID that differs from ours; anything unreadable
+# or malformed keeps the owner-alive deferral.
+owner_instance_superseded() {
+  local f="$RUN_DIR/cc-instance.$OWNER_PID" current
+  [ "$TYPE" = claude-code ] || return 1
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  current="$(cat "$f" 2>/dev/null)" || return 1
+  agmsg_instance_is_composite "$current" || return 1
+  [ "${current##*.}" = "$OWNER_PID" ] || return 1
+  [ "$current" != "$INSTANCE_ID" ] || return 1
+  owner_generation_verified
+}
+
 wait_for_owner_exit() {
   local started now deadline
   owner_process_same_generation || return 1
+  if owner_instance_superseded; then OWNER_SUPERSEDED=1; return 1; fi
   started="$(_agmsg_wait_epoch_seconds 2>/dev/null)" || {
     sleep "$OWNER_EXIT_GRACE_S"
     owner_process_same_generation
@@ -401,14 +438,17 @@ wait_for_owner_exit() {
   }
   deadline=$((started + OWNER_EXIT_GRACE_S))
   while owner_process_same_generation; do
+    if owner_instance_superseded; then OWNER_SUPERSEDED=1; return 1; fi
     now="$(_agmsg_wait_epoch_seconds 2>/dev/null)" || {
       sleep "$OWNER_EXIT_POLL_INTERVAL"
       continue
     }
-    [ "$now" -ge "$deadline" ] && return 0
+    [ "$now" -ge "$deadline" ] && break
     sleep "$OWNER_EXIT_POLL_INTERVAL"
   done
-  return 1
+  owner_process_same_generation || return 1
+  if owner_instance_superseded; then OWNER_SUPERSEDED=1; return 1; fi
+  return 0
 }
 
 write_owner_pending_records() {
@@ -467,11 +507,14 @@ if wait_for_owner_exit; then
   # published, continue normal teardown now. Otherwise the pending records
   # preserve the work for the next lifecycle pass. A live same-sid sibling
   # cannot suppress the pending write; recover's bare-sid veto holds the kill.
-  owner_process_same_generation && exit 0
+  if owner_process_same_generation; then
+    owner_instance_superseded && OWNER_SUPERSEDED=1 || exit 0
+  fi
 fi
 
 PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
-if [ -f "$PIDFILE" ] && [ ! -L "$PIDFILE" ]; then
+# A superseded owner's watcher was already replaced by SessionStart's dedup.
+if [ "$OWNER_SUPERSEDED" -eq 0 ] && [ -f "$PIDFILE" ] && [ ! -L "$PIDFILE" ]; then
   pid="$(cat "$PIDFILE" 2>/dev/null || true)"
   if [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
     cmd="$(compat_get_cmdline "$pid" 2>/dev/null || true)"

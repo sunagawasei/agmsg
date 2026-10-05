@@ -15,6 +15,9 @@ setup() {
   mkdir -p "$stub_bin"
   cat > "$stub_bin/ps" <<'STUB'
 #!/usr/bin/env bash
+if [ -n "${PS_LSTART_FAIL:-}" ] && [ "${1:-}" = -o ] && [ "${2:-}" = lstart= ]; then
+  exit 1
+fi
 if [ "${1:-}" = -o ] && [ "${2:-}" = lstart= ] && [ "${3:-}" = -p ]; then
   [ -z "${PS_TZ_CAPTURE:-}" ] || printf '%s\n' "${TZ:-unset}" >> "$PS_TZ_CAPTURE"
   printf 'Fri Aug 21 00:00:%02d 2026\n' "$(( ${4:-0} % 60 ))"
@@ -112,6 +115,95 @@ run_composite_worker() {
   [ -f "$(agmsg_pending_teardown_path "$STEAM" worker)" ]
   kill -0 "$BRIDGE_PID" 2>/dev/null
   [ -f "$(agmsg_spawn_path "$STEAM" worker)" ]
+}
+
+# /clear keeps the claude pid; SessionStart republishes cc-instance.<pid> with
+# the new session's instance (NEXT_INSTANCE).
+setup_clear_fixture() {
+  start_owner
+  start_bridge
+  write_snapshot
+  NEXT_INSTANCE="NEXT-5E55.$OWNER_PID"
+  PENDING="$(agmsg_pending_teardown_path "$STEAM" worker)"
+}
+
+@test "SessionEnd /clear: same owner pid with a different cc-instance tears down the old worker without a pending record" {
+  setup_clear_fixture
+  printf '%s\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  printf '%s\n' "$NEXT_INSTANCE" > "$(actas_lock_path "$STEAM" other)"
+  test_fixture_start_reaped_process sleep 300
+  local watcher_pid="$TEST_REAPED_PID"
+  printf '%s\n' "$watcher_pid" > "$RUN/watch.$OWNER_INSTANCE.pid"
+
+  run run_composite_worker
+  [ "$status" -eq 0 ]
+  kill -0 "$OWNER_PID" 2>/dev/null
+  run kill -0 "$BRIDGE_PID"
+  [ "$status" -ne 0 ]
+  [ ! -e "$(agmsg_spawn_path "$STEAM" worker)" ]
+  [ ! -e "$PENDING" ]
+  [ "$(cat "$RUN/cc-instance.$OWNER_PID")" = "$NEXT_INSTANCE" ]
+  [ "$(cat "$(actas_lock_path "$STEAM" other)")" = "$NEXT_INSTANCE" ]
+  kill -0 "$watcher_pid" 2>/dev/null
+}
+
+@test "SessionEnd /clear: an unreadable or malformed cc-instance keeps pending teardown" {
+  setup_clear_fixture
+  local variant
+  for variant in absent empty bare wrong-pid symlink; do
+    rm -f "$RUN/cc-instance.$OWNER_PID" "$PENDING"
+    write_snapshot
+    case "$variant" in
+      absent) ;;
+      empty) : > "$RUN/cc-instance.$OWNER_PID" ;;
+      bare) printf 'NEXT-5E55\n' > "$RUN/cc-instance.$OWNER_PID" ;;
+      wrong-pid) printf 'NEXT-5E55.%s\n' "$((OWNER_PID + 1))" > "$RUN/cc-instance.$OWNER_PID" ;;
+      symlink)
+        printf '%s\n' "$NEXT_INSTANCE" > "$BATS_TEST_TMPDIR/real-instance"
+        ln -s "$BATS_TEST_TMPDIR/real-instance" "$RUN/cc-instance.$OWNER_PID" ;;
+    esac
+    run run_composite_worker
+    [ "$status" -eq 0 ]
+    [ -f "$PENDING" ] || { echo "no pending for $variant: $output"; return 1; }
+    kill -0 "$BRIDGE_PID" 2>/dev/null || { echo "bridge killed for $variant"; return 1; }
+  done
+}
+
+@test "SessionEnd /clear: an owner start token that cannot be read keeps pending teardown" {
+  setup_clear_fixture
+  printf '%s\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  PS_LSTART_FAIL=1 run run_composite_worker
+  [ "$status" -eq 0 ]
+  [ -f "$PENDING" ]
+  kill -0 "$BRIDGE_PID" 2>/dev/null
+}
+
+@test "SessionEnd /clear: an instance published during the grace wait is detected" {
+  setup_clear_fixture
+  printf '%s\n' "$OWNER_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  AGMSG_OWNER_EXIT_GRACE_S=5 run_composite_worker >/dev/null 2>&1 &
+  local worker_pid=$!
+  sleep 0.5
+  printf '%s\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  wait "$worker_pid"
+  run kill -0 "$BRIDGE_PID"
+  [ "$status" -ne 0 ]
+  [ ! -e "$PENDING" ]
+}
+
+@test "SessionEnd /clear: a resume back to the old instance before teardown aborts it" {
+  setup_clear_fixture
+  printf '%s\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  agmsg_team_lifecycle_lock_acquire "$STEAM" 5
+  run_composite_worker >/dev/null 2>&1 &
+  local worker_pid=$!
+  sleep 0.5
+  printf '%s\n' "$OWNER_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  agmsg_team_lifecycle_lock_release "$STEAM"
+  wait "$worker_pid"
+  kill -0 "$BRIDGE_PID" 2>/dev/null
+  [ "$(cat "$(agmsg_spawn_path "$STEAM" worker)")" = "$BRIDGE_RECORD" ]
+  [ "$(cat "$RUN/cc-instance.$OWNER_PID")" = "$OWNER_INSTANCE" ]
 }
 
 @test "SessionEnd owner exit during grace continues normal teardown" {
