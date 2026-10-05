@@ -78,9 +78,56 @@ LOCK="$RUN_DIR/ensure-${TYPE}.$key.lock"
 # can only remove that owner's record, never a successor's.
 GRACE_MIN=1  # an ownerless or unreadable lock is a crash between mkdir and publish
 
+# An owner that could not read its start token leaves an empty token in its
+# record, so a recycled pid is told apart by time: the record is written after
+# the owner starts, hence a holder that started more than RECYCLE_SLACK seconds
+# after the record's mtime is not the owner. Known limit: this assumes the file
+# mtime and ps etime share one clock, so a wall-clock step or drift beyond the
+# slack between the two can free the lock of a live owner.
+RECYCLE_SLACK=120
+
 lock_record() {
   set -- "$LOCK"/owner.*
   [ -e "$1" ] && [ "$#" -eq 1 ] && printf '%s\n' "$1"
+}
+
+# Prints a plain unsigned integer from "$@" (at most 10 digits); fails on a
+# non-zero exit, empty, multi-line or non-numeric output.
+lock_uint_from() {
+  local out
+  out="$("$@" 2>/dev/null)" || return 1
+  [[ "$out" =~ ^[0-9]{1,10}$ ]] || return 1
+  printf '%s\n' "$((10#$out))"
+}
+
+# ps etime ([[dd-]hh:]mm:ss) to seconds; fails on anything else.
+lock_etime_secs() {
+  local raw="$1" d h m s secs
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  [[ "$raw" =~ ^((([0-9]{1,5})-)?([0-9]{1,2}):)?([0-9]{1,2}):([0-9]{2})$ ]] || return 1
+  d=$((10#${BASH_REMATCH[3]:-0})) h=$((10#${BASH_REMATCH[4]:-0}))
+  m=$((10#${BASH_REMATCH[5]})) s=$((10#${BASH_REMATCH[6]}))
+  [ "$h" -lt 24 ] && [ "$m" -lt 60 ] && [ "$s" -lt 60 ] || return 1
+  secs=$((((d * 24 + h) * 60 + m) * 60 + s))
+  [ "${#secs}" -le 10 ] || return 1
+  printf '%s\n' "$secs"
+}
+
+# 0 only when the record is exactly "<pid>\n\n" (an empty token) and the pid's
+# current holder started after the record was written. Every input that cannot
+# be read or validated answers 1, i.e. the lock stays held.
+lock_holder_started_after_record() {
+  local pid="$1" rec="$2" content now raw etime mtime
+  content="$(cat "$rec" 2>/dev/null; printf x)"
+  [ "$content" = "$pid"$'\n\nx' ] || return 1
+  # now is read before ps so that a slow ps can only make the holder look older.
+  now="$(lock_uint_from date +%s)" || return 1
+  raw="$(LC_ALL=C ps -o etime= -p "$pid" 2>/dev/null)" || return 1
+  etime="$(lock_etime_secs "$raw")" || return 1
+  mtime="$(lock_uint_from stat -c %Y "$rec")" || mtime="$(lock_uint_from stat -f %m "$rec")" || return 1
+  [ "$etime" -le "$now" ] && [ "$mtime" -le "$now" ] || return 1
+  [ $((now - etime)) -gt $((mtime + RECYCLE_SLACK)) ]
 }
 
 # 0 = the holder is gone and its lock was removed (or already vanished); 1 = held.
@@ -108,6 +155,8 @@ lock_reap_if_gone() {
       cur="$(agmsg_pid_start_token "$pid" 2>/dev/null || true)"
       if [ -n "$cur" ] && [ "$(agmsg_pid_start_token_method "$cur")" = "$(agmsg_pid_start_token_method "$tok" 2>/dev/null || true)" ] \
         && [ "$cur" != "$tok" ]; then dead=1; fi
+    elif lock_holder_started_after_record "$pid" "$rec"; then
+      dead=1
     fi
   elif [ -n "$(find "$rec" -maxdepth 0 -mmin +"$GRACE_MIN" -print 2>/dev/null)" ]; then
     dead=1
@@ -131,14 +180,21 @@ lock_publish() {
   # recreated by another owner first, the record landed in their directory:
   # the directory's inode no longer matches the one we created, so withdraw.
   mv "$tmp" "$OWNER_REC" 2>/dev/null || { rm -f "$tmp"; OWNER_REC=""; return 1; }
-  if [ "$(lock_dir_id)" != "$1" ]; then
+  # An unobservable inode (empty or failed ls) must not pass as "unchanged".
+  if [ -z "$1" ] || [ "$(lock_dir_id)" != "$1" ]; then
     rm -f "$OWNER_REC"
     OWNER_REC=""
     return 1
   fi
 }
 
-lock_dir_id() { ls -di "$LOCK" 2>/dev/null | awk '{print $1}'; }
+# Prints the lock dir's inode; prints nothing unless ls exits 0 with exactly one.
+lock_dir_id() {
+  local out
+  out="$(ls -di "$LOCK" 2>/dev/null)" || return 1
+  [[ "$out" =~ ^[[:space:]]*([0-9]+)[[:space:]] ]] && [[ "$out" != *$'\n'* ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
 
 lock_release() {
   [ -n "$OWNER_REC" ] || return 0
