@@ -378,12 +378,10 @@ JSON
 }
 
 @test "agent-binaries: process names come from the type manifest, not a hardcoded list" {
-  # cursor and grok-build have no case arm here and used to fall through to the
-  # "claude codex gemini" guess — so their detect_proc was ignored entirely.
+  # cursor has no case arm here and used to fall through to the
+  # "claude codex" guess — so its detect_proc was ignored entirely.
   run _agmsg_agent_binaries cursor
   [ "$output" = "cursor-agent" ]
-  run _agmsg_agent_binaries grok-build
-  [ "$output" = "grok" ]
   run _agmsg_agent_binaries codex
   [ "$output" = "codex" ]
 }
