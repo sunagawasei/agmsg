@@ -339,6 +339,7 @@ If you prefer a global PATH shim, run `~/.agents/skills/<cmd>/scripts/drivers/ty
 ~/.agents/skills/<cmd>/scripts/inbox.sh <team> <agent_id>
 ~/.agents/skills/<cmd>/scripts/history.sh <team> [agent_id] [limit]
 ~/.agents/skills/<cmd>/scripts/team.sh <team>
+~/.agents/skills/<cmd>/scripts/team.sh <team> --health <name> <expected-type>   # headless claude-code/codex/cursor bridges only; exit code says why (see --help)
 ~/.agents/skills/<cmd>/scripts/whoami.sh <project_path> <type>
 ~/.agents/skills/<cmd>/scripts/delivery.sh set <mode> <type> <project_path>
 ~/.agents/skills/<cmd>/scripts/delivery.sh status [<type> <project_path>]

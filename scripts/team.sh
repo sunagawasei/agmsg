@@ -2,9 +2,36 @@
 set -euo pipefail
 
 # Usage: team.sh <team>
-# Shows team members.
+#        team.sh <team> --health <name> <expected-type>
+# Shows team members, or asserts that one member is registered exactly once
+# under <expected-type> and that its headless bridge is the live lease owner.
 
-TEAM="${1:?Usage: team.sh <team>}"
+health_usage() {
+  cat <<'EOF_USAGE'
+Usage: team.sh <team>
+       team.sh <team> --health <name> <expected-type>
+
+--health applies to headless bridge owners only: claude-code, codex, cursor.
+It does not describe interactive members or watchers.
+
+Exit codes for --health:
+   0  healthy: one registration of <expected-type>, bridge owns its lease
+   1  team not found
+   2  usage error or unknown <expected-type>
+  10  type mismatch: <name> is registered, but not as <expected-type>
+  11  not registered: <name> is absent from the team or has no registration
+  12  bridge absent: registered, but no live bridge process was found
+  13  owner unconfirmed: lease degraded or unverifiable (bridge may be alive)
+  14  duplicate registration: <name> has more than one registration
+  15  <expected-type> is not a headless bridge owner type
+EOF_USAGE
+}
+
+case "${1:-}" in
+  -h|--help) health_usage; exit 0 ;;
+esac
+
+TEAM="${1:?Usage: team.sh <team> [--health <name> <expected-type>]}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -18,6 +45,70 @@ CONFIG="$SCRIPT_DIR/../teams/$TEAM/config.json"
 if [ ! -f "$CONFIG" ]; then
   echo "Team not found: $TEAM"
   exit 1
+fi
+
+if [ "${2:-}" = "--health" ]; then
+  [ "$#" -eq 4 ] || { health_usage >&2; exit 2; }
+  HEALTH_NAME="$3"
+  HEALTH_TYPE="$4"
+  agmsg_validate_agent_name "$HEALTH_NAME" >/dev/null 2>&1 || { health_usage >&2; exit 2; }
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/lib/type-registry.sh"
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/lib/process-identity.sh"
+  if ! agmsg_is_known_type "$HEALTH_TYPE"; then
+    echo "health: unknown type '$HEALTH_TYPE'" >&2
+    exit 2
+  fi
+
+  # The one place that calls into process-identity.sh. Prints a stable health
+  # vocabulary (owned | absent | unconfirmed), so a change to the library's
+  # state names only has to be absorbed here.
+  _health_lease_state() {
+    agmsg_process_identity_state "$1" "$2" "$3" || true
+    case "${AGMSG_PROCESS_STATE:-}" in
+      owned) echo owned ;;
+      stale|legacy-dead|unverified-dead|degraded-dead) echo absent ;;
+      *) echo unconfirmed ;;
+    esac
+  }
+
+  # Spliced as SQL literals for the same reason as CONFIG_ESCAPED below.
+  H_CONFIG_ESCAPED=$(sed "s/'/''/g" "$CONFIG")
+  H_NAME_ESCAPED=$(printf '%s' "$HEALTH_NAME" | sed "s/'/''/g")
+  H_TYPE_ESCAPED=$(printf '%s' "$HEALTH_TYPE" | sed "s/'/''/g")
+  # total registrations, then registrations of the expected type; 0 0 when absent
+  read -r H_TOTAL H_MATCH < <(sqlite3 -separator ' ' :memory: \
+    "WITH regs AS (
+       SELECT json_extract(r.value, '\$.type') AS type
+       FROM json_each(json_extract('$H_CONFIG_ESCAPED', '\$.agents')) AS a,
+            json_each(CASE
+              WHEN json_type(json_extract(a.value, '\$.registrations')) = 'array' THEN json_extract(a.value, '\$.registrations')
+              ELSE json_array(json_object('type', json_extract(a.value, '\$.type')))
+            END) AS r
+       WHERE a.key = '$H_NAME_ESCAPED'
+     )
+     SELECT COUNT(*), COALESCE(SUM(type = '$H_TYPE_ESCAPED'), 0) FROM regs;" | tr -d '\r')
+
+  h_report() { echo "health: $TEAM/$HEALTH_NAME type=$HEALTH_TYPE $2"; exit "$1"; }
+
+  [ "$H_TOTAL" -gt 0 ] || h_report 11 "not registered"
+  [ "$H_MATCH" -gt 0 ] || h_report 10 "type mismatch: registered, but not as $HEALTH_TYPE"
+  [ "$H_TOTAL" -le 1 ] || h_report 14 "duplicate registration: $H_TOTAL registrations"
+  # Both gates: the manifest must declare headless, and the type must have a
+  # bridge kind here (a headless manifest alone says nothing about pidfile names).
+  H_HEADLESS="$(agmsg_type_get "$HEALTH_TYPE" headless)"
+  case "$H_HEADLESS:$HEALTH_TYPE" in
+    yes:claude-code|yes:codex|yes:cursor) H_KIND="$HEALTH_TYPE-bridge" ;;
+    *) h_report 15 "not a headless bridge owner type" ;;
+  esac
+  H_STATE=$(_health_lease_state "$H_KIND" \
+    "$SCRIPT_DIR/../run/$H_KIND.$TEAM.$HEALTH_NAME.pid" "$H_KIND|$TEAM.$HEALTH_NAME")
+  case "$H_STATE" in
+    owned) h_report 0 "bridge owns its lease" ;;
+    absent) h_report 12 "bridge absent" ;;
+    *) h_report 13 "owner unconfirmed: lease degraded or unverifiable (bridge may be alive)" ;;
+  esac
 fi
 
 echo "Team: $TEAM"

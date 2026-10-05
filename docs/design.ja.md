@@ -115,7 +115,7 @@ Agent responds → Stop hook fires → check-inbox.sh runs
 | `history.sh` | メッセージ履歴を表示（新しい順に取得し、古い順に表示） |
 | `join.sh` | エージェントをチームに追加（必要ならチームを作成） |
 | `leave.sh` | エージェントをチームから削除（チームが空になれば削除） |
-| `team.sh` | チームメンバーを一覧表示 |
+| `team.sh` | チームメンバーを一覧表示。`--health <name> <type>` は登録が1件で bridge の lease が生きていることを検査する(headless の claude-code/codex/cursor のみ) |
 | `whoami.sh` | プロジェクトパスとタイプでエージェントを識別 |
 | `rename.sh` | 設定とメッセージ履歴内でエージェント名を変更 |
 | `check-inbox.sh` | フックのエントリポイント — クールダウン、チェック、通知 |

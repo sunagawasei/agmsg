@@ -135,7 +135,7 @@ must track the same resolved project); direct shell invocations and
 | `history.sh` | Show message history (newest first, displayed oldest first) |
 | `join.sh` | Add agent to team (create team if needed) |
 | `leave.sh` | Remove agent from team (delete team if empty) |
-| `team.sh` | List team members |
+| `team.sh` | List team members; `--health <name> <type>` asserts one registration and a live bridge lease (headless claude-code/codex/cursor only) |
 | `whoami.sh` | Identify agent by project path and type |
 | `rename.sh` | Rename agent in config and message history |
 | `check-inbox.sh` | Hook entry point — cooldown, check, notify |
