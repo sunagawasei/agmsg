@@ -128,10 +128,10 @@ pane_json() {  # <pane_id> <status> <cwd> [agent] [terminal_id]
 
 send_msg() {  # <from> <body> -> echoes new message id
   bash "$SCRIPTS/send.sh" "$TEAM" "$1" "$AGENT" "$2" --force >/dev/null
-  sqlite3 "$DB" "SELECT max(id) FROM messages;"
+  sqlite3 "$DB" "SELECT id FROM events WHERE type='message_sent' ORDER BY seq DESC LIMIT 1;"
 }
 
-msg_read_at() { sqlite3 "$DB" "SELECT read_at FROM messages WHERE id=$1;"; }
+msg_read_at() { sqlite3 "$DB" "SELECT at FROM events WHERE type='message_read' AND msg_id='$1';"; }
 
 start_inject() {  # <session_id> <pane_id> <instance_id> [terminal_id]
   bash "$TYPES/cursor/inject-watch.sh" "$1" "$TEST_PROJECT" cursor "$2" "$3" "${4:-}" \
@@ -357,6 +357,17 @@ _resend_pending_has_id() {  # <iid> <id>
   wait_until 60 _wait_read_at "$id"
 }
 
+@test "a body containing the unit separator is injected whole" {
+  local sid="sess-us" pane="paneUs" iid="iid-us"
+  pane_json "$pane" idle "$TEST_PROJECT" > "$HERDR_LIST_JSON"
+  local id; id="$(send_msg bob $'before\x1fafter')"
+
+  start_inject "$sid" "$pane" "$iid" >/dev/null
+  wait_until 60 _wait_read_at "$id"
+  run grep -F $'before\x1fafter' "$HERDR_LOG"
+  [ "$status" -eq 0 ]
+}
+
 @test "pane id reuse (same pane id, different project cwd): never injects" {
   local sid="sess-e" pane="paneE" iid="iid-e"
   pane_json "$pane" idle "/some/other/project" > "$HERDR_LIST_JSON"
@@ -404,7 +415,7 @@ _resend_pending_has_id() {  # <iid> <id>
   local sid="sess-f" pane="paneF" iid="iid-f"
   pane_json "$pane" idle "$TEST_PROJECT" > "$HERDR_LIST_JSON"
   local id; id="$(send_msg bob hello-f)"
-  sqlite3 "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=$id;"
+  bash "$SCRIPTS/inbox.sh" "$TEAM" "$AGENT" --mark-read-ids "$id" >/dev/null
 
   mkdir -p "$RUN_DIR"
   printf '%s\t%s\t%s\t0\n' "$id" "$TEAM" "$AGENT" > "$(inject_journal "$iid")"

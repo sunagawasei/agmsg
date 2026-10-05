@@ -257,15 +257,23 @@ pane_status() {
   esac
 }
 
-DB="$(agmsg_db_path)"
+# Unread state is read through inbox.sh --format ids, never from the legacy
+# messages table: ids are UUIDv7 in the event log, and an ack writes a
+# message_read event without touching messages.read_at.
+# Prints "from<US>body_escaped" for <id> when it is still unread, else nothing.
+_unread_row() {  # <team> <agent> <id>
+  "$SCRIPT_DIR/inbox.sh" "$1" "$2" --format ids 2>/dev/null \
+    | awk -F'\037' -v id="$3" '$1==id { b=$3; for (i=4; i<NF; i++) b=b FS $i; print $2 FS b; exit }'
+}
 
 # inbox.sh --mark-read-ids swallows its own DB write failures (`|| true`,
 # scripts/inbox.sh) and always exits 0, so its exit status is not evidence of
-# anything. This is the only real signal that an ack actually took effect.
-_msg_is_read() {  # <id>
-  local v
-  v="$(agmsg_sqlite "$DB" "SELECT read_at FROM messages WHERE id=$1;" 2>/dev/null)"
-  [ -n "$v" ]
+# anything. This is the only real signal that an ack actually took effect; a
+# failed listing counts as "not acked" so the in-flight entry is kept.
+_msg_is_read() {  # <team> <agent> <id>
+  local out
+  out="$("$SCRIPT_DIR/inbox.sh" "$1" "$2" --format ids 2>/dev/null)" || return 1
+  [ -z "$(printf '%s\n' "$out" | awk -F'\037' -v id="$3" '$1==id { print "x"; exit }')" ]
 }
 
 # Attempt one message's delivery. <retry> is this id's failed-attempt count
@@ -281,11 +289,7 @@ inject_one() {
   # Re-check unread status right before acting on it — both the primary guard
   # against injecting stale content and the only guard against `both` mode's
   # stop hook winning the race and marking this id read first.
-  row="$(agmsg_sqlite "$DB" "
-    SELECT from_agent || char(31) || replace(replace(body, char(10), '\n'), char(9), '\t')
-    FROM messages
-    WHERE id=$id AND team='$(_sqlesc "$team")' AND to_agent='$(_sqlesc "$agent")' AND read_at IS NULL;
-  " 2>/dev/null)"
+  row="$(_unread_row "$team" "$agent" "$id")"
   if [ -z "$row" ]; then
     journal_remove "$id"
     resend_pending_consume "$id"
@@ -311,7 +315,7 @@ $body"
 
   if "$HERDR" agent prompt "$PANE_ID" "$text" >/dev/null 2>&1; then
     "$SCRIPT_DIR/inbox.sh" "$team" "$agent" --mark-read-ids "$id" >/dev/null 2>&1
-    if _msg_is_read "$id"; then
+    if _msg_is_read "$team" "$agent" "$id"; then
       journal_remove "$id"
       resend_pending_consume "$id"
     else
@@ -333,7 +337,7 @@ $body"
     if printf '%s' "[inject-error] delivery to $agent failed after $RETRY_LIMIT attempt(s) (message id $id). Resend to retry." \
         | "$SCRIPT_DIR/send.sh" "$team" "$agent" "$from" --stdin --force >/dev/null 2>&1; then
       "$SCRIPT_DIR/inbox.sh" "$team" "$agent" --mark-read-ids "$id" >/dev/null 2>&1
-      if _msg_is_read "$id"; then
+      if _msg_is_read "$team" "$agent" "$id"; then
         journal_remove "$id"
         return 0
       fi
