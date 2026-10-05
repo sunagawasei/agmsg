@@ -370,6 +370,14 @@ if [ "$UPDATE_ONLY" = true ]; then
   # ship without enumerating files. The agent-type manifests and per-type runtimes
   # live under scripts/drivers/types/ now, so this single copy carries them too.
   cp -R "$SCRIPT_DIR/scripts/." "$SKILL_DIR/scripts/"
+  # Bundled types and scripts/windows removed from this repo stay in an
+  # existing install because cp -R never deletes. Named individually (not a
+  # glob) so user-added types under scripts/drivers/types/ survive.
+  for _agmsg_removed in gemini antigravity copilot grok-build hermes opencode agmsg-app; do
+    rm -rf "$SKILL_DIR/scripts/drivers/types/$_agmsg_removed"
+  done
+  rm -rf "$SKILL_DIR/scripts/windows"
+  unset _agmsg_removed
   # #1249: drivers/terminals/{herdr,plain,tmux}/SKILL.md used to name each
   # driver's own doc file, and a directory-scanning skill loader (e.g.
   # codex's) treated it as a standalone skill missing YAML frontmatter,
@@ -507,6 +515,14 @@ sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path "$TPL_TYPE")" > "
 # without enumerating files. The agent-type manifests and per-type runtimes live
 # under scripts/drivers/types/ now, so this single copy carries them too.
 cp -R "$SCRIPT_DIR/scripts/." "$SKILL_DIR/scripts/"
+# Bundled types and scripts/windows removed from this repo stay in an
+# existing install because cp -R never deletes. Named individually (not a
+# glob) so user-added types under scripts/drivers/types/ survive.
+for _agmsg_removed in gemini antigravity copilot grok-build hermes opencode agmsg-app; do
+  rm -rf "$SKILL_DIR/scripts/drivers/types/$_agmsg_removed"
+done
+rm -rf "$SKILL_DIR/scripts/windows"
+unset _agmsg_removed
 # Ship the external-plugin drop-in dir (just its README) so the location exists
 # post-install. A plain cp — not cp -R --delete — preserves any plugins the user
 # dropped in and their db/trusted-plugins opt-ins.

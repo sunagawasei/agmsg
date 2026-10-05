@@ -27,7 +27,7 @@ source "$SCRIPT_DIR/lib/process-identity.sh"
 # without branching on the type name.
 EVENT="${3:-Stop}"
 
-# Some Stop-hook runtimes (codex, copilot) want an explicit JSON status object
+# Some Stop-hook runtimes (codex) want an explicit JSON status object
 # even when there is nothing to deliver; others (claude-code) stay silent. This
 # is the type's manifest `stop_output=` (data), not a hardcoded type list.
 STOP_OUTPUT="$(agmsg_type_get "$TYPE" stop_output 2>/dev/null || true)"
@@ -46,8 +46,8 @@ emit_status_json() {
   printf '{\n  "continue": true,\n  "systemMessage": "%s"\n}\n' "$1"
 }
 
-# Hook runtimes that pass JSON do so on stdin. Interactive invocations such as
-# Gemini's PostToolUse command may inherit a terminal stdin instead; reading
+# Hook runtimes that pass JSON do so on stdin. Interactive invocations of a
+# hook command may inherit a terminal stdin instead; reading
 # unconditionally there blocks waiting for input. The `[ ! -t 0 ]` guard just below
 # only rules out that TTY case -- a non-TTY stdin whose write end is left
 # open (a hook runtime that writes the payload and then simply never closes
@@ -74,16 +74,14 @@ fi
 
 # The session id is still resolved: the actas-ownership check further down
 # needs it. Only the deferral that used to follow it is gone. The field name
-# differs by vendor: Claude Code emits snake_case "session_id"; Grok Build (and
-# Cursor) emit camelCase "sessionId". Try snake first (claude-code unaffected),
-# then camel, then the GROK_SESSION_ID env Grok injects into every hook.
+# differs by vendor: Claude Code emits snake_case "session_id"; Cursor
+# emits camelCase "sessionId". Try snake first (claude-code unaffected), then camel.
 SESSION_ID=$(printf '%s' "$INPUT" \
   | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
   | head -1)
 [ -z "$SESSION_ID" ] && SESSION_ID=$(printf '%s' "$INPUT" \
   | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
   | head -1)
-[ -z "$SESSION_ID" ] && SESSION_ID="${GROK_SESSION_ID:-}"
 RAW_SESSION_ID="$SESSION_ID"
 # Normalized to the per-process instance id (#93), which is the token the
 # actas owner file is keyed on.

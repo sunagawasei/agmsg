@@ -8,7 +8,7 @@ set -euo pipefail
 # Not joined:      not_joined=true available_teams=<t1,t2,...> (or "none")
 #
 # Usage: whoami.sh <project_path> [type]
-#   type: claude-code, codex, gemini, antigravity, copilot, opencode
+#   type: claude-code, codex, cursor
 #   If type is omitted, auto-detect from env vars and process tree.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -71,8 +71,8 @@ RUN_DIR="$SKILL_DIR/run"
 # strip/add reference it to detect agmsg-owned entries).
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/hooks-json.sh"
-# Shared "rule-file" delivery behavior (rulefile_apply), delegated to by the
-# rule-file types' _delivery.sh plugs.
+# Shared "rule-file" delivery behavior (rulefile_apply), kept for external
+# plugin types' _delivery.sh (see docs/agent-types.md); no bundled type uses it.
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/delivery-rulefile.sh"
 # shellcheck disable=SC1091
@@ -345,7 +345,7 @@ agmsg_delivery_on_enable() { :; }
 agmsg_delivery_on_disable() { kill_all_watchers "$2" "$1" >/dev/null 2>&1 || true; }
 # Default in-session stop directive: tell a running Claude Code session to find
 # and TaskStop its watcher. Types whose runtime launches the watcher a different
-# way (e.g. grok-build's `monitor` tool) override this with their own wording.
+# way override this with their own wording.
 agmsg_delivery_stop_directive() { emit_stop_directive; }
 # Default preflight: no side effects to check, so nothing to fail on. A type
 # whose monitor/both mode depends on external runtime state it cannot recover
@@ -688,7 +688,7 @@ EOF
 # Reject a malformed project_path before any delivery-apply implementation
 # gets to build a hooks/rule file path from it and `mkdir -p` the result
 # (#493). Every implementation -- agmsg_delivery_apply_default,
-# rulefile_apply, and the cursor/copilot/grok-build overrides -- shares this
+# rulefile_apply, and the cursor override -- shares this
 # file's resolve_hooks_file(), and apply_settings (this function's sole
 # caller) is the only place any of them get invoked from, so validating here
 # once covers every agent type without touching each apply implementation.
@@ -805,7 +805,7 @@ do_set() {
   esac
   # Second: does THIS type accept the mode? A type declares the modes its CLI
   # accepts via the delivery_modes= manifest key (e.g. codex omits 'both' — the
-  # the bridge has no both-mode; rule-file types like opencode omit
+  # the bridge has no both-mode; a type may omit
   # 'monitor'/'both'). Reject anything not listed, before any file is touched.
   # Types without the key fall back to the full set so an unconfigured manifest
   # still works.
@@ -854,7 +854,7 @@ do_set() {
       kill_inject_watchers "$PROJECT" "$TYPE" >/dev/null 2>&1 || true
       # Only emit the in-session watcher-stop directive for types that actually
       # have an automatic delivery mode to stop. A manual-only type
-      # (delivery_modes=off, e.g. hermes) has no Monitor/watcher, so the
+      # (delivery_modes=off) has no Monitor/watcher, so the
       # directive would be noise — and a stray TaskStop could disturb an
       # unrelated agent's watcher. Data-driven, so no per-type branch here.
       case " $SUPPORTED_MODES " in
@@ -890,7 +890,7 @@ do_default_mode() {
   esac
 
   # Stage 2: does THIS type accept it? default_mode=monitor under a turn-only
-  # type (opencode/copilot) is a no-op, not an error — fall back to the prompt.
+  # type is a no-op, not an error — fall back to the prompt.
   local supported
   supported=$(agmsg_type_get "$TYPE" delivery_modes 2>/dev/null || true)
   [ -z "$supported" ] && supported="monitor turn both off"
@@ -999,7 +999,7 @@ kill_all_watchers() {
           agmsg_process_cleanup_observed "$f" || true ;;
         legacy-foreign-live)
           # Scoped (project,type) sweeps pass argv needles for the TARGET type.
-          # A live claude-code watcher is legacy-foreign to copilot needles — not
+          # A live claude-code watcher is legacy-foreign to another type's needles — not
           # stale, and must keep its pidfile (#218).
           if [ -z "$type" ]; then
             agmsg_process_cleanup_observed "$f" || true

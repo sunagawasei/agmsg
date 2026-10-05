@@ -6,7 +6,7 @@ agmsgのプラグイン可能な単位は**ドライバー**であり、**軸(ax
 
 | axis | 何を差し替えるか | status |
 |---|---|---|
-| `types` | エージェントランタイム(claude-code, codex, gemini, …) | shipping |
+| `types` | エージェントランタイム(claude-code, codex, cursor, …) | shipping |
 | `storage` | メッセージストア(sqlite, …) | planned |
 | `delivery` | メッセージがエージェントに届く方法(monitor / turn / …) | planned |
 

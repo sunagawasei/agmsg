@@ -678,12 +678,6 @@ skip_unless_windows() {
   esac
 }
 
-# Antigravity's TUI monitor is intentionally Linux-only. Installation tests
-# which execute its shim use this guard; file-handling tests remain portable.
-skip_unless_linux() {
-  [ "$(uname -s)" = Linux ] || skip "${1:-Antigravity TUI monitor is Linux-only}"
-}
-
 # In-memory sqlite for test ASSERTIONS, stripping CR. sqlite3.exe writes stdout
 # in text mode on Windows (\n -> \r\n); $(...) keeps the trailing \r, so a probe
 # like [ "$(sqlite3 :memory: 'SELECT json_valid(...)')" = "1" ] compares "1\r"

@@ -294,8 +294,7 @@ PROJECT="$(agmsg_normalize_project_path "$PROJECT")"
 # `cli=` is trusted manifest data (agmsg ships it, not runtime user input), so
 # it may be a single binary name OR a fixed command-line prefix of several
 # space-separated tokens — a subcommand and/or fixed flags a CLI needs before
-# its own options (e.g. `opencode run --interactive`, whose message is not a
-# top-level argument). Only the first word names the actual executable to
+# its own options. Only the first word names the actual executable to
 # resolve/check; the rest are passed through as-is in the boot script below.
 SPAWN_LAUNCHER="$(agmsg_type_get "$AGENT_TYPE" spawn)"
 CLI_BIN="$(agmsg_type_get "$AGENT_TYPE" cli)"
@@ -312,7 +311,7 @@ fi
 # --model is pass-through: the model id is handed to the CLI unchecked (the CLI
 # rejects an unknown id), so agmsg never has to track each vendor's model list.
 # The flag SPELLING differs per CLI, so it comes from the manifest `model_arg=`
-# (e.g. claude-code/grok-build use --model, codex uses -m). A type with no
+# (e.g. claude-code uses --model, codex uses -m). A type with no
 # model_arg has no known flag, so --model is refused rather than guessed.
 MODEL_ARG="$(agmsg_type_get "$AGENT_TYPE" model_arg)"
 if [ -n "$MODEL_ID" ] && [ -z "$MODEL_ARG" ]; then
@@ -320,7 +319,7 @@ if [ -n "$MODEL_ID" ] && [ -z "$MODEL_ARG" ]; then
 fi
 
 # Note: prompt_arg= (some CLIs require the actas prompt as a named flag's value
-# rather than a bare positional, e.g. antigravity's --prompt-interactive) is
+# rather than a bare positional, a named flag instead of a bare positional) is
 # resolved inside agmsg_role_cli_args (lib/boot-command.sh) now, so it stays in
 # sync with the name/resume flags across spawn and resurrect-panes.sh.
 
@@ -350,7 +349,7 @@ fi
 #
 # This reads a dedicated `spawn_unset_env=` manifest key, NOT `detect=`. `detect=`
 # names the vars whoami uses to recognize a live session of a type, but those are
-# not always session-identity vars: gemini's `detect=GEMINI_API_KEY ...` is a
+# not always session-identity vars: a `detect=` value may be an API key, i.e. a
 # CREDENTIAL, and unsetting it would break the spawned child's auth — the opposite
 # of the fix. `spawn_unset_env=` lists only vars that are safe (and necessary) to
 # drop on spawn; unset (the default) strips nothing.
@@ -592,7 +591,7 @@ esac
     # Direct-CLI launch:
     # `<cli> [<resume_arg> <uuid>] [<model_arg> <model_id>] [spawn-options...] [<name_arg> <name>] [<prompt_arg>] "/<cmd> actas <name>"`.
     # cli is emitted unquoted — it is trusted fixed-prefix manifest data (see
-    # above) that may itself be several tokens (e.g. `opencode run --interactive`).
+    # above) that may itself be several tokens (a subcommand plus flags).
     # The resume head (#339) is emitted RIGHT AFTER the cli, before all other
     # args: mandatory for a subcommand-shaped resume (codex `resume <id>`),
     # harmless for a flag-shaped one (claude `--resume <id>`) -- see
@@ -846,7 +845,7 @@ place_and_launch() {
 # Types with `monitor=no` do not produce a spawn-awaitable readiness sentinel, so
 # skip the wait. That covers types with no Monitor at all (codex) AND types whose
 # watcher attaches via the agent's own launch rather than a spawn-time sentinel
-# (grok-build, whose monitor mode is real but not awaitable here) — receive there
+# (a type whose monitor mode is real but not awaitable here) — receive there
 # is poll-based or agent-launched anyway.
 READY_PATH="$(agmsg_ready_path "$TEAM" "$NAME")"
 if [ "$(agmsg_type_get "$AGENT_TYPE" monitor)" = "no" ] && [ "$WAIT_READY" = "1" ]; then

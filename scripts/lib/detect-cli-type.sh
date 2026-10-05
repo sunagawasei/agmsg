@@ -21,8 +21,8 @@ agmsg_detect_cli_type() {
 
   # 1. Environment variables. Sorted registry order preserves the historical
   # precedence: a runtime's own session vars (CLAUDE_CODE_SESSION_ID, CODEX_*) are
-  # checked before the GEMINI_* family, which users also set for the SDK without
-  # the CLI. `detect=explicit` (and types with no detect=) are never auto-detected.
+  # checked before weaker signals such as SDK API keys users set without the CLI.
+  # `detect=explicit` (and types with no detect=) are never auto-detected.
   local _t _v _detect _toks
   while IFS= read -r _t; do
     [ -n "$_t" ] || continue

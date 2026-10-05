@@ -6,7 +6,7 @@ Developer documentation for contributors and maintainers.
 
 ## Identity Model
 
-An agent is identified by `(name, team)`. Project path and agent type (claude-code, codex, gemini) are metadata — reference information stored alongside the identity but not part of it.
+An agent is identified by `(name, team)`. Project path and agent type (claude-code, codex, cursor) are metadata — reference information stored alongside the identity but not part of it.
 
 - An agent can be registered from multiple projects under the same name
 - `whoami.sh` uses project path and type to suggest an identity, but the user can choose any name

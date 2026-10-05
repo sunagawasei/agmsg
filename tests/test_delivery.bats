@@ -1308,12 +1308,11 @@ JSON
   [ ! -f "$TEST_SKILL_DIR/run/cc-instance.$dead_pid" ]
 }
 
-# --- session-id resolution: vendor field-name differences (grok) ---
-# Grok Build emits the session id on stdin as camelCase "sessionId" and injects
-# GROK_SESSION_ID into every hook; Claude uses snake_case "session_id" (and so
+# --- session-id resolution: vendor field-name differences (cursor) ---
+# Cursor-style payloads may carry the session id as camelCase "sessionId"; Claude uses snake_case "session_id" (and so
 # does Cursor -- measured on cursor-agent 2026.09.10-fd3934a, top-level and
 # snake_case there too, unlike this camelCase field). The shared resolver
-# tries snake -> camel -> $GROK_SESSION_ID. The Monitor directive echoes the
+# tries snake -> camel. The Monitor directive echoes the
 # resolved id as the watch.sh command's session arg, so we assert through
 # that. (Exercised via claude-code since the resolver is shared.)
 
@@ -3141,8 +3140,6 @@ EOF
   wait "$fake_server" 2>/dev/null || true
 }
 
-# --- hermes (manual-only: delivery_modes=off, no automatic hook) ---
-
 @test "default-mode: unset config -> empty (join prompts as before)" {
   run bash -c "bash '$SCRIPTS/delivery.sh' default-mode claude-code 2>/dev/null"
   [ "$status" -eq 0 ]
@@ -3187,11 +3184,6 @@ EOF
   run bash "$SCRIPTS/delivery.sh" default-mode
   [ "$status" -ne 0 ]
 }
-
-# --- grok-build (turn|off via a markdown rule file .grok/rules/agmsg.md) ---
-# Grok passive hooks can't inject (stdout is discarded), so grok delivers via the
-# rule-file self-poll model (like gemini/opencode): a .grok/rules/agmsg.md that
-# tells the agent to poll inbox.sh each turn. turn => rule present, off => absent.
 
 @test "delivery status (codex): a recorded seat makes \"not running\" mean the process (#579)" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null

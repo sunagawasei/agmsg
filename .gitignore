@@ -5,7 +5,6 @@ teams/
 .codex/
 .claude/
 .cursor/
-.opencode/
 .playwright-mcp/
 
 # Nix devShell: direnv が allow 時に生成するローカルcache。

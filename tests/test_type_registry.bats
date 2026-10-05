@@ -4,7 +4,7 @@
 # per-key manifest reader. The behavioral wiring (whoami detection, join
 # whitelist, spawn dispatch, delivery routing) is covered by the existing
 # whoami/join/spawn/delivery suites; these lock the registry primitives and the
-# six built-in manifests themselves.
+# three built-in manifests themselves.
 #
 # setup_test_env copies scripts/ (with scripts/drivers/types/) into TEST_SKILL_DIR, so the lib
 # resolves <skill-root>/scripts/drivers/types there. Each case sources the lib in a wiped env so

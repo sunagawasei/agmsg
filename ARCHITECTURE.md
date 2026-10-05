@@ -6,7 +6,7 @@ This document describes the internal shape of agmsg — the mental model a contr
 
 ## Goal
 
-A cross-agent messaging primitive that works between any combination of Claude Code, Codex, Gemini CLI, Antigravity, and future agent runtimes — with no daemon, no network, no shared cloud. Messages move through local files on a single machine; receivers are notified through whatever hook or streaming mechanism their host runtime provides.
+A cross-agent messaging primitive that works between any combination of Claude Code, Codex, Cursor, and future agent runtimes — with no daemon, no network, no shared cloud. Messages move through local files on a single machine; receivers are notified through whatever hook or streaming mechanism their host runtime provides.
 
 The default install must work with **bash + sqlite3 only**. Any feature beyond that is opt-in and may require additional dependencies that the user agrees to install.
 
@@ -17,7 +17,7 @@ agmsg is built around three orthogonal axes, each of which has exactly one **dri
 | Axis | What it abstracts | Bundled drivers |
 |---|---|---|
 | **storage** | Where messages and team state live, and how they are queried | `sqlite` (default), `jsonl-duckdb` |
-| **agent** | Per-runtime differences (hook formats, settings file locations, monitor tool availability) | `claude-code`, `codex`, `gemini`, `antigravity`, `copilot` |
+| **agent** | Per-runtime differences (hook formats, settings file locations, monitor tool availability) | `claude-code`, `codex`, `cursor` |
 | **delivery** | How a recipient is notified that a message arrived | `monitor`, `turn`, `both`, `off` |
 
 The three axes are independent: any storage driver can be paired with any agent driver and any delivery mode. They share a common discovery/config/dependency-check protocol (see the spec) but expose axis-specific operations.
@@ -71,7 +71,7 @@ Message identifiers are **UUIDv7** strings. The interface treats them as opaque 
 | **bundled driver** | A driver shipped inside agmsg core |
 | **storage** | The storage axis, or its active driver, in user-facing contexts |
 | **AGMSG-DIRECTIVE** | A JSON line emitted on stdout instructing the host agent to take a specific action |
-| **host agent** | The runtime invoking agmsg scripts (Claude Code, Codex, Gemini CLI, Antigravity, …) |
+| **host agent** | The runtime invoking agmsg scripts (Claude Code, Codex, Cursor, …) |
 | **event log** | The append-only record of message lifecycle events that bundled storage drivers project queries over |
 
 ## See also

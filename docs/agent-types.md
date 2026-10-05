@@ -1,7 +1,6 @@
 # Agent types
 
-agmsg supports several agent runtimes — claude-code, codex, gemini, antigravity,
-copilot, opencode, hermes, cursor — and each is described by a small **manifest** so that the rest
+agmsg supports several agent runtimes — claude-code, codex, and cursor — and each is described by a small **manifest** so that the rest
 of agmsg (detection, the join whitelist, spawn, and delivery routing) discovers it
 from data instead of hardcoded `case` arms.
 
@@ -21,15 +20,15 @@ a manifest cannot execute code. Multi-value keys are whitespace-separated.
 | `template` | yes | the `/agmsg` command template filename, relative to the type dir (e.g. `template.md`); becomes `SKILL.md` |
 | `detect` | — | env-var names whose presence selects this type. `explicit` = never auto-detected from the environment |
 | `detect_proc` | — | parent-process-name glob patterns that select this type (e.g. `codex codex-*`) |
-| `cli` | spawnable types | the launch command. Usually a single binary name, but may be a fixed multi-word prefix (subcommand and/or flags a CLI needs ahead of its own options, e.g. `opencode run --interactive`) — only the first word is resolved/checked as the executable; the rest are passed through as-is. Safe because this is manifest data agmsg ships, not runtime user input |
+| `cli` | spawnable types | the launch command. Usually a single binary name, but may be a fixed multi-word prefix (subcommand and/or flags a CLI needs ahead of its own options) — only the first word is resolved/checked as the executable; the rest are passed through as-is. Safe because this is manifest data agmsg ships, not runtime user input |
 | `spawnable` | — | `yes` if `spawn.sh` can launch this type |
 | `spawn` | — | a `.mjs` node-launcher (beside the manifest) `spawn.sh` runs via Node; also marks the type spawnable |
 | `model_arg` | — | the `--model`/`-m`-style flag `spawn --model <id>` passes through to the CLI; a type with no `model_arg` refuses `--model` |
-| `prompt_arg` | — | for a CLI that does not accept the actas prompt as a bare positional argument, the named flag whose value IS the prompt (e.g. antigravity's `--prompt-interactive`, copilot's `--interactive`) — `spawn.sh` inserts it immediately before the (already-quoted) prompt. Unset = bare positional, the default |
+| `prompt_arg` | — | for a CLI that does not accept the actas prompt as a bare positional argument, the named flag whose value IS the prompt — `spawn.sh` inserts it immediately before the (already-quoted) prompt. Unset = bare positional, the default |
 | `hooks_file` | yes | project-relative delivery hooks file (e.g. `.codex/hooks.json`) |
 | `monitor` | — | `yes` if the type exposes a native Monitor tool; `spawn` skips the readiness wait when `no` |
 | `delivery_modes` | — | space-separated delivery modes the type's CLI accepts (e.g. `monitor turn off`); `delivery.sh`'s gate rejects anything else. Defaults to `monitor turn both off` when omitted |
-| `stop_output` | — | output protocol for the Stop/turn inbox check — `json` (codex, copilot), `followup` (cursor: a stdout `{"followup_message":...}` re-injects the reply as the next turn) vs. plain text (default) |
+| `stop_output` | — | output protocol for the Stop/turn inbox check — `json` (codex), `followup` (cursor: a stdout `{"followup_message":...}` re-injects the reply as the next turn) vs. plain text (default) |
 | `hook_windows_wrap` | — | `yes` if JSON hook entries also need a Windows-native `commandWindows` variant (codex) |
 | `session_team` | — | `yes` if the type can host its own per-session team (cursor) |
 
@@ -42,8 +41,7 @@ a manifest cannot execute code. Multi-value keys are whitespace-separated.
 `whoami.sh` auto-detects the running type when none is passed:
 
 1. **Environment** — the manifests' `detect=` env vars, evaluated in sorted type
-   order, which preserves the precedence claude-code < codex < gemini (a runtime's
-   own session vars beat the `GEMINI_*` family that users also set for the SDK).
+   order, which preserves the precedence claude-code < codex.
    `detect=explicit` types are never selected here.
 2. **Process tree** — walking up from the current process, the first type whose
    `detect_proc=` glob matches the ancestor's name wins.
@@ -52,8 +50,7 @@ a manifest cannot execute code. Multi-value keys are whitespace-separated.
 > Precedence note: env detection iterates types in **sorted name order**, so when
 > two types' `detect=` vars are both present the alphabetically-earlier type wins.
 > Keep `detect=` vars runtime-exclusive (a runtime's own session var, not a shared
-> SDK var) so ties don't arise; this is why the `GEMINI_*` family — which users
-> set without the CLI — sits behind the claude-code/codex session vars.
+> SDK var) so ties don't arise.
 
 ### Delivery
 
@@ -63,7 +60,7 @@ a manifest cannot execute code. Multi-value keys are whitespace-separated.
 `delivery.sh` defines the default behavior (JSON event-hooks) and a type's optional
 `scripts/drivers/types/<name>/_delivery.sh` plug overrides any of
 `agmsg_delivery_apply` / `on_enable` / `on_disable` / `status`. Rule-file types
-(gemini, antigravity, …) delegate to the shared `rulefile_apply`; codex's plug adds
+(external plugin types; no bundled type uses it) delegate to the shared `rulefile_apply`; codex's plug adds
 its bridge/shim lifecycle. No per-type `case` arms remain in `delivery.sh`.
 
 ### Node-launcher types (external add-ons)

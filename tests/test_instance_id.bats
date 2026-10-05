@@ -621,14 +621,6 @@ _no_dirname_path() {
   wait "$pb" 2>/dev/null || true
 }
 
-# --- grok-build session binding (#245) ---
-#
-# A grok-build watcher launched by Grok's `monitor` tool gets an empty session id.
-# Keying on a bare throwaway id means no liveness gating, so the watcher lingers
-# forever after grok exits (the pid-91475-alive-3h orphan). These cover the
-# resolution that binds the watcher to a composite "<grok-session>.<grok-pid>"
-# (liveness-gated) for both the `--resume` and the fresh (no-resume) launch.
-
 # --- liveness: "can I signal this" is not "is this running" ---
 
 # A pid that exists but this user cannot signal, so `kill -0` fails with EPERM

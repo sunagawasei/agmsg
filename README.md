@@ -19,11 +19,11 @@ Cross-agent messaging for CLI AI agents. No daemon, no network, no complexity.
   </picture>
 </a>
 
-You stop being the copy-paste courier between your agents. Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, and any other CLI agent message each other directly through a shared local SQLite database — no human in the middle.
+You stop being the copy-paste courier between your agents. Claude Code, Codex, Cursor, and any other CLI agent message each other directly through a shared local SQLite database — no human in the middle.
 
 <p align="center">
   <img src="docs/logos/supported-agents.png" width="780"
-       alt="Supported agents: Claude Code, Codex, Gemini, GitHub Copilot, Antigravity, OpenCode, Hermes">
+       alt="Supported agents: Claude Code, Codex, Cursor">
 </p>
 
 **What it isn't:**
@@ -50,14 +50,11 @@ In real use it looks like this — Claude Code asking Codex for a code review an
 # 1. Install — npx is the fastest path, no clone needed
 npx agmsg
 
-# 2. Restart Claude Code / Codex / Gemini CLI / Antigravity / OpenCode to pick up the new skill
+# 2. Restart Claude Code / Codex / Cursor to pick up the new skill
 
 # 3. Run the command — it will prompt for team and agent name on first use
 #    Claude Code:  /agmsg
 #    Codex:        $agmsg
-#    Gemini CLI:   $agmsg
-#    Antigravity:  $agmsg
-#    OpenCode:     $agmsg
 ```
 
 That's it. The slash command prompts you for a team name and an agent name on first use, then asks you to pick a [delivery mode](#delivery-modes) (default on Claude Code and Codex: `monitor` — real-time push; Codex delivers it through a bridge). After that, you talk to your agent naturally — see [First run](#first-run) below.
@@ -108,18 +105,17 @@ git clone https://github.com/fujibee/agmsg.git
 cd agmsg
 ./install.sh              # Interactive (asks command name, default: agmsg)
 ./install.sh --cmd m      # Non-interactive with custom command name
-./install.sh --agent-type gemini    # Install a Gemini-oriented SKILL.md
-./install.sh --agent-type opencode  # OpenCode-only: sets shared skill to OpenCode template
+./install.sh --agent-type cursor    # Cursor-only: sets shared skill to the Cursor template
 ```
 
 The **command name** determines:
 - Skill folder: `~/.agents/skills/<cmd>/`
-- Claude Code / Copilot CLI: `/<cmd>`
-- Codex / Gemini CLI / Antigravity: `$<cmd>`
+- Claude Code: `/<cmd>`
+- Codex: `$<cmd>`
 
 `--cmd` and `--agent-type` are only available via the direct-script path; the `npm` and plugin paths always install as `agmsg` and auto-detect the host agent type.
 
-After install, **restart your agent** (Claude Code / Codex / Gemini CLI / Copilot CLI / Antigravity / OpenCode) so it picks up the new skill.
+After install, **restart your agent** (Claude Code / Codex / Cursor) so it picks up the new skill.
 
 ### Windows: Git Bash
 
@@ -152,11 +148,11 @@ Git Bash PATH). There is no PowerShell reimplementation.
 
 ## First run
 
-Open your project in your agent (Claude Code, Codex, Gemini CLI, etc.) and run:
+Open your project in your agent (Claude Code, Codex, Cursor) and run:
 
 ```
-/agmsg              # Claude Code, Copilot CLI
-$agmsg              # Codex, Gemini CLI, Antigravity
+/agmsg              # Claude Code
+$agmsg              # Codex
 ```
 
 On first use it asks for a **team name** (joins an existing team or creates a new one) and an **agent name** for this project — that's the whole onboarding. After that, talk to your agent naturally:
@@ -213,7 +209,7 @@ codex:
   --dangerously-skip-permissions: false  # a `false` value suppresses the flag entirely
 ```
 
-Eight of the nine agent types are spawnable — `claude-code`, `codex`, `grok-build`, `cursor`, `gemini`, `antigravity`, `copilot`, `opencode`. `hermes` is not: its CLI has no mode that starts an interactive session pre-seeded with an initial prompt (#279). macOS is the primary target; Linux and Windows are best-effort (please open an issue/PR if your terminal isn't handled). Headless environments — no tmux **and** no usable terminal — error out, since the agent CLIs need an interactive terminal.
+All three agent types are spawnable — `claude-code`, `codex`, `cursor`. macOS is the primary target; Linux and Windows are best-effort (please open an issue/PR if your terminal isn't handled). Headless environments — no tmux **and** no usable terminal — error out, since the agent CLIs need an interactive terminal.
 
 ### Tear down a spawned agent (`despawn`)
 
@@ -250,7 +246,7 @@ How incoming messages reach your agent. Pick one at first join via the prompt, o
 | mode | mechanism | latency | who it's for |
 |---|---|---|---|
 | **`monitor`** (default on Claude Code) | SessionStart hook → Monitor tool → blocking SQLite stream | ~5s | Claude Code users wanting real-time push |
-| **`turn`** (default on Codex / Copilot CLI / OpenCode) | Stop hook fires `check-inbox.sh` between assistant turns | until your next interaction | Codex / Copilot CLI / OpenCode (no Monitor tool); Claude Code users on a quieter loop |
+| **`turn`** (default on Codex) | Stop hook fires `check-inbox.sh` between assistant turns | until your next interaction | Codex (no Monitor tool); Claude Code users on a quieter loop |
 | **`both`** | monitor primary, turn as per-session safety net | ~5s; falls back to turn-end on watcher failure | belt-and-suspenders |
 | **`off`** | no automatic delivery | manual `/agmsg` only | minimalists |
 
@@ -337,26 +333,6 @@ Codex supports `mode monitor` through an app-server bridge, plus `mode turn` and
 > ⚠️ **Monitor mode changes how Codex starts — enable it knowing that.** Codex has no Monitor tool, so `mode monitor` prints a shell function that makes `codex` route through agmsg's monitor shim in your interactive shell. In monitor-mode projects the shim routes interactive launches through a bridge that turns incoming agmsg messages into turns on the current Codex thread; `codex exec` and non-monitor projects pass straight through to the real Codex. It depends on Codex app-server behavior and has a known limitation (orphans on TUI close — #149).
 
 If you prefer a global PATH shim, run `~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-shim-install.sh install` and put `~/.agents/bin` before the real Codex binary on PATH. You can also launch with `~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-monitor.sh`. Codex sandboxing must allow writes to the skill's `db/`, `teams/`, and `run/` dirs — `install.sh` configures those `writable_roots` when `~/.codex/config.toml` exists. Setup notes and internals: [docs/codex-monitor-beta.md](docs/codex-monitor-beta.md).
-
-### GitHub Copilot CLI
-
-```
-/agmsg                          — invokes the agmsg skill
-```
-
-The Copilot installer drops a `SKILL.md` at `~/.copilot/skills/agmsg/` so `/agmsg` is auto-discovered. Per-project hooks live at `<project>/.github/hooks/agmsg.json`. Copilot CLI has no Monitor-tool equivalent, so only `mode turn` and `mode off` are supported. Asking for `monitor` or `both` is rejected with an error.
-
-### OpenCode
-
-```
-$agmsg
-```
-
-Install with `./install.sh` (when `~/.config/opencode/` exists, the OpenCode-typed skill is placed automatically alongside the default Codex-typed shared skill). Use `--agent-type opencode` only for OpenCode-only environments where Codex is not installed. OpenCode supports `mode monitor` (via the external [`opencode-sentinel`](https://github.com/tsukimiya/opencode-sentinel) plugin; without it the rule instructs a fallback to turn mode, which the agent follows rather than agmsg enforcing it), `mode turn`, and `mode off`. `spawn opencode` is available via `opencode --prompt` (TUI mode, which stays resident after the boot prompt's turn). `both` is not supported.
-
-This makes OpenCode useful as a local coding agent, including configurations backed by local providers such as Ollama.
-
-See [docs/opencode.md](docs/opencode.md) for full setup instructions.
 
 ### Shell (any agent)
 
@@ -614,24 +590,6 @@ to change), and write through the existing scripts (`send.sh`, `join.sh`,
 - **Product Hunt**: #5 Product of the Day, [2026-06-09 launch](https://www.producthunt.com/products/agmsg) — 219 upvotes, 39 comments
 - **Derivative projects**: `agmsg-shogi`, `agmsg-go`, `agmsg-mcp` (community-built)
 - **External contributors**: [@MiuraKatsu](https://github.com/MiuraKatsu) (Gemini support + whoami auto-detect), [@roundrop](https://github.com/roundrop) (Copilot CLI support), [@TOMONOSUKEJP](https://github.com/TOMONOSUKEJP) (native Windows / Git Bash), [@kenshin-yamada](https://github.com/kenshin-yamada) (watcher scoping fix), [@utenadev](https://github.com/utenadev) (OpenCode contribution), [@lucianlamp](https://github.com/lucianlamp) (native Windows PowerShell helpers), [@tatsuya6502](https://github.com/tatsuya6502) (sandboxed Bash tool support)
-
-## Project site (agmsg.cc)
-
-[agmsg.cc](https://agmsg.cc) is an Astro project under [`site/`](site/).
-
-- **Source of truth:** `site/` (Astro + Tailwind). The built output is **not** committed — CI builds it.
-- **Local preview:**
-  ```bash
-  cd site
-  npm install
-  npm run dev        # http://localhost:4321, live reload
-  # or, to serve the production build:
-  npm run build && npm run preview
-  ```
-- **Publish:** pushing to `main` with changes under `site/` runs [`.github/workflows/pages.yml`](.github/workflows/pages.yml), which builds the site and deploys it to GitHub Pages. The custom domain is set by `site/public/CNAME`.
-- The agent-types gallery is generated at build time from `scripts/drivers/types/*/type.conf`, so adding an agent type surfaces it on the site automatically.
-
-`docs/` is developer documentation (markdown, ADRs, spec) read on GitHub — it is **not** the published site.
 
 ## Contributing
 

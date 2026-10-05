@@ -924,11 +924,8 @@ _record_handover_events() {
   [ "$(grep -c 'ERROR: cannot open message DB' "$out")" -eq 1 ]
 }
 
-# Empty session_id fallback (#236 grok monitor): Grok's `monitor` tool may run
-# the launch command with an empty $GROK_SESSION_ID, so watch.sh must self-assign
-# an id and start, not die with a "Usage" error (which left the monitor down).
 # No silent message loss across a burst (#245): the head-5 truncation bug had a
-# grok agent append `| head -5` to the monitor command, so after the 5th line the
+# monitor wrapper append `| head -5` to the monitor command, so after the 5th line the
 # consumer closed and later messages were dropped while the watermark advanced
 # past them. With the watcher streaming normally (no downstream truncation), a
 # burst of N>5 consecutive messages must ALL be delivered.
@@ -969,7 +966,7 @@ _record_handover_events() {
   ! grep -q "Usage: watch.sh" "$out"
 }
 
-# Callers pass "${GROK_SESSION_ID:--}" (and the same pattern for other hosts)
+# Callers pass "${SESSION_VAR:--}"-style args
 # so a launcher that drops a quoted-empty first arg cannot shift project/type.
 # watch.sh must fold "-" into the same generated-fallback path as "" (#236).
 @test "watch: sentinel '-' session_id resolves like an empty one (#477)" {

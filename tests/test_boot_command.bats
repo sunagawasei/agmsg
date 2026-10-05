@@ -32,7 +32,7 @@ teardown() { teardown_test_env; }
 }
 
 @test "resume_head: nothing when the type has no resume_arg" {
-  [ -z "$(agmsg_role_resume_head gemini sess-1)" ]
+  [ -z "$(agmsg_role_resume_head cursor sess-1)" ]
 }
 
 @test "resume_head: composes right after the cli, before other args" {
@@ -53,7 +53,7 @@ teardown() { teardown_test_env; }
 }
 
 @test "role_cli_args: a type without name_arg omits the name flag" {
-  local out; out="$(agmsg_role_cli_args gemini T-alice '/agmsg actas alice')"
+  local out; out="$(agmsg_role_cli_args cursor T-alice '/agmsg actas alice')"
   [[ "$out" != *" -n "* ]]
   [[ "$out" == *"actas"* ]]
 }
@@ -75,8 +75,8 @@ teardown() { teardown_test_env; }
 # --- agmsg_role_resume_uuid (gate) ---
 
 @test "role_resume_uuid: empty for a type with no resume_arg" {
-  agmsg_role_session_record T alice sess-1 /proj gemini
-  [ -z "$(agmsg_role_resume_uuid gemini T alice /proj)" ]
+  agmsg_role_session_record T alice sess-1 /proj cursor
+  [ -z "$(agmsg_role_resume_uuid cursor T alice /proj)" ]
 }
 
 @test "role_resume_uuid: empty when force_fresh is set" {

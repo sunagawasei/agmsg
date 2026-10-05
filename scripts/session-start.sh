@@ -97,8 +97,8 @@ mkdir -p "$RUN_DIR" 2>/dev/null || true
 # verified empirically 2026-08-23). Every other type/mode keeps the plain
 # read: writing every SessionStart's hook payload (which can include
 # cwd/session_id) to disk as a side effect of a check that only fires for
-# session-team-capable types is not a cost to impose on codex/gemini/grok/
-# copilot and the (default) mode-off path. TYPE and
+# session-team-capable types is not a cost to impose on codex/cursor
+# and the (default) mode-off path. TYPE and
 # agmsg_session_team_enabled are both already resolvable here.
 if _agmsg_session_team_active; then
   # Template + $RUN_DIR (not bare mktemp in $TMPDIR) match this repo's other
@@ -136,7 +136,7 @@ fi
 SESSION_ID=""
 if [ -n "$INPUT" ]; then
   # The session id field name differs by vendor: Claude Code emits snake_case
-  # "session_id"; Grok Build (and Cursor) emit camelCase "sessionId". Try snake
+  # "session_id"; Cursor emits camelCase "sessionId". Try snake
   # first (claude-code unaffected), then camel.
   #
   # This runs for every type, not just claude-code, and is a best-effort
@@ -158,7 +158,6 @@ if [ -n "$INPUT" ]; then
   fi
 fi
 [ -z "$SESSION_ID" ] && SESSION_ID="${CLAUDE_CODE_SESSION_ID:-}"
-[ -z "$SESSION_ID" ] && SESSION_ID="${GROK_SESSION_ID:-}"
 
 # Claude Code's session-team registration is fail-closed: only a valid,
 # top-level, non-empty string session_id from the hook payload is authoritative.

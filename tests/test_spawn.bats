@@ -390,8 +390,7 @@ seed_resumable() {
 }
 
 @test "spawn --model: refused for a type with no model_arg in its manifest" {
-  # No real built-in is spawnable without a model_arg (#279 dropped hermes'
-  # spawnable=yes, its only remaining example) — fixture a minimal one,
+  # No real built-in is spawnable without a model_arg — fixture a minimal one,
   # reusing the already-stubbed `claude` binary as its cli=.
   local nd="$TEST_SKILL_DIR/scripts/drivers/types/nomodeltype"
   mkdir -p "$nd"

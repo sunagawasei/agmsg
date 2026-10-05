@@ -6,7 +6,7 @@ agmsg's pluggable units are **drivers**, grouped by **axis**:
 
 | axis | what it swaps | status |
 |---|---|---|
-| `types` | agent runtimes (claude-code, codex, gemini, …) | shipping |
+| `types` | agent runtimes (claude-code, codex, cursor, …) | shipping |
 | `storage` | the message store (sqlite, …) | planned |
 | `delivery` | how messages reach an agent (monitor / turn / …) | planned |
 

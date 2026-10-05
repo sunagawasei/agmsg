@@ -19,11 +19,11 @@ CLI AI エージェント間のクロスエージェントメッセージング�
   </picture>
 </a>
 
-もうエージェント間のコピペ運び屋にならなくていい。Claude Code、Codex、Gemini CLI、GitHub Copilot CLI、その他あらゆるCLIエージェントが、共有のローカルSQLiteデータベースを通じて直接メッセージをやり取りする — 人間が間に入る必要はない。
+もうエージェント間のコピペ運び屋にならなくていい。Claude Code、Codex、Cursor、その他あらゆるCLIエージェントが、共有のローカルSQLiteデータベースを通じて直接メッセージをやり取りする — 人間が間に入る必要はない。
 
 <p align="center">
   <img src="docs/logos/supported-agents.png" width="780"
-       alt="Supported agents: Claude Code, Codex, Gemini, GitHub Copilot, Antigravity, OpenCode, Hermes">
+       alt="Supported agents: Claude Code, Codex, Cursor">
 </p>
 
 **これではないもの:**
@@ -50,14 +50,11 @@ CLI AI エージェント間のクロスエージェントメッセージング�
 # 1. インストール — npxが最速の道、クローン不要
 npx agmsg
 
-# 2. Claude Code / Codex / Gemini CLI / Antigravity / OpenCode を再起動して新しいスキルを反映
+# 2. Claude Code / Codex / Cursor を再起動して新しいスキルを反映
 
 # 3. コマンドを実行 — 初回はチーム名とエージェント名を尋ねられる
 #    Claude Code:  /agmsg
 #    Codex:        $agmsg
-#    Gemini CLI:   $agmsg
-#    Antigravity:  $agmsg
-#    OpenCode:     $agmsg
 ```
 
 これだけだ。スラッシュコマンドは初回使用時にチーム名とエージェント名を尋ね、続けて[配信モード](#配信モード)を選ばせる（Claude CodeとCodexのデフォルトは `monitor` — リアルタイムプッシュ。Codexはブリッジ経由で実現する）。その後は自然な言葉でエージェントに話しかければよい — 詳しくは下記の[初回実行](#初回実行)を参照。
@@ -108,18 +105,17 @@ git clone https://github.com/fujibee/agmsg.git
 cd agmsg
 ./install.sh              # インタラクティブ（コマンド名を尋ねる、デフォルト: agmsg）
 ./install.sh --cmd m      # カスタムコマンド名で非インタラクティブ
-./install.sh --agent-type gemini    # Gemini向けのSKILL.mdをインストール
-./install.sh --agent-type opencode  # OpenCode専用: 共有スキルをOpenCodeテンプレートに設定
+./install.sh --agent-type cursor    # Cursor専用: 共有スキルをCursorテンプレートに設定
 ```
 
 **コマンド名**が決めるもの:
 - スキルフォルダ: `~/.agents/skills/<cmd>/`
-- Claude Code / Copilot CLI: `/<cmd>`
-- Codex / Gemini CLI / Antigravity: `$<cmd>`
+- Claude Code: `/<cmd>`
+- Codex: `$<cmd>`
 
 `--cmd` と `--agent-type` は直接スクリプト経路でのみ利用可能。`npm` とプラグインの経路は常に `agmsg` としてインストールされ、ホストのエージェントタイプを自動検出する。
 
-インストール後、**エージェントを再起動**して（Claude Code / Codex / Gemini CLI / Copilot CLI / Antigravity / OpenCode）新しいスキルを反映させる。
+インストール後、**エージェントを再起動**して（Claude Code / Codex / Cursor）新しいスキルを反映させる。
 
 ### Windows: Git Bash と Codex
 
@@ -150,8 +146,8 @@ agmsgの実装は `scripts/` 配下のBashスクリプト群であるため、Wi
 エージェント（Claude Code、Codexなど）でプロジェクトを開き、次を実行する:
 
 ```
-/agmsg              # Claude Code, Copilot CLI
-$agmsg              # Codex, Gemini CLI, Antigravity
+/agmsg              # Claude Code
+$agmsg              # Codex
 ```
 
 初回使用時に**チーム名**（既存チームへの参加、または新規作成）とこのプロジェクトの**エージェント名**を尋ねられる — オンボーディングはこれだけだ。あとは自然な言葉でエージェントに話しかければよい:
@@ -208,7 +204,7 @@ codex:
   --dangerously-skip-permissions: false  # `false`の値はフラグ自体を出力しない
 ```
 
-9種類のエージェントタイプのうち8つがspawn可能 — `claude-code`、`codex`、`grok-build`、`cursor`、`gemini`、`antigravity`、`copilot`、`opencode`。`hermes` は不可 — そのCLIには初期プロンプトを事前に仕込んだインタラクティブセッションを開始するモードがない（#279）。macOSが主なターゲットで、LinuxとWindowsはベストエフォート（ターミナルが未対応の場合はissueまたはPRを歓迎）。ヘッドレス環境 — tmuxもなく使えるターミナルもない — はエージェントCLIがインタラクティブなターミナルを必要とするためエラーになる。
+3種類のエージェントタイプすべてがspawn可能 — `claude-code`、`codex`、`cursor`。macOSが主なターゲットで、LinuxとWindowsはベストエフォート（ターミナルが未対応の場合はissueまたはPRを歓迎）。ヘッドレス環境 — tmuxもなく使えるターミナルもない — はエージェントCLIがインタラクティブなターミナルを必要とするためエラーになる。
 
 ### spawnしたエージェントを終了する（`despawn`）
 
@@ -232,7 +228,7 @@ despawnは指定されたメンバーにのみ作用する — `despawn` を実�
 | モード | 仕組み | レイテンシ | 向いている相手 |
 |---|---|---|---|
 | **`monitor`**（Claude Codeのデフォルト） | SessionStartフック → Monitorツール → ブロッキングSQLiteストリーム | 約5秒 | リアルタイムプッシュを望むClaude Codeユーザー |
-| **`turn`**（Codex / Copilot CLI / OpenCodeのデフォルト） | アシスタントのターン間でStopフックが `check-inbox.sh` を発火 | 次のやり取りまで | Codex / Copilot CLI / OpenCode（Monitorツールなし）、より静かなループを好むClaude Codeユーザー |
+| **`turn`**（Codexのデフォルト） | アシスタントのターン間でStopフックが `check-inbox.sh` を発火 | 次のやり取りまで | Codex（Monitorツールなし）、より静かなループを好むClaude Codeユーザー |
 | **`both`** | monitorを主に、turnをセッションごとの安全網として | 約5秒。ウォッチャー障害時はturn相当にフォールバック | 二重の保険をかけたい場合 |
 | **`off`** | 自動配信なし | 手動の `/agmsg` のみ | ミニマリスト |
 
@@ -291,26 +287,6 @@ Codexは `mode monitor` をapp-serverブリッジ経由でサポートし、加�
 > ⚠️ **monitorモードはCodexの起動方法を変える — それを承知した上で有効化すること。** CodexにはMonitorツールがないため、`mode monitor` はインタラクティブシェル内で `codex` をagmsgのmonitorシム経由にルーティングするシェル関数を表示する。monitorモードのプロジェクトでは、このシムがインタラクティブな起動を、受信したagmsgメッセージを現在のCodexスレッドのターンに変換するブリッジ経由にルーティングする。`codex exec` とmonitor対象外のプロジェクトは実物のCodexにそのまま通る。これはCodex app-serverの挙動に依存しており、既知の制限がある（TUIを閉じるとオーファンが残る — #149）。
 
 グローバルなPATHシムを好むなら、`~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-shim-install.sh install` を実行し、`~/.agents/bin` を実物のCodexバイナリより前にPATHに置く。`~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-monitor.sh` で直接起動することもできる。Codexのサンドボックスはスキルの `db/`、`teams/`、`run/` ディレクトリへの書き込みを許可する必要がある — `~/.codex/config.toml` が存在する場合、`install.sh` がその `writable_roots` を設定する。セットアップの詳細と内部動作: [docs/codex-monitor-beta.md](docs/codex-monitor-beta.md)。
-
-### GitHub Copilot CLI
-
-```
-/agmsg                          — agmsgスキルを呼び出す
-```
-
-Copilotインストーラーは `~/.copilot/skills/agmsg/` に `SKILL.md` を配置するので `/agmsg` は自動検出される。プロジェクトごとのフックは `<project>/.github/hooks/agmsg.json` にある。Copilot CLIにはMonitorツール相当のものがないため、`mode turn` と `mode off` のみサポートされる。`monitor` や `both` を指定するとエラーで拒否される。
-
-### OpenCode
-
-```
-$agmsg
-```
-
-`./install.sh` でインストールする（`~/.config/opencode/` が存在する場合、OpenCode向けスキルがデフォルトのCodex向け共有スキルと並んで自動的に配置される）。`--agent-type opencode` はCodexがインストールされていないOpenCode専用環境でのみ使う。OpenCodeは `mode monitor`（外部プラグイン [`opencode-sentinel`](https://github.com/tsukimiya/opencode-sentinel) 経由。プラグイン未導入時は turn へのフォールバックをruleが指示するが、それに従うのはagentであってagmsgが強制するものではない）、`mode turn`、`mode off` に対応。`spawn opencode` は `opencode --prompt`（ブートプロンプトのターンが終わってもTUIが滞在するモード）経由で利用可能。`both` は非対応。
-
-これによりOpenCodeは、Ollamaのようなローカルプロバイダーを使う構成を含め、ローカルのコーディングエージェントとして役立つ。
-
-完全なセットアップ手順は [docs/opencode.md](docs/opencode.md) を参照。
 
 ### シェル（任意のエージェント）
 
@@ -544,24 +520,6 @@ agmsgのプラグイン可能な単位は軸（axis）ごとにグループ化�
 - **Product Hunt**: Product of the Day 5位、[2026-06-09ローンチ](https://www.producthunt.com/products/agmsg) — 219アップボート、39コメント
 - **派生プロジェクト**: `agmsg-shogi`、`agmsg-go`、`agmsg-mcp`（コミュニティ製）
 - **外部コントリビューター**: [@MiuraKatsu](https://github.com/MiuraKatsu)（Geminiサポート + whoami自動検出）、[@roundrop](https://github.com/roundrop)（Copilot CLIサポート）、[@TOMONOSUKEJP](https://github.com/TOMONOSUKEJP)（ネイティブWindows / Git Bash）、[@kenshin-yamada](https://github.com/kenshin-yamada)（ウォッチャーのスコープ修正）、[@utenadev](https://github.com/utenadev)（OpenCode貢献）、[@lucianlamp](https://github.com/lucianlamp)（ネイティブWindows PowerShellヘルパー）、[@tatsuya6502](https://github.com/tatsuya6502)（サンドボックス化されたBashツールのサポート）
-
-## プロジェクトサイト（agmsg.cc）
-
-[agmsg.cc](https://agmsg.cc) は [`site/`](site/) 配下のAstroプロジェクトだ。
-
-- **正典（source of truth）:** `site/`（Astro + Tailwind）。ビルド出力はコミットされて**いない** — CIがビルドする。
-- **ローカルプレビュー:**
-  ```bash
-  cd site
-  npm install
-  npm run dev        # http://localhost:4321, ライブリロード
-  # または、プロダクションビルドを配信する場合:
-  npm run build && npm run preview
-  ```
-- **公開:** `site/` 配下に変更を含めて `main` にpushすると [`.github/workflows/pages.yml`](.github/workflows/pages.yml) が実行され、サイトをビルドしてGitHub Pagesにデプロイする。カスタムドメインは `site/public/CNAME` で設定される。
-- エージェントタイプのギャラリーはビルド時に `scripts/drivers/types/*/type.conf` から生成されるため、エージェントタイプを追加すると自動的にサイトに反映される。
-
-`docs/` はGitHub上で読まれる開発者向けドキュメント（markdown、ADR、spec）だ — 公開サイトそのものでは**ない**。
 
 ## コントリビューション
 

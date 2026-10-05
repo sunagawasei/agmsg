@@ -755,7 +755,7 @@ _doctor_scan_pair() {
   # Whether this type already reports its own per-role runtime status
   # (codex's _delivery.sh does, via the embedded delivery-status block --
   # one "Codex bridge: team/agent ..." line per role). Everything else
-  # (currently claude-code, opencode) falls through to the default runtime
+  # (currently claude-code) falls through to the default runtime
   # status, which is a single project-wide count with no per-role
   # breakdown, so those types get the watcher= field built below instead.
   # Detected structurally (does the type's plug override the function)
@@ -768,9 +768,8 @@ _doctor_scan_pair() {
 
   # Whether this type has ANY real delivery to ask about. delivery_modes= in
   # the type's manifest lists every mode the type can be SET to; a type whose
-  # list is nothing but "off" (agmsg-app, hermes) has no agmsg-side delivery
-  # at all -- agmsg-app is the desktop app's own identity, which owns its
-  # own send/receive UI. Querying delivery.sh status for such a type exits 1
+  # list is nothing but "off" has no agmsg-side delivery
+  # at all. Querying delivery.sh status for such a type exits 1
   # by design (there's nothing to report), and this doctor was turning that
   # into a WARNING on an otherwise completely healthy installation -- a real
   # installation, run once, came back "9 team(s), 56 registration(s), 5

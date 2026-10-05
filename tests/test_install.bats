@@ -1023,3 +1023,29 @@ CYG
   [ "$status" -eq 1 ]
   [[ "$output" == *"Unsupported --agent-type 'gemini'"* ]]
 }
+
+@test "install: --update prunes removed bundled types and scripts/windows, keeps user types" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  local t removed="gemini grok-build agmsg-app" # removed-type-fixture
+  for t in $removed; do
+    mkdir -p "$SK/scripts/drivers/types/$t"
+    : > "$SK/scripts/drivers/types/$t/type.conf"
+  done
+  mkdir -p "$SK/scripts/drivers/types/my-custom" "$SK/scripts/windows"
+  : > "$SK/scripts/drivers/types/my-custom/type.conf"
+  : > "$SK/scripts/windows/agmsg-run.sh"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  for t in $removed; do
+    [ ! -e "$SK/scripts/drivers/types/$t" ]
+  done
+  [ ! -e "$SK/scripts/windows" ]
+  [ -f "$SK/scripts/drivers/types/my-custom/type.conf" ]
+}
+
+@test "install: a reinstall prunes removed bundled types too" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  mkdir -p "$SK/scripts/drivers/types/hermes" "$SK/scripts/windows" # removed-type-fixture
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  [ ! -e "$SK/scripts/drivers/types/hermes" ] # removed-type-fixture
+  [ ! -e "$SK/scripts/windows" ]
+}

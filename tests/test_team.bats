@@ -12,7 +12,7 @@ teardown() {
 
 # Auto-detect tests must not depend on the actual runtime this suite itself
 # happens to run under (#142): when bats runs from inside a real Codex/
-# Gemini/etc session, ambient env vars and the real process tree can make
+# Cursor session, ambient env vars and the real process tree can make
 # detect_cli_type see a signal the test never set, masking the fallback (or
 # a different env var's) path under test.
 #
