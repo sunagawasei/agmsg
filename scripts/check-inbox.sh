@@ -3,6 +3,13 @@ set -euo pipefail
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 
+# A headless cursor worker's own turns run this Stop hook too (hooks.json
+# resolves by --workspace); it must not read or mark the worker's inbox behind
+# the bridge, which acks only after its turn succeeds. See cursor-bridge.sh.
+if [ -n "${AGMSG_CURSOR_BRIDGE:-}" ]; then
+  exit 0
+fi
+
 # Check inbox across all teams with cooldown. Skips if last check was < 60 seconds ago.
 # Usage: check-inbox.sh <type> <project_path>
 
