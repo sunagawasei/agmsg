@@ -501,6 +501,14 @@ for f in "$RUN_DIR"/cc-instance.*; do
   rm -f "$f"
 done
 
+# A lock-failure marker for a CC pid that has exited has nothing left to report.
+for f in "$RUN_DIR"/session-start-lock-failed.*; do
+  [ -f "$f" ] || continue
+  pid=${f##*.}
+  case "$pid" in ''|*[!0-9]*) continue ;; esac
+  _agmsg_pid_alive "$pid" || rm -f "$f"
+done
+
 # Same defensive pass for stale watcher pidfiles. A live leased owner holds its
 # lease for its whole life, so an unheld lease means the recorded pid was reused.
 for f in "$RUN_DIR"/watch.*.pid; do
@@ -571,9 +579,19 @@ if [ -n "$CC_PID" ]; then
   if ! agmsg_team_lifecycle_lock_acquire "$_lifecycle_team" \
       "${AGMSG_LIFECYCLE_LOCK_TIMEOUT:-10}"; then
     echo "agmsg: could not serialize SessionStart registration for $_lifecycle_team" >&2
+    # Leave a per-pid marker so the missing cc-instance is detectable after the
+    # fact; the temp+mv keeps concurrent timeouts from interleaving one file.
+    _lockfail_tmp="$(mktemp "$RUN_DIR/.session-start-lock-failed.XXXXXX" 2>/dev/null || true)"
+    if [ -n "$_lockfail_tmp" ]; then
+      printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)" \
+        "$CC_PID" "$_lifecycle_team" "$INSTANCE_ID" > "$_lockfail_tmp" 2>/dev/null \
+        && mv -f "$_lockfail_tmp" "$RUN_DIR/session-start-lock-failed.$CC_PID" 2>/dev/null \
+        || rm -f "$_lockfail_tmp" 2>/dev/null || true
+    fi
     exit 0
   fi
   printf '%s\n' "$INSTANCE_ID" > "$STATE"
+  rm -f "$RUN_DIR/session-start-lock-failed.$CC_PID"
   # Recover this team under the same lock that published cc-instance so a
   # resume's bare-sid veto and the kill decision cannot straddle another
   # SessionStart. Other teams are recovered after release to avoid holding

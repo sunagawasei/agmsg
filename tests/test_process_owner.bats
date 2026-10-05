@@ -922,7 +922,7 @@ PY
   # callsite: a file-level grep can pass while the real branch still uses a
   # raw PID operation elsewhere in the same file.
   assert_process_callsite_range scripts/watch.sh 200 209 'agmsg_process_assert_bootstrap watch'
-  assert_process_callsite_range scripts/session-start.sh 201 206 'agmsg_process_signal_owned watch "\$orphan_pidfile"'
+  assert_process_callsite_pattern scripts/session-start.sh 'agmsg_process_signal_owned watch "\$orphan_pidfile"'
   assert_process_callsite_pattern scripts/delivery.sh 'agmsg_process_signal_owned watch "\$f"'
   assert_process_callsite_range scripts/check-inbox.sh 82 86 'agmsg_process_dedup_should_suppress watch "\$PIDFILE"'
   assert_process_callsite_range scripts/drivers/types/codex/_session-start.sh 169 172 'agmsg_process_dedup_should_suppress codex-bridge "\$pidfile"'
@@ -952,4 +952,94 @@ PY
 @test "process-owner existing watcher canaries remain present and unmodified by additions" {
   grep -Fq '@test "session-start: skips directive when watcher already alive (compact dedup)"' tests/test_watch.bats
   grep -Fq '@test "watch: relaunch with the SAME instance id replaces the previous watcher (#66 preserved)"' tests/test_watch.bats
+}
+
+# session-start.sh's dead cc-instance pass: end-to-end, through the real script.
+start_orphan_watcher() {
+  local pidfile="$1" scope="$2"
+  local target="$TEST_PROCESS_ROOT/orphan-target.sh" ready="$TEST_PROCESS_ROOT/orphan.ready" report="$TEST_PROCESS_ROOT/orphan.report"
+  write_owner_target "$target" "$ready" "$report"
+  start_owner_registered watch "$pidfile" "$scope" "$target" "$ready" "$report"
+}
+
+run_orphan_session_start() {
+  local sid="$1" project="$2" agent_pid="${3:-}"
+  run env AGMSG_RESOLVE_PROJECT=0 AGMSG_AGENT_PID="$agent_pid" CLAUDE_CODE_SESSION_ID="$sid" \
+    bash "$SCRIPTS/session-start.sh" claude-code "$project" <<<"{\"session_id\":\"$sid\"}"
+}
+
+@test "session-start owned-orphan: a dead cc-instance terminates its owned watcher and is removed" {
+  local project="$TEST_PROCESS_ROOT/orphan-project" dead_sid="orphan-dead-$BATS_TEST_NUMBER" dead_pid dead_iid pidfile
+  mkdir -p "$project"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$project" >/dev/null
+  test_fixture_start_reaped_process sleep 300
+  dead_pid="$TEST_REAPED_PID"
+  kill -TERM "$dead_pid"
+  wait_for_pid_exit "$dead_pid"
+  dead_iid="$dead_sid.$dead_pid"
+  printf '%s\n' "$dead_iid" >"$TEST_SKILL_DIR/run/cc-instance.$dead_pid"
+  pidfile="$TEST_SKILL_DIR/run/watch.$dead_iid.pid"
+  start_orphan_watcher "$pidfile" "watch|$dead_iid|$project|claude-code"
+  process_is_owned "$pidfile" "watch|$dead_iid|$project|claude-code"
+
+  run_orphan_session_start "orphan-new-$BATS_TEST_NUMBER" "$project"
+  [ "$status" -eq 0 ]
+  wait_for_pid_exit "$TEST_OWNER_PID"
+  [ ! -e "$TEST_SKILL_DIR/run/cc-instance.$dead_pid" ]
+  [ ! -e "$pidfile" ]
+}
+
+@test "session-start owned-orphan: a live cc-instance holding the same record keeps the watcher" {
+  local project="$TEST_PROCESS_ROOT/orphan-project" sid="orphan-shared-$BATS_TEST_NUMBER" dead_pid pidfile
+  mkdir -p "$project"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$project" >/dev/null
+  test_fixture_start_reaped_process sleep 300
+  dead_pid="$TEST_REAPED_PID"
+  kill -TERM "$dead_pid"
+  wait_for_pid_exit "$dead_pid"
+  sleep 600 &
+  TEST_FOREIGN_PID=$!
+  printf '%s\n' "$sid" >"$TEST_SKILL_DIR/run/cc-instance.$dead_pid"
+  printf '%s\n' "$sid" >"$TEST_SKILL_DIR/run/cc-instance.$TEST_FOREIGN_PID"
+  pidfile="$TEST_SKILL_DIR/run/watch.$sid.pid"
+  start_orphan_watcher "$pidfile" "watch|$sid|$project|claude-code"
+
+  run_orphan_session_start "orphan-new-$BATS_TEST_NUMBER" "$project"
+  [ "$status" -eq 0 ]
+  [ ! -e "$TEST_SKILL_DIR/run/cc-instance.$dead_pid" ]
+  kill -0 "$TEST_OWNER_PID"
+  [ -e "$pidfile" ]
+}
+
+@test "session-start leaves a marker when the lifecycle lock times out and publishes on the next run" {
+  local project="$TEST_PROCESS_ROOT/lock-project" sid="lockfail-$BATS_TEST_NUMBER" team holder_ready holder
+  mkdir -p "$project"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$project" >/dev/null
+  sleep 600 &
+  TEST_FOREIGN_PID=$!
+  team="$(env SKILL_DIR="$TEST_SKILL_DIR" SCRIPT_DIR="$SCRIPTS" CLAUDE_CODE_SESSION_ID="$sid" bash -c '
+    for l in compat storage actas-lock team-lifecycle instance-id process-identity session-team; do . "$SCRIPT_DIR/lib/$l.sh"; done
+    agmsg_session_hook_team claude-code "$1"' _ "$sid")"
+  [ -n "$team" ]
+  holder_ready="$TEST_PROCESS_ROOT/holder.ready"
+  env SKILL_DIR="$TEST_SKILL_DIR" SCRIPT_DIR="$SCRIPTS" bash -c '
+    for l in compat storage actas-lock team-lifecycle; do . "$SCRIPT_DIR/lib/$l.sh"; done
+    agmsg_team_lifecycle_lock_acquire "$1" 5 && : >"$2" && exec sleep 600' _ "$team" "$holder_ready" &
+  holder=$!
+  test_fixture_register_owned_pid "$holder"
+  wait_for_file "$holder_ready"
+
+  run env AGMSG_LIFECYCLE_LOCK_TIMEOUT=1 AGMSG_RESOLVE_PROJECT=0 AGMSG_AGENT_PID="$TEST_FOREIGN_PID" \
+    CLAUDE_CODE_SESSION_ID="$sid" bash "$SCRIPTS/session-start.sh" claude-code "$project" <<<"{\"session_id\":\"$sid\"}"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"invoke the Monitor tool"* ]]
+  [ ! -e "$TEST_SKILL_DIR/run/cc-instance.$TEST_FOREIGN_PID" ]
+  grep -q "$team" "$TEST_SKILL_DIR/run/session-start-lock-failed.$TEST_FOREIGN_PID"
+
+  stop_test_pid "$holder"
+  run env AGMSG_RESOLVE_PROJECT=0 AGMSG_AGENT_PID="$TEST_FOREIGN_PID" \
+    CLAUDE_CODE_SESSION_ID="$sid" bash "$SCRIPTS/session-start.sh" claude-code "$project" <<<"{\"session_id\":\"$sid\"}"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$TEST_SKILL_DIR/run/cc-instance.$TEST_FOREIGN_PID")" = "$sid.$TEST_FOREIGN_PID" ]
+  [ ! -e "$TEST_SKILL_DIR/run/session-start-lock-failed.$TEST_FOREIGN_PID" ]
 }
