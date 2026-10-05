@@ -283,10 +283,13 @@ STUB
 requested="${*: -1}"
 printf 'requested=%s argv=%s\n' "$requested" "$*" >> "$PS_STUB_LOG"
 # The production liveness helper cross-checks an unsignalable/dead PID with
-# `ps -o stat=`. Keep that query truthful; the fixture below only virtualizes
+# `ps -o stat=` and, when kill(2) reports no such process, a whole-table
+# `ps -Ao pid=,stat=` snapshot. Keep both truthful: a stubbed snapshot lacks the
+# caller's own pid, so a finished probe child is read as unknown-so-alive and
+# every probe runs to its timeout. The fixture below only virtualizes
 # command-line discovery for bridges.
 case " $* " in
-  *" -o stat= "*) exec /bin/ps "$@" ;;
+  *" -o stat= "*|*" -Ao pid=,stat= "*) exec /bin/ps "$@" ;;
 esac
 for args_file in "$FAKE_CAPTURE"/bridge.args.*; do
   [ -f "$args_file" ] || continue
