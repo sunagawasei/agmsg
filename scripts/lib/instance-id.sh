@@ -435,6 +435,36 @@ agmsg_normalize_instance_id() {
   agmsg_instance_id "$token" "$type"
 }
 
+# The instance cc-instance.<pid> currently names, read strictly enough to
+# authorize a destructive decision (worker teardown), not just a comparison.
+#   rc 0  prints the token: a regular file holding exactly one line
+#         "<bare sid>.<pid>" for this very pid
+#   rc 1  no such file
+#   rc 2  something is there but is not that: a symlink (dangling included), a
+#         directory, an unreadable file, extra lines/NULs/whitespace, a dotted
+#         sid, another pid
+# Callers treat rc 1 and rc 2 alike ("no instance-level evidence") and keep the
+# owner; they are separate codes so a caller can say which one it saw.
+agmsg_cc_instance_current() {   # <pid>
+  local pid="$1" f current
+  case "$pid" in ''|*[!0-9]*) return 2 ;; esac
+  f="$SKILL_DIR/run/cc-instance.$pid"
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then return 1; fi
+  [ -f "$f" ] && [ ! -L "$f" ] || return 2
+  current="$(cat "$f" 2>/dev/null)" || return 2
+  case "$current" in
+    ''|*[!A-Za-z0-9._-]*|.*|*..*) return 2 ;;
+  esac
+  # command substitution drops NULs and extra trailing newlines; the file must
+  # be exactly the value plus one newline.
+  [ "$(LC_ALL=C wc -c < "$f" 2>/dev/null | tr -d '[:space:]')" = "$((${#current} + 1))" ] \
+    || return 2
+  [ "${current%.*}" != "$current" ] || return 2
+  case "${current%.*}" in *.*) return 2 ;; esac
+  [ "${current##*.}" = "$pid" ] || return 2
+  printf '%s' "$current"
+}
+
 # True iff <token> identifies a still-live instance.
 #   composite "<sid>.<pid>" → the embedded pid is alive (kill -0), AND, when a
 #                            cc-instance.<pid> record exists for that pid, its

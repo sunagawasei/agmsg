@@ -434,34 +434,19 @@ owner_generation_verified() {
 # well-formed instance of this PID that differs from ours; anything unreadable
 # or malformed keeps the owner-alive deferral.
 owner_instance_superseded() {
-  local f="$RUN_DIR/cc-instance.$OWNER_PID" current
+  local current
   [ "$TYPE" = claude-code ] || return 1
-  [ -f "$f" ] && [ ! -L "$f" ] || return 1
-  current="$(cat "$f" 2>/dev/null)" || return 1
-  # Exactly "<bare sid>.<owner pid>" on one line: this reader authorizes a
-  # destructive action, so a dotted sid or stray whitespace is malformed.
-  case "$current" in
-    ''|*[!A-Za-z0-9._-]*|.*|*..*) return 1 ;;
-  esac
-  # command substitution drops NULs and extra trailing newlines; the file must
-  # be exactly the value plus one newline.
-  [ "$(LC_ALL=C wc -c < "$f" 2>/dev/null | tr -d '[:space:]')" = "$((${#current} + 1))" ] \
-    || return 1
-  [ "${current%.*}" != "$current" ] || return 1
-  case "${current%.*}" in *.*) return 1 ;; esac
-  [ "${current##*.}" = "$OWNER_PID" ] || return 1
+  current="$(agmsg_cc_instance_current "$OWNER_PID")" || return 1
   [ "$current" != "$INSTANCE_ID" ] || return 1
   owner_generation_verified
 }
 
-# True only when a regular, well-formed cc-instance record names this very
-# instance (a resume back to it); unreadable or odd records are not "self".
+# True only when a well-formed cc-instance record names this very instance (a
+# resume back to it); unreadable or odd records are not "self".
 owner_instance_is_self() {
-  local f="$RUN_DIR/cc-instance.$OWNER_PID" current
-  [ -f "$f" ] && [ ! -L "$f" ] || return 1
-  current="$(cat "$f" 2>/dev/null)" || return 1
-  [ "$current" = "$INSTANCE_ID" ] || return 1
-  [ "$(LC_ALL=C wc -c < "$f" 2>/dev/null | tr -d '[:space:]')" = "$((${#current} + 1))" ]
+  local current
+  current="$(agmsg_cc_instance_current "$OWNER_PID")" || return 1
+  [ "$current" = "$INSTANCE_ID" ]
 }
 
 wait_for_owner_exit() {

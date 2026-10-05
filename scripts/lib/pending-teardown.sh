@@ -282,6 +282,21 @@ _agmsg_pending_bridge_generation() {
   return 2
 }
 
+# True only when the owner pid still runs the generation the record saw and
+# cc-instance.<pid> positively names a different instance of it. Anything else
+# (no record, a malformed one, an unreadable start token) is "not proven".
+_agmsg_pending_owner_superseded() {
+  local current current_start owner_method current_method
+  current="$(agmsg_cc_instance_current "$AGMSG_PENDING_OWNER_PID")" || return 1
+  [ "$current" != "$AGMSG_PENDING_OWNER_INSTANCE" ] || return 1
+  _agmsg_pid_alive "$AGMSG_PENDING_OWNER_PID" || return 1
+  current_start="$(agmsg_pid_start_token "$AGMSG_PENDING_OWNER_PID" 2>/dev/null)" || return 1
+  owner_method="$(agmsg_pid_start_token_method "$AGMSG_PENDING_OWNER_START" 2>/dev/null || true)"
+  current_method="$(agmsg_pid_start_token_method "$current_start" 2>/dev/null || true)"
+  [ -n "$owner_method" ] && [ "$owner_method" = "$current_method" ] \
+    && [ "$current_start" = "$AGMSG_PENDING_OWNER_START" ]
+}
+
 agmsg_pending_teardown_recover_one() {
   local path="$1" despawn="$2" read_rc=0 current_start="" current record_path
   local recovery_reason=owner-dead owner_method current_method bare_sid peer_host
@@ -372,10 +387,16 @@ agmsg_pending_teardown_recover_one() {
       return 0
     fi
     if [ "$current_start" = "$AGMSG_PENDING_OWNER_START" ]; then
-      _agmsg_pending_retain "" "" "owner_pid=$AGMSG_PENDING_OWNER_PID" owner-alive
-      return 0
+      # /clear keeps the pid and generation but moves the process to a new
+      # instance; the old instance's worker is then nobody's.
+      if ! _agmsg_pending_owner_superseded; then
+        _agmsg_pending_retain "" "" "owner_pid=$AGMSG_PENDING_OWNER_PID" owner-alive
+        return 0
+      fi
+      recovery_reason=owner-superseded
+    else
+      recovery_reason=owner-replaced
     fi
-    recovery_reason=owner-replaced
   fi
 
   _agmsg_pending_unlock() {
@@ -390,6 +411,14 @@ agmsg_pending_teardown_recover_one() {
     lock_acquired=1
   else
     _agmsg_pending_retain "" "" "" lifecycle-lock-unavailable
+    return 0
+  fi
+
+  # A resume back to the old instance may have landed while we waited for the
+  # lock; the supersede has to be proven again, not merely not contradicted.
+  if [ "$recovery_reason" = owner-superseded ] && ! _agmsg_pending_owner_superseded; then
+    _agmsg_pending_unlock
+    _agmsg_pending_retain "" "" "owner_pid=$AGMSG_PENDING_OWNER_PID" owner-alive
     return 0
   fi
 

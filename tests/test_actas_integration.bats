@@ -449,3 +449,45 @@ fake_session() {
   kill "$broad" 2>/dev/null || true
   wait "$broad" 2>/dev/null || true
 }
+
+# --- /clear: the same live pid takes a new session id (#63) ---
+# The ownership unit is the instance "<sid>.<pid>", and run/cc-instance.<pid>
+# is its authority: SessionStart rewrites it on every /clear.
+
+@test "actas-claim: after /clear the role held by the old instance of the same live pid is claimed once cc-instance names the new one" {
+  skip_on_windows "actas live-session liveness under Git Bash (#182)"
+  fake_register T alice
+  export AGMSG_AGENT_PID="$$"
+  echo "sid-before-clear.$$" > "$(actas_lock_path T alice)"
+  echo "sid-after-clear.$$" > "$RUN_DIR/cc-instance.$$"
+
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p1 claude-code alice "sid-after-clear"
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -qF "status=ok"
+  [ "$(head -1 "$(actas_lock_path T alice)")" = "sid-after-clear.$$" ]
+}
+
+@test "actas-claim: while cc-instance still names the old instance a new sid on the same pid is held" {
+  skip_on_windows "actas live-session liveness under Git Bash (#182)"
+  fake_register T alice
+  export AGMSG_AGENT_PID="$$"
+  echo "sid-before-clear.$$" > "$(actas_lock_path T alice)"
+  echo "sid-before-clear.$$" > "$RUN_DIR/cc-instance.$$"
+
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p1 claude-code alice "sid-other"
+  [ "$status" -eq 1 ]
+  printf '%s\n' "$output" | grep -qF "status=held"
+  [ "$(head -1 "$(actas_lock_path T alice)")" = "sid-before-clear.$$" ]
+}
+
+@test "actas-claim: without a cc-instance record the old instance of a live pid keeps the role" {
+  skip_on_windows "actas live-session liveness under Git Bash (#182)"
+  fake_register T alice
+  export AGMSG_AGENT_PID="$$"
+  echo "sid-before-clear.$$" > "$(actas_lock_path T alice)"
+  rm -f "$RUN_DIR/cc-instance.$$"
+
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p1 claude-code alice "sid-after-clear"
+  [ "$status" -eq 1 ]
+  [ "$(head -1 "$(actas_lock_path T alice)")" = "sid-before-clear.$$" ]
+}

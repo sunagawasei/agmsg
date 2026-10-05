@@ -805,3 +805,46 @@ require_eperm_pid() {
     | grep -v 'agmsg-kill0-ok' || true)"
   [ -z "$offenders" ] || { echo "$offenders"; false; }
 }
+
+# --- agmsg_cc_instance_current: the strict reader of run/cc-instance.<pid> ---
+
+@test "cc_instance_current: a well-formed record for this pid prints its token" {
+  printf 'sid-new.4242\n' > "$RUN_DIR/cc-instance.4242"
+  run agmsg_cc_instance_current 4242
+  [ "$status" -eq 0 ]
+  [ "$output" = "sid-new.4242" ]
+}
+
+@test "cc_instance_current: no record is rc 1" {
+  run agmsg_cc_instance_current 4242
+  [ "$status" -eq 1 ]
+}
+
+@test "cc_instance_current: a record that cannot authorize anything is rc 2" {
+  local variant
+  for variant in empty bare wrong-pid dotted-sid multiline spaced blank-line nul symlink dangling directory; do
+    rm -rf "$RUN_DIR/cc-instance.4242"
+    case "$variant" in
+      empty) : > "$RUN_DIR/cc-instance.4242" ;;
+      bare) printf 'sid-new\n' > "$RUN_DIR/cc-instance.4242" ;;
+      wrong-pid) printf 'sid-new.4243\n' > "$RUN_DIR/cc-instance.4242" ;;
+      dotted-sid) printf 'a.b.4242\n' > "$RUN_DIR/cc-instance.4242" ;;
+      multiline) printf 'sid-new.4242\nextra\n' > "$RUN_DIR/cc-instance.4242" ;;
+      spaced) printf 'sid-new.4242 \n' > "$RUN_DIR/cc-instance.4242" ;;
+      blank-line) printf 'sid-new.4242\n\n' > "$RUN_DIR/cc-instance.4242" ;;
+      nul) printf 'sid\0-new.4242\n' > "$RUN_DIR/cc-instance.4242" ;;
+      symlink)
+        printf 'sid-new.4242\n' > "$BATS_TEST_TMPDIR/real"
+        ln -s "$BATS_TEST_TMPDIR/real" "$RUN_DIR/cc-instance.4242" ;;
+      dangling) ln -s "$BATS_TEST_TMPDIR/nowhere" "$RUN_DIR/cc-instance.4242" ;;
+      directory) mkdir "$RUN_DIR/cc-instance.4242" ;;
+    esac
+    run agmsg_cc_instance_current 4242
+    [ "$status" -eq 2 ] || { echo "$variant: rc=$status out=$output"; return 1; }
+  done
+}
+
+@test "cc_instance_current: a non-numeric pid is rc 2" {
+  run agmsg_cc_instance_current "4242x"
+  [ "$status" -eq 2 ]
+}

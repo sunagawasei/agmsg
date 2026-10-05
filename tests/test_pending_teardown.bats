@@ -343,6 +343,84 @@ setup_clear_fixture() {
   [ -f "$(agmsg_pending_teardown_path "$STEAM" worker)" ]
 }
 
+# /clear moves the live owner pid to a new instance after the worker already
+# left a pending record behind (cc-instance.<pid> names NEXT_INSTANCE).
+setup_pending_for_clear() {
+  start_owner
+  start_bridge
+  NEXT_INSTANCE="NEXT-5E55.$OWNER_PID"
+  agmsg_pending_teardown_write "$STEAM" worker codex test-clear     "$BRIDGE_RECORD" verified "$OWNER_INSTANCE" "$OWNER_PID" "$OWNER_START"     "$OWNER_INSTANCE" ""
+}
+
+@test "pending teardown recovers a live owner pid once cc-instance names a new instance" {
+  setup_pending_for_clear
+  printf '%s\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+
+  run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | grep -c "^agmsg: pending teardown recovered team=$STEAM worker=worker reason=owner-superseded$")" -eq 1 ]
+  kill -0 "$OWNER_PID" 2>/dev/null
+  run kill -0 "$BRIDGE_PID"
+  [ "$status" -ne 0 ]
+  [ ! -e "$(agmsg_pending_teardown_path "$STEAM" worker)" ]
+  [ "$(cat "$RUN/cc-instance.$OWNER_PID")" = "$NEXT_INSTANCE" ]
+}
+
+@test "pending teardown keeps a live owner whose cc-instance still names it or cannot be trusted" {
+  setup_pending_for_clear
+  local variant
+  for variant in self absent empty bare wrong-pid dotted-sid multiline symlink; do
+    rm -f "$RUN/cc-instance.$OWNER_PID"
+    case "$variant" in
+      self) printf '%s\n' "$OWNER_INSTANCE" > "$RUN/cc-instance.$OWNER_PID" ;;
+      absent) ;;
+      empty) : > "$RUN/cc-instance.$OWNER_PID" ;;
+      bare) printf 'NEXT-5E55\n' > "$RUN/cc-instance.$OWNER_PID" ;;
+      wrong-pid) printf 'NEXT-5E55.%s\n' "$((OWNER_PID + 1))" > "$RUN/cc-instance.$OWNER_PID" ;;
+      dotted-sid) printf 'NEXT.5E55.%s\n' "$OWNER_PID" > "$RUN/cc-instance.$OWNER_PID" ;;
+      multiline) printf '%s\nextra\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID" ;;
+      symlink)
+        printf '%s\n' "$NEXT_INSTANCE" > "$BATS_TEST_TMPDIR/real-instance"
+        ln -s "$BATS_TEST_TMPDIR/real-instance" "$RUN/cc-instance.$OWNER_PID" ;;
+    esac
+    run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
+    [ "$status" -eq 0 ]
+    [ "$output" = "agmsg: pending teardown retained team=$STEAM worker=worker owner_pid=$OWNER_PID reason=owner-alive" ] \
+      || { echo "$variant: $output"; return 1; }
+    kill -0 "$BRIDGE_PID" 2>/dev/null
+  done
+}
+
+@test "pending teardown keeps a superseded owner whose start token cannot be read" {
+  setup_pending_for_clear
+  printf '%s\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+
+  PS_LSTART_FAIL=1 run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"reason=start-unavailable"* ]]
+  kill -0 "$BRIDGE_PID" 2>/dev/null
+  [ -f "$(agmsg_pending_teardown_path "$STEAM" worker)" ]
+}
+
+@test "pending teardown keeps the worker when the owner resumes its old instance while recovery waits for the lifecycle lock" {
+  setup_pending_for_clear
+  printf '%s\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  agmsg_team_lifecycle_lock_acquire "$STEAM" 5
+  # A separate bash process: a background function would share this shell's $$,
+  # and the lifecycle lock is reentrant for its own owner.
+  bash -c 'source "$SCRIPTS/lib/actas-lock.sh"; source "$SCRIPTS/lib/pending-teardown.sh"; agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"' \
+    >"$BATS_TEST_TMPDIR/recover.out" 2>&1 &
+  local recover_pid=$!
+  sleep 1
+  printf '%s\n' "$OWNER_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  agmsg_team_lifecycle_lock_release "$STEAM"
+  wait "$recover_pid"
+
+  grep -q "reason=owner-alive" "$BATS_TEST_TMPDIR/recover.out"
+  kill -0 "$BRIDGE_PID" 2>/dev/null
+  [ -f "$(agmsg_pending_teardown_path "$STEAM" worker)" ]
+}
+
 @test "pending teardown retains a dead composite owner while a bare-session sibling is alive" {
   start_bridge
   test_fixture_start_reaped_process sleep 300
