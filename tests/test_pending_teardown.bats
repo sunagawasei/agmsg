@@ -162,7 +162,7 @@ setup_clear_fixture() {
 @test "SessionEnd /clear: an unreadable or malformed cc-instance keeps pending teardown" {
   setup_clear_fixture
   local variant
-  for variant in absent empty bare wrong-pid dotted-sid multiline spaced symlink; do
+  for variant in absent empty bare wrong-pid dotted-sid multiline spaced nul blank-line symlink; do
     rm -f "$RUN/cc-instance.$OWNER_PID" "$PENDING"
     write_snapshot
     case "$variant" in
@@ -171,6 +171,8 @@ setup_clear_fixture() {
       bare) printf 'NEXT-5E55\n' > "$RUN/cc-instance.$OWNER_PID" ;;
       dotted-sid) printf 'NEXT.5E55.%s\n' "$OWNER_PID" > "$RUN/cc-instance.$OWNER_PID" ;;
       multiline) printf '%s\nextra\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID" ;;
+      nul) printf 'NEXT-5E55\0.%s\n' "$OWNER_PID" > "$RUN/cc-instance.$OWNER_PID" ;;
+      blank-line) printf '%s\n\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID" ;;
       spaced) printf '%s \n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID" ;;
       wrong-pid) printf 'NEXT-5E55.%s\n' "$((OWNER_PID + 1))" > "$RUN/cc-instance.$OWNER_PID" ;;
       symlink)

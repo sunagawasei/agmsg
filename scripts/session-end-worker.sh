@@ -107,8 +107,11 @@ cleanup_owned_artifacts() {
   fi
   # A supersede that turned unreadable mid-drain leaves the targets for the
   # owner-death recovery instead of dropping them.
-  [ "$NEED_PENDING" -eq 1 ] && owner_process_same_generation \
-    && write_owner_pending_records || true
+  # The saved owner start token lets recovery decide death, so this does not
+  # depend on the owner still being alive.
+  if [ "$NEED_PENDING" -eq 1 ] && ! write_owner_pending_records; then
+    return 0
+  fi
   [ -n "$SNAPSHOT_PATH" ] && rm -f -- "$SNAPSHOT_PATH" 2>/dev/null || true
 }
 trap cleanup_owned_artifacts EXIT
@@ -123,8 +126,7 @@ session_sibling_alive() {
     # Otherwise (resumed to this instance, or the record became unreadable)
     # abort; an unreadable record also keeps the work as a pending record.
     if owner_process_same_generation; then
-      [ "$(cat "$RUN_DIR/cc-instance.$OWNER_PID" 2>/dev/null || true)" = "$INSTANCE_ID" ] \
-        || NEED_PENDING=1
+      owner_instance_is_self || NEED_PENDING=1
       return 0
     fi
     OWNER_SUPERSEDED=0
@@ -439,13 +441,27 @@ owner_instance_superseded() {
   # Exactly "<bare sid>.<owner pid>" on one line: this reader authorizes a
   # destructive action, so a dotted sid or stray whitespace is malformed.
   case "$current" in
-    ''|*[[:space:]]*|*[[:cntrl:]]*|.*|*..*) return 1 ;;
+    ''|*[!A-Za-z0-9._-]*|.*|*..*) return 1 ;;
   esac
+  # command substitution drops NULs and extra trailing newlines; the file must
+  # be exactly the value plus one newline.
+  [ "$(LC_ALL=C wc -c < "$f" 2>/dev/null | tr -d '[:space:]')" = "$((${#current} + 1))" ] \
+    || return 1
   [ "${current%.*}" != "$current" ] || return 1
   case "${current%.*}" in *.*) return 1 ;; esac
   [ "${current##*.}" = "$OWNER_PID" ] || return 1
   [ "$current" != "$INSTANCE_ID" ] || return 1
   owner_generation_verified
+}
+
+# True only when a regular, well-formed cc-instance record names this very
+# instance (a resume back to it); unreadable or odd records are not "self".
+owner_instance_is_self() {
+  local f="$RUN_DIR/cc-instance.$OWNER_PID" current
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  current="$(cat "$f" 2>/dev/null)" || return 1
+  [ "$current" = "$INSTANCE_ID" ] || return 1
+  [ "$(LC_ALL=C wc -c < "$f" 2>/dev/null | tr -d '[:space:]')" = "$((${#current} + 1))" ]
 }
 
 wait_for_owner_exit() {
