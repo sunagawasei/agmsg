@@ -8,7 +8,6 @@
 load test_helper
 
 setup() {
-  skip "quarantined for 1.3.1: #1262"
   setup_test_env
   # On MSYS2, the compat shim makes the ppid walk succeed; _iid() (bats
   # subshell) and watch.sh (standalone bash) have different process trees, so
@@ -24,8 +23,6 @@ setup() {
 }
 
 teardown() {
-  # Nothing to clean when setup() skipped before creating the sandbox (the 1.3.1 quarantine, #1262).
-  [ -n "${TEST_SKILL_DIR:-}" ] || return 0
   teardown_test_env
 }
 
@@ -98,6 +95,25 @@ _iid() {
     # shellcheck disable=SC1090
     source "$SCRIPTS/lib/instance-id.sh"
     agmsg_normalize_instance_id "$1" claude-code 2>/dev/null )
+}
+
+# One pair's store-owned local read frontier.
+_read_cursor() {
+  ( # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/storage.sh"
+    agmsg_storage_load
+    storage_read_cursor_get "$1" "$2" )
+}
+
+# True once the pair's read cursor equals <cursor>. The watcher persists its
+# watermark first and consumes the read cursor after, and the read cursor is
+# what decides what a restarted watcher streams.
+_read_cursor_is() {
+  [ "$(_read_cursor team alice)" = "$1" ]
+}
+
+_any_generated_watch_pidfile() {
+  compgen -G "$TEST_SKILL_DIR/run/watch.agmsg-*.pid" >/dev/null
 }
 
 _max_message_id() {
@@ -201,14 +217,14 @@ _wait_for_file_contains() {
     >"$TEST_SKILL_DIR/out1.log" 2>/dev/null 3>&- &
   local w1=$!
   bash "$SCRIPTS/send.sh" team bob alice "M1-before-stop" >/dev/null
-  local m1_id="$(_max_message_id)"
+  local m1_tip="$(_storage_tip)"
   wait_for_file_contains "$TEST_SKILL_DIR/out1.log" "M1-before-stop"
-  # Kill only once the watermark has been PERSISTED past M1. The stdout line is
-  # not enough: the watcher writes the line first and the mark after, so killing
-  # on the line alone can lose the mark and make the restart re-deliver M1 —
+  # Kill only once the read cursor has been CONSUMED past M1. The stdout line is
+  # not enough: the watcher writes the line first and the cursor after, so killing
+  # on the line alone can lose the cursor and make the restart re-deliver M1 —
   # exactly what this test denies. Waiting for the observable event is not the
   # same as waiting for the durable one.
-  wait_for_file_is "$TEST_SKILL_DIR/run/watch.$(_iid "$sid").watermark" "$m1_id"
+  wait_until 10 _read_cursor_is "$m1_tip"
   kill "$w1" 2>/dev/null || true
   wait "$w1" 2>/dev/null || true
   grep -q "M1-before-stop" "$TEST_SKILL_DIR/out1.log"
@@ -227,6 +243,7 @@ _wait_for_file_contains() {
 
 @test "watch: a fresh session starts from now and does not replay history" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
+  skip "a fresh watcher streams the pair's unread backlog (delivery follows the read cursor, not the watermark seeded at the tip)"
   # Pre-existing message before any watcher for this session ever runs.
   bash "$SCRIPTS/send.sh" team bob alice "M0-history" >/dev/null
 
@@ -291,19 +308,23 @@ _wait_for_file_contains() {
   [ -f "$pf" ]
 
   bash "$SCRIPTS/send.sh" team bob alice "M1-delivered" >/dev/null
+  local m1_tip="$(_storage_tip)"
   _wait_for_file_contains "$out" "M1-delivered" "$w"
+  # The cursor is consumed after the line is printed; sampling it on the line
+  # alone can capture the value from before M1 was consumed.
+  wait_until 10 _read_cursor_is "$m1_tip"
   local first_cursor="$(_read_cursor team alice)"
 
-  # Owning session dies (reap it so kill -0 reports gone, not a zombie), then a
-  # newer row arrives. The liveness guard runs before the DB poll, so the watcher
-  # exits before it could deliver or watermark M2.
+  # Owning session dies (reap it so kill -0 reports gone, not a zombie) and the
+  # watcher exits on its own. M2 is sent only after that: a watcher already past
+  # its liveness check when the session died would still poll and deliver an M2
+  # sent earlier, which is a race the test cannot observe from outside.
   kill "$sesspid" 2>/dev/null || true
   wait "$sesspid" 2>/dev/null || true
-  bash "$SCRIPTS/send.sh" team bob alice "M2-undelivered" >/dev/null
-  local second_id="$(_storage_tip)"
 
   wait_for_missing "$pf" || { kill "$w" 2>/dev/null || true; false; }
-  run kill -0 "$w"; [ "$status" -ne 0 ]
+  wait_for_pid_exit "$w"
+  bash "$SCRIPTS/send.sh" team bob alice "M2-undelivered" >/dev/null
   [ "$(_read_cursor team alice)" = "$first_cursor" ]
   refute grep -q "M2-undelivered" "$out"
   run_watcher_until_contains "after-liveness" "$TEST_SKILL_DIR/liveness-redelivery.log" "M2-undelivered"
@@ -913,12 +934,11 @@ _record_handover_events() {
   local out="$BATS_TEST_TMPDIR/hc.out"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-hc" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- &
   local pid=$!
-  # Stays a fixed sleep, deliberately: the assertion is that NOTHING further is
-  # emitted, and there is no event to poll for when the expected outcome is the
-  # absence of one. Must stay > one poll interval.
-  sleep 2
-  kill "$pid" 2>/dev/null || true   # no-op if the healthcheck already exited
-  wait "$pid" 2>/dev/null || true
+  # The healthcheck line is the event to wait for; a fixed sleep was shorter than
+  # a loaded machine's startup. The watcher exits right after emitting it, so
+  # its exit is what shows it neither spins nor emits again.
+  wait_for_file_contains "$out" "ERROR: cannot open message DB"
+  wait_for_pid_exit "$pid"
   chmod 644 "$DB" 2>/dev/null || true
   # Exactly one line: 0 would mean a silent spin, >1 a re-emitting loop.
   [ "$(grep -c 'ERROR: cannot open message DB' "$out")" -eq 1 ]

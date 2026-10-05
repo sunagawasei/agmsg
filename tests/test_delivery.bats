@@ -1001,8 +1001,53 @@ JSON
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
   wait_for_pid_exit "$watch_pid"
   [ ! -f "$TEST_SKILL_DIR/run/watch.stop-test.pid" ]
-  wait_for_pid_exit "$watch_pid"
   ! kill -0 "$watch_pid" 2>/dev/null
+}
+
+# Insert <statement> before/after the one line of the sandboxed watch.sh that
+# contains <anchor>. The watcher is signalled at an exact point of its startup
+# instead of racing it, so these tests do not depend on how fast the machine is.
+_inject_into_watch() {
+  local where="$1" anchor="$2" statement="$3" copy="$TEST_SKILL_DIR/scripts/watch.sh"
+  [ "$(grep -cF -- "$anchor" "$copy")" -eq 1 ]
+  awk -v where="$where" -v anchor="$anchor" -v stmt="$statement" '
+    index($0, anchor) { if (where == "before") print stmt; print; if (where == "after") print stmt; next }
+    { print }' "$copy" > "$copy.new"
+  mv "$copy.new" "$copy"
+  [ "$(grep -cF -- "$statement" "$copy")" -eq 1 ]
+}
+
+_watch_registered_team() {
+  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
+  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
+{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
+JSON
+}
+
+@test "watch: TERM right after the pidfile is published still removes its pidfile and filter" {
+  skip_on_windows "watcher process mgmt under Git Bash (#182)"
+  _watch_registered_team
+  _inject_into_watch after 'echo $$ > "$PIDFILE"' 'kill -TERM $$'
+  run bash "$SCRIPTS/watch.sh" term-early "$TEST_PROJECT" claude-code </dev/null
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"unbound variable"* ]]
+  [ ! -e "$RUN/watch.term-early.pid" ]
+  [ ! -e "$RUN/watch.term-early.filter" ]
+}
+
+@test "watch: TERM before it publishes anything leaves another owner's pidfile and filter alone" {
+  skip_on_windows "watcher process mgmt under Git Bash (#182)"
+  _watch_registered_team
+  # The recorded owner is this test process: alive, and not a watch.sh, so the
+  # newcomer does not displace it.
+  echo "$$" > "$RUN/watch.term-foreign.pid"
+  printf 'unfiltered\n%s\n%s\n' "$TEST_PROJECT" "$$" > "$RUN/watch.term-foreign.filter"
+  _inject_into_watch before '> "$FILTERFILE" 2>/dev/null || true' 'kill -TERM $$'
+  run bash "$SCRIPTS/watch.sh" term-foreign "$TEST_PROJECT" claude-code </dev/null
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"unbound variable"* ]]
+  [ "$(cat "$RUN/watch.term-foreign.pid")" = "$$" ]
+  [ "$(sed -n 3p "$RUN/watch.term-foreign.filter")" = "$$" ]
 }
 
 @test "delivery stop: skips pid whose command line is not watch.sh (pid recycling safety)" {
@@ -1278,36 +1323,67 @@ JSON
 
 # --- session-start.sh dedup across /clear ---
 
-@test "session-start.sh kills previous watcher when called with new session_id in same cc-instance" {
-  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
-  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
-{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
-JSON
+# The previous watcher is the lease-owning stand-in used by the `delivery stop`
+# tests: session-start.sh only signals a process whose owner record it can verify.
+# The agent pid is this test process, so cc-instance.$$ is the record the hook keeps
+# for "this Claude Code instance". AGMSG_AGENT_PID is unset for the hook (setup()
+# pins it empty): without a resolvable owner pid it keys on the bare sid and skips
+# the dedup step entirely.
+_start_owned_watcher_for_cc_instance() {
+  skip_without_lockf
+  # A runner that is itself a leased process carries these; inherited, they make
+  # the stand-in skip its launcher and never publish a pidfile.
+  unset AGMSG_PROCESS_OWNER_FD AGMSG_PROCESS_BOOTSTRAP_MODE AGMSG_PROCESS_OWNER_GENERATION
+  _watch_registered_team
   bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
-  mkdir -p "$TEST_SKILL_DIR/run"
+  install_delayed_watch_stub
+  PREV_INSTANCE="$1.$$"
+  AGMSG_RESOLVE_PROJECT=0 start_delayed_watch "$PREV_INSTANCE" "$TEST_PROJECT"
+  # The pidfile names the lease owner, which is not always the job's $! (a
+  # python wrapper re-execs under a new pid), so identity is compared on it.
+  PREV_OWNER_PID="$(cat "$RUN/watch.$PREV_INSTANCE.pid")"
+  echo "$PREV_INSTANCE" > "$RUN/cc-instance.$$"
+}
 
-  # Stand in for the previous watcher: a sleep that updates its own pidfile.
-  sleep 30 3>&- &
-  local prev_pid=$!
-  echo "$prev_pid" > "$TEST_SKILL_DIR/run/watch.session-A.pid"
-  # Pin the cc-instance state to "session-A" for a fake CC pid we control.
-  local fake_cc_pid="$$"
-  echo "session-A" > "$TEST_SKILL_DIR/run/cc-instance.$fake_cc_pid"
+_session_start_for_cc_instance() {
+  env -u AGMSG_AGENT_PID CLAUDE_PID="$$" AGMSG_RESOLVE_PROJECT=0 \
+    AGMSG_TEST_PROCESS_SIGNAL_RECORD="$SIGNAL_RECORD" \
+    bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<< "{\"session_id\":\"$1\"}"
+}
 
-  # Patch find_cc_pid by stubbing ps via PATH override — too invasive. Instead
-  # invoke a wrapper that exports the discovered CC pid via env, then have
-  # session-start.sh consult it. (We test the cleanup path explicitly below.)
+# The stand-in exits on TERM once released; the hook's TERM is only recorded.
+_stop_owned_watcher() {
+  : >"$AGMSG_TEST_WATCH_RELEASE_FILE"
+  kill "$PREV_OWNER_PID"
+  wait_for_pid_exit "$TEST_WATCH_PID"
+}
 
-  # Verify the cleanup logic in isolation: feed the same script its inputs.
-  # Simulate by hand: session_id changed → prev_pid should be killed.
-  STATE="$TEST_SKILL_DIR/run/cc-instance.$fake_cc_pid"
-  prev=$(cat "$STATE")
-  pidfile="$TEST_SKILL_DIR/run/watch.$prev.pid"
-  [ -f "$pidfile" ]
-  prev_p=$(cat "$pidfile")
-  kill "$prev_p"
-  wait_for_pid_exit "$prev_p"
-  ! kill -0 "$prev_p" 2>/dev/null
+# The hook's signal is recorded instead of delivered, so what it tried to send
+# is read from the record and not inferred from whether a process still runs.
+@test "session-start.sh kills previous watcher when called with new session_id in same cc-instance" {
+  skip_on_windows "watcher process mgmt under Git Bash (#182)"
+  SIGNAL_RECORD="$RUN/signals"
+  _start_owned_watcher_for_cc_instance session-A
+
+  run _session_start_for_cc_instance session-B
+  [ "$status" -eq 0 ]
+  [ "$(awk -F'\t' '{print $1 " " $2}' "$SIGNAL_RECORD")" = "$PREV_OWNER_PID TERM" ]
+  [ "$(cat "$RUN/cc-instance.$$")" = "session-B.$$" ]
+  _stop_owned_watcher
+  [ ! -e "$RUN/watch.$PREV_INSTANCE.pid" ]
+}
+
+@test "session-start.sh leaves the watcher alone when the same session_id fires again" {
+  skip_on_windows "watcher process mgmt under Git Bash (#182)"
+  SIGNAL_RECORD="$RUN/signals"
+  _start_owned_watcher_for_cc_instance session-A
+
+  run _session_start_for_cc_instance session-A
+  [ "$status" -eq 0 ]
+  [ ! -s "$SIGNAL_RECORD" ]
+  [ "$(cat "$RUN/watch.$PREV_INSTANCE.pid")" = "$PREV_OWNER_PID" ]
+  [ "$(cat "$RUN/cc-instance.$$")" = "$PREV_INSTANCE" ]
+  _stop_owned_watcher
 }
 
 @test "session-start.sh cleans stale cc-instance files for dead CC pids" {

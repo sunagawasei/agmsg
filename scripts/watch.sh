@@ -569,6 +569,63 @@ if [ -f "$PIDFILE" ]; then
   fi
 fi
 
+# Readiness sentinels this watcher created (see #108). Populated once the
+# subscription is resolved; removed on exit so the file is present iff a live
+# watcher is currently receiving for that role.
+READY_FILES=""
+cleanup() {
+  # EXIT only removes the pidfile if it still records our pid. A successor
+  # watcher (Monitor re-invoked for the same session_id) overwrites $PIDFILE
+  # with its own pid before signalling us, so this read sees the successor's
+  # pid and leaves its record alone. See #66, and #595 for what happened when
+  # the signal came first: read, then the successor's write, then this remove
+  # — a guard that is three steps cannot decide anything about a file another
+  # process may write between them. The order is what makes it sound, not the
+  # comparison.
+  #
+  # This is still not atomic, and it is not relied on to be: a predecessor
+  # that entered cleanup for its OWN reasons before any successor existed can
+  # still race a newcomer's write. That window is not the relaunch path and
+  # is not what #595 observed.
+  local pidfile_pid=""
+  [ -f "$PIDFILE" ] && IFS= read -r pidfile_pid < "$PIDFILE" || true
+  # Both files are removed by their owner, but they do not share an owner test:
+  # the pidfile's owner is whoever it names, and the filter file's is whoever it
+  # records. See below for why the pidfile cannot answer for both.
+  #
+  # Neither may be left behind. A stale pidfile makes the next watcher count a
+  # ghost. A stale filter file is worse in the direction that matters: it keeps
+  # asserting a role on behalf of a dead process, and if that role is a name,
+  # every other watcher reads it as "filtered, not sharing" -- so the warning is
+  # SUPPRESSED by a process that no longer exists.
+  [ "$pidfile_pid" = "$$" ] && rm -f "$PIDFILE"
+  # The filter file is judged on ITS OWN recorded owner, not on the pidfile.
+  # During a replacement the pidfile still names the predecessor while the
+  # successor's metadata is already on disk, so deciding by the pidfile lets the
+  # predecessor delete a file it did not write.
+  _ff="$RUN_DIR/watch.$SESSION_ID.filter"
+  if [ -f "$_ff" ] && [ "$(sed -n '3p' "$_ff" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$_ff" 2>/dev/null || true
+  fi
+  if [ -n "$READY_FILES" ]; then
+    while IFS= read -r _rf; do
+      [ -z "$_rf" ] && continue
+      # Only remove a sentinel we still own. A successor actas watcher for the
+      # same (team, name) overwrites it with its own session_id before this one
+      # exits; without this guard our EXIT could delete the live successor's
+      # sentinel. Mirrors the pidfile guard above. See #108 review.
+      local _owner=""
+      [ -f "$_rf" ] && IFS= read -r _owner < "$_rf" || true
+      [ "$_owner" = "$SESSION_ID" ] && rm -f "$_rf" 2>/dev/null || true
+    done <<< "$READY_FILES"
+  fi
+  [ -n "${INSTALL_STAMP:-}" ] && rm -f "$INSTALL_STAMP" 2>/dev/null || true
+}
+# Installed before the pidfile is published: a TERM that lands between the
+# pidfile write and a later trap would skip EXIT and leave the pidfile behind.
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
+
 # Metadata BEFORE the pidfile, deliberately.
 #
 # A reader that finds a live pid with no filter file cannot tell what that
@@ -665,62 +722,6 @@ if [ -z "$ACTIVE_NAME" ]; then
     watch_log "to receive only your own: /agmsg actas <name>"
   fi
 fi
-# Readiness sentinels this watcher created (see #108). Populated once the
-# subscription is resolved; removed on exit so the file is present iff a live
-# watcher is currently receiving for that role.
-READY_FILES=""
-cleanup() {
-  # EXIT only removes the pidfile if it still records our pid. A successor
-  # watcher (Monitor re-invoked for the same session_id) overwrites $PIDFILE
-  # with its own pid before signalling us, so this read sees the successor's
-  # pid and leaves its record alone. See #66, and #595 for what happened when
-  # the signal came first: read, then the successor's write, then this remove
-  # — a guard that is three steps cannot decide anything about a file another
-  # process may write between them. The order is what makes it sound, not the
-  # comparison.
-  #
-  # This is still not atomic, and it is not relied on to be: a predecessor
-  # that entered cleanup for its OWN reasons before any successor existed can
-  # still race a newcomer's write. That window is not the relaunch path and
-  # is not what #595 observed.
-  local pidfile_pid=""
-  [ -f "$PIDFILE" ] && IFS= read -r pidfile_pid < "$PIDFILE" || true
-  # Both files are removed by their owner, but they do not share an owner test:
-  # the pidfile's owner is whoever it names, and the filter file's is whoever it
-  # records. See below for why the pidfile cannot answer for both.
-  #
-  # Neither may be left behind. A stale pidfile makes the next watcher count a
-  # ghost. A stale filter file is worse in the direction that matters: it keeps
-  # asserting a role on behalf of a dead process, and if that role is a name,
-  # every other watcher reads it as "filtered, not sharing" -- so the warning is
-  # SUPPRESSED by a process that no longer exists.
-  [ "$pidfile_pid" = "$$" ] && rm -f "$PIDFILE"
-  # The filter file is judged on ITS OWN recorded owner, not on the pidfile.
-  # During a replacement the pidfile still names the predecessor while the
-  # successor's metadata is already on disk, so deciding by the pidfile lets the
-  # predecessor delete a file it did not write.
-  _ff="$RUN_DIR/watch.$SESSION_ID.filter"
-  if [ -f "$_ff" ] && [ "$(sed -n '3p' "$_ff" 2>/dev/null || true)" = "$$" ]; then
-    rm -f "$_ff" 2>/dev/null || true
-  fi
-  if [ -n "$READY_FILES" ]; then
-    while IFS= read -r _rf; do
-      [ -z "$_rf" ] && continue
-      # Only remove a sentinel we still own. A successor actas watcher for the
-      # same (team, name) overwrites it with its own session_id before this one
-      # exits; without this guard our EXIT could delete the live successor's
-      # sentinel. Mirrors the pidfile guard above. See #108 review.
-      local _owner=""
-      [ -f "$_rf" ] && IFS= read -r _owner < "$_rf" || true
-      [ "$_owner" = "$SESSION_ID" ] && rm -f "$_rf" 2>/dev/null || true
-    done <<< "$READY_FILES"
-  fi
-  [ -n "${INSTALL_STAMP:-}" ] && rm -f "$INSTALL_STAMP" 2>/dev/null || true
-}
-# Install these traps as early as re-entry permits because owner publication
-# can precede the target becoming signal-ready.
-trap cleanup EXIT
-trap 'exit 0' INT TERM HUP
 
 # A resident process keeps executing the code it was started with. An update
 # rewrites the scripts in place (same inode -- confirmed with lsof, #684), so
