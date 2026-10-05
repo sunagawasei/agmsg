@@ -146,14 +146,13 @@ agmsg_retention_reap_unmarked_dir() {
   agmsg_team_lifecycle_lock_acquire "$team" "${AGMSG_LIFECYCLE_LOCK_TIMEOUT:-10}" || return 1
   local tomb rc=0
   tomb="$(agmsg_retention_tombstone_path "$team")"
-  rm -f "$tomb" 2>/dev/null || true
-  # A tombstone that could not be dropped would still authorise the sweep once
-  # the dir is gone: keep the dir.
-  if [ -e "$tomb" ] || [ -L "$tomb" ]; then
-    rc=1
+  # Absence is proven only by rm succeeding: a failed stat (unreadable run/)
+  # also makes `-e` false. Any rm failure keeps the dir.
+  if rm -f "$tomb" 2>/dev/null && [ ! -e "$tomb" ] && [ ! -L "$tomb" ] \
+      && rm -rf "$dir" 2>/dev/null && [ ! -d "$dir" ]; then
+    :
   else
-    rm -rf "$dir" 2>/dev/null || true
-    [ ! -d "$dir" ] || rc=1
+    rc=1
   fi
   agmsg_team_lifecycle_lock_release "$team"
   return "$rc"
