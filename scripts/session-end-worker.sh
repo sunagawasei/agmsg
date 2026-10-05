@@ -59,6 +59,8 @@ DRAIN_NONCE=""
 DRAIN_FENCE="$(agmsg_drain_fence_path "$STEAM")"
 DRAIN_ABORTED=0
 OWNER_SUPERSEDED=0
+SUPERSEDED_SEEN=0
+NEED_PENDING=0
 
 # Retry teardown left by earlier SessionEnd/watchdog races. A bare instance
 # cannot publish cc-instance, so it cannot veto recovery for its own team.
@@ -103,6 +105,10 @@ cleanup_owned_artifacts() {
         && rm -f -- "$marker" 2>/dev/null || true
     done
   fi
+  # A supersede that turned unreadable mid-drain leaves the targets for the
+  # owner-death recovery instead of dropping them.
+  [ "$NEED_PENDING" -eq 1 ] && owner_process_same_generation \
+    && write_owner_pending_records || true
   [ -n "$SNAPSHOT_PATH" ] && rm -f -- "$SNAPSHOT_PATH" 2>/dev/null || true
 }
 trap cleanup_owned_artifacts EXIT
@@ -113,7 +119,15 @@ session_sibling_alive() {
   # A /clear teardown is authorized only while the owner's cc-instance still
   # names another instance; a resume back to this sid must abort it.
   if [ "${OWNER_SUPERSEDED:-0}" -eq 1 ] && ! owner_instance_superseded; then
-    return 0
+    # Owner positively gone: fall back to the ordinary owner-dead teardown.
+    # Otherwise (resumed to this instance, or the record became unreadable)
+    # abort; an unreadable record also keeps the work as a pending record.
+    if owner_process_same_generation; then
+      [ "$(cat "$RUN_DIR/cc-instance.$OWNER_PID" 2>/dev/null || true)" = "$INSTANCE_ID" ] \
+        || NEED_PENDING=1
+      return 0
+    fi
+    OWNER_SUPERSEDED=0
   fi
   agmsg_instance_is_composite "$INSTANCE_ID" && self_pid="${INSTANCE_ID##*.}"
   for f in "$RUN_DIR"/cc-instance.*; do
@@ -373,10 +387,11 @@ notify_drain_timeout() {
 
 cleanup_session_artifacts() {
   local f state
-  rm -f "$RUN_DIR/watch.$INSTANCE_ID.watermark" 2>/dev/null || true
   # The new instance on this PID may be claiming locks right now, and the read
   # then rm below is not atomic with that; its SessionStart GC reclaims ours.
-  [ "${OWNER_SUPERSEDED:-0}" -eq 1 ] && return 0
+  # A resume back to this instance also owns the watermark.
+  [ "$SUPERSEDED_SEEN" -eq 1 ] && return 0
+  rm -f "$RUN_DIR/watch.$INSTANCE_ID.watermark" 2>/dev/null || true
   for f in "$RUN_DIR"/cc-instance.*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     state="$(cat "$f" 2>/dev/null || true)"
@@ -421,7 +436,13 @@ owner_instance_superseded() {
   [ "$TYPE" = claude-code ] || return 1
   [ -f "$f" ] && [ ! -L "$f" ] || return 1
   current="$(cat "$f" 2>/dev/null)" || return 1
-  agmsg_instance_is_composite "$current" || return 1
+  # Exactly "<bare sid>.<owner pid>" on one line: this reader authorizes a
+  # destructive action, so a dotted sid or stray whitespace is malformed.
+  case "$current" in
+    ''|*[[:space:]]*|*[[:cntrl:]]*|.*|*..*) return 1 ;;
+  esac
+  [ "${current%.*}" != "$current" ] || return 1
+  case "${current%.*}" in *.*) return 1 ;; esac
   [ "${current##*.}" = "$OWNER_PID" ] || return 1
   [ "$current" != "$INSTANCE_ID" ] || return 1
   owner_generation_verified
@@ -430,7 +451,7 @@ owner_instance_superseded() {
 wait_for_owner_exit() {
   local started now deadline
   owner_process_same_generation || return 1
-  if owner_instance_superseded; then OWNER_SUPERSEDED=1; return 1; fi
+  if owner_instance_superseded; then OWNER_SUPERSEDED=1; SUPERSEDED_SEEN=1; return 1; fi
   started="$(_agmsg_wait_epoch_seconds 2>/dev/null)" || {
     sleep "$OWNER_EXIT_GRACE_S"
     owner_process_same_generation
@@ -438,7 +459,7 @@ wait_for_owner_exit() {
   }
   deadline=$((started + OWNER_EXIT_GRACE_S))
   while owner_process_same_generation; do
-    if owner_instance_superseded; then OWNER_SUPERSEDED=1; return 1; fi
+    if owner_instance_superseded; then OWNER_SUPERSEDED=1; SUPERSEDED_SEEN=1; return 1; fi
     now="$(_agmsg_wait_epoch_seconds 2>/dev/null)" || {
       sleep "$OWNER_EXIT_POLL_INTERVAL"
       continue
@@ -447,7 +468,7 @@ wait_for_owner_exit() {
     sleep "$OWNER_EXIT_POLL_INTERVAL"
   done
   owner_process_same_generation || return 1
-  if owner_instance_superseded; then OWNER_SUPERSEDED=1; return 1; fi
+  if owner_instance_superseded; then OWNER_SUPERSEDED=1; SUPERSEDED_SEEN=1; return 1; fi
   return 0
 }
 
@@ -508,13 +529,13 @@ if wait_for_owner_exit; then
   # preserve the work for the next lifecycle pass. A live same-sid sibling
   # cannot suppress the pending write; recover's bare-sid veto holds the kill.
   if owner_process_same_generation; then
-    owner_instance_superseded && OWNER_SUPERSEDED=1 || exit 0
+    owner_instance_superseded && { OWNER_SUPERSEDED=1; SUPERSEDED_SEEN=1; } || exit 0
   fi
 fi
 
 PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
 # A superseded owner's watcher was already replaced by SessionStart's dedup.
-if [ "$OWNER_SUPERSEDED" -eq 0 ] && [ -f "$PIDFILE" ] && [ ! -L "$PIDFILE" ]; then
+if [ "$SUPERSEDED_SEEN" -eq 0 ] && [ -f "$PIDFILE" ] && [ ! -L "$PIDFILE" ]; then
   pid="$(cat "$PIDFILE" 2>/dev/null || true)"
   if [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
     cmd="$(compat_get_cmdline "$pid" 2>/dev/null || true)"

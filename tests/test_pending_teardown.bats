@@ -26,6 +26,18 @@ fi
 exec /bin/ps "$@"
 STUB
   chmod +x "$stub_bin/ps"
+  # Makes agmsg_pid_start_token fail on both its /proc and ps paths when asked.
+  cat > "$stub_bin/sed" <<'STUB'
+#!/usr/bin/env bash
+if [ -n "${PS_LSTART_FAIL:-}" ]; then
+  for a in "$@"; do
+    case "$a" in /proc/*/stat) exit 1 ;; esac
+  done
+fi
+for d in /usr/bin /bin; do [ -x "$d/sed" ] && exec "$d/sed" "$@"; done
+exit 127
+STUB
+  chmod +x "$stub_bin/sed"
   export PATH="$stub_bin:$PATH"
   bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/null
   bash "$SCRIPTS/join.sh" "$STEAM" worker codex "$PROJ" >/dev/null
@@ -150,13 +162,16 @@ setup_clear_fixture() {
 @test "SessionEnd /clear: an unreadable or malformed cc-instance keeps pending teardown" {
   setup_clear_fixture
   local variant
-  for variant in absent empty bare wrong-pid symlink; do
+  for variant in absent empty bare wrong-pid dotted-sid multiline spaced symlink; do
     rm -f "$RUN/cc-instance.$OWNER_PID" "$PENDING"
     write_snapshot
     case "$variant" in
       absent) ;;
       empty) : > "$RUN/cc-instance.$OWNER_PID" ;;
       bare) printf 'NEXT-5E55\n' > "$RUN/cc-instance.$OWNER_PID" ;;
+      dotted-sid) printf 'NEXT.5E55.%s\n' "$OWNER_PID" > "$RUN/cc-instance.$OWNER_PID" ;;
+      multiline) printf '%s\nextra\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID" ;;
+      spaced) printf '%s \n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID" ;;
       wrong-pid) printf 'NEXT-5E55.%s\n' "$((OWNER_PID + 1))" > "$RUN/cc-instance.$OWNER_PID" ;;
       symlink)
         printf '%s\n' "$NEXT_INSTANCE" > "$BATS_TEST_TMPDIR/real-instance"
@@ -199,11 +214,58 @@ setup_clear_fixture() {
   local worker_pid=$!
   sleep 0.5
   printf '%s\n' "$OWNER_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  printf '999\n' > "$RUN/watch.$OWNER_INSTANCE.watermark"
   agmsg_team_lifecycle_lock_release "$STEAM"
   wait "$worker_pid"
   kill -0 "$BRIDGE_PID" 2>/dev/null
   [ "$(cat "$(agmsg_spawn_path "$STEAM" worker)")" = "$BRIDGE_RECORD" ]
   [ "$(cat "$RUN/cc-instance.$OWNER_PID")" = "$OWNER_INSTANCE" ]
+  [ "$(cat "$RUN/watch.$OWNER_INSTANCE.watermark")" = 999 ]
+}
+
+@test "SessionEnd /clear: an instance published while the pending write is blocked still tears down" {
+  setup_clear_fixture
+  printf '%s\n' "$OWNER_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  agmsg_team_lifecycle_lock_acquire "$STEAM" 5
+  AGMSG_OWNER_EXIT_GRACE_S=1 run_composite_worker >/dev/null 2>&1 &
+  local worker_pid=$!
+  sleep 2
+  printf '%s\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  agmsg_team_lifecycle_lock_release "$STEAM"
+  wait "$worker_pid"
+  run kill -0 "$BRIDGE_PID"
+  [ "$status" -ne 0 ]
+  [ ! -e "$PENDING" ]
+  [ "$(cat "$RUN/cc-instance.$OWNER_PID")" = "$NEXT_INSTANCE" ]
+}
+
+@test "SessionEnd /clear: the owner exiting after the supersede falls back to the owner-dead teardown" {
+  setup_clear_fixture
+  printf '%s\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  agmsg_team_lifecycle_lock_acquire "$STEAM" 5
+  run_composite_worker >/dev/null 2>&1 &
+  local worker_pid=$!
+  sleep 0.5
+  kill "$OWNER_PID" 2>/dev/null || true
+  agmsg_team_lifecycle_lock_release "$STEAM"
+  wait "$worker_pid"
+  run kill -0 "$BRIDGE_PID"
+  [ "$status" -ne 0 ]
+  [ ! -e "$PENDING" ]
+}
+
+@test "SessionEnd /clear: a cc-instance that turns unreadable after the supersede keeps the work pending" {
+  setup_clear_fixture
+  printf '%s\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
+  agmsg_team_lifecycle_lock_acquire "$STEAM" 5
+  run_composite_worker >/dev/null 2>&1 &
+  local worker_pid=$!
+  sleep 0.5
+  rm -f "$RUN/cc-instance.$OWNER_PID"
+  agmsg_team_lifecycle_lock_release "$STEAM"
+  wait "$worker_pid"
+  kill -0 "$BRIDGE_PID" 2>/dev/null
+  [ -f "$PENDING" ]
 }
 
 @test "SessionEnd owner exit during grace continues normal teardown" {
