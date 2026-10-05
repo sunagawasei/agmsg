@@ -34,11 +34,90 @@ all_test_files() {
   find "$REPO_ROOT/tests" -maxdepth 1 -name '*.bats' -exec basename {} \; | LC_ALL=C sort
 }
 
+# shard-tests.sh costs one grep/basename exec per test file per call, so the
+# partition properties below read one precomputed run of every (total, index)
+# pair they need instead of re-running it per test.
+SHARD_TOTALS="1 2 3 4 5 8"
+
+setup_file() {
+  local repo_root total i
+  repo_root="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
+  export SHARD_CACHE="$BATS_FILE_TMPDIR/shards"
+  mkdir -p "$SHARD_CACHE"
+  for total in $SHARD_TOTALS; do
+    for ((i = 1; i <= total; i++)); do
+      local rc=0
+      (cd "$repo_root" && bash "$repo_root/.github/scripts/shard-tests.sh" "$i" "$total") \
+        > "$SHARD_CACHE/$total.$i.out" 2> "$SHARD_CACHE/$total.$i.err" || rc=$?
+      printf '%s\n' "$rc" > "$SHARD_CACHE/$total.$i.rc"
+    done
+  done
+}
+
+# Print the cached output of `shard-tests.sh <index> <total>`. A missing entry,
+# a malformed exit code or a non-zero one is a failure, never an empty shard.
+cached_shard() {
+  local total="$1" index="$2" rc
+  [ -f "$SHARD_CACHE/$total.$index.rc" ] && [ -f "$SHARD_CACHE/$total.$index.out" ] || {
+    echo "no cached shard run for index $index of $total" >&2
+    return 1
+  }
+  rc="$(cat "$SHARD_CACHE/$total.$index.rc")"
+  case "$rc" in ''|*[!0-9]*) echo "malformed cached exit code for index $index of $total" >&2; return 1 ;; esac
+  [ "$rc" -eq 0 ] || {
+    echo "shard-tests.sh $index $total exited $rc" >&2
+    cat "$SHARD_CACHE/$total.$index.err" >&2
+    return 1
+  }
+  cat "$SHARD_CACHE/$total.$index.out"
+}
+
+# Basenames of every file the shards of one total hand out, sorted. Every
+# index is checked on its own, so a failing shard cannot be masked by the
+# sort at the end of the pipeline.
 union_of_shards() {
-  local total="$1" i
+  local total="$1" i out all=""
   for ((i = 1; i <= total; i++)); do
-    (cd "$REPO_ROOT" && bash "$SHARD" "$i" "$total")
-  done | sed 's|.*/||' | LC_ALL=C sort
+    out="$(cached_shard "$total" "$i")" || return 1
+    [ -z "$out" ] || all="$all$out"$'\n'
+  done
+  printf '%s' "$all" | sed 's|.*/||' | LC_ALL=C sort
+}
+
+@test "a failed, malformed or missing cached shard run fails the partition checks" {
+  local saved="$SHARD_CACHE" dir="$BATS_TEST_TMPDIR/cache"
+  mkdir -p "$dir"
+  SHARD_CACHE="$dir"
+
+  # missing entry
+  run cached_shard 4 1
+  [ "$status" -ne 0 ]
+
+  # good output but a non-zero exit code must not read as a shard
+  printf 'tests/a.bats\n' > "$dir/1.1.out"
+  printf '3\n' > "$dir/1.1.rc"
+  run cached_shard 1 1
+  [ "$status" -ne 0 ]
+  run union_of_shards 1
+  [ "$status" -ne 0 ]
+
+  # malformed exit code
+  printf 'x\n' > "$dir/1.1.rc"
+  run cached_shard 1 1
+  [ "$status" -ne 0 ]
+
+  # a failure in the middle index survives the successful index after it
+  printf 'tests/a.bats\n' > "$dir/3.1.out"; printf '0\n' > "$dir/3.1.rc"
+  printf 'tests/b.bats\n' > "$dir/3.2.out"; printf '1\n' > "$dir/3.2.rc"
+  printf 'tests/c.bats\n' > "$dir/3.3.out"; printf '0\n' > "$dir/3.3.rc"
+  run union_of_shards 3
+  [ "$status" -ne 0 ]
+
+  printf '0\n' > "$dir/3.2.rc"
+  run union_of_shards 3
+  [ "$status" -eq 0 ]
+
+  SHARD_CACHE="$saved"
 }
 
 @test "shard-tests.sh is executable and self-documents its usage" {
@@ -185,8 +264,9 @@ union_of_shards() {
 }
 
 @test "the split is deterministic across repeated runs" {
+  # The cached run from setup_file is the first run; this is the second.
   local first second
-  first="$(cd "$REPO_ROOT" && bash "$SHARD" 2 4)"
+  first="$(cached_shard 4 2)"
   second="$(cd "$REPO_ROOT" && bash "$SHARD" 2 4)"
   [ "$first" = "$second" ]
 }
@@ -194,7 +274,7 @@ union_of_shards() {
 @test "no shard is empty at the shard count CI uses" {
   local i out
   for i in 1 2 3 4; do
-    out="$(cd "$REPO_ROOT" && bash "$SHARD" "$i" 4)"
+    out="$(cached_shard 4 "$i")"
     [ -n "$out" ]
   done
 }
@@ -203,14 +283,13 @@ union_of_shards() {
   # Not a correctness property — a balance smoke test. Greedy LPT should never
   # put the two largest files together while lighter shards exist; if it does,
   # the weighting has broken and CI is slower than it looks.
-  local heaviest second
-  heaviest="$(cd "$REPO_ROOT" && grep -c '^[[:space:]]*@test' tests/*.bats \
-    | sort -t: -k2 -rn | sed -n '1s/:.*//p')"
-  second="$(cd "$REPO_ROOT" && grep -c '^[[:space:]]*@test' tests/*.bats \
-    | sort -t: -k2 -rn | sed -n '2s/:.*//p')"
+  local counts heaviest second
+  counts="$(cd "$REPO_ROOT" && grep -c '^[[:space:]]*@test' tests/*.bats | sort -t: -k2 -rn)"
+  heaviest="$(sed -n '1s/:.*//p' <<<"$counts")"
+  second="$(sed -n '2s/:.*//p' <<<"$counts")"
   local i shard_files
   for i in 1 2 3 4; do
-    shard_files="$(cd "$REPO_ROOT" && bash "$SHARD" "$i" 4)"
+    shard_files="$(cached_shard 4 "$i")"
     if [[ "$shard_files" == *"$heaviest"* ]]; then
       [[ "$shard_files" != *"$second"* ]]
     fi
@@ -234,7 +313,7 @@ union_of_shards() {
   for total in 2 3 4 5 8; do
     together=0
     for ((i = 1; i <= total; i++)); do
-      shard_files="$(cd "$REPO_ROOT" && bash "$SHARD" "$i" "$total")"
+      shard_files="$(cached_shard "$total" "$i")"
       if grep -qF "$pin1" <<<"$shard_files" && grep -qF "$pin2" <<<"$shard_files"; then
         together=1
       fi
