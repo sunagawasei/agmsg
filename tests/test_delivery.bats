@@ -335,10 +335,10 @@ release_delayed_watch() {
   [[ "$output" == *"mode: monitor"* ]]
   grep -qF -- "watch processes:" <<<"$output"
   # `mode: monitor` reports configuration, not the runtime Monitor task; the
-  # claude-code-only note points at TaskList, not the background-task footer
+  # claude-code-only note says a task missing from TaskList is not a failure
   # (#270).
   grep -qF -- "configured hooks only" <<<"$output"
-  [[ "$output" == *"Verify with TaskList"* ]]
+  grep -qF -- "a task missing from TaskList is not a failure" <<<"$output"
 }
 
 # A pid that exists but this user cannot signal, so `kill -0` fails with EPERM
@@ -932,7 +932,7 @@ _guidance_block_from_text() {
   # Written once here, independent of both heredocs' current text, so either
   # branch losing content -- alone or in lockstep with the other -- fails
   # this test.
-  local expected_generic='Use Claude Code'"'"'s generic Monitor tool only. First confirm ToolSearch select:Monitor finds that generic tool; Azure Monitor, MCP monitor, or other monitor-branded tools are not valid for agmsg delivery. Do not start watch.sh with Bash/background/nohup or a shell task. Success is: - Monitor(agmsg inbox stream) starts - TaskList shows a task whose description begins with "agmsg inbox stream" for this session (the reliable check; the background-task footer is not) - the transcript later contains Monitor event: "agmsg inbox stream" If the generic Monitor tool is unavailable, do not treat a background shell watcher as success. Switch to turn delivery or run manual inbox checks instead; those fallbacks are not real-time monitor delivery.'
+  local expected_generic='Use Claude Code'"'"'s generic Monitor tool only. First confirm ToolSearch select:Monitor finds that generic tool; Azure Monitor, MCP monitor, or other monitor-branded tools are not valid for agmsg delivery. Do not start watch.sh with Bash/background/nohup or a shell task. Success is: - Monitor(agmsg inbox stream) starts - the transcript later contains Monitor event: "agmsg inbox stream" TaskList may list this task, but not every environment does (the desktop app'"'"'s Code tab runs the Monitor and delivers its events without listing it), so a task missing from TaskList is not a failure: judge by the Monitor call starting and its events arriving. The background-task footer is not a reliable check either. If the generic Monitor tool is unavailable, do not treat a background shell watcher as success. Switch to turn delivery or run manual inbox checks instead; those fallbacks are not real-time monitor delivery.'
 
   run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< '{"session_id":"sid-verify-generic"}'
   [ "$status" -eq 0 ]
@@ -949,13 +949,13 @@ _guidance_block_from_text() {
   role_block=$(_guidance_block_from_text "$output")
   [ -n "$role_block" ]
   norm_role_block=$(_normalize_ws "$role_block")
-  # The annotation must appear exactly 3 times (Monitor(...), TaskList's
-  # description prefix, and the transcript-event bullet) before it is
+  # The annotation must appear exactly 2 times (Monitor(...) and the
+  # transcript-event bullet) before it is
   # stripped below -- fewer means a bullet already lost its annotation (or
   # was dropped outright and a DIFFERENT stray match is inflating the
   # count), more means an unexpected extra occurrence; either way the blind
   # strip on the next line would otherwise mask it.
-  [ "$(grep -o ' (acting as alice)' <<<"$norm_role_block" | wc -l | tr -d ' ')" -eq 3 ]
+  [ "$(grep -o ' (acting as alice)' <<<"$norm_role_block" | wc -l | tr -d ' ')" -eq 2 ]
   # Strip only the role-only "(acting as alice)" annotation -- the remainder
   # must still equal the SAME absolute literal used for generic above.
   role_block_generic_shape="${norm_role_block// (acting as alice)/}"
@@ -966,12 +966,20 @@ _guidance_block_from_text() {
   run bash "$SCRIPTS/delivery.sh" set turn claude-code "$TEST_PROJECT"
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
   [[ "$output" =~ "TaskStop" ]]
+  # stops only a TaskList-listed or own-Monitor task_id, never a guess
+  local flat="${output//$'\n'/ }"
+  [[ "$flat" == *"or the task_id returned by your own Monitor call"* ]]
+  [[ "$flat" == *"do not guess a task_id"* ]]
 }
 
 @test "delivery set off: emits AGMSG-DIRECTIVE to stop any running watcher" {
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
   [[ "$output" =~ "TaskStop" ]]
+  # stops only a TaskList-listed or own-Monitor task_id, never a guess
+  local flat="${output//$'\n'/ }"
+  [[ "$flat" == *"or the task_id returned by your own Monitor call"* ]]
+  [[ "$flat" == *"do not guess a task_id"* ]]
 }
 
 # --- stop subcommand ---

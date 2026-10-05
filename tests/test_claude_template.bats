@@ -37,3 +37,14 @@ setup() {
   grep -Fq 'Do not report `actas` as complete without saying this' "$TEMPLATE"
   grep -Fq 'Do not report the drop as complete without mentioning it' "$TEMPLATE"
 }
+
+@test "Claude template stops only a TaskList or own-Monitor task_id, and a missing TaskList entry is not a failure" {
+  # actas + drop each carry the rule; mode slot carries the "not a failure" judgement.
+  [ "$(grep -Fc 'or the task_id returned by a Monitor call you made earlier in this conversation' "$TEMPLATE")" -eq 2 ]
+  [ "$(grep -Fc '**If you have such a task_id**: TaskStop it.' "$TEMPLATE")" -eq 2 ]
+  grep -Fq 'a task missing from TaskList is not a failure' "$TEMPLATE"
+  run grep -Fq 'Run TaskList. Find any task' "$TEMPLATE"
+  [ "$status" -ne 0 ]
+  run grep -Fq 'that is the reliable check' "$TEMPLATE"
+  [ "$status" -ne 0 ]
+}
