@@ -181,7 +181,7 @@ delivery:
   # default_mode: monitor
   monitor:
     # watch.sh SQLite poll interval, seconds
-    poll_interval: 5
+    poll_interval: 1
   turn:
     # Stop hook cooldown, seconds. Legacy alias: hook.check_interval
     check_interval: 60

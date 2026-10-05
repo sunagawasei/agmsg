@@ -30,7 +30,7 @@ ORIG_ARGS=("$@")
 #     a restart of this session's watcher (actas/drop/clear/self-restart)
 #     resumes from the last delivered id and does not drop messages that
 #     arrived during the restart gap. See #107.
-#   - Polls the SQLite DB at AGMSG_WATCH_INTERVAL seconds (default 5, also
+#   - Polls the SQLite DB at AGMSG_WATCH_INTERVAL seconds (default 1, also
 #     overridable via the delivery.monitor.poll_interval config key).
 #   - Emits one line per new message:
 #         <ts> | <team> | <from> → <to> | <body>
@@ -521,12 +521,12 @@ close_own_placement() {
   return 0
 }
 
-# Resolve poll interval. Env var wins over config, default 5s.
+# Resolve poll interval. Env var wins over config, default 1s.
 INTERVAL="${AGMSG_WATCH_INTERVAL:-}"
 if [ -z "$INTERVAL" ]; then
-  INTERVAL="$("$SCRIPT_DIR/config.sh" get delivery.monitor.poll_interval 5 2>/dev/null || echo 5)"
+  INTERVAL="$("$SCRIPT_DIR/config.sh" get delivery.monitor.poll_interval 1 2>/dev/null || echo 1)"
 fi
-case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
+case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=1 ;; esac
 
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 
