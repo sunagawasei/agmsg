@@ -1300,7 +1300,7 @@ class CodexBridge {
     // Lease before pidfile: once a peer can see our pid in the pidfile, lease.<pid>
     // must already carry our start token, not a crashed predecessor's.
     this.writeLease();
-    fs.writeFileSync(this.pidfile, `${process.pid}\n`);
+    this.claimPidfile();
     fs.writeFileSync(
       this.metafile,
       [
@@ -2455,21 +2455,26 @@ class CodexBridge {
     }
   }
 
+  // Early, read-only refusal so a loser dies before it publishes anything. It
+  // never removes records: reclaiming a stale pidfile is only safe under the claim
+  // lock (claimPidfile), where it cannot delete a peer's fresh claim.
   ensureSingleInstance() {
     const existing = readPid(this.pidfile);
-    if (!existing) return;
+    if (existing) this.judgeExisting(existing);
+  }
+
+  // "stale" when the recorded pid is not a live bridge of this role, "self" when
+  // it is this process, otherwise dies.
+  judgeExisting(existing) {
     // The launcher records the spawned PID immediately so status never points
     // at a stale predecessor. When that write wins the startup race, this
     // process sees its own PID here; it owns the reservation, not a peer bridge.
-    if (existing === process.pid) return;
+    if (existing === process.pid) return "self";
     let denied = false;
     try {
       process.kill(existing, 0);
     } catch (error) {
-      if (error && error.code === "ESRCH") {
-        this.removeStaleRecords(existing);
-        return;
-      }
+      if (error && error.code === "ESRCH") return "stale";
       if (!error || error.code !== "EPERM") {
         die(`cannot verify existing bridge pid ${existing}: ${error && error.message}`);
       }
@@ -2478,12 +2483,95 @@ class CodexBridge {
     // A live pid is not a live bridge: the number may have been recycled. Only
     // positive proof that it names something other than the bridge we leased
     // clears the record; any doubt keeps refusing.
-    if (this.pidRecycled(existing)) {
-      this.removeStaleRecords(existing);
-      return;
-    }
+    if (this.pidRecycled(existing)) return "stale";
     if (denied) die(`cannot verify existing bridge pid ${existing}: not permitted to signal it`);
     die(`bridge already running for ${this.identity.team}/${this.identity.name} (pid ${existing})`);
+  }
+
+  // Take the pidfile exactly once. The pid is linked into place from a complete
+  // temp file, so the claim is atomic and a peer never reads a half-written one;
+  // stale reclaim and the claim run under one lock so two contenders cannot both
+  // judge the same record stale and then delete each other's fresh claim.
+  claimPidfile() {
+    const gate = process.env.AGMSG_TEST_CODEX_BRIDGE_CLAIM_GATE;
+    if (gate) {
+      fs.writeFileSync(`${gate}.ready`, `${process.pid}\n`);
+      while (!fs.existsSync(`${gate}.go`)) sleepMs(20);
+    }
+    const tmp = `${this.pidfile}.${process.pid}.claim`;
+    try {
+      this.withClaimLock(() => {
+        fs.writeFileSync(tmp, `${process.pid}\n`);
+        for (let attempt = 0; attempt < 5; attempt++) {
+          try {
+            fs.linkSync(tmp, this.pidfile);
+            return;
+          } catch (error) {
+            if (!error || error.code !== "EEXIST") throw error;
+          }
+          const existing = readPid(this.pidfile);
+          if (existing && this.judgeExisting(existing) === "self") return;
+          // Stale, or a record with no readable pid: remove it and claim again.
+          this.removeStaleRecords(existing);
+        }
+        throw new Error("cannot claim pidfile");
+      });
+    } catch (error) {
+      this.cleanupLease();
+      die(`cannot claim ${this.pidfile}: ${error.message}`);
+    } finally {
+      try { fs.unlinkSync(tmp); } catch (_) { /* already gone */ }
+    }
+  }
+
+  // The lock is a file linked into place from a complete temp holding the holder
+  // pid, so it never exists without an owner and a live holder is never mistaken
+  // for a dead one by timing. The holder is inside for a few fs calls only; a lock
+  // whose recorded pid is gone is moved aside by rename (one contender wins it),
+  // checked to still be the record judged dead, and retaken.
+  withClaimLock(fn) {
+    const lock = `${this.pidfile}.lock`;
+    const mine = `${lock}.${process.pid}`;
+    const deadline = Date.now() + 10000;
+    fs.writeFileSync(mine, `${process.pid}\n`);
+    try {
+      for (;;) {
+        try {
+          fs.linkSync(mine, lock);
+          break;
+        } catch (error) {
+          if (!error || error.code !== "EEXIST") throw error;
+        }
+        const holder = readPid(lock);
+        let gone = false;
+        if (holder) {
+          try { process.kill(holder, 0); } catch (error) { gone = Boolean(error && error.code === "ESRCH"); }
+        }
+        if (gone) {
+          const aside = `${lock}.dead.${process.pid}`;
+          try {
+            fs.renameSync(lock, aside);
+            if (readPid(aside) !== holder) {
+              // Moved a lock taken after we judged: hand it back unless retaken.
+              try { fs.linkSync(aside, lock); } catch (_) { /* retaken: nothing more to do */ }
+            }
+          } catch (_) { /* a peer reclaimed it */ }
+          try { fs.unlinkSync(aside); } catch (_) { /* best effort */ }
+          continue;
+        }
+        if (Date.now() > deadline) throw new Error(`timed out waiting for ${lock}`);
+        sleepMs(10);
+      }
+      try {
+        fn();
+      } finally {
+        if (readPid(lock) === process.pid) {
+          try { fs.unlinkSync(lock); } catch (_) { /* best effort */ }
+        }
+      }
+    } finally {
+      try { fs.unlinkSync(mine); } catch (_) { /* already gone */ }
+    }
   }
 
   // True when pid's lease was written by a bridge of this role that is gone: the
@@ -2644,6 +2732,10 @@ function processCommand(pid) {
   } catch (_) { /* no /proc (macOS/BSD) or unreadable */ }
   const ps = spawnSync("ps", ["-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8" });
   return ps.status === 0 ? String(ps.stdout || "").trim() : "";
+}
+
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 function readPid(file) {

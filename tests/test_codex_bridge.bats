@@ -1009,15 +1009,21 @@ refused() {
   read -r src tok <<<"$(current_start_token "$OCCUPANT")"
   write_lease_file "$OCCUPANT" "$src" "$(other_start_token "$src")"
   printf 'pid=999999\nproject=%s\n' "$PROJ" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta"
-  # Exit as soon as the bridge would write its own records, so only the
-  # single-instance cleanup has touched them.
+  # Exit as soon as the bridge would re-claim the pidfile after its first link
+  # attempt hit the stale record, so only the stale cleanup has touched them.
   local spy="$TEST_SKILL_DIR/stop-at-records.js"
   cat >"$spy" <<'EOF'
 const fs = require("fs");
-const real = fs.writeFileSync;
+const realWrite = fs.writeFileSync;
 fs.writeFileSync = function (file, ...rest) {
-  if (/codex-bridge\.team\.alice\.(pid|meta)$/.test(String(file))) process.exit(0);
-  return real.call(this, file, ...rest);
+  if (/codex-bridge\.team\.alice\.meta$/.test(String(file))) process.exit(0);
+  return realWrite.call(this, file, ...rest);
+};
+const realLink = fs.linkSync;
+let links = 0;
+fs.linkSync = function (src, dest) {
+  if (/codex-bridge\.team\.alice\.pid$/.test(String(dest)) && ++links > 1) process.exit(0);
+  return realLink.call(this, src, dest);
 };
 EOF
   NODE_OPTIONS="--require $spy" run_bridge_over_pidfile "$OCCUPANT"
@@ -1059,7 +1065,7 @@ const append = fs.appendFileSync;
 const wrap = (name, label) => {
   const real = fs[name];
   fs[name] = function (...args) {
-    const target = String(args[args.length > 1 && name === "renameSync" ? 1 : 0]);
+    const target = String(args[args.length > 1 && (name === "renameSync" || name === "linkSync") ? 1 : 0]);
     if (/codex-bridge(-lease)?\./.test(target) && !target.endsWith(".tmp")) {
       append(log, `${label} ${target}\n`);
     }
@@ -1068,6 +1074,7 @@ const wrap = (name, label) => {
 };
 wrap("writeFileSync", "write");
 wrap("renameSync", "rename");
+wrap("linkSync", "link");
 EOF
   FS_EVENTS_LOG="$events" NODE_OPTIONS="--require $spy" \
     AGMSG_CODEX_APP_SERVER_CMD="sleep 300" node "$TYPES/codex/codex-bridge.js" \
@@ -1075,17 +1082,78 @@ EOF
     >"$TEST_SKILL_DIR/spy-bridge.log" 2>&1 &
   local bridge=$! i
   for i in $(seq 1 100); do
-    grep -q "codex-bridge.team.alice.pid" "$events" 2>/dev/null && break
+    grep -q "^link .*codex-bridge\.team\.alice\.pid$" "$events" 2>/dev/null && break
     sleep 0.05
   done
   kill "$bridge" 2>/dev/null || true
   wait "$bridge" 2>/dev/null || true
   local lease_line pid_line
   lease_line="$(grep -n "^rename .*codex-bridge-lease\." "$events" | head -1 | cut -d: -f1)"
-  pid_line="$(grep -n "^write .*codex-bridge.team.alice.pid" "$events" | head -1 | cut -d: -f1)"
+  pid_line="$(grep -n "^link .*codex-bridge\.team\.alice\.pid$" "$events" | head -1 | cut -d: -f1)"
   [ -n "$lease_line" ] || { cat "$TEST_SKILL_DIR/spy-bridge.log"; return 1; }
   [ -n "$pid_line" ]
   [ "$lease_line" -lt "$pid_line" ]
+}
+
+# --- pidfile claim is atomic (#57) ---
+
+# Two bridges for one identity, both held after the early liveness check and
+# before the pidfile claim; A claims first, then B is released and must refuse.
+run_gated_claim_race() {
+  local gate_a="$TEST_SKILL_DIR/gate-a" gate_b="$TEST_SKILL_DIR/gate-b" i
+  local pidfile="$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+  AGMSG_TEST_CODEX_BRIDGE_CLAIM_GATE="$gate_a" AGMSG_CODEX_APP_SERVER_CMD="sleep 300"     node "$TYPES/codex/codex-bridge.js" --project "$PROJ" --team team --name alice     --request-timeout-ms 60000 >"$TEST_SKILL_DIR/bridge-a.log" 2>&1 &
+  BRIDGE_A=$!
+  AGMSG_TEST_CODEX_BRIDGE_CLAIM_GATE="$gate_b" AGMSG_CODEX_APP_SERVER_CMD="sleep 300"     node "$TYPES/codex/codex-bridge.js" --project "$PROJ" --team team --name alice     --request-timeout-ms 60000 >"$TEST_SKILL_DIR/bridge-b.log" 2>&1 &
+  BRIDGE_B=$!
+  for i in $(seq 1 200); do
+    [ -e "$gate_a.ready" ] && [ -e "$gate_b.ready" ] && break
+    sleep 0.05
+  done
+  [ -e "$gate_a.ready" ] && [ -e "$gate_b.ready" ]
+  touch "$gate_a.go"
+  for i in $(seq 1 200); do
+    [ "$(cat "$pidfile" 2>/dev/null)" = "$BRIDGE_A" ] && break
+    sleep 0.05
+  done
+  [ "$(cat "$pidfile")" = "$BRIDGE_A" ]
+  touch "$gate_b.go"
+  for i in $(seq 1 200); do
+    kill -0 "$BRIDGE_B" 2>/dev/null || break
+    sleep 0.05
+  done
+  BRIDGE_B_STATUS=0
+  wait "$BRIDGE_B" || BRIDGE_B_STATUS=$?
+}
+
+@test "codex-bridge: a second bridge past the early check cannot take the pidfile from the first (#57)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  run_gated_claim_race
+  local pidfile_now
+  pidfile_now="$(cat "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid")"
+  kill "$BRIDGE_A" 2>/dev/null || true
+  wait "$BRIDGE_A" 2>/dev/null || true
+  [ "$BRIDGE_B_STATUS" -eq 1 ]
+  grep -q "bridge already running" "$TEST_SKILL_DIR/bridge-b.log"
+  [ "$pidfile_now" = "$BRIDGE_A" ]
+}
+
+@test "codex-bridge: two bridges reclaiming the same stale pidfile leave exactly one owner (#57)" {
+  skip_on_windows "codex bridge identity resolution on Windows (#182)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  sh -c 'exit 0' &
+  local dead=$!
+  wait "$dead"
+  echo "$dead" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+  run_gated_claim_race
+  local pidfile_now
+  pidfile_now="$(cat "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid")"
+  kill "$BRIDGE_A" 2>/dev/null || true
+  wait "$BRIDGE_A" 2>/dev/null || true
+  [ "$BRIDGE_B_STATUS" -eq 1 ]
+  grep -q "bridge already running" "$TEST_SKILL_DIR/bridge-b.log"
+  [ "$pidfile_now" = "$BRIDGE_A" ]
 }
 
 @test "codex-bridge: starts a turn when app-server reports watch-once pending" {
