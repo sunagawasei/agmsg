@@ -77,7 +77,10 @@ scripts/despawn.sh <team> <leader-name> wall --force
 
 1. `spawn.sh codex <name> --headless --model <id>` — the same `--model` flag an
    interactive spawn accepts, reused here for the headless path.
-2. config `spawn.codex_model.<name>` — keyed by the spawned actas name.
+2. config `spawn.codex_model.<name>` — keyed by the spawned actas name. A bare
+   family name (`sol`, `luna`) resolves at spawn time to the newest listed
+   `gpt-<version>-<family>` in `codex debug models`; no match aborts the spawn.
+   A full slug such as `gpt-5.6-sol` is used as written.
 3. unset — falls back to the worker's global `~/.codex/config.toml`.
 
 **Reasoning effort** (headless-only knob, no CLI flag):

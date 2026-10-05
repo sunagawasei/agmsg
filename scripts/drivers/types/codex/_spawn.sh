@@ -422,6 +422,30 @@ agmsg_codex_sanitize_for_log() {
 # wrapped in a single-quoted `-c 'key="value"'` clause: the single quotes protect
 # the clause across the `sh -lc` re-parse, and the literal double quotes inside
 # make the spliced text a valid quoted TOML string for codex's -c KEY=VALUE.
+# A model value that is a bare family name (`sol`, `luna`, ...) is resolved at
+# spawn time to the newest listed `gpt-<version>-<family>` slug in the CLI's own
+# catalog, so a new generation is picked up without editing config. A concrete
+# slug (`gpt-5.6-sol`) is never touched. No match fails closed: an unpinned
+# worker would silently fall back to the global default model.
+agmsg_codex_resolve_model_family() {
+  local family="$1" slug
+  slug="$(codex debug models 2>/dev/null | node -e '
+    let t = ""; process.stdin.on("data", d => t += d).on("end", () => {
+      let ms; try { ms = JSON.parse(t).models; } catch (e) { process.exit(1); }
+      const re = new RegExp("^gpt-([0-9]+(?:\\.[0-9]+)*)-" + process.argv[1] + "$");
+      const key = s => re.exec(s)[1].split(".").map(Number);
+      const cmp = (a, b) => { for (let i = 0; i < Math.max(a.length, b.length); i++) { const d = (a[i] || 0) - (b[i] || 0); if (d) return d; } return 0; };
+      const hits = ms.filter(m => m.visibility === "list" && re.test(m.slug)).map(m => m.slug).sort((a, b) => cmp(key(b), key(a)));
+      if (!hits.length) process.exit(1);
+      console.log(hits[0]);
+    });' "$family")" || slug=""
+  if [ -z "$slug" ]; then
+    echo "spawn: no listed codex model for family '$family' in 'codex debug models'; refusing to start unpinned" >&2
+    return 1
+  fi
+  printf '%s' "$slug"
+}
+
 agmsg_codex_model_effort_args() {
   local name="$1" model="" effort="" args="" name_safe=1
   agmsg_codex_safe_token "$name" || name_safe=0
@@ -447,6 +471,10 @@ agmsg_codex_model_effort_args() {
     echo "spawn: ignoring unsafe codex reasoning-effort value '$(agmsg_codex_sanitize_for_log "$effort")' (must match ^[A-Za-z0-9._-]+\$)" >&2
     effort=""
   fi
+
+  case "$model" in
+    [a-z]*) case "$model" in *[!a-z]*) ;; *) model="$(agmsg_codex_resolve_model_family "$model")" || return 1 ;; esac ;;
+  esac
 
   [ -n "$model" ]  && args="$args -c 'model=\"$model\"'"
   [ -n "$effort" ] && args="$args -c 'model_reasoning_effort=\"$effort\"'"
@@ -733,7 +761,7 @@ agmsg_spawn_headless() {
   agmsg_validate_team_name "$TEAM" >/dev/null 2>&1 || die "spawn: team name '$TEAM' is not a path-safe segment"
   agmsg_validate_agent_name "$NAME" >/dev/null 2>&1 || die "spawn: agent name '$NAME' is not valid (same rule join.sh applies: no '.', '..', '/', '\\', '\"', '[', ']', leading '-', or control chars)"
   local bridge="${AGMSG_CODEX_BRIDGE_CMD:-$SCRIPT_DIR/drivers/types/codex/codex-bridge.js}"
-  local model_effort_args; model_effort_args="$(agmsg_codex_model_effort_args "$NAME")"
+  local model_effort_args; model_effort_args="$(agmsg_codex_model_effort_args "$NAME")" || die "spawn: could not resolve the codex model for '$NAME'"
   local codex_client_name; codex_client_name="$(agmsg_codex_client_name "$NAME")"
   local codex_turn_timeout; codex_turn_timeout="$(agmsg_codex_turn_timeout "$NAME")"
   [ -z "$codex_turn_timeout" ] && codex_turn_timeout="${AGMSG_CODEX_BRIDGE_TURN_TIMEOUT:-}"

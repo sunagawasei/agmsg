@@ -46,6 +46,10 @@ setup() {
   # proceeds. Tests that simulate a fail-open / nested build override this per-test.
   cat > "$STUB_BIN/codex" <<'CODEX_STUB'
 #!/usr/bin/env bash
+if [ "$1" = debug ] && [ "$2" = models ]; then
+  printf '%s' '{"models":[{"slug":"gpt-5.6-sol","visibility":"list"},{"slug":"gpt-6-sol","visibility":"list"},{"slug":"gpt-10-sol","visibility":"list"},{"slug":"gpt-11-sol","visibility":"hide"},{"slug":"gpt-5.6-luna","visibility":"list"}]}'
+  exit 0
+fi
 if [ "$1" = sandbox ]; then
   case "$*" in
     *"rm -f"*) exit 0 ;;                                                   # positive probe (run/ write) — allowed
@@ -2466,6 +2470,34 @@ CODEX_STUB
   wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"model="* ]]
+}
+
+@test "spawn: a bare family name in spawn.codex_model.<name> resolves to the newest listed version" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_model.reviewer sol
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+
+  local i
+  wait_until 10 _capture_nonempty
+  run cat "$CAPTURE"
+  # gpt-10-sol beats gpt-6-sol numerically; the hidden gpt-11-sol is skipped.
+  [[ "$output" == *'model="gpt-10-sol"'* ]]
+}
+
+@test "spawn: a family name with no listed model fails closed instead of spawning unpinned" {
+  bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
+  bash "$SCRIPTS/config.sh" set spawn.codex_model.reviewer nosuchfamily
+  _make_fake_bridge
+
+  run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex reviewer --project "$PROJ" --headless
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no listed codex model for family 'nosuchfamily'"* ]]
+  [ ! -s "$CAPTURE" ]
 }
 
 @test "spawn: --model takes precedence over spawn.codex_model.<name> for headless codex" {
