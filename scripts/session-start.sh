@@ -691,8 +691,9 @@ if agmsg_session_team_enabled; then
     for _ttl_rec in "$RUN_DIR/spawn.${_tn}__"*; do
       [ -f "$_ttl_rec" ] || continue
       _ttl_line=""
-      [ -r "$_ttl_rec" ] || { _ttl_unverified_placement=1; break; }
-      IFS= read -r _ttl_line <"$_ttl_rec" 2>/dev/null || true
+      # A failed read of a non-empty record is unknown, not "no placement".
+      IFS= read -r _ttl_line <"$_ttl_rec" 2>/dev/null || [ -n "$_ttl_line" ] \
+        || [ ! -s "$_ttl_rec" ] || { _ttl_unverified_placement=1; break; }
       _ttl_placement="${_ttl_line%%$'\t'*}"
       case "$_ttl_placement" in
         pid:*)

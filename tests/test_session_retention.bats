@@ -349,3 +349,16 @@ SH
   [ -d "$TEST_SKILL_DIR/teams/s-NNN-1" ]
   [ "$(rows s-NNN-1)" != 0 ]
 }
+
+@test "veto unverified-placement: a spawn record that cannot be read keeps the team" {
+  [ "$(id -u)" -ne 0 ] || skip "root reads every file"
+  local team=s-VETO-unread
+  printf 'pid:1\t%s\tcodex\n' "$PROJ" > "$TEST_SKILL_DIR/run/spawn.${team}__w"
+  chmod 000 "$TEST_SKILL_DIR/run/spawn.${team}__w"
+  seed_rows "$team" 30
+  : > "$TEST_SKILL_DIR/run/session-tombstone.$team"
+  run run_session_start
+  chmod 600 "$TEST_SKILL_DIR/run/spawn.${team}__w"
+  [ "$status" -eq 0 ]
+  [ "$(rows "$team")" != 0 ]
+}

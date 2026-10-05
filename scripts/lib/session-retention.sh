@@ -54,8 +54,9 @@ agmsg_retention_veto() {
   for rec in "$RUN_DIR/spawn.${team}__"*; do
     [ -f "$rec" ] || continue
     line=""
-    [ -r "$rec" ] || { unverified=1; break; }
-    IFS= read -r line <"$rec" 2>/dev/null || true
+    # A failed read of a non-empty record is unknown, not "no placement".
+    IFS= read -r line <"$rec" 2>/dev/null || [ -n "$line" ] || [ ! -s "$rec" ] \
+      || { unverified=1; break; }
     placement="${line%%$'\t'*}"
     case "$placement" in
       pid:*)
