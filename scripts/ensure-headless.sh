@@ -91,20 +91,29 @@ lock_record() {
   [ -e "$1" ] && [ "$#" -eq 1 ] && printf '%s\n' "$1"
 }
 
+# Runs "$@" and leaves its stdout minus one trailing newline in LOCK_OUT; fails
+# on a non-zero exit. A variable, not a substitution, so that further blank
+# lines are not stripped before they are checked.
+lock_capture() {
+  local out
+  out="$("$@" 2>/dev/null && printf x)" || return 1
+  out="${out%x}"
+  LOCK_OUT="${out%$'\n'}"
+}
+
 # Prints a plain unsigned integer from "$@" (at most 10 digits); fails on a
 # non-zero exit, empty, multi-line or non-numeric output.
 lock_uint_from() {
-  local out
-  out="$("$@" 2>/dev/null)" || return 1
-  [[ "$out" =~ ^[0-9]{1,10}$ ]] || return 1
-  printf '%s\n' "$((10#$out))"
+  lock_capture "$@" || return 1
+  [[ "$LOCK_OUT" =~ ^[0-9]{1,10}$ ]] || return 1
+  printf '%s\n' "$((10#$LOCK_OUT))"
 }
 
 # ps etime ([[dd-]hh:]mm:ss) to seconds; fails on anything else.
 lock_etime_secs() {
   local raw="$1" d h m s secs
-  raw="${raw#"${raw%%[![:space:]]*}"}"
-  raw="${raw%"${raw##*[![:space:]]}"}"
+  raw="${raw#"${raw%%[![ $'\t']*}"}"
+  raw="${raw%"${raw##*[![ $'\t']}"}"
   [[ "$raw" =~ ^((([0-9]{1,5})-)?([0-9]{1,2}):)?([0-9]{1,2}):([0-9]{2})$ ]] || return 1
   d=$((10#${BASH_REMATCH[3]:-0})) h=$((10#${BASH_REMATCH[4]:-0}))
   m=$((10#${BASH_REMATCH[5]})) s=$((10#${BASH_REMATCH[6]}))
@@ -118,13 +127,13 @@ lock_etime_secs() {
 # current holder started after the record was written. Every input that cannot
 # be read or validated answers 1, i.e. the lock stays held.
 lock_holder_started_after_record() {
-  local pid="$1" rec="$2" content now raw etime mtime
-  content="$(cat "$rec" 2>/dev/null; printf x)"
+  local pid="$1" rec="$2" content now etime mtime
+  content="$(cat "$rec" 2>/dev/null && printf x)" || return 1
   [ "$content" = "$pid"$'\n\nx' ] || return 1
   # now is read before ps so that a slow ps can only make the holder look older.
   now="$(lock_uint_from date +%s)" || return 1
-  raw="$(LC_ALL=C ps -o etime= -p "$pid" 2>/dev/null)" || return 1
-  etime="$(lock_etime_secs "$raw")" || return 1
+  LC_ALL=C lock_capture ps -o etime= -p "$pid" || return 1
+  etime="$(lock_etime_secs "$LOCK_OUT")" || return 1
   mtime="$(lock_uint_from stat -c %Y "$rec")" || mtime="$(lock_uint_from stat -f %m "$rec")" || return 1
   [ "$etime" -le "$now" ] && [ "$mtime" -le "$now" ] || return 1
   [ $((now - etime)) -gt $((mtime + RECYCLE_SLACK)) ]

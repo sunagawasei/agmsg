@@ -320,6 +320,11 @@ case "$cmd" in
       -c) if [ -n "${T_STAT_GNU+x}" ]; then printf '%s' "$T_STAT_GNU"; exit "${T_STAT_GNU_RC:-0}"; fi ;;
       -f) if [ -n "${T_STAT_BSD+x}" ]; then printf '%s' "$T_STAT_BSD"; exit "${T_STAT_BSD_RC:-0}"; fi ;;
     esac ;;
+  cat)
+    if [ -n "${T_CAT_FAIL+x}" ] && [[ "$*" == *owner.* ]]; then
+      if [ -n "$T_CAT_FAIL" ]; then p="${*##*owner.}"; printf '%s\n\n' "${p%%.*}"; fi
+      exit 1
+    fi ;;
   ls)
     if [ "$1" = "-di" ] && [ -s "${T_LS_SEQ:-/nonexistent}" ]; then
       line="$(head -n 1 "$T_LS_SEQ")"; sed -i.bak 1d "$T_LS_SEQ"; rm -f "$T_LS_SEQ.bak"
@@ -334,7 +339,7 @@ esac
 exec "${!real_var}" "$@"
 STUB
   chmod +x "$stub_bin/stub"
-  for name in ps date stat ls; do
+  for name in ps date stat ls cat; do
     ln -sf stub "$stub_bin/$name"
     export "STUB_REAL_$(printf '%s' "$name" | tr a-z A-Z)=$(command -v "$name")"
   done
@@ -486,6 +491,18 @@ done
 
 bats_test_function --description "ensure-headless: empty token, etime is on two lines, keeps the lock" \
   -- keep_when_input_is +721 $'10:00\n10:00'
+bats_test_function --description "ensure-headless: empty token, etime with a leading blank line, keeps the lock" \
+  -- keep_when_input_is +721 $'\n10:00'
+bats_test_function --description "ensure-headless: empty token, etime with an extra trailing blank line, keeps the lock" \
+  -- keep_when_input_is +721 $'10:00\n\n'
+bats_test_function --description "ensure-headless: empty token, date with an extra trailing blank line, keeps the lock" \
+  -- keep_when_input_is $'1700000721\n\n' "10:00"
+bats_test_function --description "ensure-headless: empty token, stat with an extra trailing blank line, keeps the lock" \
+  -- keep_when_input_is +721 "10:00" T_STAT_GNU=$'1700000000\n\n' T_STAT_BSD=$'1700000000\n\n'
+bats_test_function --description "ensure-headless: empty token, reading the record fails after printing its expected bytes, keeps the lock" \
+  -- keep_when_input_is +721 "10:00" T_CAT_FAIL=partial
+bats_test_function --description "ensure-headless: empty token, reading the record fails without output, keeps the lock" \
+  -- keep_when_input_is +721 "10:00" T_CAT_FAIL=
 bats_test_function --description "ensure-headless: empty token, ps fails after printing a plausible etime, keeps the lock" \
   -- keep_when_input_is +721 "10:00" T_ETIME_RC=1
 bats_test_function --description "ensure-headless: empty token, date prints text, keeps the lock" \
@@ -520,6 +537,11 @@ bats_test_function --description "ensure-headless: empty-token record with a thi
   -- keep_when_record_is '%s\n\nextra\n'
 bats_test_function --description "ensure-headless: empty-token record with an extra blank line keeps the lock" \
   -- keep_when_record_is '%s\n\n\n'
+
+@test "ensure-headless: etime padded with spaces and one trailing newline is accepted" {
+  run_empty_token +721 $'  10:00 \n'
+  assert_lock_reaped
+}
 
 @test "ensure-headless: GNU stat failing while BSD answers a late holder still reclaims" {
   run_empty_token +721 "10:00" T_STAT_GNU= T_STAT_GNU_RC=1 T_STAT_BSD=1700000000
