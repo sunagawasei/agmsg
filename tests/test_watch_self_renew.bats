@@ -86,3 +86,36 @@ _wait_exit() {
   wait "$pid" 2>/dev/null || true
   refute grep -q 'agmsg watch: ' "$BATS_TEST_TMPDIR/out"
 }
+
+# Elapsed time and delivery count are exported across an install-change
+# re-exec (AGMSG_WATCH_ELAPSED_BASE / AGMSG_WATCH_DELIVERED_BASE); a restart
+# that lands past the limit must still renew or stop on its first cycle.
+@test "watch --max-seconds: elapsed time carried over a restart past the limit ends the first cycle" {
+  AGMSG_WATCH_ELAPSED_BASE=100 AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" renew-base "$PROJ" claude-code alice --max-seconds=50 \
+    >"$BATS_TEST_TMPDIR/out" 2>/dev/null 3>&- 4>&- &
+  local pid=$!
+  _wait_exit "$pid" 10 || { kill "$pid" 2>/dev/null; false; }
+  wait "$pid"
+  grep -q '^agmsg watch: stopping - ' "$BATS_TEST_TMPDIR/out"
+}
+
+@test "watch --max-seconds: delivery count carried over a restart makes it 're-arm'" {
+  AGMSG_WATCH_ELAPSED_BASE=100 AGMSG_WATCH_DELIVERED_BASE=1 AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" renew-carry "$PROJ" claude-code alice --max-seconds=50 \
+    >"$BATS_TEST_TMPDIR/out" 2>/dev/null 3>&- 4>&- &
+  local pid=$!
+  _wait_exit "$pid" 10 || { kill "$pid" 2>/dev/null; false; }
+  wait "$pid"
+  grep -q '^agmsg watch: re-arm - ' "$BATS_TEST_TMPDIR/out"
+}
+
+@test "watch --max-seconds: an explicitly empty AGMSG_CC_MONITOR_KEEP_ALIVE counts as OFF" {
+  AGMSG_CC_MONITOR_KEEP_ALIVE= AGMSG_WATCH_ELAPSED_BASE=100 AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" renew-empty "$PROJ" claude-code alice --max-seconds=50 \
+    >"$BATS_TEST_TMPDIR/out" 2>/dev/null 3>&- 4>&- &
+  local pid=$!
+  _wait_exit "$pid" 10 || { kill "$pid" 2>/dev/null; false; }
+  wait "$pid"
+  grep -q '^agmsg watch: stopping - ' "$BATS_TEST_TMPDIR/out"
+}
