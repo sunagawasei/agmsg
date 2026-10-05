@@ -10,7 +10,7 @@ Status: Accepted
 
 - A team's rows are deleted when they are older than `delivery.message_retention_days` (default 7) and the team is proven to be a session team. Resume now returns only the history inside that window.
 - Proof is `teams/<team>/session-team`, written by session-start only when its join created the dir, or `run/session-tombstone.<team>`, written when the TTL GC removed a marked dir. The name `s-<uuid>` alone is never proof. A pre-existing dir of that name (a project team) is never marked.
-- Deletion re-reads the tombstone under the team lock and stops when it is gone. A dry-run of `gc-session-orphans.sh` uses a read-only veto (any inflight record vetoes) and never reaps inflight records.
+- Deletion re-reads the tombstone under the team lock and stops when it is gone. The TTL GC drops a stale tombstone and removes an unmarked dir in one step under that lock, and keeps the dir when the lock times out. A dry-run of `gc-session-orphans.sh` uses a read-only veto (any inflight record vetoes) and never reaps inflight records.
 - Deletion runs under the team's lifecycle lock, after the same vetoes as the dir GC (bare owner alive, live bridge, unverified placement, live inflight) and a check that the dir is still absent. It is one sqlite transaction over `events`, `messages` and `read_cursors`, selected by team and age.
 - Rows younger than the window survive the dir GC; later SessionStarts sweep tombstoned teams. A tombstone is removed only when the team has no rows and the tombstone is itself older than the window.
 - Teams that predate the marker are handled only by `scripts/gc-session-orphans.sh --apply` (default `--dry-run`).

@@ -136,22 +136,23 @@ agmsg_retention_reap_team() {
   printf 'delete-failed'; return 1
 }
 
+# TTL GC for a dir without the marker. Any tombstone of this name belongs to an
+# earlier generation: drop it and remove the dir under the lifecycle lock, so a
+# sweep either finishes before (and sees the dir) or starts after both are done.
+# On lock timeout the dir is kept (return 1) and retried at the next SessionStart.
+agmsg_retention_reap_unmarked_dir() {
+  local team="$1" dir="$2"
+  agmsg_team_lifecycle_lock_acquire "$team" "${AGMSG_LIFECYCLE_LOCK_TIMEOUT:-10}" || return 1
+  rm -f "$(agmsg_retention_tombstone_path "$team")" 2>/dev/null || true
+  rm -rf "$dir" 2>/dev/null || true
+  agmsg_team_lifecycle_lock_release "$team"
+}
+
 # Called by the TTL GC right after `rm -rf teams/<team>`. $2 = 1 when the dir
 # carried the session-team marker before it was removed.
 agmsg_retention_after_dir_reap() {
   local team="$1" had_marker="$2" tomb
-  if [ "$had_marker" != 1 ]; then
-    # An unmarked dir of this name is a different generation than any tombstone.
-    # Taken under the lifecycle lock so a reap that already re-read the proof
-    # finishes first; on lock timeout dropping the proof is still the safe side.
-    if agmsg_team_lifecycle_lock_acquire "$team" "${AGMSG_LIFECYCLE_LOCK_TIMEOUT:-10}"; then
-      rm -f "$(agmsg_retention_tombstone_path "$team")" 2>/dev/null || true
-      agmsg_team_lifecycle_lock_release "$team"
-    else
-      rm -f "$(agmsg_retention_tombstone_path "$team")" 2>/dev/null || true
-    fi
-    return 0
-  fi
+  [ "$had_marker" = 1 ] || return 0   # unmarked dirs go through reap_unmarked_dir
   [ ! -d "$SKILL_DIR/teams/$team" ] || return 0   # rm failed: keep the rows
   tomb="$(agmsg_retention_tombstone_path "$team")"
   : >"$tomb" 2>/dev/null || return 0

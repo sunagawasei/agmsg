@@ -743,7 +743,12 @@ if agmsg_session_team_enabled; then
     fi
     _ttl_had_marker=0
     [ -f "$(agmsg_retention_marker_path "$_tn")" ] && _ttl_had_marker=1
-    rm -rf "$_d" 2>/dev/null || true
+    if [ "$_ttl_had_marker" = 1 ]; then
+      rm -rf "$_d" 2>/dev/null || true
+    else
+      # Proof invalidation and dir removal are one step under the lifecycle lock.
+      agmsg_retention_reap_unmarked_dir "$_tn" "$_d" || continue
+    fi
     agmsg_retention_after_dir_reap "$_tn" "$_ttl_had_marker" || true
     rm -rf "$SKILL_DIR/run/codex-$_tn-cwd" 2>/dev/null || true
     rm -f "$SKILL_DIR/run/codex-bridge.$_tn".* 2>/dev/null || true

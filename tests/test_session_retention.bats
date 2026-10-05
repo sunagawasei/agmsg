@@ -309,3 +309,27 @@ veto_case() {   # <kind>
   AGMSG_JOIN_MARK_SESSION_TEAM=1 AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" s-LLL-2 claude claude-code "$PROJ" >/dev/null
   [ ! -f "$TEST_SKILL_DIR/teams/s-LLL-2/session-team" ]
 }
+
+@test "a sweep running while an unmarked dir is reaped cannot use the old tombstone" {
+  seed_rows s-MMM-1 30
+  : > "$TEST_SKILL_DIR/run/session-tombstone.s-MMM-1"
+  make_team s-MMM-1
+  mkdir "$TEST_SKILL_DIR/shim"
+  cat > "$TEST_SKILL_DIR/shim/rm" <<SH
+#!/bin/sh
+case "\$*" in *teams/s-MMM-1*)
+  /bin/rm "\$@"
+  AGMSG_LIFECYCLE_LOCK_TIMEOUT=1 /bin/bash -c '
+    SCRIPT_DIR="$SCRIPTS"; SKILL_DIR="$TEST_SKILL_DIR"; RUN_DIR="$TEST_SKILL_DIR/run"
+    for l in compat actas-lock storage team-lifecycle instance-id process-identity pending-teardown inflight session-retention; do . "\$SCRIPT_DIR/lib/\$l.sh"; done
+    agmsg_retention_sweep'
+  exit 0 ;;
+esac
+exec /bin/rm "\$@"
+SH
+  chmod +x "$TEST_SKILL_DIR/shim/rm"
+  PATH="$TEST_SKILL_DIR/shim:$PATH" run run_session_start
+  [ ! -d "$TEST_SKILL_DIR/teams/s-MMM-1" ]
+  [ ! -f "$TEST_SKILL_DIR/run/session-tombstone.s-MMM-1" ]
+  [ "$(rows s-MMM-1)" != 0 ]
+}
