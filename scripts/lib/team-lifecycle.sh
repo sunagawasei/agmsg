@@ -43,7 +43,7 @@ agmsg_team_lifecycle_lock_acquire() {
     case "$owner" in
       ''|*[!0-9]*) ;;
       *)
-        if ! kill -0 "$owner" 2>/dev/null; then
+        if ! _agmsg_pid_alive_local "$owner"; then
           owner="$(agmsg_runtime_lock_acquire "$resource" "$$" "$owner" 2>/dev/null || true)"
           [ "$owner" = "$$" ] && return 0
         fi

@@ -65,7 +65,7 @@ lock_holder_script='
   release=$2
   parent=$3
   printf "ready\n" >"$ready" || exit 70
-  while kill -0 "$parent" 2>/dev/null && [ ! -e "$release" ]; do
+  while kill -0 "$parent" 2>/dev/null && [ ! -e "$release" ]; do # agmsg-kill0-ok: our own parent, same user
     sleep 0.05
   done
 '
@@ -85,7 +85,12 @@ fi
 LOCK_HOLDER_PID=$!
 
 while [ ! -f "$LOCK_READY" ] || [ -L "$LOCK_READY" ]; do
-  if ! kill -0 "$LOCK_HOLDER_PID" 2>/dev/null; then
+  # Our own child: the shell's job table is exact, where a signal probe plus ps
+  # reads "ps unavailable" as alive and would wait forever on a child that exited.
+  holder_jobs="$(jobs -pr)"
+  nl=$'\n'
+  case "$nl$holder_jobs$nl" in *"$nl$LOCK_HOLDER_PID$nl"*) holder_running=1 ;; *) holder_running=0 ;; esac
+  if [ "$holder_running" -eq 0 ]; then
     lock_rc=0
     if wait "$LOCK_HOLDER_PID" 2>/dev/null; then
       lock_rc=0

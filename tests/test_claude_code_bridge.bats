@@ -721,6 +721,47 @@ STUB
   [ "$(db_scalar "SELECT COUNT(*) FROM messages WHERE from_agent='worker' AND body LIKE 'fake outbound%';")" -eq 1 ]
 }
 
+# A holder that was killed leaves its lock directory behind. The instance lock
+# is broken on the same terms as every other lock: a dead holder is, a live one
+# and an older-format lock with a live owner are not.
+bridge_lock() { printf '%s/claude-code-bridge.team.worker.lock' "$RUN"; }
+
+dead_pid() { sleep 0 & local p=$!; wait "$p" 2>/dev/null || true; printf '%s' "$p"; }
+
+@test "instance lock: a lock left by a killed bridge is taken over" {
+  run bash -c '. "$1"; _agmsg_lock_scope_load; [ -n "$_AGMSG_LOCK_SCOPE" ]' _ "$SCRIPTS/lib/registry-lock.sh"
+  [ "$status" -eq 0 ] || skip "this host cannot name its process table"
+  run env L="$(bridge_lock)" LOCKLIB="$SCRIPTS/lib/registry-lock.sh" bash -c '
+    . "$LOCKLIB"; _agmsg_lock_ident; _agmsg_lock_try "$L" "" 0 || exit 1; kill -9 $$'
+  [ -f "$(bridge_lock)"/holder.* ]
+  send_to_worker alice dead-holder
+  export FAKE_MODE=success
+  run bridge
+  [ "$status" -eq 0 ]
+  [ "$(cat "$CAPTURE/call-count")" -eq 1 ]
+  [ ! -e "$(bridge_lock)" ]
+}
+
+@test "instance lock: a lock from before holder records is judged by the pid in its owner file" {
+  mkdir "$(bridge_lock)"
+  dead_pid > "$(bridge_lock)/owner"
+  send_to_worker alice legacy-dead
+  export FAKE_MODE=success
+  run bridge
+  [ "$status" -eq 0 ]
+  [ "$(cat "$CAPTURE/call-count")" -eq 1 ]
+
+  sleep 30 &
+  live=$!
+  mkdir "$(bridge_lock)"
+  printf '%s\n' "$live" > "$(bridge_lock)/owner"
+  run bridge
+  kill "$live" 2>/dev/null || true
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"already running"* ]]
+  [ -f "$(bridge_lock)/owner" ]
+}
+
 @test "message arriving during a turn stays unread until the next exact snapshot" {
   send_to_worker alice early
   export FAKE_MODE=barrier-success

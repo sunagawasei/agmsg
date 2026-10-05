@@ -795,10 +795,13 @@ require_eperm_pid() {
   # #500's lesson: a partially-hardened file reads as a fixed one. Every
   # liveness check must go through _agmsg_pid_alive, which is EPERM-aware and
   # cross-checks ps; instance-id.sh is where that check is implemented, so it
-  # is the one file allowed to call kill -0 directly.
+  # is the one file allowed to call kill -0 directly. A line may carry
+  # `agmsg-kill0-ok` where the pid is the caller's own parent and the answer
+  # must not depend on ps (watchdog.sh's lock-holder child).
   local offenders
   offenders="$(cd "$BATS_TEST_DIRNAME/.." && grep -rn -e 'kill -0' -e 'kill -s 0' scripts bin 2>/dev/null \
     | grep -v '^scripts/lib/instance-id.sh:' \
-    | grep -v ':[0-9]*: *#' || true)"
+    | grep -v ':[0-9]*: *#' \
+    | grep -v 'agmsg-kill0-ok' || true)"
   [ -z "$offenders" ] || { echo "$offenders"; false; }
 }

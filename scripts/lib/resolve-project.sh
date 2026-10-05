@@ -453,25 +453,6 @@ agmsg_pid_is_agent() {
   return 1
 }
 
-# Match instance-id liveness semantics without sourcing instance-id.sh back
-# into this lower-level resolver. In particular, EPERM means alive: a sandbox
-# may deny signalling its live parent agent process.
-_agmsg_resolve_pid_alive() {
-  local pid="$1"
-  case "${MSYSTEM:-}" in
-    MINGW*|MSYS*|CLANGARM*)
-      MSYS_NO_PATHCONV=1 tasklist /FI "PID eq $pid" 2>/dev/null | grep -q "$pid"
-      return $?
-      ;;
-  esac
-  local err
-  err="$(export LC_ALL=C; kill -0 "$pid" 2>&1)" && return 0
-  case "$err" in
-    *[Nn]"o such process"*) return 1 ;;
-    *) return 0 ;;
-  esac
-}
-
 # Walk the process tree from $$ upward, echoing the PID of the nearest ancestor
 # that looks like an agent process of <type>. Empty (return 1) when none is
 # found — e.g. a detached watcher or a plain human shell.
@@ -491,7 +472,7 @@ agmsg_agent_pid() {
         printf 'agmsg: ignoring non-numeric AGMSG_AGENT_PID=%s; using bare session_id\n' "$AGMSG_AGENT_PID" >&2
         return 1 ;;
       *)
-        if _agmsg_resolve_pid_alive "$AGMSG_AGENT_PID"; then
+        if _agmsg_pid_alive "$AGMSG_AGENT_PID"; then
           printf '%s' "$AGMSG_AGENT_PID"
           return 0
         fi
@@ -504,7 +485,7 @@ agmsg_agent_pid() {
       ''|*[!0-9]*) ;;
       *)
         if [ "$CLAUDE_PID" -gt 0 ] 2>/dev/null \
-            && _agmsg_resolve_pid_alive "$CLAUDE_PID"; then
+            && _agmsg_pid_alive "$CLAUDE_PID"; then
           printf '%s' "$CLAUDE_PID"
           return 0
         fi

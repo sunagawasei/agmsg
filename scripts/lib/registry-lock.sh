@@ -395,10 +395,70 @@ _agmsg_lock_now() {
   if [ -n "${SECONDS+x}" ] && [ -n "$SECONDS" ]; then _AGMSG_LOCK_NOW="$SECONDS"; else _AGMSG_LOCK_NOW="$(date +%s)"; fi
 }
 
+# Everything a holder record needs that costs a process, fetched BEFORE a lock is
+# taken (see agmsg_lock_acquire for why). Sets _LK_NONCE, _LK_CMD and _LK_HOST.
+_agmsg_lock_ident() {
+  _LK_NONCE="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || _LK_NONCE=""
+  [ -n "$_LK_NONCE" ] || _LK_NONCE="${RANDOM:-}${RANDOM:-}${RANDOM:-}"
+  _agmsg_lock_scope_load
+  _LK_CMD="${0##*/}"
+  _LK_HOST="${HOSTNAME:-}"
+  [ -n "$_LK_HOST" ] || _LK_HOST="$(uname -n 2>/dev/null || echo unknown)"
+  _LK_CMD="${_LK_CMD//[![:print:]]/?}"
+  _LK_HOST="${_LK_HOST//[![:print:]]/?}"
+}
+
+_AGMSG_LOCK_ATTEMPT=0
+
+# One attempt to take <lock> (a directory path), with no waiting and no traps:
+# every wait loop that takes a lock built on this library -- the registry lock
+# below, the placement lock, the claude-code bridge instance lock -- makes its
+# attempt here and breaks a dead holder with _agmsg_lock_break_dead, so "who holds
+# this, and is it gone" has one answer. Needs _agmsg_lock_ident to have run.
+#
+#   0  taken; the holder record is published and the token is kept for release
+#   1  not ours after all (a breaker removed the directory between mkdir and
+#      publish); it has been handed back, start over
+#   2  could not publish; reported
+#   3  somebody holds it, or mkdir failed for another reason (text in _LK_ERR)
+#
+# <held> 1 registers the lock in AGMSG_HELD_LOCKS, so the registry lock's
+# EXIT/INT/TERM handlers release it. 0 leaves release to the caller
+# (_agmsg_lock_drop), for a caller that owns its own traps.
+_agmsg_lock_try() {   # <lock> <unbreakable|""> <held 0|1>
+  local lock="$1" unbreakable="$2" held="$3" token="" rc=0
+  _LK_ERR=""
+  if ! _LK_ERR="$(mkdir "$lock" 2>&1)"; then return 3; fi
+  _LK_ERR=""
+  # THE TOKEN IS THE GENERATION, per lock, not per process. This library's
+  # contract is that a process can hold several locks at once (rename-team
+  # takes two), so a single token would be overwritten by the second acquire.
+  # It names the record inside the directory, and release and break remove
+  # only a record they can name -- so a lock that changed hands is never
+  # removed by someone who held the previous one. One per attempt: a lock
+  # given up and taken again is a new generation.
+  [ -z "$_LK_NONCE" ] || token="$$.$_LK_NONCE.$_AGMSG_LOCK_ATTEMPT"
+  _AGMSG_LOCK_ATTEMPT=$((_AGMSG_LOCK_ATTEMPT + 1))
+  # Registered before the record exists, so a signal in between still goes
+  # through release and takes back a directory this process made.
+  [ -z "$token" ] || _agmsg_lock_set_token "$lock" "$token"
+  if [ "$held" = 1 ]; then
+    AGMSG_HELD_LOCKS="${AGMSG_HELD_LOCKS:+$AGMSG_HELD_LOCKS
+}$lock"
+  fi
+  _agmsg_lock_publish "$lock" "$token" "$unbreakable" "$_LK_CMD" "$_LK_HOST" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) [ "$held" = 1 ] && _agmsg_lock_unhold "$lock"; return 2 ;;
+  esac
+  [ "$held" = 1 ] && _agmsg_lock_unhold "$lock"
+  return 1
+}
+
 agmsg_lock_acquire() {
   local team_dir="$1" unbreakable="${2:-}" lock i=0 max="${AGMSG_LOCK_TRIES:-1000}" err=""
   local budget="${AGMSG_LOCK_SECONDS:-10}" started elapsed
-  local nonce token rc attempt=0 cmd host
+  local rc
   case "$unbreakable" in
     ''|unbreakable) ;;
     *) echo "agmsg: agmsg_lock_acquire: unknown option '$unbreakable'" >&2; return 1 ;;
@@ -416,48 +476,23 @@ agmsg_lock_acquire() {
   # not a weak one: with none, this process records nothing, holds the lock,
   # and refuses to delete anything at release -- the lock leaks, which is the
   # failure this file chose over taking a live lock away.
-  nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || nonce=""
-  [ -n "$nonce" ] || nonce="${RANDOM:-}${RANDOM:-}${RANDOM:-}"
-  _agmsg_lock_scope_load
-  # The record is a line protocol and these two fields are display text out of the
-  # environment (HOSTNAME is a variable anyone can set; the command is whatever
-  # this was run as). A newline in either would start a line of its own -- a
-  # `break yes` ahead of the real `break no` -- so each is made one printable
-  # line. Fetched here for the same reason as the above: `uname` is a program.
-  cmd="${0##*/}"
-  host="${HOSTNAME:-}"
-  [ -n "$host" ] || host="$(uname -n 2>/dev/null || echo unknown)"
-  cmd="${cmd//[![:print:]]/?}"
-  host="${host//[![:print:]]/?}"
+  # The record is a line protocol and the command and host fields are display
+  # text out of the environment; _agmsg_lock_ident makes each one printable line.
+  _agmsg_lock_ident
   # The budget is for WAITING, so it starts after the above: a process that is
   # slow to start must not spend its wait on starting. The clock is the shell's
   # own SECONDS (no process per spin), `date` only where that is not available.
   _agmsg_lock_now; started="$_AGMSG_LOCK_NOW"
   while :; do
-    if err="$(mkdir "$lock" 2>&1)"; then
-      # THE TOKEN IS THE GENERATION, per lock, not per process. This library's
-      # contract is that a process can hold several locks at once (rename-team
-      # takes two), so a single token would be overwritten by the second acquire.
-      # It names the record inside the directory, and release and break remove
-      # only a record they can name -- so a lock that changed hands is never
-      # removed by someone who held the previous one. One per attempt: a lock
-      # given up and taken again is a new generation.
-      token=""
-      [ -z "$nonce" ] || token="$$.$nonce.$attempt"
-      attempt=$((attempt + 1))
-      # Registered before the record exists, so a signal in between still goes
-      # through release and takes back a directory this process made.
-      [ -z "$token" ] || _agmsg_lock_set_token "$lock" "$token"
-      AGMSG_HELD_LOCKS="${AGMSG_HELD_LOCKS:+$AGMSG_HELD_LOCKS
-}$lock"
-      rc=0
-      _agmsg_lock_publish "$lock" "$token" "$unbreakable" "$cmd" "$host" || rc=$?
+    rc=0
+    _agmsg_lock_try "$lock" "$unbreakable" 1 || rc=$?
+    err="$_LK_ERR"
+    if [ "$rc" != 3 ]; then
       case "$rc" in
         0) break ;;
-        2) _agmsg_lock_unhold "$lock"; return 1 ;;
+        2) return 1 ;;
       esac
       # 1: not ours after all, and it has been handed back. Start over.
-      _agmsg_lock_unhold "$lock"
     else
       # WHY mkdir failed decides whether waiting can help, and only one reason
       # ever clears on its own: somebody holds the lock. Everything else -- no

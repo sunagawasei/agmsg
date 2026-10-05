@@ -35,6 +35,10 @@
 # liveness check (actas_lock_sid_alive) delegates to agmsg_instance_alive.
 # shellcheck disable=SC1091
 . "$SKILL_DIR/scripts/lib/instance-id.sh"
+# The placement lock below takes and breaks its directory through the registry
+# lock's primitives, so there is one answer to "is this lock's holder gone".
+# shellcheck disable=SC1091
+. "$SKILL_DIR/scripts/lib/registry-lock.sh"
 
 _actas_lock_dir() { printf '%s/run' "$SKILL_DIR"; }
 
@@ -382,23 +386,36 @@ _agmsg_placement_lock_path() {
 }
 
 # Serializes spawn-record write against despawn --force teardown for one member.
+#
+# Taken and broken through registry-lock.sh: a holder that is positively gone is
+# broken at once, a live holder is never broken however old the lock is, and any
+# other state waits. The one exception is a directory with no holder record at
+# all: its owner died between mkdir and publishing its record, nothing can say
+# otherwise, and an empty directory is safe to remove -- so that alone is given
+# up on after two minutes.
 agmsg_placement_lock_acquire() {
-  local team="$1" agent="$2" timeout="${3:-10}" lock stale_match=""
+  local team="$1" agent="$2" timeout="${3:-10}" lock stale_match="" rc
   local poll_interval now="" started="" last="" elapsed=0
   case "$timeout" in ''|*[!0-9]*) return 1 ;; esac
   poll_interval="$(agmsg_wait_knob_resolve \
     "${AGMSG_PLACEMENT_LOCK_POLL_INTERVAL-}" 1 0.01 60 decimal)"
   lock="$(_agmsg_placement_lock_path "$team" "$agent")"
   mkdir -p "$(_actas_lock_dir)" 2>/dev/null || true
+  _agmsg_lock_ident
   while :; do
-    stale_match=""
-    if [ -d "$lock" ]; then
-      stale_match="$(find "$lock" -maxdepth 0 -mmin +2 -print -quit 2>/dev/null || true)"
-    fi
-    if [ -n "$stale_match" ]; then
-      rmdir "$lock" 2>/dev/null || true
-    fi
-    mkdir "$lock" 2>/dev/null && return 0
+    rc=0
+    _agmsg_lock_try "$lock" "" 0 || rc=$?
+    case "$rc" in
+      0) return 0 ;;
+      2) return 1 ;;
+      3)
+        if _agmsg_lock_break_dead "$lock"; then continue; fi
+        if [ "$_J_VERDICT" = none ]; then
+          stale_match="$(find "$lock" -maxdepth 0 -mmin +2 -print -quit 2>/dev/null || true)"
+          if [ -n "$stale_match" ] && rmdir "$lock" 2>/dev/null; then continue; fi
+        fi
+        ;;
+    esac
 
     now="$(_agmsg_wait_epoch_seconds)" || return 1
     if [ -z "$started" ]; then
@@ -420,7 +437,7 @@ agmsg_placement_lock_acquire() {
 
 agmsg_placement_lock_release() {
   local lock; lock="$(_agmsg_placement_lock_path "$1" "$2")"
-  rmdir "$lock" 2>/dev/null || true
+  _agmsg_lock_drop "$lock" quiet || true
 }
 
 # ---------------------------------------------------------------------------

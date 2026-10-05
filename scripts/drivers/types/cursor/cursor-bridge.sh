@@ -236,6 +236,8 @@ source "$SCRIPTS_DIR/lib/session-team.sh"
 SCRIPT_DIR="$SCRIPTS_DIR" agmsg_session_unset_env
 # shellcheck disable=SC1091
 source "$SCRIPTS_DIR/lib/process-identity.sh"
+# shellcheck disable=SC1091
+source "$SCRIPTS_DIR/lib/instance-id.sh"
 # Defense-in-depth (the parent _spawn.sh validates too): TEAM/NAME compose the
 # pidfile/meta/log AND the rm -rf'd scratch CFGDIR. Reuse the same UTF-8-safe
 # path-segment deny-list as join.sh (rejects '/','\\','.'/'..', leading '-',
@@ -312,8 +314,8 @@ kill_inflight() {
   [ -n "${CHILD_PID:-}" ] || return 0
   kill "$CHILD_PID" 2>/dev/null || true
   local n=0
-  while kill -0 "$CHILD_PID" 2>/dev/null && [ "$n" -lt 8 ]; do sleep 0.5; n=$((n + 1)); done
-  if kill -0 "$CHILD_PID" 2>/dev/null; then
+  while _agmsg_pid_alive_local "$CHILD_PID" && [ "$n" -lt 8 ]; do sleep 0.5; n=$((n + 1)); done
+  if _agmsg_pid_alive_local "$CHILD_PID"; then
     pkill -9 -P "$CHILD_PID" 2>/dev/null || true
     kill -9 "$CHILD_PID" 2>/dev/null || true
   fi

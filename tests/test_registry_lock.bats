@@ -345,8 +345,8 @@ mkholder() {   # <dir> <token> <pid> [scope]
   # degraded path records nothing, release finds no match, and the lock leaks
   # rather than being taken from whoever holds it (raised in review).
   local lib="$BATS_TEST_TMPDIR/nolib.sh"
-  sed -e 's|^ *nonce="\$(LC_ALL=C od.*|nonce=""|' \
-      -e 's|^ *\[ -n "\$nonce" \] \|\| nonce=.*|:|' "$LOCKLIB" > "$lib"
+  sed -e 's|^ *_LK_NONCE="\$(LC_ALL=C od.*|_LK_NONCE=""|' \
+      -e 's|^ *\[ -n "\$_LK_NONCE" \] \|\| _LK_NONCE=.*|:|' "$LOCKLIB" > "$lib"
   bash -n "$lib"
 
   run env LIB="$lib" TEAM_DIR="$TEAM_DIR" bash -c '

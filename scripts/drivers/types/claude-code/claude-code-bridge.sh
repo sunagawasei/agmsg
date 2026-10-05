@@ -190,32 +190,54 @@ log() {
 }
 
 pid_alive() {
-  local pid="$1" err
+  local pid="$1"
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  err="$(export LC_ALL=C; kill -0 "$pid" 2>&1)" && return 0
-  case "$err" in *[Nn]'o such process'*) return 1 ;; *) return 0 ;; esac
+  _agmsg_pid_alive_local "$pid"
 }
 
-# Atomically serialize bridge ownership. The pidfile alone has a check/write
-# race when two launchers start together.
+# Atomically serialize bridge ownership through registry-lock.sh, so a dead
+# holder is broken the same way every other lock is and a live one never is.
+# A lock left by a bridge from before holder records (<lock>/owner, no record)
+# is judged by the pid in it and removed when that pid is gone.
 acquire_instance() {
-  local owner=""
-  if mkdir "$LOCK_DIR" 2>/dev/null; then
-    printf '%s\n' "$$" > "$LOCK_OWNER"
-    return 0
-  fi
-  owner="$(cat "$LOCK_OWNER" 2>/dev/null || true)"
-  if pid_alive "$owner"; then
-    echo "claude-code-bridge: already running for $TEAM/$NAME (pid $owner)" >&2
-    return 1
-  fi
-  rm -f "$LOCK_OWNER" 2>/dev/null || true
-  rmdir "$LOCK_DIR" 2>/dev/null || true
-  if mkdir "$LOCK_DIR" 2>/dev/null; then
-    printf '%s\n' "$$" > "$LOCK_OWNER"
-    return 0
-  fi
-  echo "claude-code-bridge: could not acquire instance lock for $TEAM/$NAME" >&2
+  local rc owner tries=0 empty=0
+  _agmsg_lock_ident
+  while [ "$tries" -lt 40 ]; do
+    tries=$((tries + 1))
+    rc=0
+    _agmsg_lock_try "$LOCK_DIR" "" 0 || rc=$?
+    case "$rc" in
+      0) return 0 ;;
+      1) continue ;;
+      2) break ;;
+    esac
+    if [ -f "$LOCK_OWNER" ]; then
+      owner="$(cat "$LOCK_OWNER" 2>/dev/null || true)"
+      if pid_alive "$owner"; then
+        echo "claude-code-bridge: already running for $TEAM/$NAME (pid $owner)" >&2
+        return 1
+      fi
+      rm -f "$LOCK_OWNER" 2>/dev/null || true
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      continue
+    fi
+    if _agmsg_lock_break_dead "$LOCK_DIR"; then continue; fi
+    case "$_J_VERDICT" in
+      alive)
+        _agmsg_lock_parse "$_J_FILE"
+        echo "claude-code-bridge: already running for $TEAM/$NAME (pid $_R_PID)" >&2
+        return 1
+        ;;
+      none)
+        # A peer between its mkdir and publishing its record: give it a moment.
+        empty=$((empty + 1))
+        [ "$empty" -le 20 ] || break
+        sleep 0.1
+        ;;
+      *) break ;;
+    esac
+  done
+  echo "claude-code-bridge: could not acquire instance lock for $TEAM/$NAME (${_J_VERDICT:-busy}); if no bridge is running for it, remove $LOCK_DIR" >&2
   return 1
 }
 
@@ -223,8 +245,7 @@ acquire_instance || exit 1
 
 old_pid="$(cat "$PIDFILE" 2>/dev/null || true)"
 if [ -n "$old_pid" ] && [ "$old_pid" != "$$" ] && pid_alive "$old_pid"; then
-  rm -f "$LOCK_OWNER" 2>/dev/null || true
-  rmdir "$LOCK_DIR" 2>/dev/null || true
+  _agmsg_lock_drop "$LOCK_DIR" quiet || true
   echo "claude-code-bridge: already running for $TEAM/$NAME (pid $old_pid)" >&2
   exit 1
 fi
@@ -283,10 +304,9 @@ cleanup() {
     WATCH_PID=""
   fi
 
-  local pid_owner meta_owner lock_owner
+  local pid_owner meta_owner
   pid_owner="$(cat "$PIDFILE" 2>/dev/null || true)"
   meta_owner="$(sed -n 's/^pid=//p' "$METAFILE" 2>/dev/null | head -1)"
-  lock_owner="$(cat "$LOCK_OWNER" 2>/dev/null || true)"
   if [ "$pid_owner" = "$$" ] && [ "$meta_owner" = "$$" ]; then
     rm -f "$METAFILE" "$ROLE_SNAPSHOT" \
       "$PROMPT_FILE" "$ROWS_FILE" "$SELECTED_FILE" "$CONSUMED_FILE" \
@@ -294,10 +314,7 @@ cleanup() {
       "$SELECTED_FILE.next" "$PROMPT_FILE.next" 2>/dev/null || true
     agmsg_process_cleanup_self claude-code-bridge "$PIDFILE" "$CLAUDE_OWNER_SCOPE"
   fi
-  if [ "$lock_owner" = "$$" ]; then
-    rm -f "$LOCK_OWNER" 2>/dev/null || true
-    rmdir "$LOCK_DIR" 2>/dev/null || true
-  fi
+  _agmsg_lock_drop "$LOCK_DIR" quiet || true
 }
 
 on_signal() {
