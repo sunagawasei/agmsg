@@ -97,6 +97,7 @@ agmsg_claude_bridge_running() {
 #   GC owns final prefix-wide settings/log/session/transient/spool and cwd removal.
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run" storage_dir worker_home
+  agmsg_pending_spawn_owner_capture
   storage_dir="$(agmsg_storage_dir)"
   worker_home="$SKILL_DIR/db/claude-worker-home"
 
@@ -529,12 +530,18 @@ agmsg_spawn_headless() {
   printf '%s\n' "$bpid" > "$pidfile" \
     || _agmsg_claude_spawn_fail "cannot write Claude bridge pidfile"
 
-  local spawn_record
+  local spawn_record placement_record bridge_start
   spawn_record="$(agmsg_spawn_path "$TEAM" "$NAME")"
-  printf '%s\t%s\t%s\n' "pid:$bpid" "$scratch" "claude-code" > "$spawn_record" \
+  placement_record="$(printf '%s\t%s\t%s' "pid:$bpid" "$scratch" "claude-code")"
+  printf '%s\n' "$placement_record" > "$spawn_record" \
     || _agmsg_claude_spawn_fail "cannot record Claude bridge placement"
+  bridge_start="$(agmsg_pid_start_token "$bpid" 2>/dev/null || true)"
 
+  # despawn takes the placement lock inside the lifecycle lock; release ours
+  # before the pending record's publish takes the lifecycle lock.
   _agmsg_claude_spawn_lk_release
+  agmsg_pending_teardown_write_spawn_owner "$TEAM" "$NAME" claude-code \
+    "$placement_record" "$bridge_start" || true
   echo "spawned headless $layout claude-code '$NAME' in team '$TEAM' (pid $bpid)"
   [ "$layout" = implementer ] && echo "  repo (WRITE via --add-dir): $PROJECT"
   [ "$layout" = reviewer ] && echo "  repo (read-only via --add-dir): $PROJECT"

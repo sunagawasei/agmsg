@@ -105,6 +105,7 @@ agmsg_codex_bridge_running_pid() {
 # approval_policy=never in every mode because a headless worker cannot answer approvals.
 agmsg_spawn_headless() {
   local run_dir="$SKILL_DIR/run"
+  agmsg_pending_spawn_owner_capture
   local storage_dir; storage_dir="$(agmsg_storage_dir)"
   mkdir -p "$run_dir"   # reviewer mode's cwd is the repo, so nothing else creates run/
 
@@ -383,8 +384,15 @@ agmsg_spawn_headless() {
   # Record placement as pid:<n> so despawn tears it down by pid (not a tmux id).
   # The project field is the cwd we registered above so despawn --force's reset.sh
   # drops exactly that registration.
-  printf '%s\t%s\t%s\n' "pid:$bpid" "$cwd" "codex" \
+  local placement_record
+  placement_record="$(printf '%s\t%s\t%s' "pid:$bpid" "$cwd" "codex")"
+  printf '%s\n' "$placement_record" \
     > "$(agmsg_spawn_path "$TEAM" "$NAME")" 2>/dev/null || true
+  # despawn takes the placement lock inside the lifecycle lock; release ours
+  # before the pending record's publish takes the lifecycle lock.
+  _agmsg_spawn_lk_release
+  agmsg_pending_teardown_write_spawn_owner "$TEAM" "$NAME" codex "$placement_record" \
+    "$(agmsg_pid_start_token "$bpid" 2>/dev/null || true)" || true
   local kind="headless codex"; [ "$REVIEWER" = 1 ] && kind="headless reviewer codex"
   [ "$IMPLEMENTER" = 1 ] && kind="headless implementer codex"
   echo "spawned $kind '$NAME' in team '$TEAM' (pid $bpid)"

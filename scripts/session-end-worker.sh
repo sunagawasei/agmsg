@@ -316,12 +316,15 @@ cleanup_target_locked() {
   else
     despawn_rc=$?
   fi
+  # Removed under the lock: a spawn that lands after it is released publishes
+  # its own pending record, which this must not delete.
+  [ "$despawn_rc" -eq 0 ] \
+    && rm -f -- "$(agmsg_pending_teardown_path "$STEAM" "$name")" 2>/dev/null || true
   agmsg_team_lifecycle_lock_release "$STEAM"
   if [ "$despawn_rc" -ne 0 ]; then
     echo "session-end-worker: teardown incomplete for $STEAM/$name (despawn status $despawn_rc); preserving its placement record" >&2
     return 4
   fi
-  rm -f -- "$(agmsg_pending_teardown_path "$STEAM" "$name")" 2>/dev/null || true
   return 0
 }
 

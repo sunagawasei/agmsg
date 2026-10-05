@@ -122,6 +122,8 @@ source "$SCRIPT_DIR/lib/spawn-options.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 # shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/pending-teardown.sh"  # spawn-time crash-recovery record
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/role-session.sh"  # role->session record lookup (#339)
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/boot-command.sh"  # shared boot-command construction (#339)

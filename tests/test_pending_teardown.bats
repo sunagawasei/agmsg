@@ -45,6 +45,8 @@ STUB
   source "$SCRIPTS/lib/actas-lock.sh"
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/pending-teardown.sh"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/resolve-project.sh"
 }
 
 teardown() {
@@ -837,4 +839,170 @@ EOF
   run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
   [ "$status" -eq 0 ]
   cmp -s "$newer" "$pending"
+}
+
+# --- spawn-time record: crash recovery that does not depend on SessionEnd ---
+
+# Spawn as seen from the owner process: the helper reads the caller from the
+# session env and AGMSG_AGENT_PID, as the spawn plugs do.
+arm_spawn_owner() {
+  start_owner
+  start_bridge
+  CLAUDE_CODE_SESSION_ID="$SESSION_ID" AGMSG_AGENT_PID="$OWNER_PID" \
+    agmsg_pending_spawn_owner_capture
+  agmsg_pending_teardown_write_spawn_owner "$STEAM" worker codex \
+    "$BRIDGE_RECORD" "$BRIDGE_START"
+}
+
+@test "spawn record: an owner killed with SIGKILL right after spawn has its worker recovered" {
+  arm_spawn_owner
+  agmsg_pending_teardown_read "$(agmsg_pending_teardown_path "$STEAM" worker)"
+  [ "$AGMSG_PENDING_OWNER_STATE" = verified ]
+  [ "$AGMSG_PENDING_OWNER_INSTANCE" = "$OWNER_INSTANCE" ]
+  [ "$AGMSG_PENDING_OWNER_START" = "$OWNER_START" ]
+  [ "$AGMSG_PENDING_BRIDGE_START" = "$BRIDGE_START" ]
+
+  kill -9 "$OWNER_PID"
+  run kill -0 "$OWNER_PID"
+  [ "$status" -ne 0 ]
+  run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
+  [ "$status" -eq 0 ]
+  [ "$output" = "agmsg: pending teardown recovered team=$STEAM worker=worker reason=owner-dead" ]
+  run kill -0 "$BRIDGE_PID"
+  [ "$status" -ne 0 ]
+  [ ! -e "$(agmsg_pending_teardown_path "$STEAM" worker)" ]
+  [ ! -e "$(agmsg_spawn_path "$STEAM" worker)" ]
+}
+
+@test "spawn record: a live owner keeps its worker" {
+  arm_spawn_owner
+  run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
+  [ "$status" -eq 0 ]
+  [ "$output" = "agmsg: pending teardown retained team=$STEAM worker=worker owner_pid=$OWNER_PID reason=owner-alive" ]
+  kill -0 "$BRIDGE_PID" 2>/dev/null
+  [ -f "$(agmsg_pending_teardown_path "$STEAM" worker)" ]
+}
+
+@test "spawn record: a reused owner pid (different start token) has its worker recovered" {
+  arm_spawn_owner
+  local pending
+  pending="$(agmsg_pending_teardown_path "$STEAM" worker)"
+  sed "s|^owner_start=.*|owner_start=$(_actas_lock_encode "${OWNER_START%%:*}:old-generation")|" \
+    "$pending" > "$pending.new"
+  mv "$pending.new" "$pending"
+
+  run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
+  [ "$status" -eq 0 ]
+  [ "$output" = "agmsg: pending teardown recovered team=$STEAM worker=worker reason=owner-replaced" ]
+  kill -0 "$OWNER_PID" 2>/dev/null
+  run kill -0 "$BRIDGE_PID"
+  [ "$status" -ne 0 ]
+}
+
+@test "spawn record: an owner that moved to a new instance (/clear) has its worker recovered" {
+  arm_spawn_owner
+  printf 'NEXT-5E55.%s\n' "$OWNER_PID" > "$RUN/cc-instance.$OWNER_PID"
+  run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
+  [ "$status" -eq 0 ]
+  [ "$output" = "agmsg: pending teardown recovered team=$STEAM worker=worker reason=owner-superseded" ]
+  run kill -0 "$BRIDGE_PID"
+  [ "$status" -ne 0 ]
+}
+
+@test "spawn record: a dead owner with a live bare-session sibling keeps its worker" {
+  arm_spawn_owner
+  test_fixture_start_reaped_process sleep 300
+  local sibling_pid="$TEST_REAPED_PID"
+  printf '%s.%s\n' "$SESSION_ID" "$sibling_pid" > "$RUN/cc-instance.$sibling_pid"
+  kill -9 "$OWNER_PID"
+
+  run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"reason=bare-owner-alive"* ]]
+  kill -0 "$BRIDGE_PID" 2>/dev/null
+}
+
+@test "spawn record: nothing is written for a team that is not the caller's own session team" {
+  start_owner
+  start_bridge
+  bash "$SCRIPTS/join.sh" other-team worker codex "$PROJ" >/dev/null
+  printf '%s\n' "$BRIDGE_RECORD" > "$(agmsg_spawn_path other-team worker)"
+  CLAUDE_CODE_SESSION_ID="$SESSION_ID" AGMSG_AGENT_PID="$OWNER_PID" \
+    agmsg_pending_spawn_owner_capture
+  run agmsg_pending_teardown_write_spawn_owner other-team worker codex \
+    "$BRIDGE_RECORD" "$BRIDGE_START"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -e "$(agmsg_pending_teardown_path other-team worker)" ]
+}
+
+@test "spawn record: an unresolved caller writes nothing and does not fail the spawn" {
+  start_bridge
+  env -u CLAUDE_CODE_SESSION_ID AGMSG_AGENT_PID= bash -c '
+    source "$SCRIPTS/lib/pending-teardown.sh"; source "$SCRIPTS/lib/resolve-project.sh"
+    agmsg_pending_spawn_owner_capture
+    agmsg_pending_teardown_write_spawn_owner "$STEAM" worker codex "$BRIDGE_RECORD" "$BRIDGE_START"'
+  [ ! -e "$(agmsg_pending_teardown_path "$STEAM" worker)" ]
+}
+
+@test "spawn record: a spawn record replaced by another spawn is not given this owner" {
+  start_owner
+  start_bridge
+  local newer="pid:1$BRIDGE_PID"$'\t'"$PROJ"$'\tcodex'
+  printf '%s\n' "$newer" > "$(agmsg_spawn_path "$STEAM" worker)"
+  CLAUDE_CODE_SESSION_ID="$SESSION_ID" AGMSG_AGENT_PID="$OWNER_PID" \
+    agmsg_pending_spawn_owner_capture
+  run agmsg_pending_teardown_write_spawn_owner "$STEAM" worker codex \
+    "$BRIDGE_RECORD" "$BRIDGE_START"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"crash recovery not armed for $STEAM/worker (spawn record changed)"* ]]
+  [ ! -e "$(agmsg_pending_teardown_path "$STEAM" worker)" ]
+}
+
+@test "spawn record: a missing bridge start token warns and writes nothing" {
+  start_owner
+  start_bridge
+  CLAUDE_CODE_SESSION_ID="$SESSION_ID" AGMSG_AGENT_PID="$OWNER_PID" \
+    agmsg_pending_spawn_owner_capture
+  run agmsg_pending_teardown_write_spawn_owner "$STEAM" worker codex "$BRIDGE_RECORD" ""
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"(bridge start token unavailable)"* ]]
+  [ ! -e "$(agmsg_pending_teardown_path "$STEAM" worker)" ]
+}
+
+@test "spawn record: a lifecycle lock that cannot be taken warns and keeps the spawn" {
+  start_owner
+  start_bridge
+  CLAUDE_CODE_SESSION_ID="$SESSION_ID" AGMSG_AGENT_PID="$OWNER_PID" \
+    agmsg_pending_spawn_owner_capture
+  agmsg_team_lifecycle_lock_acquire "$STEAM" 5
+  run env AGMSG_LIFECYCLE_LOCK_TIMEOUT=1 bash -c '
+    source "$SCRIPTS/lib/pending-teardown.sh"
+    AGMSG_SPAWN_OWNER_TEAM="$1" AGMSG_SPAWN_OWNER_INSTANCE="$2" AGMSG_SPAWN_OWNER_PID="$3" AGMSG_SPAWN_OWNER_START="$4"
+    agmsg_pending_teardown_write_spawn_owner "$1" worker codex "$5" "$6"' _ \
+    "$STEAM" "$OWNER_INSTANCE" "$OWNER_PID" "$OWNER_START" "$BRIDGE_RECORD" "$BRIDGE_START"
+  agmsg_team_lifecycle_lock_release "$STEAM"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"(lifecycle lock unavailable)"* ]]
+  [ -f "$(agmsg_spawn_path "$STEAM" worker)" ]
+}
+
+@test "SessionEnd teardown that follows the owner's exit removes the spawn-time pending record" {
+  start_owner 1.5
+  start_bridge
+  CLAUDE_CODE_SESSION_ID="$SESSION_ID" AGMSG_AGENT_PID="$OWNER_PID" \
+    agmsg_pending_spawn_owner_capture
+  agmsg_pending_teardown_write_spawn_owner "$STEAM" worker codex \
+    "$BRIDGE_RECORD" "$BRIDGE_START"
+  [ -f "$(agmsg_pending_teardown_path "$STEAM" worker)" ]
+  write_snapshot
+
+  # The worker's opening recovery pass finds the owner alive and keeps the
+  # record; the teardown after the owner's exit is what must remove it.
+  AGMSG_OWNER_EXIT_GRACE_S=8 run run_composite_worker
+  [ "$status" -eq 0 ]
+  run kill -0 "$BRIDGE_PID"
+  [ "$status" -ne 0 ]
+  [ ! -e "$(agmsg_pending_teardown_path "$STEAM" worker)" ]
+  [ ! -e "$(agmsg_spawn_path "$STEAM" worker)" ]
 }

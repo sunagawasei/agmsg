@@ -105,6 +105,8 @@ agmsg_spawn_headless() {
   # --workspace, not cwd, so a headless cursor run with --workspace "$PROJECT"
   # would otherwise trigger the project's own .cursor/hooks.json.
   export AGMSG_CURSOR_BRIDGE=1
+  # Before the unset below: it removes the session identity the owner is read from.
+  agmsg_pending_spawn_owner_capture
   # The worker must not inherit the starting session's id from any host.
   agmsg_session_unset_env
 
@@ -306,8 +308,15 @@ agmsg_spawn_headless() {
   local bpid=$!
   # Record placement as pid:<n> with type=cursor so despawn --force tears it down
   # by pid through the type-aware kill path (see despawn.sh kill_headless_pid).
-  printf '%s\t%s\t%s\n' "pid:$bpid" "$PROJECT" "cursor" \
+  local placement_record
+  placement_record="$(printf '%s\t%s\t%s' "pid:$bpid" "$PROJECT" "cursor")"
+  printf '%s\n' "$placement_record" \
     > "$(agmsg_spawn_path "$TEAM" "$NAME")" 2>/dev/null || true
+  # despawn takes the placement lock inside the lifecycle lock; release ours
+  # before the pending record's publish takes the lifecycle lock.
+  _agmsg_cursor_spawn_lk_release
+  agmsg_pending_teardown_write_spawn_owner "$TEAM" "$NAME" cursor "$placement_record" \
+    "$(agmsg_pid_start_token "$bpid" 2>/dev/null || true)" || true
   echo "spawned headless cursor reviewer '$NAME' in team '$TEAM' (pid $bpid)"
   if [ "$readonly_on" = 1 ]; then
     echo "  read-only: ENFORCED (deny Write/Shell + credential-path Read denylist via scratch .cursor/cli.json; paths inside the workspace are exempt — see bridge log)"

@@ -3048,3 +3048,75 @@ _spawn_recorded_id() {
     ! grep -q "pane run" "$HERDR_CALL_LOG"
   done
 }
+
+# --- spawn-time pending teardown (crash recovery without SessionEnd) ---
+
+_spawn_owner_fixture() {
+  SID=5AAD0001-0000-4000-8000-000000000001
+  SPAWN_TEAM="s-$SID"
+  bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/null
+  bash "$SCRIPTS/join.sh" "$SPAWN_TEAM" lead claude-code "$PROJ" >/dev/null
+  # The spawning session's process: a live pid the spawn can name as owner.
+  test_fixture_start_reaped_process sleep 300
+  OWNER_PID="$TEST_REAPED_PID"
+  printf '#!/usr/bin/env bash\nexec sleep 300\n' > "$STUB_BIN/long-bridge.sh"
+  chmod +x "$STUB_BIN/long-bridge.sh"
+}
+
+_spawn_owner_cleanup() {
+  local pid
+  kill "$OWNER_PID" 2>/dev/null || true
+  for pid in $(cat "$TEST_SKILL_DIR"/run/*.pid 2>/dev/null); do
+    kill "$pid" 2>/dev/null || true
+  done
+}
+
+@test "spawn: a headless codex spawned into the caller's session team gets a verified pending record" {
+  _spawn_owner_fixture
+  run env CLAUDE_CODE_SESSION_ID="$SID" AGMSG_AGENT_PID="$OWNER_PID" \
+    AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/long-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex aaa --team "$SPAWN_TEAM" --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless codex 'aaa'"* ]]
+  [[ "$output" != *"crash recovery not armed"* ]]
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  source "$SCRIPTS/lib/actas-lock.sh"
+  source "$SCRIPTS/lib/pending-teardown.sh"
+  agmsg_pending_teardown_read "$(agmsg_pending_teardown_path "$SPAWN_TEAM" aaa)"
+  [ "$AGMSG_PENDING_OWNER_STATE" = verified ]
+  [ "$AGMSG_PENDING_OWNER_INSTANCE" = "$SID.$OWNER_PID" ]
+  [ "$AGMSG_PENDING_OWNER_PID" = "$OWNER_PID" ]
+  [ "$AGMSG_PENDING_RECORD" = "$(cat "$(agmsg_spawn_path "$SPAWN_TEAM" aaa)")" ]
+  [ -n "$AGMSG_PENDING_BRIDGE_START" ]
+  _spawn_owner_cleanup
+}
+
+@test "spawn: a headless cursor still names its owner although the spawn clears the session env" {
+  _spawn_owner_fixture
+  _make_fake_cursor_headless
+  cp "$STUB_BIN/long-bridge.sh" "$STUB_BIN/fake-cursor-bridge.sh"
+  run env CLAUDE_CODE_SESSION_ID="$SID" AGMSG_AGENT_PID="$OWNER_PID" \
+    AGMSG_CURSOR_BRIDGE_CMD="$STUB_BIN/fake-cursor-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" cursor aaa --team "$SPAWN_TEAM" --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"spawned headless cursor reviewer 'aaa'"* ]]
+  [[ "$output" != *"crash recovery not armed"* ]]
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  source "$SCRIPTS/lib/actas-lock.sh"
+  source "$SCRIPTS/lib/pending-teardown.sh"
+  agmsg_pending_teardown_read "$(agmsg_pending_teardown_path "$SPAWN_TEAM" aaa)"
+  [ "$AGMSG_PENDING_OWNER_INSTANCE" = "$SID.$OWNER_PID" ]
+  [ "$AGMSG_PENDING_TYPE" = cursor ]
+  _spawn_owner_cleanup
+}
+
+@test "spawn: a headless codex spawned into a project team writes no pending record" {
+  _spawn_owner_fixture
+  bash "$SCRIPTS/join.sh" proj-team existing codex "$PROJ" >/dev/null
+  run env CLAUDE_CODE_SESSION_ID="$SID" AGMSG_AGENT_PID="$OWNER_PID" \
+    AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/long-bridge.sh" \
+    bash "$SCRIPTS/spawn.sh" codex aaa --team proj-team --project "$PROJ" --headless
+  [ "$status" -eq 0 ]
+  [ -z "$(ls "$TEST_SKILL_DIR"/run/pending-teardown.* 2>/dev/null)" ]
+  _spawn_owner_cleanup
+}

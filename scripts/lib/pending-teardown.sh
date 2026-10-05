@@ -154,6 +154,75 @@ _agmsg_pending_publish() {
   return 0
 }
 
+# Spawn-time owner capture. Names the process that is spawning a worker into
+# its own session team; unset (all empty) for any other caller. Capture before
+# anything clears the session env (cursor's spawn does), and pass the result to
+# agmsg_pending_teardown_write_spawn_owner once the worker's bridge is launched.
+agmsg_pending_spawn_owner_capture() {
+  local pid start
+  AGMSG_SPAWN_OWNER_TEAM=""
+  AGMSG_SPAWN_OWNER_INSTANCE=""
+  AGMSG_SPAWN_OWNER_PID=""
+  AGMSG_SPAWN_OWNER_START=""
+  agmsg_session_resolve || return 0
+  [ "$AGMSG_SESSION_STATE" = ok ] && [ -n "$AGMSG_SESSION_TEAM" ] || return 0
+  pid="$(agmsg_agent_pid "$AGMSG_SESSION_HOST" 2>/dev/null)" || return 0
+  start="$(agmsg_pid_start_token "$pid" 2>/dev/null)" || return 0
+  [ -n "$start" ] || return 0
+  AGMSG_SPAWN_OWNER_TEAM="$AGMSG_SESSION_TEAM"
+  AGMSG_SPAWN_OWNER_INSTANCE="$AGMSG_SESSION_SID.$pid"
+  AGMSG_SPAWN_OWNER_PID="$pid"
+  AGMSG_SPAWN_OWNER_START="$start"
+}
+
+# Arm crash recovery for a freshly spawned worker: publish the same verified
+# record SessionEnd writes, so recover_one can reclaim the worker after the
+# owner dies without SessionEnd ever running. <record> and <bridge_start> are
+# what the spawn itself launched; the record is written only while the spawn
+# record on disk still equals it, checked under the lifecycle lock that also
+# serializes the publish, so a slower spawn can never attach its owner to a
+# newer worker. Returns 0 without writing when the spawner is not the owner of
+# <team> (not a session team, or its own is another team) and 1, after a
+# warning, when it should have armed recovery but could not.
+agmsg_pending_teardown_write_spawn_owner() {
+  local team="$1" name="$2" type="$3" record="$4" bridge_start="${5:-}"
+  local lock_acquired=0 lock_timeout why="" rc=0
+  [ -n "${AGMSG_SPAWN_OWNER_INSTANCE:-}" ] && [ "${AGMSG_SPAWN_OWNER_TEAM:-}" = "$team" ] \
+    || return 0
+  [ "$(agmsg_session_team_class "$team")" = session ] || return 0
+  if [ -z "$bridge_start" ]; then
+    why="bridge start token unavailable"
+  else
+    lock_timeout="${AGMSG_LIFECYCLE_LOCK_TIMEOUT:-10}"
+    case "$lock_timeout" in ''|*[!0-9]*) lock_timeout=10 ;; esac
+    if [ "${AGMSG_TEAM_LIFECYCLE_HELD:-}" = "$team" ]; then
+      :
+    elif agmsg_team_lifecycle_lock_acquire "$team" "$lock_timeout"; then
+      lock_acquired=1
+    else
+      why="lifecycle lock unavailable"
+    fi
+  fi
+  if [ -z "$why" ]; then
+    if [ "$(cat "$(agmsg_spawn_path "$team" "$name")" 2>/dev/null || true)" != "$record" ]; then
+      why="spawn record changed"
+    elif ! AGMSG_TEAM_LIFECYCLE_HELD="$team" agmsg_pending_teardown_write \
+        "$team" "$name" "$type" spawn-owner "$record" verified \
+        "$AGMSG_SPAWN_OWNER_INSTANCE" "$AGMSG_SPAWN_OWNER_PID" \
+        "$AGMSG_SPAWN_OWNER_START" "$AGMSG_SPAWN_OWNER_INSTANCE" \
+        "$AGMSG_SPAWN_OWNER_INSTANCE" "$bridge_start"; then
+      why="pending record write failed"
+    fi
+  fi
+  [ "$lock_acquired" -eq 1 ] && agmsg_team_lifecycle_lock_release "$team"
+  if [ -n "$why" ]; then
+    printf 'agmsg: spawn: crash recovery not armed for %s/%s (%s); a SessionEnd still tears it down\n' \
+      "$(agmsg_pending_log_sanitize "$team")" "$(agmsg_pending_log_sanitize "$name")" "$why" >&2
+    rc=1
+  fi
+  return "$rc"
+}
+
 _agmsg_pending_read_field() {
   local line="$1" key="$2"
   case "$line" in "$key="*) printf '%s' "${line#*=}" ;; *) return 1 ;; esac
