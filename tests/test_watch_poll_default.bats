@@ -9,6 +9,7 @@ load test_helper
 setup() {
   setup_test_env
   unset HERDR_PANE_ID HERDR_ENV
+  unset AGMSG_WATCH_INTERVAL
   export PROJ="/tmp/agmsg-watch-poll-proj"
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
   bash "$SCRIPTS/join.sh" team bob claude-code "$PROJ" >/dev/null
