@@ -132,3 +132,39 @@ _wait_for_holder_ready() {
   _spawn_probe; TMPDIR=""  TEST_SKILL_DIR="$marker" _reap_test_skill_dir_procs;         kill -0 "$pp"; kill "$pp" 2>/dev/null || true
   _spawn_probe; TMPDIR="/" TEST_SKILL_DIR="$marker" _reap_test_skill_dir_procs;         kill -0 "$pp"; kill "$pp" 2>/dev/null || true
 }
+
+# --- background jobs the test left running (#72) ---
+
+@test "job reaper kills a background job and a TERM-ignoring descendant of it" {
+  local f="$TEST_SKILL_DIR/child.pid" n=0 job child
+  bash -c 'trap "" TERM; sleep 300 & echo $! > "$1"; wait' _ "$f" \
+    </dev/null >/dev/null 2>&1 3>&- &
+  job=$!
+  while [ ! -s "$f" ] && [ "$n" -lt 100 ]; do sleep 0.05; n=$((n + 1)); done
+  child="$(cat "$f")"
+  kill -0 "$child"                   # alive and ignoring TERM, so only KILL ends it
+  _reap_test_jobs                    # THE FIX — a no-op reaper leaves both alive (mutation)
+  n=0
+  while kill -0 "$job" 2>/dev/null && [ "$n" -lt 40 ]; do sleep 0.05; n=$((n + 1)); done
+  refute kill -0 "$job"
+  refute kill -0 "$child"
+}
+
+@test "job reaper leaves a process that is not this shell's job or its descendant alone" {
+  local f="$TEST_SKILL_DIR/bystander.pid" other
+  # Orphaned through a subshell, so it is neither a job nor a descendant of this shell.
+  # Short, so a failure before the kill below cannot leave it holding bats's descriptors.
+  ( sleep 20 </dev/null >/dev/null 2>&1 3>&- & printf '%s\n' "$!" > "$f" )
+  other="$(cat "$f")"
+  sleep 30 </dev/null >/dev/null 2>&1 3>&- &    # a job, so the reaper has something to do
+  _reap_test_jobs
+  local survived=0
+  kill -0 "$other" 2>/dev/null && survived=1
+  kill "$other" 2>/dev/null || true
+  [ "$survived" -eq 1 ]              # untouched
+}
+
+@test "job reaper is a no-op when the test started no background job" {
+  run _reap_test_jobs
+  [ "$status" -eq 0 ]
+}

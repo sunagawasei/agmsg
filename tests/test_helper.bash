@@ -388,7 +388,47 @@ _reap_test_skill_dir_procs() {
   done
 }
 
+# Background jobs a test started with `&` outlive it: the rm below succeeds with
+# them still running, and a watcher or sleep that keeps a descriptor bats handed it
+# makes bats wait for an EOF that never comes (every test ok, the shard runs to the
+# CI cap). Scoped to this shell's own job table and their descendants, each signalled
+# only while it is still the process first recorded (pid + start time). Reached only
+# when the test left a job running, so the ps cost is not paid by the other tests.
+# Not covered: `disown`ed or double-forked children, a child whose parent was
+# already killed (it is no longer a descendant), and the later members of a `a | b &`
+# pipeline (`jobs -p` names only the first). The watchdog's Windows skip applies here too.
+_reap_test_jobs() {
+  local jp p line sig i alive recorded=""
+  case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; esac
+  jp="$(jobs -p 2>/dev/null)"
+  [ -n "$jp" ] || return 0
+  : "${_WD_PS:=$(PATH=/bin:/usr/bin:/usr/sbin:/sbin command -v ps)}"
+  for p in $jp $(for p in $jp; do _agmsg_wd_desc "$p"; done); do
+    line="$(_agmsg_wd_ident "$p")"
+    [ -n "$line" ] && recorded="$recorded
+$p|$line"
+  done
+  for sig in TERM KILL; do
+    _wd_seen="$recorded"
+    _agmsg_wd_each_seen "$sig"
+    i=0
+    while [ "$i" -lt 10 ]; do
+      alive=0
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        [ "$(_agmsg_wd_ident "${line%%|*}")" = "${line#*|}" ] && alive=1
+      done <<EOF2
+$recorded
+EOF2
+      [ "$alive" -eq 0 ] && return 0
+      sleep 0.1 2>/dev/null || true
+      i=$((i + 1))
+    done
+  done
+}
+
 teardown_test_env() {
+  _reap_test_jobs || true
   # Try the plain rm FIRST, and only reap when it actually fails. The reaper's scan is a
   # full `ps -eo pid=,args=`; running it in EVERY teardown would add that cost to all of
   # the (vast majority of) tests that hold nothing — across the suite's hundreds of tests

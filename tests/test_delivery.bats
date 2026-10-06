@@ -1768,12 +1768,12 @@ EOF
   # hang even when the hook itself exits immediately.
   { printf '%s' '{"stop_hook_active":false,"session_id":"repro-381"}'; sleep 300; } \
     3>&- 4>&- > "$fifo" &
-  local writer_pid="$!"
 
   local newpath="$bindir:$PATH"
   run bash -c "PATH='$newpath' AGMSG_HOOK_STDIN_TIMEOUT=1 bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT' < '$fifo'"
 
-  kill "$writer_pid" 2>/dev/null || true
+  # The writer and its sleep are left to teardown_test_env: killing only the writer
+  # here would orphan the sleep, which then holds bats's descriptors.
   rm -f "$fifo"
 
   [ "$status" -eq 0 ]
