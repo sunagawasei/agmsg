@@ -30,6 +30,7 @@ a manifest cannot execute code. Multi-value keys are whitespace-separated.
 | `delivery_modes` | — | space-separated delivery modes the type's CLI accepts (e.g. `monitor turn off`); `delivery.sh`'s gate rejects anything else. Defaults to `monitor turn both off` when omitted |
 | `stop_output` | — | output protocol for the Stop/turn inbox check — `json` (codex), `followup` (cursor: a stdout `{"followup_message":...}` re-injects the reply as the next turn) vs. plain text (default) |
 | `hook_windows_wrap` | — | `yes` if JSON hook entries also need a Windows-native `commandWindows` variant (codex) |
+| `hook_session_end_timeout` | — | seconds (1-60) written as the `timeout` of the registered SessionEnd hook entry (claude-code: 5). Existing installs pick it up when `delivery.sh set` is re-run for the project |
 | `session_team` | — | `yes` if the type can host its own per-session team (cursor) |
 
 > The reader does not fail-fast: an omitted key reads as the empty string, so

@@ -250,6 +250,8 @@ How incoming messages reach your agent. Pick one at first join via the prompt, o
 | **`both`** | monitor primary, turn as per-session safety net | ~5s; falls back to turn-end on watcher failure | belt-and-suspenders |
 | **`off`** | no automatic delivery | manual `/agmsg` only | minimalists |
 
+On Claude Code the SessionEnd hook is registered with `timeout: 5` (seconds) instead of the 1.5s default. A project set up earlier gets it when you re-run `/agmsg mode <mode>` (`delivery.sh set`) there.
+
 ### Picking a mode
 
 ```

@@ -195,6 +195,10 @@ agmsg_delivery_apply_default() {
   # which stays type-agnostic (see hooks-json.sh header).
   local ww
   ww=$(agmsg_type_get "$type" hook_windows_wrap 2>/dev/null || true)
+  # SessionEnd shares a 1.5s default budget that session-end.sh can overrun under
+  # load; a type may raise it per hook with this manifest key (seconds).
+  local se_timeout
+  se_timeout=$(agmsg_type_get "$type" hook_session_end_timeout 2>/dev/null || true)
 
   # Mid-turn delivery (#1003): a type whose manifest carries a posttooluse_output
   # datum also gets a PostToolUse hook running check-inbox between tool calls, not
@@ -266,7 +270,7 @@ agmsg_delivery_apply_default() {
       local ss="$(_agmsg_shq "$SKILL_DIR/scripts/session-start.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       local se="$(_agmsg_shq "$SKILL_DIR/scripts/session-end.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       add_event_entry_file "$tmp_state" "SessionStart" "$ss" "$ww"
-      add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$ww"
+      add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$ww" "$se_timeout"
       ;;
     turn)
       local cmd="$(_agmsg_shq "$SKILL_DIR/scripts/check-inbox.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
@@ -283,7 +287,7 @@ agmsg_delivery_apply_default() {
       local se="$(_agmsg_shq "$SKILL_DIR/scripts/session-end.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       local st="$(_agmsg_shq "$SKILL_DIR/scripts/check-inbox.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       add_event_entry_file "$tmp_state" "SessionStart" "$ss" "$ww"
-      add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$ww"
+      add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$ww" "$se_timeout"
       add_event_entry_file "$tmp_state" "Stop"         "$st" "$ww"
       if [ "$pt_install" = 1 ]; then
         add_event_entry_file "$tmp_state" "PostToolUse" "$st $(_agmsg_shq "PostToolUse")" "$ww"

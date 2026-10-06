@@ -104,6 +104,7 @@ add_event_entry_file() {
   local event="$2"
   local cmd="$3"
   local windows_wrap="${4:-}"
+  local timeout_s="${5:-}"
   local sql_path
   sql_path=$(agmsg_sql_readfile_path "$path")
 
@@ -122,6 +123,13 @@ add_event_entry_file() {
     cw_lit=$(printf '%s' "$cw" | sed "s/'/''/g")
     hook_obj="$hook_obj,'commandWindows','$cw_lit'"
   fi
+  # Optional per-hook timeout in seconds. A value that is not a whole number of
+  # 1-60 is dropped (no timeout key) rather than written, so it never reaches SQL.
+  case "$timeout_s" in
+    ''|*[!0-9]*) ;;
+    *) [ "${#timeout_s}" -le 2 ] && [ "$((10#$timeout_s))" -ge 1 ] && [ "$((10#$timeout_s))" -le 60 ] \
+         && hook_obj="$hook_obj,'timeout',$((10#$timeout_s))" ;;
+  esac
   hook_obj="$hook_obj)"
   local entry_sql="json_object('matcher','','hooks',json_array($hook_obj))"
 
