@@ -10,7 +10,9 @@ load test_helper
 
 setup() {
   setup_test_env
-  PROJ="/tmp/agmsg-st-proj"
+  # delivery.sh set refuses a project path that does not exist.
+  PROJ="$BATS_TEST_TMPDIR/project"
+  mkdir -p "$PROJ"
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/identity-key.sh"
 }
