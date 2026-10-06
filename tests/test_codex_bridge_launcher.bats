@@ -327,7 +327,7 @@ run_launcher() {
 
 @test "launcher: ignores a stale request app-server URL and binds to its live server" {
   put_record team alice rec-thread-1 "$PROJ" codex
-  write_request old-request-thread ws://127.0.0.1:2 team alice
+  write_request rec-thread-1 ws://127.0.0.1:2 team alice
   run_launcher
 
   [ -f "$CAPTURE" ]
