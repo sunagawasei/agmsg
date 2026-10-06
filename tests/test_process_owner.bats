@@ -215,7 +215,11 @@ sleep 600 &
 blocker=$!
 trap 'kill "$blocker" 2>/dev/null || true; wait "$blocker" 2>/dev/null || true; exit 0' TERM INT HUP
 printf '%s\n' "$blocker" >"$marker_dir/$trace-blocker-pid"
-wait "$blocker"
+# Exit with the watcher: when the test fails before it records this pid, a stub
+# left behind holds bats's descriptors until sleep 600 ends.
+parent=$PPID
+while kill -0 "$parent" 2>/dev/null; do sleep 0.2; done
+kill "$blocker" 2>/dev/null || true
 WATCHDOG
   chmod +x "$SCRIPTS/watchdog.sh"
   local instrumented="$TEST_PROCESS_ROOT/watch.sh.instrumented"
