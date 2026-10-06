@@ -625,3 +625,31 @@ _stale_team() {   # <team> <touch -t stamp>
   n1="$(grep -c find "$FORK_LOG" || true)"
   [ "$((n1 - n0))" -le 1 ]
 }
+
+@test "session-start TTL GC keeps a team dir touched after the batch listed it as old" {
+  enable_session_team
+  _stale_team s-0D0004 202501010000
+  local real
+  real="$(command -v xargs)"
+  mkdir -p "$TEST_SKILL_DIR/touch-bin"
+  # the batch answers first, then the dir is written to, before the per-team check
+  printf '#!/usr/bin/env bash\n"%s" "$@"; rc=$?\ntouch "%s"\nexit $rc\n' \
+    "$real" "$TEST_SKILL_DIR/teams/s-0D0004" > "$TEST_SKILL_DIR/touch-bin/xargs"
+  chmod +x "$TEST_SKILL_DIR/touch-bin/xargs"
+  export PATH="$TEST_SKILL_DIR/touch-bin:$PATH"
+  run run_session_start
+  [ "$status" -eq 0 ]
+  [ -d "$TEST_SKILL_DIR/teams/s-0D0004" ]
+}
+
+@test "session-start TTL GC survives a find that fails and keeps the team" {
+  enable_session_team
+  _stale_team s-0D0005 202501010000
+  mkdir -p "$TEST_SKILL_DIR/fail-bin"
+  printf '#!/bin/sh\nexit 1\n' > "$TEST_SKILL_DIR/fail-bin/find"
+  chmod +x "$TEST_SKILL_DIR/fail-bin/find"
+  export PATH="$TEST_SKILL_DIR/fail-bin:$PATH"
+  run run_session_start
+  [ "$status" -eq 0 ]
+  [ -d "$TEST_SKILL_DIR/teams/s-0D0005" ]
+}

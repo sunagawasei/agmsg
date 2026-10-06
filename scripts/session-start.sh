@@ -742,9 +742,9 @@ if agmsg_session_team_enabled; then
   _ttl="$("$SCRIPT_DIR/config.sh" get delivery.session_team_ttl_days 7 2>/dev/null || echo 7)"
   case "$_ttl" in ''|*[!0-9]*) _ttl=7 ;; esac
   # Which team dirs are past the TTL, asked once for all of them (one find per
-  # xargs batch) instead of one find per team. A name with a TAB or LF could
-  # forge a neighbouring line of the output, and a failed batch proves nothing
-  # about any dir: both take the per-team find below.
+  # xargs batch) so the many recent ones cost nothing each. A name with a TAB or
+  # LF could forge a neighbouring line of the output, and a failed batch proves
+  # nothing about any dir: both take the per-team find below.
   _ttl_old_map=$'\n'
   _ttl_batch_ok=1
   _ttl_batch_dirs=()
@@ -812,16 +812,21 @@ if agmsg_session_team_enabled; then
     fi
     # `find -mtime` exits 0 whether or not the dir matches, so gate on its
     # OUTPUT (non-empty == older than the TTL), not its exit code.
+    # The batch only rules dirs OUT: one it did not list was recent when it ran,
+    # and keeping it is the safe answer. A listed one is asked again here, after
+    # this team's owner and bridge checks, as before: a dir touched since the
+    # batch must not be deleted on the batch's word.
+    _ttl_is_old=""
+    _ttl_ask=1
     case "$_d" in
-      *$'\t'*|*$'\n'*) _ttl_is_old="$(find "$_d" -maxdepth 0 -mtime +"$_ttl" 2>/dev/null)" ;;
+      *$'\t'*|*$'\n'*) ;;
       *)
         if [ "$_ttl_batch_ok" = 1 ]; then
-          case "$_ttl_old_map" in *$'\n'"$_d"$'\n'*) _ttl_is_old=1 ;; *) _ttl_is_old="" ;; esac
-        else
-          _ttl_is_old="$(find "$_d" -maxdepth 0 -mtime +"$_ttl" 2>/dev/null)"
+          case "$_ttl_old_map" in *$'\n'"$_d"$'\n'*) ;; *) _ttl_ask=0 ;; esac
         fi
         ;;
     esac
+    [ "$_ttl_ask" = 0 ] || _ttl_is_old="$(find "$_d" -maxdepth 0 -mtime +"$_ttl" 2>/dev/null || true)"
     [ -n "$_ttl_is_old" ] || continue  # too recent → keep
     # Live/unverified inflight is independent proof of a still-consumed turn.
     # Spawn may already be gone, so the live-bridge veto above cannot see it.
