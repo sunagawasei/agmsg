@@ -38,14 +38,14 @@ case "$1 $2" in
   "agent list")
     if [ -n "${AGMSG_TEST_HERDR_LIST_BARRIER:-}" ]; then
       : > "${AGMSG_TEST_HERDR_LIST_BARRIER}.reached"
-      while [ ! -e "${AGMSG_TEST_HERDR_LIST_BARRIER}.release" ]; do sleep 0.02; done
+      while [ ! -e "${AGMSG_TEST_HERDR_LIST_BARRIER}.release" ] && [ -d "${AGMSG_TEST_HERDR_LIST_BARRIER%/*}" ]; do sleep 0.02; done
     fi
     cat "${AGMSG_TEST_HERDR_LIST_JSON:?missing list json}"
     ;;
   "agent prompt")
     if [ -n "${AGMSG_TEST_HERDR_PROMPT_BARRIER:-}" ]; then
       : > "${AGMSG_TEST_HERDR_PROMPT_BARRIER}.reached"
-      while [ ! -e "${AGMSG_TEST_HERDR_PROMPT_BARRIER}.release" ]; do sleep 0.02; done
+      while [ ! -e "${AGMSG_TEST_HERDR_PROMPT_BARRIER}.release" ] && [ -d "${AGMSG_TEST_HERDR_PROMPT_BARRIER%/*}" ]; do sleep 0.02; done
     fi
     exit "${AGMSG_TEST_HERDR_PROMPT_RC:-0}"
     ;;
@@ -83,6 +83,8 @@ STUB
 
 teardown() {
   local pid
+  # Before the kill -9 below orphans the watcher's children out of jobs/ps reach.
+  _reap_test_jobs || true
   for pid in "${_INJECT_PIDS[@]:-}"; do
     [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
   done
@@ -93,8 +95,8 @@ teardown() {
   chmod -R u+w "$TEST_SKILL_DIR/db" 2>/dev/null || true
   # Release any barrier a test left blocked, so its stub subprocess (now
   # orphaned once its parent was killed above) doesn't spin forever.
-  for f in "$TEST_SKILL_DIR"/*.barrier; do
-    [ -e "$f" ] && : > "$f.release"
+  for f in "$TEST_SKILL_DIR"/*.barrier.reached; do
+    [ -e "$f" ] && : > "${f%.reached}.release"
   done
   # Safety net for the env-propagation test: its own despawn.sh cleanup step
   # never runs if an earlier assertion in that test fails, which would
@@ -135,10 +137,21 @@ msg_read_at() { sqlite3 "$DB" "SELECT at FROM events WHERE type='message_read' A
 
 start_inject() {  # <session_id> <pane_id> <instance_id> [terminal_id]
   bash "$TYPES/cursor/inject-watch.sh" "$1" "$TEST_PROJECT" cursor "$2" "$3" "${4:-}" \
-    >"$TEST_SKILL_DIR/inject.$3.out" 2>"$TEST_SKILL_DIR/inject.$3.err" &
+    >"$TEST_SKILL_DIR/inject.$3.out" 2>"$TEST_SKILL_DIR/inject.$3.err" 3>&- 4>&- &
   local pid=$!
   _INJECT_PIDS+=("$pid")
   echo "$pid"
+}
+
+# SIGKILL both the launcher this test backgrounded and the watcher it
+# re-exec'd into (the pidfile's pid). Killing only the launcher leaves the
+# watcher alive, holding bats' pipes and finishing the delivery the test needs
+# to see interrupted. ${a[-1]} is a "bad array subscript" on bash 3.2 (macOS CI).
+_kill_inject_watcher() {  # <instance_id>
+  local watcher
+  watcher="$(cat "$(inject_pidfile "$1")" 2>/dev/null)" || true
+  [ -z "$watcher" ] || kill -9 "$watcher" 2>/dev/null || true
+  kill -9 "${_INJECT_PIDS[${#_INJECT_PIDS[@]}-1]}"
 }
 
 inject_pidfile() { echo "$RUN_DIR/inject-watch.$1.pid"; }
@@ -208,7 +221,7 @@ path_without_herdr() {
   [ -z "$(cat "$(inject_journal "$iid")" 2>/dev/null)" ]
   [ -z "$(msg_read_at "$id")" ]
 
-  kill -9 "${_INJECT_PIDS[-1]}"
+  _kill_inject_watcher "$iid"
   : > "$barrier.release"
   rm -f "$(inject_pidfile "$iid")"
   [ -z "$(msg_read_at "$id")" ]  # still not lost after the crash
@@ -237,7 +250,7 @@ _wait_read_at() { [ -n "$(msg_read_at "$1")" ]; }
   run cat "$(inject_journal "$iid")"
   [[ "$output" == "$id"$'\t'* ]]
 
-  kill -9 "${_INJECT_PIDS[-1]}"
+  _kill_inject_watcher "$iid"
   : > "$barrier.release"
   rm -f "$(inject_pidfile "$iid")"
   [ -z "$(msg_read_at "$id")" ]
