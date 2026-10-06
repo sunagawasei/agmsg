@@ -618,11 +618,48 @@ TARGET
   done
 }
 
+# The claim holder waits on files only the test creates, so a test killed without
+# running teardown would leave it polling forever. It exits when its launching
+# shell (argv[1], fixed by the launcher so a parent that died before Python
+# started is caught too) is no longer its parent.
+write_claim_holder() {
+  cat >"$1" <<'PY'
+import fcntl
+import os
+import subprocess
+import sys
+import time
+
+expected_parent, claim, pidfile, pid, generation, ready, cleanup_request, release, launcher, cleaned = sys.argv[1:]
+
+
+def parent_alive():
+    return os.getppid() == int(expected_parent)
+
+
+if not parent_alive():
+    raise SystemExit(70)
+fd = os.open(claim, os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(ready, "w").close()
+while not os.path.exists(cleanup_request):
+    if not parent_alive():
+        raise SystemExit(70)
+    time.sleep(0.01)
+subprocess.run(["bash", launcher, "--internal-cleanup-observed", pidfile, pid, generation, "0", "--"], check=True)
+open(cleaned, "w").close()
+while not os.path.exists(release):
+    if not parent_alive():
+        raise SystemExit(70)
+    time.sleep(0.01)
+PY
+}
+
 @test "process-owner claim barrier keeps its inode while cleanup runs under the holder" {
   local python scope='watch|claim-continuity|project|claude-code' scope_hash
   python="$(command -v python3 2>/dev/null || true)"
   local pidfile="$TEST_PROCESS_ROOT/inode.pid" owner claim generation=inode-generation lease_file
-  local wrapper probe ready cleanup_request release cleaned
+  local wrapper probe ready cleanup_request release cleaned holder_parent
   local lock_pid contender_pid probe_status before_inode after_inode final_inode
   local dead_pid contender_launcher_pid contender_status contender_target contender_ready contender_report signal_record
   local before_pid before_owner before_lease before_pid_inode before_owner_inode before_lease_inode
@@ -664,26 +701,11 @@ except BlockingIOError:
     raise SystemExit(75)
 raise SystemExit(0)
 PY
-  cat >"$wrapper" <<'PY'
-import fcntl
-import os
-import subprocess
-import sys
-import time
-
-claim, pidfile, pid, generation, ready, cleanup_request, release, launcher, cleaned = sys.argv[1:]
-fd = os.open(claim, os.O_RDWR | os.O_CREAT, 0o600)
-fcntl.flock(fd, fcntl.LOCK_EX)
-open(ready, "w").close()
-while not os.path.exists(cleanup_request):
-    time.sleep(0.01)
-subprocess.run(["bash", launcher, "--internal-cleanup-observed", pidfile, pid, generation, "0", "--"], check=True)
-open(cleaned, "w").close()
-while not os.path.exists(release):
-    time.sleep(0.01)
-PY
+  write_claim_holder "$wrapper"
   rm -f "$ready" "$cleanup_request" "$release" "$cleaned" "$contender_ready" "$contender_report" "$signal_record"
-  "$python" "$wrapper" "$claim" "$pidfile" "$dead_pid" "$generation" "$ready" "$cleanup_request" "$release" \
+  # Expanded here: a `&` command expands its words in the forked child, where BASHPID is the child's.
+  holder_parent="${BASHPID:-$$}"
+  "$python" "$wrapper" "$holder_parent" "$claim" "$pidfile" "$dead_pid" "$generation" "$ready" "$cleanup_request" "$release" \
     "$SCRIPTS/internal/process-owner-launch.sh" "$cleaned" &
   lock_pid=$!
   test_fixture_register_owned_pid "$lock_pid"
@@ -754,6 +776,58 @@ PY
   [ -e "$claim" ]
   final_inode="$(stat -f '%i' "$claim" 2>/dev/null || stat -c '%i' "$claim")"
   [ "$final_inode" = "$before_inode" ]
+}
+
+# Runs the claim holder under a middle bash that stays its parent, then SIGKILLs the
+# middle bash at the given phase so no teardown path can stop the holder.
+_claim_holder_exits_when_parent_is_killed() {
+  local phase="$1" python holder middle_pid holder_pid
+  local ready="$TEST_PROCESS_ROOT/orphan.ready" cleanup_request="$TEST_PROCESS_ROOT/orphan.cleanup"
+  local cleaned="$TEST_PROCESS_ROOT/orphan.cleaned" release="$TEST_PROCESS_ROOT/orphan.release"
+  local holder_pid_file="$TEST_PROCESS_ROOT/orphan.holder-pid"
+  python="$(command -v python3 2>/dev/null || true)"
+  [ -n "$python" ]
+  holder="$TEST_PROCESS_ROOT/orphan-holder.py"
+  write_claim_holder "$holder"
+  : >"$TEST_PROCESS_ROOT/orphan-launcher.sh"
+  bash -c '"$1" "$2" "$$" "$3" "$4" 0 gen "$5" "$6" "$7" "$8" "$9" 3>&- &
+    printf "%s\n" "$!" >"${10}"
+    wait' _ "$python" "$holder" "$TEST_PROCESS_ROOT/orphan.claim" "$TEST_PROCESS_ROOT/orphan.pid" \
+    "$ready" "$cleanup_request" "$release" "$TEST_PROCESS_ROOT/orphan-launcher.sh" "$cleaned" "$holder_pid_file" &
+  middle_pid=$!
+  test_fixture_register_owned_pid "$middle_pid"
+  wait_for_file "$ready"
+  wait_for_file "$holder_pid_file"
+  holder_pid="$(cat "$holder_pid_file")"
+  # Not our child once reparented, so the reaper cannot find it; teardown stops it if the check fails.
+  TEST_FOREIGN_PID="$holder_pid"
+  if [ "$phase" = release ]; then
+    : >"$cleanup_request"
+    wait_for_file "$cleaned"
+  fi
+  kill -KILL "$middle_pid"
+  wait "$middle_pid" 2>/dev/null || true
+  wait_for_pid_exit "$holder_pid"
+}
+
+@test "process-owner claim holder exits when its parent is killed while waiting for cleanup" {
+  _claim_holder_exits_when_parent_is_killed cleanup
+}
+
+@test "process-owner claim holder exits when its parent is killed while waiting for release" {
+  _claim_holder_exits_when_parent_is_killed release
+}
+
+@test "process-owner claim holder exits at startup when its expected parent is not its parent" {
+  local python holder status=0
+  python="$(command -v python3 2>/dev/null || true)"
+  [ -n "$python" ]
+  holder="$TEST_PROCESS_ROOT/startup-holder.py"
+  write_claim_holder "$holder"
+  "$python" "$holder" 1 "$TEST_PROCESS_ROOT/startup.claim" x 0 gen "$TEST_PROCESS_ROOT/startup.ready" \
+    "$TEST_PROCESS_ROOT/startup.cleanup" "$TEST_PROCESS_ROOT/startup.release" x "$TEST_PROCESS_ROOT/startup.cleaned" || status=$?
+  [ "$status" -eq 70 ]
+  [ ! -e "$TEST_PROCESS_ROOT/startup.ready" ]
 }
 
 @test "process-owner signal_owned defaults to TERM after leased assertion" {
