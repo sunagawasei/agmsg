@@ -201,25 +201,3 @@ If argument starts with "rename-team":
 2. Never invent either team name. Before execution, repeat the old and new team names and ask the user to confirm. Wait for confirmation.
 3. Run: `bash ~/.agents/skills/__SKILL_NAME__/scripts/rename-team.sh <old_team> <new_team>`
 4. Show the result.
-
-If argument starts with "key generate" followed by an optional team name:
-1. Run: `~/.agents/skills/__SKILL_NAME__/scripts/key.sh generate [<team>]`
-2. Show the full output to the user, including the mandatory key-backup notice — do not summarize it away.
-
-If argument starts with "key show":
-1. Parse an optional team name and `--reveal-secret`.
-2. Run: `~/.agents/skills/__SKILL_NAME__/scripts/key.sh show [<team>] [--reveal-secret]`
-3. `--reveal-secret` requires a real interactive terminal and is refused in agent mode — if the user wants to reveal a secret, tell them to run it themselves directly in their own terminal rather than through you.
-4. Show the output to the user.
-
-If argument starts with "key import" followed by a team name:
-1. **Do not ask the user to paste the private identity into this chat, and do not run this command yourself.** This identity is a permanent secret. Tell the user to run this directly in their own terminal:
-   ```
-   read -rsp 'Identity: ' IDENTITY; echo
-   printf '%s' "$IDENTITY" | ~/.agents/skills/__SKILL_NAME__/scripts/key.sh import <team> --identity-stdin
-   unset IDENTITY
-   ```
-2. Ask them to paste back only the command's output (never the identity itself) once it's done.
-3. **No advanced/automation env-var path is offered for key import** — not even a pre-existing, before-session variable. An identity file is a permanent secret; always use the human-in-own-terminal flow above.
-
-`key rotate` and device-pairing `key request`/`key approve` are not available yet (they refuse unconditionally and change no state) — if the user asks for either, tell them so rather than attempting to run them.

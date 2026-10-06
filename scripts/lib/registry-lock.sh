@@ -1023,7 +1023,7 @@ agmsg_write_atomic() {
   #
   # 0600 applies to every caller of this helper -- team configs, roster
   # journals, the codex port file, migrations. That is deliberate: it is how
-  # this product already treats its own state (`key.sh`, the handoff bundle).
+  # this product already treats its own state.
   # THE TEMP LIVES IN A DIRECTORY THIS CALL MADE, and that is the whole point.
   #
   # Two earlier shapes were refused by review, and the second one is why this is

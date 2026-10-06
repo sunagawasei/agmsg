@@ -400,6 +400,9 @@ if [ "$UPDATE_ONLY" = true ]; then
   # template. A plain cp -R never deletes a file absent from the source
   # tree, so an --update from 1.3.1 would otherwise keep this one forever.
   rm -f "$SKILL_DIR/scripts/rearm.sh"
+  # key.sh managed keys for a remote sync this build does not ship; an older
+  # install would keep the script (and its template commands are gone).
+  rm -f "$SKILL_DIR/scripts/key.sh"
   # Ship the external-plugin drop-in dir (just its README) so the location exists
   # post-install. A plain cp — not cp -R --delete — preserves any plugins the
   # user dropped in and their db/trusted-plugins opt-ins.
@@ -524,6 +527,7 @@ for _agmsg_removed in gemini antigravity copilot grok-build hermes opencode agms
   rm -rf "$SKILL_DIR/scripts/drivers/types/$_agmsg_removed"
 done
 rm -rf "$SKILL_DIR/scripts/windows"
+rm -f "$SKILL_DIR/scripts/key.sh"
 unset _agmsg_removed
 # Ship the external-plugin drop-in dir (just its README) so the location exists
 # post-install. A plain cp — not cp -R --delete — preserves any plugins the user

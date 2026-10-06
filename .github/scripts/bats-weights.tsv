@@ -47,7 +47,6 @@ test_inbox_target.bats	53	12
 test_inflight.bats	48	12
 test_install.bats	20	8
 test_instance_id.bats	42	7
-test_key.bats	23	10
 test_legacy_mirror.bats	3	1
 test_locator.bats	4	2
 test_lock_liveness_unified.bats	6	5

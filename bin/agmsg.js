@@ -85,7 +85,7 @@ function readVersion() {
 // disk, so printNotACommand checks the actual file there before naming it.
 const SCRIPT_FOR_VERB = {
   send: 'send.sh', history: 'history.sh', inbox: 'inbox.sh', join: 'join.sh',
-  team: 'team.sh', key: 'key.sh', whoami: 'whoami.sh',
+  team: 'team.sh', whoami: 'whoami.sh',
   leave: 'leave.sh', rename: 'rename.sh', config: 'config.sh',
   watch: 'watch.sh', spawn: 'spawn.sh', version: 'version.sh', api: 'api.sh',
 };

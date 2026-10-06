@@ -1098,3 +1098,13 @@ CYG
   [ ! -e "$SK/scripts/drivers/types/hermes" ] # removed-type-fixture
   [ ! -e "$SK/scripts/windows" ]
 }
+
+@test "install: --update and a reinstall remove a previously installed key.sh" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  : > "$SK/scripts/key.sh"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ ! -e "$SK/scripts/key.sh" ]
+  : > "$SK/scripts/key.sh"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  [ ! -e "$SK/scripts/key.sh" ]
+}

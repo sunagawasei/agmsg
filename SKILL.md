@@ -241,41 +241,6 @@ Every agmsg step above runs through the host's Bash tool, so on Claude Code each
 }
 ```
 
-### End-to-end encryption
-
-If argument starts with "key generate" followed by an optional team name:
-1. Run: `bash ~/.agents/skills/agmsg/scripts/key.sh generate [<team>]`
-2. Show the full output to the user, including the mandatory key-backup notice.
-
-If argument starts with "key show":
-1. Parse an optional team name and `--reveal-secret`.
-2. Run: `bash ~/.agents/skills/agmsg/scripts/key.sh show [<team>] [--reveal-secret]`
-3. `--reveal-secret` requires a real interactive terminal and is refused in
-   agent mode. Tell the user to run it directly in their own terminal.
-4. Show the output to the user.
-
-If argument starts with "key handoff" followed by a team name:
-1. Parse optional `--out <file>` and run:
-   `bash ~/.agents/skills/agmsg/scripts/key.sh handoff <team> [--out <file>]`
-2. The output bundle contains every epoch identity and is itself permanent
-   secret key material. Never read it into agent chat or display its contents.
-3. Show the bundle path, latest snapshot digest, and full secrecy warning.
-
-If argument starts with "key import" followed by a team name:
-1. Do not ask the user to paste the private identity into this chat, and do not
-   run the command yourself. Tell the user to run this in their own terminal:
-   ```
-   read -rsp 'Identity: ' IDENTITY; echo
-   printf '%s' "$IDENTITY" | ~/.agents/skills/agmsg/scripts/key.sh import <team> --identity-stdin
-   unset IDENTITY
-   ```
-2. Ask them to paste back only the command output, never the identity itself.
-3. Do not offer an environment-variable path. An identity file is a permanent
-   secret; always use the human-in-own-terminal flow above.
-
-`key rotate` and device-pairing `key request`/`key approve` are not available
-yet. If the user asks for one, tell them so instead of attempting to run it.
-
 ## Sandbox compatibility (Claude Code)
 
 When Claude Code's sandbox is enabled, `watch.sh` (monitor mode) runs inside the sandbox and needs to write pidfiles and SQLite WAL files under `~/.agents/skills/agmsg/`. Add an allowlist entry to `~/.claude/settings.json` (or project-level `.claude/settings.local.json`):
