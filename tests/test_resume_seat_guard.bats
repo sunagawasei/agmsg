@@ -193,3 +193,20 @@ _run_session_start() {
   local cmd; cmd="$(_directive_command "$output")"
   [ -z "$cmd" ]
 }
+
+# --- session-team mode is pinned to one team, so it is not stood down ---
+
+@test "resume, session-team on, unidentified seat, multi-pair: emits the --team pinned watcher, not stand-down" {
+  bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/null
+  local sid="11111111-2222-4333-8444-555555555555"
+  run _run_session_start "$sid"
+  [ "$status" -eq 0 ]
+  refute grep -qF "standing down" <<<"$output"
+  local cmd; cmd="$(_directive_command "$output")"
+  eval "set -- $cmd"
+  # <watch.sh> <iid> <project> <type> claude --team s-<sid> --max-seconds=N
+  [ "$#" -eq 8 ]
+  [ "$5" = "claude" ]
+  [ "$6" = "--team" ]
+  [ "$7" = "s-$sid" ]
+}
