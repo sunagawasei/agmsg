@@ -713,7 +713,7 @@ test_fixture_cleanup() {
     _AGMSG_TEST_FIXTURE_BLOCK_FD_OPEN=0
   fi
 
-  for pid in "${_AGMSG_TEST_FIXTURE_PIDS[@]}"; do
+  for pid in ${_AGMSG_TEST_FIXTURE_PIDS[@]+"${_AGMSG_TEST_FIXTURE_PIDS[@]}"}; do
     if _test_fixture_pid_signature_state \
       "$pid" "$AGMSG_TEST_FIXTURE_SIGNATURE"; then
       cleanup_pids[${#cleanup_pids[@]}]="$pid"
@@ -724,30 +724,30 @@ test_fixture_cleanup() {
       fi
     fi
   done
-  for pid in "${cleanup_pids[@]}"; do
+  for pid in ${cleanup_pids[@]+"${cleanup_pids[@]}"}; do
     kill -TERM "$pid" 2>/dev/null || true
   done
   attempt=0
   while [ "$attempt" -lt 20 ]; do
     alive=0
-    for pid in "${cleanup_pids[@]}"; do
+    for pid in ${cleanup_pids[@]+"${cleanup_pids[@]}"}; do
       kill -0 "$pid" 2>/dev/null && alive=1
     done
     [ "$alive" -eq 0 ] && break
     sleep 0.05
     attempt=$((attempt + 1))
   done
-  for pid in "${cleanup_pids[@]}"; do
+  for pid in ${cleanup_pids[@]+"${cleanup_pids[@]}"}; do
     kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
   done
-  for pid in "${cleanup_pids[@]}"; do
+  for pid in ${cleanup_pids[@]+"${cleanup_pids[@]}"}; do
     wait "$pid" 2>/dev/null || true
   done
   _test_fixture_retire_registered_pids || ledger_status=$?
   _AGMSG_TEST_FIXTURE_PIDS=()
 
   local fifo
-  for fifo in "${_AGMSG_TEST_FIXTURE_FIFOS[@]}"; do
+  for fifo in ${_AGMSG_TEST_FIXTURE_FIFOS[@]+"${_AGMSG_TEST_FIXTURE_FIFOS[@]}"}; do
     rm -f "$fifo"
   done
   _AGMSG_TEST_FIXTURE_FIFOS=()
