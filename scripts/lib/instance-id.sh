@@ -465,6 +465,26 @@ agmsg_cc_instance_current() {   # <pid>
   printf '%s' "$current"
 }
 
+# Content of a small state file as `$(cat FILE 2>/dev/null || true)` gives it
+# (trailing newlines stripped, "" when unreadable), set in _AGMSG_FILE_TEXT, but
+# without a process: a cat in a command substitution is a fork+exec per call and
+# the bare-sid check below runs it once per cc-instance file for every caller.
+# A NUL byte ends `read -d ''` early (rc 0), which the cat form would have
+# dropped instead, so that rare file takes the original form.
+_agmsg_file_text() {   # <file>
+  local rc=0
+  _AGMSG_FILE_TEXT=""
+  IFS= read -r -d '' _AGMSG_FILE_TEXT 2>/dev/null <"$1" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    _AGMSG_FILE_TEXT="$(cat "$1" 2>/dev/null || true)"
+    return 0
+  fi
+  while [ "${_AGMSG_FILE_TEXT%$'\n'}" != "$_AGMSG_FILE_TEXT" ]; do
+    _AGMSG_FILE_TEXT="${_AGMSG_FILE_TEXT%$'\n'}"
+  done
+  return 0
+}
+
 # True iff <token> identifies a still-live instance.
 #   composite "<sid>.<pid>" → the embedded pid is alive (kill -0), AND, when a
 #                            cc-instance.<pid> record exists for that pid, its
@@ -492,7 +512,7 @@ agmsg_instance_alive() {
     local f s
     f="$SKILL_DIR/run/cc-instance.$pid"
     [ -f "$f" ] || return 0
-    s="$(cat "$f" 2>/dev/null || true)"
+    _agmsg_file_text "$f"; s="$_AGMSG_FILE_TEXT"
     [ "$s" = "$token" ] && return 0
     return 1
   fi
@@ -504,7 +524,7 @@ agmsg_instance_alive() {
     p=${f##*.}
     case "$p" in ''|*[!0-9]*) continue ;; esac
     _agmsg_pid_alive "$p" || continue
-    s="$(cat "$f" 2>/dev/null || true)"
+    _agmsg_file_text "$f"; s="$_AGMSG_FILE_TEXT"
     [ "$s" = "$token" ] && return 0
     # upgrade compat: cc-instance stores "<sid>.<pid>" but the lock holds "<sid>"
     if agmsg_instance_is_composite "$s" && [ "${s%.*}" = "$token" ]; then
