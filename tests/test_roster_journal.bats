@@ -70,14 +70,25 @@ _seed_roster() {
 }
 
 @test "a retired member rejoins with the same identity" {
-  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
-  local config="$TEST_SKILL_DIR/teams/demo/config.json"
+  _seed_roster demo alice
+  local team_dir="$TEST_SKILL_DIR/teams/demo"
+  local config="$team_dir/config.json"
   local member_id
   member_id="$(config_field "$config" '$.agents.alice.member_id')"
-  bash "$SCRIPTS/leave.sh" demo alice
+  [[ "$member_id" =~ $UUID7_RE ]]
 
+  agmsg_roster_append_left "$team_dir" "$member_id" alice "2026-01-01T00:00:01Z"
+  agmsg_roster_project_config "$team_dir" "$config"
+  [ "$(journal_query "$team_dir/roster.jsonl" \
+    "SELECT count(*) FROM records
+      WHERE json_extract(event,'\$.type')='member_left'
+        AND json_extract(event,'\$.member_id')='$member_id'
+        AND json_extract(event,'\$.name')='alice';")" -eq 1 ]
+  [ "$(config_field "$config" '$.agents.alice')" = "" ]
   [ "$(config_field "$config" '$.retired_members.alice.member_id')" = "$member_id" ]
-  bash "$SCRIPTS/join.sh" demo alice codex /tmp/b
+
+  agmsg_roster_append_joined "$team_dir" "$member_id" alice "2026-01-01T00:00:02Z"
+  agmsg_roster_project_config "$team_dir" "$config"
   [ "$(config_field "$config" '$.agents.alice.member_id')" = "$member_id" ]
   [ "$(config_field "$config" '$.retired_members.alice')" = "" ]
 }
@@ -103,20 +114,26 @@ _seed_roster() {
 }
 
 @test "concurrent renames accept only the first event whose from name is current" {
-  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  _seed_roster demo alice
   local team_dir="$TEST_SKILL_DIR/teams/demo"
   local config="$team_dir/config.json"
   local member_id
   member_id="$(config_field "$config" '$.agents.alice.member_id')"
+  [[ "$member_id" =~ $UUID7_RE ]]
 
-  source "$SCRIPTS/lib/roster-journal.sh"
   agmsg_roster_append_renamed "$team_dir" "$member_id" alice carol \
     "2026-01-01T00:00:00Z"
   agmsg_roster_append_renamed "$team_dir" "$member_id" alice dave \
     "2026-01-01T00:00:01Z"
   agmsg_roster_project_config "$team_dir" "$config"
 
+  [ "$(journal_query "$team_dir/roster.jsonl" \
+    "SELECT count(*) FROM records
+      WHERE json_extract(event,'\$.type')='member_renamed'
+        AND json_extract(event,'\$.member_id')='$member_id'
+        AND json_extract(event,'\$.from')='alice';")" -eq 2 ]
   [ "$(config_field "$config" '$.agents.carol.member_id')" = "$member_id" ]
+  [ "$(config_field "$config" '$.agents.alice')" = "" ]
   [ "$(config_field "$config" '$.agents.dave')" = "" ]
 }
 
