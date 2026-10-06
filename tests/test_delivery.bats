@@ -1574,7 +1574,9 @@ JSON
   printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$stubdir/tasklist"
   chmod +x "$stubdir/tasklist"
 
-  sleep 30 3>&- &
+  # A legacy pidfile is kept only while its pid still looks like watch.sh.
+  printf '%s\n' '#!/usr/bin/env bash' 'sleep 30' > "$stubdir/watch.sh"
+  bash "$stubdir/watch.sh" 3>&- &
   local live_pid=$!
   echo "$live_pid" > "$TEST_SKILL_DIR/run/watch.sweep-live.pid"
 

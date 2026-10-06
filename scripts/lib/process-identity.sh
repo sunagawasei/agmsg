@@ -116,13 +116,15 @@ agmsg_process_identity_state() {
   local kind="$1" pidfile="$2" scope="$3"
   shift 3
   local owner lease pid owner_pid owner_kind owner_scope owner_generation
-  local owner_lease scope_hash probe_rc cmd version
+  local owner_lease scope_hash probe_rc cmd version alive_fn=_agmsg_pid_alive
 
   AGMSG_PROCESS_STATE=""
   AGMSG_PROCESS_PID=""
   AGMSG_PROCESS_GENERATION=""
   AGMSG_PROCESS_SCOPE_HASH=""
   AGMSG_PROCESS_OWNER_LEASE=""
+  # A watch pid is minted by a shell, which tasklist cannot see under MSYS.
+  [ "$kind" = watch ] && alive_fn=_agmsg_pid_alive_local
 
   owner="$(agmsg_process_owner_path "$pidfile")"
   pid="$(_agmsg_process_read_pid "$pidfile" 2>/dev/null || true)"
@@ -154,12 +156,12 @@ agmsg_process_identity_state() {
                 && { [ -z "$scope" ] || [ "$owner_scope" = "$scope_hash" ]; } \
                 && [ -n "$pid" ] && [ "$pid" = "$owner_pid" ] \
                 && [ -n "$owner_generation" ] \
-                && _agmsg_pid_alive "$pid"; then
+                && "$alive_fn" "$pid"; then
               AGMSG_PROCESS_STATE=owned
             else
               AGMSG_PROCESS_STATE=held-unverified
             fi
-          elif [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
+          elif [ -n "$pid" ] && "$alive_fn" "$pid"; then
             AGMSG_PROCESS_STATE=unverified-live
           else
             AGMSG_PROCESS_STATE=unverified-dead
@@ -172,9 +174,9 @@ agmsg_process_identity_state() {
             && [ "$owner_kind" = "$kind" ] \
             && { [ -z "$scope" ] || [ "$owner_scope" = "$scope_hash" ]; } \
             && [ -n "$pid" ] && [ "$pid" = "$owner_pid" ] \
-            && [ -n "$owner_generation" ] && _agmsg_pid_alive "$pid"; then
+            && [ -n "$owner_generation" ] && "$alive_fn" "$pid"; then
           AGMSG_PROCESS_STATE=degraded-live
-        elif [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
+        elif [ -n "$pid" ] && "$alive_fn" "$pid"; then
           AGMSG_PROCESS_STATE=unverified-live
         else
           AGMSG_PROCESS_STATE=degraded-dead
@@ -188,7 +190,7 @@ agmsg_process_identity_state() {
           probe_rc=$?
           if [ "$probe_rc" -eq 75 ]; then
             AGMSG_PROCESS_STATE=held-unverified
-          elif [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
+          elif [ -n "$pid" ] && "$alive_fn" "$pid"; then
             AGMSG_PROCESS_STATE=unverified-live
           else
             AGMSG_PROCESS_STATE=unverified-dead
@@ -199,7 +201,7 @@ agmsg_process_identity_state() {
     esac
   fi
 
-  if [ -z "$pid" ] || ! _agmsg_pid_alive "$pid"; then
+  if [ -z "$pid" ] || ! "$alive_fn" "$pid"; then
     AGMSG_PROCESS_STATE=legacy-dead
     return 0
   fi
