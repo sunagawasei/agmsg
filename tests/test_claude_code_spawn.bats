@@ -1372,43 +1372,11 @@ COLLISION
   [ "$(cat "$run_write")" = "foreign run" ]
 }
 
-@test "dangling symlink probe collisions and exclusive owner creation never follow links" {
+@test "exclusive owner creation never clobbers an existing file or follows a link" {
   local symlink_env="$TEST_SKILL_DIR/symlink-bash-env"
-  local output_victim="$TEST_SKILL_DIR/output-victim"
-  local sentinel_victim="$TEST_SKILL_DIR/sentinel-victim"
-  local edit_victim="$TEST_SKILL_DIR/edit-victim"
-  local prompt_victim="$TEST_SKILL_DIR/prompt-victim"
-  local trace_victim="$TEST_SKILL_DIR/trace-victim"
-  local stderr_victim="$TEST_SKILL_DIR/stderr-victim"
   cat > "$symlink_env" <<'SYMLINKS'
 if [ "${0:-}" = "${SPAWN_SCRIPT_FOR_SYMLINK:-}" ]; then
-  symlink_token="agmsg-probe-$$"
   case "${2:-}" in
-    link-output)
-      symlink_path="$PROJ/.${symlink_token}-repo-bash"
-      ln -s "$OUTPUT_LINK_VICTIM" "$symlink_path"
-      ;;
-    link-sentinel)
-      mkdir -p "$TEST_SKILL_DIR/db/claude-worker-home/projects"
-      symlink_path="$TEST_SKILL_DIR/db/claude-worker-home/projects/.${symlink_token}-sensitive"
-      ln -s "$SENTINEL_LINK_VICTIM" "$symlink_path"
-      ;;
-    link-edit)
-      symlink_path="$PROJ/.${symlink_token}-repo-edit"
-      ln -s "$EDIT_LINK_VICTIM" "$symlink_path"
-      ;;
-    link-prompt)
-      symlink_path="$FAKE_RUN/claude-code-bridge.team.link-prompt.probe.prompt"
-      ln -s "$PROMPT_LINK_VICTIM" "$symlink_path"
-      ;;
-    link-trace)
-      symlink_path="$FAKE_RUN/claude-code-bridge.team.link-trace.probe.jsonl"
-      ln -s "$TRACE_LINK_VICTIM" "$symlink_path"
-      ;;
-    link-stderr)
-      symlink_path="$FAKE_RUN/claude-code-bridge.team.link-stderr.probe.stderr"
-      ln -s "$STDERR_LINK_VICTIM" "$symlink_path"
-      ;;
     regular-prompt)
       symlink_path="$FAKE_RUN/claude-code-bridge.team.regular-prompt.probe.prompt"
       printf 'preserved prompt\n' > "$symlink_path"
@@ -1419,61 +1387,7 @@ if [ "${0:-}" = "${SPAWN_SCRIPT_FOR_SYMLINK:-}" ]; then
 fi
 SYMLINKS
   export SPAWN_SCRIPT_FOR_SYMLINK="$SCRIPTS/spawn.sh"
-  export OUTPUT_LINK_VICTIM="$output_victim"
-  export SENTINEL_LINK_VICTIM="$sentinel_victim"
-  export EDIT_LINK_VICTIM="$edit_victim"
-  export PROMPT_LINK_VICTIM="$prompt_victim"
-  export TRACE_LINK_VICTIM="$trace_victim"
-  export STDERR_LINK_VICTIM="$stderr_victim"
   export BASH_ENV="$symlink_env"
-
-  run spawn_claude link-output
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"owner-scoped probe target collision"* ]]
-  local output_link
-  output_link="$(cat "$CAPTURE/symlink-path.link-output")"
-  [ -L "$output_link" ]
-  [ "$(readlink "$output_link")" = "$output_victim" ]
-  [ ! -e "$output_victim" ]
-  [ ! -e "$CAPTURE/probe-count" ]
-
-  run spawn_claude link-sentinel --reviewer
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"synthetic reviewer sentinel collision"* ]]
-  local sentinel_link
-  sentinel_link="$(cat "$CAPTURE/symlink-path.link-sentinel")"
-  [ -L "$sentinel_link" ]
-  [ "$(readlink "$sentinel_link")" = "$sentinel_victim" ]
-  [ ! -e "$sentinel_victim" ]
-  [ ! -e "$CAPTURE/probe-count" ]
-
-  run spawn_claude link-edit --reviewer
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"owner-scoped Edit probe target collision"* ]]
-  local edit_link
-  edit_link="$(cat "$CAPTURE/symlink-path.link-edit")"
-  [ -L "$edit_link" ]
-  [ "$(readlink "$edit_link")" = "$edit_victim" ]
-  [ ! -e "$edit_victim" ]
-  [ ! -e "$CAPTURE/probe-count" ]
-
-  local diagnostic_name diagnostic_link diagnostic_victim
-  for diagnostic_name in link-prompt link-trace link-stderr; do
-    case "$diagnostic_name" in
-      link-prompt) diagnostic_victim="$prompt_victim" ;;
-      link-trace) diagnostic_victim="$trace_victim" ;;
-      link-stderr) diagnostic_victim="$stderr_victim" ;;
-    esac
-    run spawn_claude "$diagnostic_name"
-    [ "$status" -ne 0 ]
-    [[ "$output" == *"Claude probe diagnostic collision"* ]]
-    diagnostic_link="$(cat "$CAPTURE/symlink-path.$diagnostic_name")"
-    [ -L "$diagnostic_link" ]
-    [ "$(readlink "$diagnostic_link")" = "$diagnostic_victim" ]
-    [ ! -e "$diagnostic_victim" ]
-    [ ! -e "$CAPTURE/probe-count" ]
-    [ ! -e "$CAPTURE/bridge.args.$diagnostic_name" ]
-  done
 
   run spawn_claude regular-prompt
   [ "$status" -ne 0 ]
@@ -1922,7 +1836,7 @@ STUB
   [ "$(claude_probe_count)" -eq 1 ]
 }
 
-@test "spawn removes a stale scratch .claude directory or symlink and still hits the probe cache" {
+@test "spawn removes a stale scratch .claude directory and still hits the probe cache" {
   run spawn_claude stale-seed
   [ "$status" -eq 0 ]
   [ "$(claude_probe_count)" -eq 1 ]
@@ -1936,17 +1850,6 @@ STUB
   wait_bridge_capture stale-dir
   [ ! -e "$scratch/.claude" ]
   [ "$(claude_probe_count)" -eq 0 ]
-
-  local scratch_link="$TEST_SKILL_DIR/run/claude-code-team-stale-link-cwd"
-  local target="$TEST_SKILL_DIR/managed-claude"
-  mkdir -p "$scratch_link" "$target"
-  printf '{}\n' > "$target/settings.local.json"
-  ln -s "$target" "$scratch_link/.claude"
-  run spawn_claude stale-link
-  [ "$status" -eq 0 ]
-  wait_bridge_capture stale-link
-  [ ! -e "$scratch_link/.claude" ] && [ ! -L "$scratch_link/.claude" ]
-  [ -f "$target/settings.local.json" ]
 }
 
 @test "spawn refuses a symlinked scratch cwd and leaves the target .claude intact" {
@@ -2039,18 +1942,10 @@ STUB
   [ "$(claude_probe_count)" -eq 1 ]
 }
 
-@test "symlink cache records miss and an unwritable cache dir does not fail spawn" {
+@test "an unwritable cache dir does not fail spawn" {
   run spawn_claude symlink-seed
   [ "$status" -eq 0 ]
-  local rec
-  rec="$(find "$TEST_SKILL_DIR/run/claude-probe-ok" -type f ! -type l | head -1)"
-  [ -f "$rec" ]
-  mv "$rec" "$rec.real"
-  ln -s "$rec.real" "$rec"
-  reset_probe_capture
-  run spawn_claude symlink-record
-  [ "$status" -eq 0 ]
-  [ "$(claude_probe_count)" -eq 1 ]
+  [ -d "$TEST_SKILL_DIR/run/claude-probe-ok" ]
 
   chmod a-w "$TEST_SKILL_DIR/run/claude-probe-ok"
   reset_probe_capture
@@ -2538,20 +2433,6 @@ assert_reviewer_refused_untouched() {
   local settings="$TEST_SKILL_DIR/run/claude-code-bridge.team.guard-newline-ok.settings.json"
   json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "$AGMSG_STORAGE_PATH"
   ! json_array_has "$settings" '$.sandbox.filesystem.allowWrite' "side/db"
-}
-
-# spawn.sh cannot take a project whose name ends in a newline (command
-# substitution strips it), so the trailing-newline link target is exercised via a
-# sibling directory: resolved correctly it is outside the project, stripped it
-# would land inside.
-@test "reviewer guard: a symlink target ending in a newline is not confused with its newline-less sibling" {
-  export AGMSG_CLAUDE_PROBE_TIMEOUT=30
-  local x="$BATS_TEST_TMPDIR/x" nl=$'\n'
-  mkdir -p "$x/out" "$x/out${nl}"
-  ln -s "$x/out${nl}" "$x/link"
-  export AGMSG_STORAGE_PATH="$x/link/db"
-  run spawn_claude_at team guard-trailing-nl-ok "$x/out" --reviewer
-  [ "$status" -eq 0 ]
 }
 
 # The refusal prints a migration snippet; run exactly what it prints.

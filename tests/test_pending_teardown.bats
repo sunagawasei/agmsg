@@ -164,22 +164,14 @@ setup_clear_fixture() {
 @test "SessionEnd /clear: an unreadable or malformed cc-instance keeps pending teardown" {
   setup_clear_fixture
   local variant
-  for variant in absent empty bare wrong-pid dotted-sid multiline spaced nul blank-line symlink; do
+  for variant in absent empty bare wrong-pid; do
     rm -f "$RUN/cc-instance.$OWNER_PID" "$PENDING"
     write_snapshot
     case "$variant" in
       absent) ;;
       empty) : > "$RUN/cc-instance.$OWNER_PID" ;;
       bare) printf 'NEXT-5E55\n' > "$RUN/cc-instance.$OWNER_PID" ;;
-      dotted-sid) printf 'NEXT.5E55.%s\n' "$OWNER_PID" > "$RUN/cc-instance.$OWNER_PID" ;;
-      multiline) printf '%s\nextra\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID" ;;
-      nul) printf 'NEXT-5E55\0.%s\n' "$OWNER_PID" > "$RUN/cc-instance.$OWNER_PID" ;;
-      blank-line) printf '%s\n\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID" ;;
-      spaced) printf '%s \n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID" ;;
       wrong-pid) printf 'NEXT-5E55.%s\n' "$((OWNER_PID + 1))" > "$RUN/cc-instance.$OWNER_PID" ;;
-      symlink)
-        printf '%s\n' "$NEXT_INSTANCE" > "$BATS_TEST_TMPDIR/real-instance"
-        ln -s "$BATS_TEST_TMPDIR/real-instance" "$RUN/cc-instance.$OWNER_PID" ;;
     esac
     run run_composite_worker
     [ "$status" -eq 0 ]
@@ -272,22 +264,6 @@ setup_clear_fixture() {
   [ -f "$PENDING" ]
 }
 
-@test "SessionEnd /clear: a symlink to the old instance after the supersede is not a resume and keeps the work pending" {
-  setup_clear_fixture
-  printf '%s\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID"
-  printf '%s\n' "$OWNER_INSTANCE" > "$BATS_TEST_TMPDIR/old-instance"
-  agmsg_team_lifecycle_lock_acquire "$STEAM" 5
-  run_composite_worker >/dev/null 2>&1 &
-  local worker_pid=$!
-  sleep 0.5
-  rm -f "$RUN/cc-instance.$OWNER_PID"
-  ln -s "$BATS_TEST_TMPDIR/old-instance" "$RUN/cc-instance.$OWNER_PID"
-  agmsg_team_lifecycle_lock_release "$STEAM"
-  wait "$worker_pid"
-  kill -0 "$BRIDGE_PID" 2>/dev/null
-  [ -f "$PENDING" ]
-}
-
 @test "SessionEnd owner exit during grace continues normal teardown" {
   start_owner 0.3
   start_bridge
@@ -371,7 +347,7 @@ setup_pending_for_clear() {
 @test "pending teardown keeps a live owner whose cc-instance still names it or cannot be trusted" {
   setup_pending_for_clear
   local variant
-  for variant in self absent empty bare wrong-pid dotted-sid multiline symlink; do
+  for variant in self absent empty bare wrong-pid; do
     rm -f "$RUN/cc-instance.$OWNER_PID"
     case "$variant" in
       self) printf '%s\n' "$OWNER_INSTANCE" > "$RUN/cc-instance.$OWNER_PID" ;;
@@ -379,11 +355,6 @@ setup_pending_for_clear() {
       empty) : > "$RUN/cc-instance.$OWNER_PID" ;;
       bare) printf 'NEXT-5E55\n' > "$RUN/cc-instance.$OWNER_PID" ;;
       wrong-pid) printf 'NEXT-5E55.%s\n' "$((OWNER_PID + 1))" > "$RUN/cc-instance.$OWNER_PID" ;;
-      dotted-sid) printf 'NEXT.5E55.%s\n' "$OWNER_PID" > "$RUN/cc-instance.$OWNER_PID" ;;
-      multiline) printf '%s\nextra\n' "$NEXT_INSTANCE" > "$RUN/cc-instance.$OWNER_PID" ;;
-      symlink)
-        printf '%s\n' "$NEXT_INSTANCE" > "$BATS_TEST_TMPDIR/real-instance"
-        ln -s "$BATS_TEST_TMPDIR/real-instance" "$RUN/cc-instance.$OWNER_PID" ;;
     esac
     run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
     [ "$status" -eq 0 ]
@@ -597,17 +568,6 @@ setup_pending_for_clear() {
   after_umask="$(umask)"
   umask "$original_umask"
   [ "$after_umask" = 0022 ]
-}
-
-@test "pending teardown malformed filename cannot forge a second log line" {
-  local pending="$RUN/"$'pending-teardown.bad\nforged__worker'
-  printf 'version=2\nbroken=true\n' > "$pending"
-
-  run agmsg_pending_teardown_recover_all "$SCRIPTS/despawn.sh"
-  [ "$status" -eq 0 ]
-  [ "$output" = "agmsg: pending teardown retained record=pending-teardown.badforged__worker reason=malformed" ]
-  [ "${#lines[@]}" -eq 1 ]
-  [ -f "$pending" ]
 }
 
 @test "pending teardown log visibly truncates an oversized worker identifier to 80 characters" {

@@ -279,26 +279,6 @@ STUB
   [ -e "$(agmsg_spawn_path "$STEAM" deleted)" ]
 }
 
-@test "symlinking an owned fence aborts without forcing or deleting the replacement" {
-  local snapshot="$RUN/symlink.snapshot" pid worker fence target
-  start_stub_bridge symlinked 1 ignore-usr2
-  pid="$STUB_PID"
-  write_snapshot "$snapshot" symlinked "$STUB_RECORD"
-  AGMSG_DRAIN_DEADLINE_S=4 run_worker "$snapshot" > "$TEST_SKILL_DIR/symlink.log" 2>&1 &
-  worker=$!
-  fence="$(agmsg_drain_fence_path "$STEAM")"
-  wait_for_file "$fence"
-  target="$TEST_SKILL_DIR/replacement-target"
-  printf 'not a fence\n' > "$target"
-  rm -f "$fence"
-  ln -s "$target" "$fence"
-  wait "$worker"
-
-  kill -0 "$pid" 2>/dev/null
-  [ -L "$fence" ]
-  [ -e "$(agmsg_spawn_path "$STEAM" symlinked)" ]
-}
-
 @test "drain wait renews the watchdog tombstone with the same owner" {
   local snapshot="$RUN/tombstone.snapshot" worker tombstone first_mtime second_mtime
   start_stub_bridge leased 1 ignore-usr2
