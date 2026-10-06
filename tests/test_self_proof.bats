@@ -12,6 +12,8 @@
 # file only makes the first.
 
 setup() {
+  QUARANTINED=1
+  skip "quarantined: scripts/lib/self-proof.sh is not in this repo; restore when it lands with the terminal driver (#72)"
   load 'test_helper'
   setup_test_env
   export SKILL_DIR="$TEST_SKILL_DIR"
@@ -102,6 +104,8 @@ PSEOF
   done
 }
 teardown() {
+  # setup() skipped before load/setup_test_env, so there is nothing to clean.
+  [ -z "${QUARANTINED:-}" ] || return 0
   # Reaped right here, not left for the shell to notice later (#1187): a
   # killed background job's exit status (143) and bash's own asynchronous
   # "Terminated" notice both surface at whatever point the shell next checks
