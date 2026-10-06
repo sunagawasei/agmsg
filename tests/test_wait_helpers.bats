@@ -90,16 +90,18 @@ exercise_bats_signal_cleanup() {
     '  test_fixture_register_owned_pid "$watcher_pid"' \
     '  test_fixture_start_agent "2.1.199" bats-signal-fifo' \
     '  fifo_pid="$TEST_FIXTURE_PID"' \
-    '  printf "%s %s %s\n" "$BASHPID" "$watcher_pid" "$fifo_pid" > "$BATS_SIGNAL_READY"' \
+    '  printf "%s %s %s\n" "$$" "$watcher_pid" "$fifo_pid" > "$BATS_SIGNAL_READY"' \
     '  wait "$watcher_pid"' \
     '}' \
     >"$nested"
 
-  env --default-signal=INT --default-signal=TERM \
-    AGMSG_TEST_FIXTURE_RUN_ID="$run_id" \
+  # A background job starts with INT ignored, and that survives exec. BSD env has
+  # no --default-signal, so perl restores both defaults before exec'ing bats.
+  env AGMSG_TEST_FIXTURE_RUN_ID="$run_id" \
     AGMSG_TEST_FIXTURE_LEDGER_DIR="$ledger_dir" \
     AGMSG_TEST_SOURCE_TEST_DIR="$BATS_TEST_DIRNAME" \
     BATS_SIGNAL_READY="$ready" \
+    perl -e '$SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV or die "exec: $!\n"' -- \
     bats "$nested" >"$log" 2>&1 &
   runner=$!
   if ! wait_for_file "$ready"; then

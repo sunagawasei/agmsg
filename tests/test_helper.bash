@@ -434,6 +434,10 @@ _ready_path() {   # <team> <agent>
 }
 
 teardown_test_env() {
+  # Kills and un-ledgers every fixture the test registered; without this the
+  # fixture-pids ledger outlives the test and survivor checks see it.
+  local fixture_rc=0
+  test_fixture_cleanup || fixture_rc=$?
   _reap_test_jobs || true
   # Try the plain rm FIRST, and only reap when it actually fails. The reaper's scan is a
   # full `ps -eo pid=,args=`; running it in EVERY teardown would add that cost to all of
@@ -442,11 +446,13 @@ teardown_test_env() {
   # is rare (only the codex tests spawn the detached launcher), and it announces itself
   # as a non-zero rm ("Directory not empty" / "Device or resource busy"), so pay the cost
   # exactly there: on failure, reap the TEST_SKILL_DIR-scoped holders and retry.
-  rm -rf "$TEST_SKILL_DIR" 2>/dev/null && return 0
+  if rm -rf "$TEST_SKILL_DIR" 2>/dev/null; then
+    return "$fixture_rc"
+  fi
   local reap_status=0 rm_status=0
   _reap_test_skill_dir_procs || reap_status=$?
   rm -rf "$TEST_SKILL_DIR" || rm_status=$?
-  [ "$reap_status" -eq 0 ] && [ "$rm_status" -eq 0 ]
+  [ "$reap_status" -eq 0 ] && [ "$rm_status" -eq 0 ] && [ "$fixture_rc" -eq 0 ]
 }
 
 # Bind SessionEnd tests to a live owner PID so session-end.sh publishes a
