@@ -1340,7 +1340,9 @@ HOSTILE
   local name=foreign-collision
   local scratch="$TEST_SKILL_DIR/run/claude-code-team-$name-cwd"
   cat > "$collision_env" <<'COLLISION'
-if [ "${0:-}" = "${SPAWN_SCRIPT_FOR_COLLISION:-}" ]; then
+# bash 3.2 runs BASH_ENV before it sets $0, so spawn.sh cannot be told apart by
+# name. It is the first bash this env starts; mkdir lets only that one act.
+if mkdir "$CAPTURE/once-collision" 2>/dev/null; then
   collision_token="agmsg-probe-$$"
   collision_scratch="$FAKE_RUN/claude-code-team-$COLLISION_NAME-cwd"
   mkdir -p "$collision_scratch"
@@ -1350,13 +1352,12 @@ if [ "${0:-}" = "${SPAWN_SCRIPT_FOR_COLLISION:-}" ]; then
   printf 'foreign run\n' > "$FAKE_RUN/.${collision_token}-run-write"
 fi
 COLLISION
-  export SPAWN_SCRIPT_FOR_COLLISION="$SCRIPTS/spawn.sh"
   export COLLISION_NAME="$name"
   export BASH_ENV="$collision_env"
 
   run spawn_claude "$name"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"owner-scoped probe target collision"* ]]
+  printf '%s\n' "$output" | grep -Fq "owner-scoped probe target collision"
   [ ! -e "$CAPTURE/probe-count" ]
   [ ! -e "$CAPTURE/bridge.args.$name" ]
   [ ! -e "$TEST_SKILL_DIR/run/claude-code-bridge.team.$name.settings.json" ]
@@ -1375,23 +1376,19 @@ COLLISION
 @test "exclusive owner creation never clobbers an existing file or follows a link" {
   local symlink_env="$TEST_SKILL_DIR/symlink-bash-env"
   cat > "$symlink_env" <<'SYMLINKS'
-if [ "${0:-}" = "${SPAWN_SCRIPT_FOR_SYMLINK:-}" ]; then
-  case "${2:-}" in
-    regular-prompt)
-      symlink_path="$FAKE_RUN/claude-code-bridge.team.regular-prompt.probe.prompt"
-      printf 'preserved prompt\n' > "$symlink_path"
-      ;;
-    *) return 0 ;;
-  esac
-  printf '%s\n' "$symlink_path" > "$CAPTURE/symlink-path.${2:-unknown}"
+# bash 3.2 runs BASH_ENV before it sets $0 and $2, so spawn.sh cannot be told
+# apart by name. It is the first bash this env starts; mkdir lets only that one act.
+if mkdir "$CAPTURE/once-symlink" 2>/dev/null; then
+  symlink_path="$FAKE_RUN/claude-code-bridge.team.regular-prompt.probe.prompt"
+  printf 'preserved prompt\n' > "$symlink_path"
+  printf '%s\n' "$symlink_path" > "$CAPTURE/symlink-path.regular-prompt"
 fi
 SYMLINKS
-  export SPAWN_SCRIPT_FOR_SYMLINK="$SCRIPTS/spawn.sh"
   export BASH_ENV="$symlink_env"
 
   run spawn_claude regular-prompt
   [ "$status" -ne 0 ]
-  [[ "$output" == *"Claude probe diagnostic collision"* ]]
+  printf '%s\n' "$output" | grep -Fq "Claude probe diagnostic collision"
   local regular_prompt
   regular_prompt="$(cat "$CAPTURE/symlink-path.regular-prompt")"
   [ ! -L "$regular_prompt" ]
