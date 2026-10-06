@@ -3496,56 +3496,68 @@ EOF
   grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
 }
 
+# The one diagnostic reachable on every store layout that carries a multibyte
+# name: a watcher started on a dead composite instance id says so and exits.
+# `_mb_dead_watch <sid> <cap>` runs it once and leaves the record in the log.
+_mb_dead_watch() {
+  local wpid
+  AGMSG_WATCH_LOG_MAX_BYTES="$2" bash "$SCRIPTS/watch.sh" "$1" "$TEST_PROJECT" claude-code \
+    >/dev/null 2>/dev/null &
+  wpid=$!
+  if ! wait_for_pid_exit "$wpid"; then
+    kill "$wpid" 2>/dev/null || true
+    wait "$wpid" 2>/dev/null || true
+    echo "watch.sh kept running on a dead instance id" >&2
+    return 1
+  fi
+  wait "$wpid" 2>/dev/null || true
+}
+
+# A UTF-8 locale for the character count; without one chars == bytes and the
+# case cannot tell the two units apart.
+_mb_utf8_locale() {
+  local utf8
+  utf8="$(locale -a 2>/dev/null | grep -i -m1 -E '^(en_US|C)\.utf-?8$' || true)"
+  [ -n "$utf8" ] || return 1
+  export LC_ALL="$utf8"
+}
+
 @test "watch: the cap is bytes, not characters (#691)" {
   # `${#record}` counts CHARACTERS in a UTF-8 locale while the cap and stat are
   # BYTES, so a multibyte diagnostic passes a character check and lands over the
-  # byte ceiling. Team names may legally be Unicode and the storeless notice
-  # puts the name in the record, so this is reachable, not theoretical.
+  # byte ceiling. Instance ids and team names may legally be Unicode, so this is
+  # reachable, not theoretical.
   #
-  # Two attempts failed to measure it before this one, and both failed the same
-  # way -- the mutation stayed green. First the record was the liveness guard's,
-  # which is pure ASCII. Then the padding was large enough that BOTH counts
-  # crossed the cap, so the two answers agreed. The gap only shows in the window
-  # where chars fit and bytes do not, so the padding is computed from the record
-  # this fixture actually produces rather than guessed.
-  local log db record chars bytes pad cap live
-  bash "$SCRIPTS/join.sh" "境界検査のためのとても長い日本語チーム名" alice claude-code "$TEST_PROJECT" >/dev/null
-  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path 境界検査のためのとても長い日本語チーム名')"
-  rm -f "$db"
-  log="$TEST_SKILL_DIR/run/watch.mb-session.log"
+  # The cap has to sit in the window where the character count fits and the byte
+  # count does not, so the padding is computed from the record this fixture
+  # actually produces rather than guessed.
+  _mb_utf8_locale || skip "no UTF-8 locale available"
+  local dead sid log record chars bytes pad cap live
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || { echo "pid $dead is still alive" >&2; return 1; }
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  sid="境界検査のためのとても長い日本語.$dead"
+  log="$TEST_SKILL_DIR/run/watch.$sid.log"
   mkdir -p "$TEST_SKILL_DIR/run"
 
   # Pass 1: an effectively unlimited cap, purely to observe the record.
-  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=1000000 \
-    bash "$SCRIPTS/watch.sh" mb-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
-  local wpid=$! waited=0
-  while [ "$waited" -lt 100 ]; do
-    grep -q 'no store yet' "$log" 2>/dev/null && break
-    sleep 0.1; waited=$((waited + 1))
-  done
-  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
-  record="$(grep 'no store yet' "$log" | head -1)"
-  [ -n "$record" ] || { echo "the notice naming the team never appeared" >&2; return 1; }
+  _mb_dead_watch "$sid" 1000000
+  record="$(grep 'no longer alive' "$log" | head -1)"
+  [ -n "$record" ] || { echo "the multibyte diagnostic never appeared" >&2; return 1; }
   chars=${#record}
   bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]')"
   # The two answers must actually differ, or this fixture proves nothing.
   [ "$bytes" -gt "$chars" ] || { echo "record is not multibyte: $chars/$bytes" >&2; return 1; }
 
   # Pass 2: a cap inside the window -- chars say it fits, bytes say it does not.
-  cap=$(( 120 + chars + 1 ))
+  # The slack absorbs a pid with one more digit than pass 1's.
   pad=120
+  cap=$(( pad + chars + 1 + 5 ))
   rm -f "$log" "$log.1"
   head -c "$pad" /dev/zero | tr '\0' 'x' > "$log"
-  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=$cap \
-    bash "$SCRIPTS/watch.sh" mb-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
-  wpid=$!; waited=0
-  while [ "$waited" -lt 100 ]; do
-    grep -q 'no store yet' "$log" 2>/dev/null && break
-    grep -q 'no store yet' "$log.1" 2>/dev/null && break
-    sleep 0.1; waited=$((waited + 1))
-  done
-  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  _mb_dead_watch "$sid" "$cap"
 
+  [ -f "$log.1" ] || { echo "no rotation: chars=$chars bytes=$bytes cap=$cap" >&2; return 1; }
   live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
   [ "$live" -le "$cap" ] \
     || { echo "live log is $live bytes, cap $cap (chars=$chars bytes=$bytes pad=$pad)" >&2; return 1; }
@@ -3559,22 +3571,17 @@ EOF
   # The cap has to sit in the window where the character count would NOT
   # rotate, or the two behaviours agree and the case proves nothing. Same
   # derivation as the multibyte case: observe the record, then set the cap.
-  local log db record chars bytes cap pad live shim wpid waited
-  bash "$SCRIPTS/join.sh" "境界検査のためのとても長い日本語チーム名" alice claude-code "$TEST_PROJECT" >/dev/null
-  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path 境界検査のためのとても長い日本語チーム名')"
-  rm -f "$db"
-  log="$TEST_SKILL_DIR/run/watch.nowc-session.log"
+  _mb_utf8_locale || skip "no UTF-8 locale available"
+  local dead sid log record chars bytes cap pad shim
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || { echo "pid $dead is still alive" >&2; return 1; }
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  sid="境界検査のためのとても長い日本語.$dead"
+  log="$TEST_SKILL_DIR/run/watch.$sid.log"
   mkdir -p "$TEST_SKILL_DIR/run"
 
-  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=1000000 \
-    bash "$SCRIPTS/watch.sh" nowc-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
-  wpid=$!; waited=0
-  while [ "$waited" -lt 100 ]; do
-    grep -q 'no store yet' "$log" 2>/dev/null && break
-    sleep 0.1; waited=$((waited + 1))
-  done
-  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
-  record="$(grep 'no store yet' "$log" | head -1)"
+  _mb_dead_watch "$sid" 1000000
+  record="$(grep 'no longer alive' "$log" | head -1)"
   [ -n "$record" ] || { echo "no record to size the fixture from" >&2; return 1; }
   chars=${#record}
   bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]')"
@@ -3582,7 +3589,7 @@ EOF
 
   # In the window: the character count fits, the real byte count does not.
   pad=120
-  cap=$(( pad + chars + 1 ))
+  cap=$(( pad + chars + 1 + 5 ))
   rm -f "$log" "$log.1"
   head -c "$pad" /dev/zero | tr '\0' 'x' > "$log"
 
@@ -3590,21 +3597,15 @@ EOF
   shim="$TEST_SKILL_DIR/shim"; mkdir -p "$shim"
   printf '#!/bin/sh\nexit 1\n' > "$shim/wc"; chmod +x "$shim/wc"
 
-  PATH="$shim:$PATH" AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=$cap \
-    bash "$SCRIPTS/watch.sh" nowc-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
-  wpid=$!; waited=0
-  while [ "$waited" -lt 100 ]; do
-    [ -f "$log.1" ] && break
-    grep -q 'no store yet' "$log" 2>/dev/null && break
-    sleep 0.1; waited=$((waited + 1))
-  done
-  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  PATH="$shim:$PATH" _mb_dead_watch "$sid" "$cap"
 
+  [ -f "$log.1" ] || { echo "the unmeasurable record was written without rotating" >&2; return 1; }
+  local live
   live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
   [ "$live" -le "$cap" ] \
     || { echo "live log is $live bytes, cap $cap (chars=$chars bytes=$bytes pad=$pad)" >&2; return 1; }
   # And the diagnostic was not lost to the conservative choice.
-  grep -q 'no store yet' "$log" || { echo "the record was dropped" >&2; cat "$log" >&2; return 1; }
+  grep -q 'no longer alive' "$log" || { echo "the record was dropped" >&2; cat "$log" >&2; return 1; }
 }
 
 @test "watch: an invalid log cap falls back to the default, not to no bound (#691)" {
