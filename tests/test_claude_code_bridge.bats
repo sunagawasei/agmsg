@@ -187,7 +187,7 @@ send_to_worker() {
 }
 
 db_scalar() {
-  sqlite3 "$FAKE_DB" "$1" | tr -d '\r'
+  sqlite3 -cmd ".timeout 5000" "$FAKE_DB" "$1" | tr -d '\r'
 }
 
 event_id_for_body() {
