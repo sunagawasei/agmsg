@@ -231,7 +231,10 @@ release_delayed_watch() {
 # A Windows drive or UNC path is already absolute; prefixing $PWD would point
 # the pasted command at a path that does not exist.
 @test "delivery set: the recovery line keeps a Windows drive or UNC path as given" {
-  run bash -c 'source "$1"; _agmsg_print_delivery_recovery monitor codex "C:/work/proj" 2>&1; _agmsg_print_delivery_recovery monitor codex "D:\\work\\proj" 2>&1; _agmsg_print_delivery_recovery monitor codex "\\\\server\\share\\proj" 2>&1' _ <(sed -n '/^_agmsg_shq()/,/^}/p; /^_agmsg_print_delivery_recovery()/,/^}/p' "$SCRIPTS/delivery.sh")
+  # bash 3.2 sizes `source <(...)` by the pipe's buffered bytes, so it can load nothing
+  local fns="$BATS_TEST_TMPDIR/delivery-fns.sh"
+  sed -n '/^_agmsg_shq()/,/^}/p; /^_agmsg_print_delivery_recovery()/,/^}/p' "$SCRIPTS/delivery.sh" > "$fns"
+  run bash -c 'source "$1"; _agmsg_print_delivery_recovery monitor codex "C:/work/proj" 2>&1; _agmsg_print_delivery_recovery monitor codex "D:\\work\\proj" 2>&1; _agmsg_print_delivery_recovery monitor codex "\\\\server\\share\\proj" 2>&1' _ "$fns"
   [ "$status" -eq 0 ]
   printf '%s\n' "$output" | grep -q -F -- "'C:/work/proj'"
   printf '%s\n' "$output" | grep -q -F -- "'D:\\work\\proj'"
