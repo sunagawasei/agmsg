@@ -159,6 +159,36 @@ _wait_until_read_for_alice() {   # <body-substring> <budget-seconds>
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
 }
 
+# A ctrl:despawn row consumed up to its own position: later rows in the same
+# batch stay unread, and a new watcher for the same role does not see the
+# despawn again (it would otherwise tear down the new session).
+@test "despawn: graceful — consume stops at the control row and the despawn is not re-delivered" {
+  bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
+  setup_live_owner "$RUN" sess-n
+
+  bash "$SCRIPTS/send.sh" team leader alice "ctrl:despawn" >/dev/null
+  bash "$SCRIPTS/send.sh" team leader alice "after-despawn" >/dev/null
+
+  AGMSG_WATCH_INTERVAL=1 env -u TMUX_PANE bash "$SCRIPTS/watch.sh" sess-n "$PROJ" claude-code alice \
+    >/dev/null 2>&1 3>&- &
+  local wpid=$!
+
+  _wait_until_read_for_alice "ctrl:despawn" 10
+  [ "$(_alice_unread_state_for "after-despawn")" = "unread" ]
+
+  run bash -c "
+    source '$SCRIPTS/lib/storage.sh'
+    agmsg_storage_load || exit 2
+    cur=\$(storage_read_cursor_get team alice) || exit 3
+    storage_watch_after \"\$cur\" team:alice"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *'ctrl:despawn'* ]]
+  [[ "$output" == *'after-despawn'* ]]
+
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+}
+
 @test "despawn --force: kills recorded placement and drops registration without the member" {
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
   # Placement as spawn would have recorded it (pane %99 doesn't exist; kill is

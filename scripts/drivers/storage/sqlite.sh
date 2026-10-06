@@ -336,7 +336,7 @@ storage_watch_after() {
   _sqlite_data "
     BEGIN;
     SELECT json_object('type','message_sent','id',id,'team',team,'from',from_agent,
-                       'to',to_agent,'body',body,'at',at)
+                       'to',to_agent,'body',body,'at',at,'cursor',CAST(seq AS TEXT))
     FROM events
     WHERE type='message_sent' AND seq > $cursor
       AND (team || ':' || to_agent) IN ($pairs)

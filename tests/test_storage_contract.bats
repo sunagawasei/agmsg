@@ -87,6 +87,18 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   [[ "$output" != *m1* ]]
 }
 
+@test "contract: a message_sent record's cursor resumes right after that message" {
+  local tip; tip=$(storage_watch_tip agsuite:bob)
+  storage_send agsuite alice bob "m1"
+  storage_send agsuite alice bob "m2"
+  local out; out=$(storage_watch_after "$tip" agsuite:bob)
+  local c1; c1=$(printf '%s\n' "$out" | grep -F '"body":"m1"' | sed -n 's/.*"cursor":"\([^"]*\)".*/\1/p')
+  [ -n "$c1" ]
+  run storage_watch_after "$c1" agsuite:bob
+  [[ "$output" != *m1* ]]
+  [[ "$output" == *m2* ]]
+}
+
 @test "contract: history returns messages involving the agent" {
   storage_send agsuite alice bob "h1"
   storage_send agsuite bob alice "h2"

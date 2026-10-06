@@ -159,6 +159,9 @@ characters (e.g. a JSONL byte offset bundled with metadata) must encode it
   the same span on every poll. Poll-once: it returns what is currently available
   and exits — core loops on its own interval; a streaming backend may implement
   it as one non-blocking drain.
+  Each `message_sent` record may carry an optional `"cursor":"<opaque>"` — the
+  position immediately after that message. A caller that stops mid-batch passes it
+  to `storage_read_cursor_consume` so only the messages up to it count as consumed.
 
 Each `<pair>` is `<team>:<agent>`. Team and agent names cannot contain `:` (the
 name rules enforce this); a driver may additionally reject a pair it cannot split
