@@ -168,10 +168,12 @@ put_record() {
 
 write_request() {
   local thread="$1" app_server="${2:-ws://127.0.0.1:1}"
+  local pair_team="${3:-}" pair_name="${4:-}"
   # #1254: the request file is keyed by AGMSG_CODEX_SEAT_KEY now, not a
   # project hash -- this file's setup() exports one fixed key for the whole
   # suite, which every launcher invocation below inherits.
-  printf 'codex\t%s\t%s\n' "$thread" "$app_server" > "$RUN_DIR/codex-bridge-request.$AGMSG_CODEX_SEAT_KEY"
+  printf 'codex\t%s\t%s\t%s\t%s\n' "$thread" "$app_server" "$pair_team" "$pair_name" \
+    > "$RUN_DIR/codex-bridge-request.$AGMSG_CODEX_SEAT_KEY"
 }
 
 # Start a signal-controlled live PID without imposing a fixed-duration sleep on
@@ -325,7 +327,7 @@ run_launcher() {
 
 @test "launcher: ignores a stale request app-server URL and binds to its live server" {
   put_record team alice rec-thread-1 "$PROJ" codex
-  write_request old-request-thread ws://127.0.0.1:2
+  write_request old-request-thread ws://127.0.0.1:2 team alice
   run_launcher
 
   [ -f "$CAPTURE" ]
@@ -431,7 +433,7 @@ run_launcher() {
   bash "$SCRIPTS/join.sh" team bob codex "$PROJ" >/dev/null
   put_record team alice thread-alice "$PROJ" codex
   put_record team bob thread-bob "$PROJ" codex
-  write_request thread-bob team bob
+  write_request thread-bob ws://127.0.0.1:1 team bob
   run_launcher
 
   grep -q -- $'--pair team\tbob --thread thread-bob' "$CAPTURE"
@@ -570,7 +572,7 @@ child_count_is() {
   put_record team bob thread-bob "$PROJ" codex
   # SessionStart publishes the seat's narrowed pair. Until that request is
   # written, the project-wide identity is deliberately ignored.
-  write_request thread-bob team bob
+  write_request thread-bob ws://127.0.0.1:1 team bob
   for i in {1..100}; do
     grep -q -- $'--pair team\tbob' "$CAPTURE" 2>/dev/null && break
     sleep 0.1
