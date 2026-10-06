@@ -1602,7 +1602,9 @@ JSON
   bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
 
-  sleep 30 3>&- &
+  # A legacy pidfile is kept only while its pid still looks like watch.sh.
+  printf '%s\n' '#!/usr/bin/env bash' 'sleep 30' > "$TEST_SKILL_DIR/watch.sh"
+  bash "$TEST_SKILL_DIR/watch.sh" 3>&- &
   local live_pid=$!
   echo "$live_pid" > "$TEST_SKILL_DIR/run/watch.sweep-live-native.pid"
 
@@ -3153,6 +3155,7 @@ EOF
     --scope "codex-bridge|team.alice" -- sleep 60 3>&- >/dev/null 2>&1 &
   local bpid=$!
   wait_for_file "$TEST_SKILL_DIR/run/codex-bridge.team.alice.owner"
+  wait_for_file "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
   echo "pid=$bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta"
   : > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.log"
   # The launcher's stale-binding sidecar + the project's shared app-server record
