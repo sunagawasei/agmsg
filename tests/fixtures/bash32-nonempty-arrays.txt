@@ -35,6 +35,8 @@ scripts/lib/pending-teardown.sh|despawn_args|literal non-empty initializer
 scripts/release/sync-version.sh|DERIVED|literal non-empty initializer
 scripts/reset.sh|RESET_CONFIGS|a glob without nullglob stays one literal word
 scripts/session-end-worker.sh|argv|length checked before the loop
+scripts/session-start.sh|_gc_batch_paths|length checked before the call
+scripts/session-start.sh|_ttl_batch_dirs|length checked before the call
 scripts/spawn.sh|tmux_boot|literal non-empty initializer
 scripts/watchdog.sh|PIPESTATUS|bash always sets it
 scripts/watch.sh|PIPESTATUS|a pipeline always has at least one status
