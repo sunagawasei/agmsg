@@ -51,7 +51,12 @@ teardown() {
     kill -0 "$pid" 2>/dev/null || continue
     cmd="$(/bin/ps -p "$pid" -o args= 2>/dev/null)"
     case "$cmd" in
-      *"$expect"*) kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true ;;
+      *"$expect"*)
+        # Bounded: a watcher that survives TERM must not turn teardown into an
+        # unbounded wait that holds the whole shard until its timeout.
+        kill "$pid" 2>/dev/null
+        wait_for_pid_exit "$pid" >/dev/null 2>&1 || kill -9 "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null || true ;;
     esac
   done <<< "$WATCHED_PIDS"
   rm -rf "$FAKE_HOME"
@@ -444,8 +449,10 @@ PS1
   run kill -0 "$first"
   [ "$status" -ne 0 ]
 
+  # Bounded for the same reason as teardown: a bare `wait` here blocks forever
+  # on a watcher that survives TERM (ubuntu shard 1/5 hung 30 minutes on it).
   kill "$second" 2>/dev/null || true
-  wait 2>/dev/null || true
+  wait_for_pid_exit "$second"
 }
 
 # --- Pipe-stdin guard: simulate a curl|bash entry path (#98) ---
