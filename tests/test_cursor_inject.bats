@@ -794,7 +794,9 @@ exit 0
 EOF
   chmod +x "$ENVPROP_STUB_BIN2/fake-cursor-bridge.sh"
 
-  run env AGMSG_CURSOR_AGENT_CMD="$ENVPROP_STUB_BIN2/cursor-agent" \
+  # spawn.sh resolves the type's cli= on PATH before the driver reads the override.
+  run env PATH="$ENVPROP_STUB_BIN2:$PATH" \
+    AGMSG_CURSOR_AGENT_CMD="$ENVPROP_STUB_BIN2/cursor-agent" \
     AGMSG_CURSOR_BRIDGE_CMD="$ENVPROP_STUB_BIN2/fake-cursor-bridge.sh" \
     bash "$SCRIPTS/spawn.sh" cursor curfake --project "$ENVPROP_PROJECT2" --headless
   [ "$status" -eq 0 ]
