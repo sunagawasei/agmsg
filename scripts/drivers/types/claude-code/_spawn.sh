@@ -184,7 +184,7 @@ agmsg_spawn_headless() {
   local probe_timeout="${AGMSG_CLAUDE_PROBE_TIMEOUT:-30}" attempts=0 probe_rc=0
   case "$probe_timeout" in ''|*[!0-9]*|0) probe_timeout=30 ;; esac
   local probe_cache_enabled=1 probe_cache_ttl="" probe_cache_ttl_valid=0
-  local probe_cache_bypass=0 probe_cache_key="" probe_cache_hit=0
+  local probe_cache_key="" probe_cache_hit=0
   local probe_cache_recordable=0
 
   _agmsg_claude_cleanup_probe_targets() {
@@ -273,10 +273,18 @@ agmsg_spawn_headless() {
 
   mkdir -p "$run_dir" \
     || _agmsg_claude_spawn_fail "cannot create run directory $run_dir"
+  # A symlinked scratch would point the .claude removal below outside run/.
+  [ ! -L "$scratch" ] \
+    || _agmsg_claude_spawn_fail "Claude scratch cwd $scratch is a symlink; refusing to use it"
   if [ ! -d "$scratch" ]; then
     mkdir -p "$scratch" \
       || _agmsg_claude_spawn_fail "cannot create Claude scratch cwd $scratch"
     scratch_created=1
+  fi
+  # Project-local settings left by a previous worker would be read by this one.
+  if [ -e "$scratch/.claude" ] || [ -L "$scratch/.claude" ]; then
+    if [ -L "$scratch/.claude" ]; then rm -f -- "$scratch/.claude"; else rm -rf -- "$scratch/.claude"; fi \
+      || _agmsg_claude_spawn_fail "cannot remove stale $scratch/.claude"
   fi
   if [ ! -d "$child_tmp" ]; then
     mkdir -p "$child_tmp" \
@@ -313,11 +321,7 @@ agmsg_spawn_headless() {
     ''|*[!0-9]*|0) probe_cache_ttl_valid=0 ;;
     *) probe_cache_ttl_valid=1 ;;
   esac
-  if [ -e "$scratch/.claude" ] || [ -L "$scratch/.claude" ]; then
-    probe_cache_bypass=1
-  fi
-  if [ "$probe_cache_enabled" = 1 ] && [ "$probe_cache_ttl_valid" = 1 ] \
-    && [ "$probe_cache_bypass" != 1 ]; then
+  if [ "$probe_cache_enabled" = 1 ] && [ "$probe_cache_ttl_valid" = 1 ]; then
     probe_cache_recordable=1
   fi
   if probe_cache_key="$(agmsg_claude_probe_cache_key "$layout" "$PROJECT" \

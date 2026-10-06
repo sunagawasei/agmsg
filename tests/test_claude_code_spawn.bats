@@ -1922,32 +1922,42 @@ STUB
   [ "$(claude_probe_count)" -eq 1 ]
 }
 
-@test "scratch .claude directory or symlink bypasses probe cache without writing" {
-  run spawn_claude bypass-seed
+@test "spawn removes a stale scratch .claude directory or symlink and still hits the probe cache" {
+  run spawn_claude stale-seed
   [ "$status" -eq 0 ]
   [ "$(claude_probe_count)" -eq 1 ]
-  local rec_before
-  rec_before="$(claude_probe_cache_count)"
 
-  local scratch="$TEST_SKILL_DIR/run/claude-code-team-bypass-dir-cwd"
+  local scratch="$TEST_SKILL_DIR/run/claude-code-team-stale-dir-cwd"
   mkdir -p "$scratch/.claude"
+  printf '{}\n' > "$scratch/.claude/settings.local.json"
   reset_probe_capture
-  run spawn_claude bypass-dir
+  run spawn_claude stale-dir
   [ "$status" -eq 0 ]
-  wait_bridge_capture bypass-dir
-  [ "$(claude_probe_count)" -eq 1 ]
-  [ "$(claude_probe_cache_count)" -eq "$rec_before" ]
-  [[ "$output" != *"reusing cached Claude"* ]]
+  wait_bridge_capture stale-dir
+  [ ! -e "$scratch/.claude" ]
+  [ "$(claude_probe_count)" -eq 0 ]
 
-  local scratch_link="$TEST_SKILL_DIR/run/claude-code-team-bypass-link-cwd"
-  mkdir -p "$scratch_link"
-  ln -s "$TEST_SKILL_DIR/managed-claude" "$scratch_link/.claude"
-  reset_probe_capture
-  run spawn_claude bypass-link
+  local scratch_link="$TEST_SKILL_DIR/run/claude-code-team-stale-link-cwd"
+  local target="$TEST_SKILL_DIR/managed-claude"
+  mkdir -p "$scratch_link" "$target"
+  printf '{}\n' > "$target/settings.local.json"
+  ln -s "$target" "$scratch_link/.claude"
+  run spawn_claude stale-link
   [ "$status" -eq 0 ]
-  wait_bridge_capture bypass-link
-  [ "$(claude_probe_count)" -eq 1 ]
-  [ "$(claude_probe_cache_count)" -eq "$rec_before" ]
+  wait_bridge_capture stale-link
+  [ ! -e "$scratch_link/.claude" ] && [ ! -L "$scratch_link/.claude" ]
+  [ -f "$target/settings.local.json" ]
+}
+
+@test "spawn refuses a symlinked scratch cwd and leaves the target .claude intact" {
+  local external="$TEST_SKILL_DIR/external-cwd"
+  mkdir -p "$external/.claude" "$TEST_SKILL_DIR/run"
+  printf '{}\n' > "$external/.claude/settings.local.json"
+  ln -s "$external" "$TEST_SKILL_DIR/run/claude-code-team-symscratch-cwd"
+  run spawn_claude symscratch
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"is a symlink"* ]]
+  [ -f "$external/.claude/settings.local.json" ]
 }
 
 @test "unreadable cache-key inputs and invalid TTL stay uncacheable across consecutive spawns" {
@@ -2118,7 +2128,7 @@ STUB
   [[ "$rule" == *'\[glob\]'* ]]
 }
 
-@test "probe failure while cache is off, TTL invalid, or scratch-bypassed forgets a prior record" {
+@test "probe failure while cache is off or TTL invalid forgets a prior record" {
   run spawn_claude gate-seed
   [ "$status" -eq 0 ]
   [ "$(claude_probe_cache_count)" -eq 1 ]
@@ -2147,21 +2157,6 @@ STUB
   export FAKE_PROBE_MODE=complete
   reset_probe_capture
   run spawn_claude gate-ttl-restored
-  [ "$status" -eq 0 ]
-  [ "$(claude_probe_count)" -eq 1 ]
-  [[ "$output" != *"reusing cached Claude"* ]]
-
-  local scratch="$TEST_SKILL_DIR/run/claude-code-team-gate-byp-cwd"
-  mkdir -p "$scratch/.claude"
-  export FAKE_PROBE_MODE=missing
-  reset_probe_capture
-  run spawn_claude gate-byp
-  [ "$status" -ne 0 ]
-  [ "$(claude_probe_cache_count)" -eq 0 ]
-  rm -rf "$scratch/.claude"
-  export FAKE_PROBE_MODE=complete
-  reset_probe_capture
-  run spawn_claude gate-byp-restored
   [ "$status" -eq 0 ]
   [ "$(claude_probe_count)" -eq 1 ]
   [[ "$output" != *"reusing cached Claude"* ]]
