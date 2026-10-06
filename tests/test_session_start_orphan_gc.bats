@@ -76,7 +76,7 @@ run_session_start() {
 
   local team='s-C0DE-7EA'
   local name='race-worker'
-  local rec marker real_cat stub_bin
+  local rec marker real_stat stub_bin
   mkdir -p "$TEST_SKILL_DIR/run" "$TEST_SKILL_DIR/teams/$team"
   rec="$(agmsg_spawn_path "$team" "$name")"
   test_fixture_start_reaped_process sleep 300
@@ -85,23 +85,26 @@ run_session_start() {
   printf 'pid=%s\n' "$worker_pid" > "$TEST_SKILL_DIR/run/codex-bridge.$team.$name.meta"
 
   marker="$TEST_SKILL_DIR/run/race-cat.marker"
-  real_cat="$(command -v cat)"
+  real_stat="$(command -v stat)"
   stub_bin="$TEST_SKILL_DIR/race-bin"
   mkdir -p "$stub_bin"
-  cat > "$stub_bin/cat" <<'EOF'
+  # The mtime batch runs before any record is read, so replacing the record
+  # from it must be seen as the record the GC acts on.
+  cat > "$stub_bin/stat" <<'EOF'
 #!/usr/bin/env bash
-if [ "${1:-}" = "$RACE_REC" ] && [ ! -e "$RACE_MARKER" ]; then
+if [ ! -e "$RACE_MARKER" ] && [[ " $* " == *"$RACE_REC"* ]]; then
   : > "$RACE_MARKER"
   printf '%%99\t%s\tclaude-code\n' "$RACE_PROJECT" > "$RACE_REC"
 fi
-exec "$REAL_CAT" "$@"
+exec "$REAL_STAT" "$@"
 EOF
-  chmod +x "$stub_bin/cat"
+  chmod +x "$stub_bin/stat"
 
   export PATH="$stub_bin:$PATH" RACE_REC="$rec" RACE_MARKER="$marker" \
-    RACE_PROJECT="$PROJ" REAL_CAT="$real_cat"
+    RACE_PROJECT="$PROJ" REAL_STAT="$real_stat"
   run run_session_start
   [ "$status" -eq 0 ]
+  [ -e "$marker" ]
   run kill -0 "$worker_pid"
   [ "$status" -eq 0 ]
   [ "$(head -1 "$rec")" = $'%99\t'"$PROJ"$'\tclaude-code' ]
@@ -457,4 +460,118 @@ EOF
   [ "$status" -eq 0 ]
   [ ! -d "$TEST_SKILL_DIR/teams/$team" ]
   [ ! -e "$rec" ]
+}
+
+# A GNU stat ahead of the BSD one on PATH (nix) answers `stat -f %m` with a
+# filesystem report, so no mtime can be read at all. The tests that need a real
+# mtime put a working stat first, or skip when none exists.
+_use_working_stat() {
+  local f="$TEST_SKILL_DIR/run/stat-probe" cand
+  : > "$f"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/compat.sh"
+  case "$(compat_file_mtime "$f" 2>/dev/null)" in ''|*[!0-9]*) ;; *) return 0 ;; esac
+  for cand in /usr/bin/stat /bin/stat; do
+    [ -x "$cand" ] || continue
+    mkdir -p "$TEST_SKILL_DIR/stat-bin"
+    ln -sf "$cand" "$TEST_SKILL_DIR/stat-bin/stat"
+    PATH="$TEST_SKILL_DIR/stat-bin:$PATH"
+    case "$(compat_file_mtime "$f" 2>/dev/null)" in ''|*[!0-9]*) ;; *) return 0 ;; esac
+  done
+  skip "no stat that reads an mtime"
+}
+
+# Count the external commands the orphan GC used to start once per record. The
+# whole session-start is counted, so the figure is taken at two record counts
+# and only the difference is held to a bound: whatever else session-start
+# starts does not depend on how many spawn records exist.
+_gc_forks_for() {   # <n records> -> prints "<date> <stat> <cat> <tr>"
+  local n="$1" i team stub_bin real cmd log
+  rm -f "$TEST_SKILL_DIR"/run/spawn.s-* "$TEST_SKILL_DIR/run/fork-count.log"
+  for i in $(seq 1 "$n"); do
+    team="$(printf 's-DEAD%04d' "$i")"
+    printf 'pid:%s\t%s\tcodex\n' "$((4000000 + i))" "$PROJ" > "$(agmsg_spawn_path "$team" "w$i")"
+  done
+  stub_bin="$TEST_SKILL_DIR/count-bin"
+  mkdir -p "$stub_bin"
+  log="$TEST_SKILL_DIR/run/fork-count.log"
+  for cmd in date stat cat tr; do
+    real="$(command -v "$cmd")"
+    printf '#!/usr/bin/env bash\necho %s >> "$FORK_LOG"\nexec "%s" "$@"\n' "$cmd" "$real" > "$stub_bin/$cmd"
+    chmod +x "$stub_bin/$cmd"
+  done
+  FORK_LOG="$log" PATH="$stub_bin:$PATH" run_session_start >/dev/null 2>&1
+  for cmd in date stat cat tr; do
+    printf '%s ' "$(grep -cx "$cmd" "$log" 2>/dev/null || true)"
+  done
+}
+
+@test "session-start orphan GC starts no external command per spawn record" {
+  _use_working_stat
+  enable_session_team
+  local base more
+  # The first session-start in a fresh skill dir registers its team; count
+  # only runs that start from the same state.
+  _gc_forks_for 0 >/dev/null
+  base="$(_gc_forks_for 0)"
+  more="$(_gc_forks_for 20)"
+  read -r d0 s0 c0 t0 <<<"$base"
+  read -r d1 s1 c1 t1 <<<"$more"
+  # one mtime batch (a single xargs stat for 20 short paths), one clock read
+  [ "$((d1 - d0))" -le 1 ]
+  [ "$((s1 - s0))" -le 2 ]
+  [ "$((c1 - c0))" -eq 0 ]
+  [ "$((t1 - t0))" -eq 0 ]
+}
+
+@test "session-start orphan GC reports the age of a record from the mtime batch" {
+  _use_working_stat
+  enable_session_team
+  local team=s-DEADA9E rec
+  rec="$(agmsg_spawn_path "$team" worker)"
+  printf 'pid:%s\t%s\tcodex\n' 4000001 "$PROJ" > "$rec"
+  touch -t 202501010000 "$rec"
+  run run_session_start
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"team=$team worker=worker bridge_pid=4000001 spawn_age_s="* ]]
+  local age="${output##*spawn_age_s=}"
+  age="${age%%[!0-9]*}"
+  [ -n "$age" ] && [ "$age" -gt 86400 ]
+}
+
+@test "session-start orphan GC reads a record that has no trailing newline" {
+  enable_session_team
+  local team=s-DEAD01 rec
+  rec="$(agmsg_spawn_path "$team" worker)"
+  printf 'pid:%s\t%s\tcodex' 4000003 "$PROJ" > "$rec"
+  run run_session_start
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"team=$team worker=worker bridge_pid=4000003 spawn_age_s="* ]]
+}
+
+@test "session-start orphan GC ignores an empty record" {
+  enable_session_team
+  local rec
+  rec="$(agmsg_spawn_path s-DEAD0E worker)"
+  : > "$rec"
+  run run_session_start
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | grep -c '^agmsg: orphan candidate ')" -eq 0 ]
+  [ -e "$rec" ]
+}
+
+@test "session-start TTL GC names each team dir without starting basename" {
+  enable_session_team
+  local stub_bin="$TEST_SKILL_DIR/count-bin" real i
+  mkdir -p "$stub_bin"
+  real="$(command -v basename)"
+  printf '#!/usr/bin/env bash\necho basename >> "$FORK_LOG"\nexec "%s" "$@"\n' "$real" > "$stub_bin/basename"
+  chmod +x "$stub_bin/basename"
+  for i in 1 2 3 4 5 6; do mkdir -p "$TEST_SKILL_DIR/teams/s-AB0$i"; done
+  export FORK_LOG="$TEST_SKILL_DIR/run/basename.log" PATH="$stub_bin:$PATH"
+  run run_session_start
+  [ "$status" -eq 0 ]
+  # the six stale-looking dirs are all visited; none may cost a process
+  touch "$TEST_SKILL_DIR/run/basename.log"
+  [ "$(grep -c basename "$TEST_SKILL_DIR/run/basename.log" || true)" -lt 6 ]
 }

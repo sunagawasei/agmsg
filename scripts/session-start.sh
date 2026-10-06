@@ -623,7 +623,7 @@ if agmsg_session_team_enabled; then
   # contain `__` and are decoded after stripping the team segment.
   _orphan_gc_record() {
     local _gc_rec="$1" _gc_key _gc_enc_team _gc_enc_name
-    local _gc_team _gc_sid _gc_name _gc_snapshot _gc_id _gc_project _gc_type
+    local _gc_team _gc_sid _gc_name _gc_id _gc_project _gc_type
     local _gc_pid _gc_now _gc_mtime _gc_age _gc_pending_state _gc_pending_field
     local _gc_log_team _gc_log_name
     _gc_key="${_gc_rec##*/spawn.}"
@@ -639,18 +639,43 @@ if agmsg_session_team_enabled; then
     [ "$(_actas_lock_encode "$_gc_name" 2>/dev/null || true)" = "$_gc_enc_name" ] || return 0
     agmsg_instance_alive "$_gc_sid" 2>/dev/null && return 0
 
-    # Read once. The same immutable snapshot drives eligibility and the
-    # compare-and-act guard, so a headless→interactive replacement cannot
-    # cause despawn to act on the new interactive placement.
-    _gc_snapshot="$(cat "$_gc_rec" 2>/dev/null || true)"
-    [ -n "$_gc_snapshot" ] || return 0
-    IFS=$'\t' read -r _gc_id _gc_project _gc_type <<<"$_gc_snapshot" || return 0
+    # Read once, and only for the log line below: a record replaced after this
+    # read changes nothing the GC does. A record with no trailing newline still
+    # fills the variables, hence `|| true`.
+    _gc_id=""; _gc_project=""; _gc_type=""
+    IFS=$'\t' read -r _gc_id _gc_project _gc_type 2>/dev/null <"$_gc_rec" || true
     case "${_gc_id:-}" in
       pid:*)
         _gc_pid="${_gc_id#pid:}"
         _gc_age=unknown
-        _gc_now="$(date +%s 2>/dev/null || true)"
-        _gc_mtime="$(compat_file_mtime "$_gc_rec" 2>/dev/null || true)"
+        # Read on the first candidate and reused for the whole pass: the value
+        # only feeds spawn_age_s in the log, as a reference taken at the start
+        # (a record rewritten during the pass can show an older or larger age).
+        if [ -z "$_gc_batch_now" ]; then
+          if [ -n "${BASH_VERSINFO:-}" ] && [ "${BASH_VERSINFO[0]}" -ge 5 ]; then
+            printf -v _gc_batch_now '%(%s)T' -1
+          else
+            _gc_batch_now="$(date +%s 2>/dev/null || true)"
+          fi
+        fi
+        _gc_now="$_gc_batch_now"
+        _gc_mtime=""
+        # Both come from one batch taken before the loop (one date, one stat per
+        # argv batch) instead of a fork each per record. The key is the whole
+        # path between a TAB and a LF, so no other path can match it.
+        case "$_gc_mtime_map" in
+          *$'\t'"$_gc_rec"$'\n'*)
+            _gc_mtime="${_gc_mtime_map%%$'\t'"$_gc_rec"$'\n'*}"
+            _gc_mtime="${_gc_mtime##*$'\n'}"
+            ;;
+          *)
+            # No stat on PATH that understands the platform's flags (a GNU stat
+            # ahead of the BSD one) answers every path the same unusable way,
+            # so asking again per record would only repeat the answer.
+            [ "$_gc_mtime_unusable" = 1 ] \
+              || _gc_mtime="$(compat_file_mtime "$_gc_rec" 2>/dev/null || true)"
+            ;;
+        esac
         case "$_gc_now:$_gc_mtime" in
           *[!0-9:]*) ;;
           *:|:*) ;;
@@ -675,6 +700,30 @@ if agmsg_session_team_enabled; then
     esac
   }
 
+  _gc_batch_now=""
+  _gc_mtime_map=""
+  _gc_mtime_unusable=0
+  _gc_batch_paths=()
+  for _spawn_rec in "$RUN_DIR"/spawn.s-*__*; do
+    [ -f "$_spawn_rec" ] || continue
+    # A path holding a TAB or LF could forge a neighbouring line of the batch
+    # output; such a record is never put in the batch and takes the per-record stat.
+    case "$_spawn_rec" in *$'\t'*|*$'\n'*) continue ;; esac
+    _gc_batch_paths+=("$_spawn_rec")
+  done
+  if [ "${#_gc_batch_paths[@]}" -gt 0 ]; then
+    # Leading LF so every line, the first included, is delimited on both sides.
+    _gc_mtime_map="$(printf '\n'; printf '%s\0' "${_gc_batch_paths[@]}" | compat_files_mtime_0; printf x)" || true
+    _gc_mtime_map="${_gc_mtime_map%x}"
+    # Output that is there but holds no "<digits><TAB>/path" line is the answer
+    # of a stat that does not take this platform's flags. Empty output is a
+    # failed batch instead, and leaves every record to its own stat.
+    case "$_gc_mtime_map" in
+      $'\n') ;;
+      *$'\n'[0-9]*$'\t'/*) ;;
+      *) _gc_mtime_unusable=1 ;;
+    esac
+  fi
   for _spawn_rec in "$RUN_DIR"/spawn.s-*__*; do
     [ -f "$_spawn_rec" ] || continue
     _orphan_gc_record "$_spawn_rec"
@@ -694,7 +743,7 @@ if agmsg_session_team_enabled; then
   case "$_ttl" in ''|*[!0-9]*) _ttl=7 ;; esac
   for _d in "$SKILL_DIR"/teams/s-*/; do
     [ -d "$_d" ] || continue
-    _tn="$(basename "$_d")"                                       # s-<uuid>
+    _tn="${_d%/}"; _tn="${_tn##*/}"                               # s-<uuid>
     _ttl_log_team="$(agmsg_pending_log_sanitize "$_tn")"
     if agmsg_instance_alive "${_tn#s-}" 2>/dev/null; then
       printf 'agmsg: session-team TTL GC skipped team=%s reason=bare-owner-alive\n' \

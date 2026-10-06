@@ -36,14 +36,28 @@ _agmsg_pending_encoded_canonical() {
   printf '%s' "$decoded"
 }
 
+# Every C0 control and DEL, listed one by one: a bracket range would depend on
+# the locale's collation. NUL cannot be held in a shell string at all.
+_AGMSG_LOG_CTRL=""
+for _agmsg_c in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 127; do
+  printf -v _agmsg_o '\\%03o' "$_agmsg_c"
+  printf -v _agmsg_o "$_agmsg_o"
+  _AGMSG_LOG_CTRL="$_AGMSG_LOG_CTRL$_agmsg_o"
+done
+unset _agmsg_c _agmsg_o
+
 # Keep one-record diagnostics on one physical line even when an untrusted path
 # or decoded identity contains terminal controls. Printable non-ASCII bytes are
 # preserved; only C0 controls and DEL are removed. Match the existing spawn-log
 # convention of an 80-character field, reserving the final three for a visible
 # truncation marker so one oversized identity cannot flood stderr.
 agmsg_pending_log_sanitize() {
-  local val
-  val="$(printf '%s' "${1:-}" | LC_ALL=C tr -d '\000-\037\177')"
+  local val="${1:-}"
+  # No control character (the usual case) needs no tr, and a tr here is a fork
+  # per call. The slow path below is the original filter.
+  case "$val" in
+    *["$_AGMSG_LOG_CTRL"]*) val="$(printf '%s' "$val" | LC_ALL=C tr -d '\000-\037\177')" ;;
+  esac
   if [ "${#val}" -gt 80 ]; then
     printf '%s...' "${val:0:77}"
   else
