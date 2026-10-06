@@ -803,9 +803,12 @@ EOF
 _make_fake_bridge() {
   cat > "$STUB_BIN/fake-bridge.sh" <<EOF
 #!/usr/bin/env bash
-printf 'ARGS: %s\n' "\$*" >> "$CAPTURE"
-printf 'TURN_TIMEOUT: %s\n' "\${AGMSG_CODEX_BRIDGE_TURN_TIMEOUT:-}" >> "$CAPTURE"
-printf 'APPCMD: %s\n' "\${AGMSG_CODEX_APP_SERVER_CMD:-}" >> "$CAPTURE"
+# printf can split a record into several writes; one cat of this small record is one
+# write, so a reader that sees CAPTURE non-empty sees all three lines.
+rec="$CAPTURE.rec.\$\$"
+printf 'ARGS: %s\nTURN_TIMEOUT: %s\nAPPCMD: %s\n' "\$*" "\${AGMSG_CODEX_BRIDGE_TURN_TIMEOUT:-}" "\${AGMSG_CODEX_APP_SERVER_CMD:-}" > "\$rec"
+cat "\$rec" >> "$CAPTURE"
+rm -f "\$rec"
 exit 0
 EOF
   chmod +x "$STUB_BIN/fake-bridge.sh"
