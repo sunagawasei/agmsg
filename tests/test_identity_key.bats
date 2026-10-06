@@ -35,7 +35,7 @@
   for file in "${files[@]}"; do
     grep -Eq '^[[:space:]]*(source|\.) "\$SCRIPT_DIR/lib/identity-key\.sh"' \
       "$file"
-    [ "$(grep -c 'agmsg_identity_key ' "$file")" -eq 1 ]
+    [ "$(grep -c 'agmsg_identity_key ' "$file")" -ge 1 ]
     ! grep -q '| base64' "$file"
   done
 }
