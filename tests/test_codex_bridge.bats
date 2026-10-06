@@ -2315,11 +2315,9 @@ EOF
   # the corrupt payload survives for manual recovery
   ls "$spool".corrupt-* >/dev/null
   grep -q '"body":' "$spool".corrupt-*
-  # the fresh spool was rebuilt as valid JSON via the atomic tmp+rename path
-  grep -q "bridge-error" "$spool"
-  node -e 'const a = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); if (!Array.isArray(a)) process.exit(1);' "$spool"
-  # no tmp litter from the atomic write
-  ! ls "$spool".tmp-* 2>/dev/null
+  # the new failure notice goes to the inflight outbox, not the corrupt spool
+  [ ! -e "$spool" ]
+  ls "$TEST_SKILL_DIR/run/inflight-outbox.team=alice"/*.to >/dev/null
 }
 
 @test "codex-bridge: --role-file prepends the standing role to the turn input" {

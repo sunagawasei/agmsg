@@ -71,6 +71,23 @@ function _resolveWatchRearmMs() {
 }
 const WATCH_REARM_MS = _resolveWatchRearmMs();
 
+function encodeRunKey(value) {
+  return Array.from(Buffer.from(String(value), "utf8"), (byte) => {
+    const char = String.fromCharCode(byte);
+    return /[A-Za-z0-9._-]/.test(char) ? char : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }).join("");
+}
+
+function drainLeaseStaleSeconds() {
+  const envValue = Number(process.env.AGMSG_DRAIN_LEASE_STALE_S || "");
+  if (Number.isInteger(envValue) && envValue > 0) return envValue;
+  const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, "config.sh"), "get", "drain.lease_stale_s", "120"], {
+    encoding: "utf8",
+  });
+  const configured = Number(String(result.stdout || "").trim());
+  return Number.isInteger(configured) && configured > 0 ? configured : 120;
+}
+
 function usage() {
   console.log(`Usage: codex-bridge.js --project <path> [--type codex] [--team <team>] [--name <agent>]
 
@@ -1072,6 +1089,20 @@ class CodexBridge {
       : crypto.createHash("sha1").update(identities.map((p) => `${p.team}\t${p.name}`).join("\n")).digest("hex");
     this.pidfile = path.join(RUN_DIR, `codex-bridge.${key}.pid`);
     this.metafile = path.join(RUN_DIR, `codex-bridge.${key}.meta`);
+    this.drainFence = path.join(RUN_DIR, `drain.${encodeRunKey(this.identity.team)}.fence`);
+    this.drainMarker = path.join(
+      RUN_DIR,
+      `draining.${encodeRunKey(this.identity.team)}__${encodeRunKey(this.identity.name)}.${process.pid}`,
+    );
+    this.drainLeaseStaleSeconds = drainLeaseStaleSeconds();
+    // Failure notices whose send failed, persisted so they survive a restart and
+    // are retried before each new turn (cursor-bridge's outbound-first rule).
+    // Keep the spool keyed by the worker name even though bridge PID state is
+    // role-scoped: it has one consumer and must never be shared across workers.
+    this.outboundFile = path.join(
+      RUN_DIR,
+      `codex-bridge.${this.identity.team}.${this.identity.name}.outbound.json`,
+    );
     // A per-PID identity lease the launcher reaper reads to tell an orphan of THIS
     // (project, role) from any other bridge, without reconstructing argv from ps
     // (#943). Keyed by pid so duplicates are each enumerable; content is hashes,
