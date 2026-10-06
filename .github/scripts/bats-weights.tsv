@@ -1,7 +1,7 @@
 # Measured seconds per test file, used by shard-tests.sh as the LPT weight.
 # Columns: file<TAB>macOS seconds<TAB>Linux seconds. The *per-test row is the seconds per @test for a file not listed here.
 # Source: run 37417738500 (c3152f4a), every bats-timings-* artifact, file_end elapsed_seconds.
-# Refresh: gh run download <run> -p 'bats-timings-*' -D d; cat d/*/* | awk -F'\t' '$2=="file_end"{n=$9; sub(/.*\//,"",n); v[n,$6]=$12; f[n]=1} END{for(n in f) printf "%s\t%s\t%s\n", n, v[n,"macOS"], v[n,"Linux"]}' | LC_ALL=C sort   # then replace the rows below
+# Refresh: gh run download <run> -p 'bats-timings-*' -D d; cat d/*/* | awk -F'\t' '$2=="file_end"{n=$9; sub(/.*\//,"",n); v[n,$6]=$12; f[n]=1} END{for(n in f) printf "%s\t%s\t%s\n", n, v[n,"macOS"], v[n,"Linux"]}' | LC_ALL=C sort   # then replace the rows below. CI uploads macOS timings only, so the Linux column comes out empty: keep the existing Linux values (shard-tests.sh rejects a non-integer in either column)
 *per-test	2	2
 test_actas_integration.bats	50	35
 test_actas_lock.bats	8	5

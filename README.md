@@ -209,7 +209,7 @@ codex:
   --dangerously-skip-permissions: false  # a `false` value suppresses the flag entirely
 ```
 
-All three agent types are spawnable — `claude-code`, `codex`, `cursor`. macOS is the primary target; Linux and Windows are best-effort (please open an issue/PR if your terminal isn't handled). Without tmux **and** a usable terminal, an interactive spawn errors out since the agent CLIs need an interactive terminal; `--headless` (all three types) needs no terminal.
+All three agent types are spawnable — `claude-code`, `codex`, `cursor`. macOS is the primary target; Linux and Windows are best-effort (please open an issue/PR if your terminal isn't handled). On Linux, leased mode's lease check needs BSD `lockf`, which Linux lacks, so the bridge and watcher do not start; CI runs the bats suite on macOS only. Without tmux **and** a usable terminal, an interactive spawn errors out since the agent CLIs need an interactive terminal; `--headless` (all three types) needs no terminal.
 
 ### Tear down a spawned agent (`despawn`)
 

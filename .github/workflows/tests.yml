@@ -224,11 +224,11 @@ jobs:
     # `_wait_pidfile`, windows runtime #567) are unrelated to this cap.
     timeout-minutes: 30
     strategy:
-      # Cover both GNU (Linux) and BSD (macOS) userlands — the scripts shell out
-      # to sed/stat/mktemp/ps etc. whose flags differ between them.
+      # macOS only: Linux has no BSD lockf, so leased mode's lease check fails
+      # and the bridge and watcher never start (#78).
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [macos-latest]
         shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
@@ -469,7 +469,7 @@ jobs:
           set -euo pipefail
           expected="$(find tests -maxdepth 1 -name '*.bats' | LC_ALL=C sort)"
           status=0
-          for os in ubuntu-latest macos-latest; do
+          for os in macos-latest; do
             actual="$(cat manifests/bats-manifest-"$os"-*/shard-files.txt | LC_ALL=C sort)"
             if [ "$actual" = "$expected" ]; then
               echo "$os: all $(printf '%s\n' "$expected" | wc -l | tr -d ' ') test file(s) ran."
@@ -495,7 +495,7 @@ jobs:
           # The other green, named the same way (#798): how many files the
           # shards ran, so a full pass and a skip never read alike.
           count="$(printf '%s\n' "$expected" | grep -c .)"
-          printf '%s\n' "## bats: suite ran" "" "The shards ran $count test files on ubuntu-latest and macos-latest and every shard passed." >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "## bats: suite ran" "" "The shards ran $count test files on macos-latest and every shard passed." >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
   # Windows coverage for the native helpers shipped in #103 (Git Bash runner,
@@ -503,7 +503,7 @@ jobs:
   # is not fully green on Windows yet, so this is staged (#125): a single focused
   # leg targeting the Windows-relevant install tests. Not a required check yet —
   # promote it to required once it is reliably green. The required checks stay
-  # bats (ubuntu/macos).
+  # bats (macos).
   #
   # The old informational "full" leg (the whole suite, continue-on-error) was
   # removed: it ran POSIX-assuming tests that hang on Windows and hit the job

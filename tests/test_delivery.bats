@@ -2457,7 +2457,7 @@ sql_lit() { printf '%s' "$1" | sed "s/'/''/g"; }
 
 # The quote/backslash path cases below use " and \ in directory names, which are
 # not legal filename characters on NTFS — they can't even be created under Git
-# Bash on Windows. Skip there; the required ubuntu/macos legs cover them.
+# Bash on Windows. Skip there; the required macOS legs cover them.
 skip_if_no_special_fs() {
   case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) skip "\" and \\ are not legal filename chars on NTFS" ;;
