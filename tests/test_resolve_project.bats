@@ -31,7 +31,7 @@ _make_watch_poll_probe() {
   printf '%s\n' \
     '#!/bin/sh' \
     'case "$*" in' \
-    '  *"WHERE id >"*) : > "$AGMSG_TEST_WATCH_POLL_MARKER" ;;' \
+    "  *\"type='message_sent' AND seq >\"*) : > \"\$AGMSG_TEST_WATCH_POLL_MARKER\" ;;" \
     'esac' \
     'exec "$AGMSG_TEST_REAL_SQLITE" "$@"' \
     >"$bindir/sqlite3"
