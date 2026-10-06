@@ -294,13 +294,13 @@ if [ "$*" = "-ww -o args= -p $FAKE_BRIDGE_PID" ]; then
   printf 'node /x/codex-bridge.js --identity-key %s --pair s-sessAPS\tcodex --inline-inbox\n' "$FAKE_IDENTITY_KEY"
   exit 0
 fi
-exit 1
+exec "$REAL_PS" "$@"
 STUB
   chmod +x "$stub_bin/ps"
   mkdir -p "$TEST_SKILL_DIR/run"
   agmsg_test_start_session_owner
   printf 'pid:%s\t%s\tcodex\n' "$fake" "/tmp/scratch-aps" > "$TEST_SKILL_DIR/run/spawn.s-sessAPS__codex"
-  printf '{"session_id":"sessAPS"}' | env PATH="$stub_bin:$PATH" \
+  printf '{"session_id":"sessAPS"}' | env PATH="$stub_bin:$PATH" REAL_PS="$(command -v ps)" \
     FAKE_BRIDGE_PID="$fake" FAKE_IDENTITY_KEY="$key" \
     bash "$SCRIPTS/session-end.sh" claude-code "$PROJ"
   agmsg_test_stop_session_owner

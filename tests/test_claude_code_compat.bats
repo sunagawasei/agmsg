@@ -14,11 +14,13 @@ setup() {
   export TEAM='s-C0DE-001'
   export TEST_PIDS=''
   export FAKE_LIVE_STATE="$TEST_SKILL_DIR/fake-live-state"
+  export FAKE_ALL_PIDS="$TEST_SKILL_DIR/fake-all-pids"
   export FAKE_SIGNAL_LOG="$TEST_SKILL_DIR/fake-signal.log"
   export FAKE_KILL_ENV="$TEST_SKILL_DIR/fake-kill-env.sh"
   mkdir -p "$RUN" "$PROJ"
   bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/null
   : > "$FAKE_LIVE_STATE"
+  : > "$FAKE_ALL_PIDS"
   : > "$FAKE_SIGNAL_LOG"
   cat > "$FAKE_KILL_ENV" <<'EOF'
 kill() {
@@ -78,7 +80,7 @@ start_identity_process() {
   FAKE_NEXT_PID=$(( ${FAKE_NEXT_PID:-41000} + 1 ))
   LAST_PID="$FAKE_NEXT_PID"
   LAST_CMD="$cmd"
-  printf '%s\n' "$LAST_PID" >> "$FAKE_LIVE_STATE"
+  printf '%s\n' "$LAST_PID" | tee -a "$FAKE_ALL_PIDS" >> "$FAKE_LIVE_STATE"
 }
 
 assert_fake_alive() { grep -Fxq "$1" "$FAKE_LIVE_STATE"; }
@@ -99,7 +101,7 @@ start_extension_process() {
   FAKE_NEXT_PID=$(( ${FAKE_NEXT_PID:-41000} + 1 ))
   LAST_PID="$FAKE_NEXT_PID"
   LAST_CMD="$cmd"
-  printf '%s\n' "$LAST_PID" >> "$FAKE_LIVE_STATE"
+  printf '%s\n' "$LAST_PID" | tee -a "$FAKE_ALL_PIDS" >> "$FAKE_LIVE_STATE"
 }
 
 write_meta() {
@@ -199,10 +201,23 @@ assert_claude_artifacts_absent() {
   local cmd_correct cmd_wrong cmd_wrong_bridge cmd_key_suffix cmd_missing cmd_codex cmd_cursor
   local ps_stub="$TEST_SKILL_DIR/ps-stub"
   mkdir -p "$ps_stub"
+  # The liveness probe lists every pid with a full `ps -Ao pid=,stat=` snapshot and
+  # needs its own pid in it, so the stub lists the real table plus the fake live pids.
+  export REAL_PS
+  REAL_PS="$(command -v ps)"
   cat > "$ps_stub/ps" <<'EOF'
 #!/usr/bin/env bash
+set -o pipefail
 if [ "$*" = "-ww -o args= -p $FAKE_PS_PID" ]; then
   printf '%s\n' "$FAKE_PS_ARGS"
+  exit 0
+fi
+if [ "$*" = "-Ao pid=,stat=" ]; then
+  # A real host process may own a fake pid number; only the fake state counts.
+  "$REAL_PS" -Ao pid=,stat= | awk 'FILENAME == ARGV[1] { fake[$1] = 1; next } !($1 in fake)' "$FAKE_ALL_PIDS" - || exit $?
+  while IFS= read -r pid; do
+    [ -z "$pid" ] || printf '%s S\n' "$pid"
+  done < "$FAKE_LIVE_STATE"
   exit 0
 fi
 exit 1
