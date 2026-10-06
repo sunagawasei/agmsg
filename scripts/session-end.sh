@@ -51,13 +51,18 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
 
 # Read session_id from the hook input JSON on stdin.
-INPUT=$(cat 2>/dev/null || true)
+# Builtins only (no cat|sed|head): each fork counts against the hook budget.
+# Same pick as the sed this replaced: the last "session_id" on a line, from the
+# first line that has one.
+IFS= read -r -d '' INPUT 2>/dev/null || true
 SESSION_ID=""
-if [ -n "$INPUT" ]; then
-  SESSION_ID=$(printf '%s' "$INPUT" \
-    | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -1)
-fi
+SESSION_ID_RE='^.*"session_id"[[:space:]]*:[[:space:]]*"([^"]*)"'
+while IFS= read -r INPUT_LINE || [ -n "$INPUT_LINE" ]; do
+  if [[ "$INPUT_LINE" =~ $SESSION_ID_RE ]]; then
+    SESSION_ID="${BASH_REMATCH[1]}"
+    break
+  fi
+done <<<"$INPUT"
 [ -z "$SESSION_ID" ] && exit 0
 
 # Resolve the instance id in-process (see #93 note above). actas-lock.sh pulls in
@@ -120,7 +125,7 @@ if [ -n "$SNAPSHOT_PATH" ]; then
     ENCODED_NAME="${SPAWN_FILE#"$SPAWN_PREFIX"}"
     [ "$ENCODED_NAME" != "$SPAWN_FILE" ] || continue
     NAME="$(_actas_lock_decode "$ENCODED_NAME")"
-    RECORD="$(cat "$SPAWN_FILE" 2>/dev/null || true)"
+    { RECORD="$(<"$SPAWN_FILE")"; } 2>/dev/null || RECORD=""
     printf '%s\t%s\n' "$NAME" "$RECORD" >>"$SNAPSHOT_PATH" 2>/dev/null || true
   done
 fi

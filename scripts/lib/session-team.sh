@@ -49,30 +49,41 @@ agmsg_session_team_enabled() {
 
 # --- host manifest ---------------------------------------------------------
 
-# Read <key> from builtin type <type>'s manifest. Plain grep on purpose: this
-# sits on the send/whoami path and must not pull in type-registry.sh.
+# Read <key> from builtin type <type>'s manifest. Builtins only on purpose: this
+# sits on the send/whoami/SessionEnd path, where a grep|head pipeline per call
+# (it is called per host, several times) cost more than the hook's whole budget.
 _agmsg_st_conf() {
-  local type="$1" key="$2" sd conf line val
-  sd="$(agmsg_session_team_scripts_dir)" || return 0
+  local type="$1" key="$2" sd conf line val="" re
+  if [ -n "${SCRIPT_DIR:-}" ]; then
+    sd="$SCRIPT_DIR"
+  elif [ -n "${BASH_SOURCE[0]:-}" ]; then
+    case "${BASH_SOURCE[0]}" in */*) sd="${BASH_SOURCE[0]%/*}/.." ;; *) sd=".." ;; esac
+  else
+    return 0
+  fi
   case "$type" in ''|*[!A-Za-z0-9_-]*) return 0 ;; esac
   conf="$sd/drivers/types/$type/type.conf"
   [ -f "$conf" ] || return 0
-  line="$( { grep -E "^[[:space:]]*${key}[[:space:]]*=" "$conf" 2>/dev/null || true; } | head -1)"
-  [ -n "$line" ] || return 0
-  val="${line#*=}"
-  val="${val#"${val%%[![:space:]]*}"}"
-  val="${val%"${val##*[![:space:]]}"}"
+  re="^[[:space:]]*${key}[[:space:]]*=(.*)\$"
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ $re ]]; then
+      val="${BASH_REMATCH[1]}"
+      val="${val#"${val%%[![:space:]]*}"}"
+      val="${val%"${val##*[![:space:]]}"}"
+      break
+    fi
+  done 2>/dev/null <"$conf"
   printf '%s' "$val"
 }
 
 # Echo the host (type) names that declare a session_env, one per line.
 agmsg_session_hosts() {
-  local sd conf
+  local sd conf t
   sd="$(agmsg_session_team_scripts_dir)" || return 0
   for conf in "$sd"/drivers/types/*/type.conf; do
     [ -f "$conf" ] || continue
-    [ -n "$(_agmsg_st_conf "$(basename "$(dirname "$conf")")" session_env)" ] \
-      && basename "$(dirname "$conf")"
+    t="${conf%/type.conf}"; t="${t##*/}"
+    [ -n "$(_agmsg_st_conf "$t" session_env)" ] && printf '%s\n' "$t"
   done
   return 0
 }
@@ -346,7 +357,7 @@ agmsg_session_team_class() {
       fi
       printf 'unknown'; return 0
     fi
-    if ! content="$(cat "$marker" 2>/dev/null)"; then printf 'unknown'; return 0; fi
+    if ! { content="$(<"$marker")"; } 2>/dev/null; then printf 'unknown'; return 0; fi
     if [ "$content" = "$host" ]; then printf 'session'; else printf 'unknown'; fi
     return 0
   done <<EOF
