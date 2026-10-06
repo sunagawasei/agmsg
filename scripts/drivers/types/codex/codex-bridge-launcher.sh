@@ -838,43 +838,65 @@ EOF
 
   # The role-session record is the sole thread authority (#150 phase 2/#350).
 
+  # Reset each tick: a pre-owner live bridge (no owner record, so its binding
+  # cannot be read) sets these to its pid and the start token it had at that
+  # moment. We never kill it from here; the token is how the guard before the
+  # spawn proves it is gone, and the lease-based reaper below is the only
+  # reuse-safe path that may retire it.
+  need_kill=""; need_kill_token=""
   if [ -f "$pidfile" ]; then
     bridge_pid=""
     IFS= read -r bridge_pid < "$pidfile" 2>/dev/null || true
-    if [ -n "$bridge_pid" ] && _agmsg_pid_alive "$bridge_pid"; then
-      agmsg_process_identity_state codex-bridge "$pidfile" "$bridge_scope" codex-bridge
-      # Only an owned bridge may be inspected or signalled. Any other live state
-      # (legacy, unverified, held by a claimant) is not authority to touch it.
-      if [ "$AGMSG_PROCESS_STATE" != owned ]; then
+    agmsg_process_identity_state codex-bridge "$pidfile" "$bridge_scope" codex-bridge
+    case "$AGMSG_PROCESS_STATE" in
+      owned)
+        # Reuse only when the live bridge is bound to BOTH the current
+        # app-server AND the current thread. A codex upgrade makes
+        # codex-monitor.sh start a fresh app-server on a new port (#237); the
+        # thread guard (#350) lets a bridge first launched on the ambiguous
+        # "loaded" thread rebind once this role's recorded thread becomes known.
+        binding_lockf="$(_agmsg_process_lockf_bin)"
+        [ -n "$binding_lockf" ] || { poll_sleep; continue; }
+        binding_claim="$(agmsg_process_lease_path "$pidfile")"
+        if "$binding_lockf" -k -s -t 0 "$binding_claim" \
+            "$SKILL_DIR/scripts/internal/process-owner-launch.sh" \
+            --internal-companions-match "$pidfile" "$AGMSG_PROCESS_PID" \
+            "$AGMSG_PROCESS_GENERATION" -- \
+            "$appserver_file" "$req_app_server" "$thread_file" "$thread_id"; then
+          poll_sleep
+          continue
+        else
+          binding_rc=$?
+        fi
+        # Exit 1 means this same generation has a stale binding. Claim contention
+        # or a changed generation is only a transient snapshot, so never signal it.
+        [ "$binding_rc" -eq 1 ] || { poll_sleep; continue; }
+        stop_owned_bridge_and_cleanup_binding || true
+        # Let TERM release the lease before attempting the successor.
         poll_sleep
         continue
-      fi
-      # Reuse only when the live bridge is bound to BOTH the current app-server
-      # AND the current thread. A codex upgrade makes codex-monitor.sh start a
-      # fresh app-server on a new port (#237); the thread guard (#350) lets a
-      # bridge first launched on the ambiguous "loaded" thread rebind once this
-      # role's recorded thread becomes known.
-      binding_lockf="$(_agmsg_process_lockf_bin)"
-      [ -n "$binding_lockf" ] || { poll_sleep; continue; }
-      binding_claim="$(agmsg_process_lease_path "$pidfile")"
-      if "$binding_lockf" -k -s -t 0 "$binding_claim" \
-          "$SKILL_DIR/scripts/internal/process-owner-launch.sh" \
-          --internal-companions-match "$pidfile" "$AGMSG_PROCESS_PID" \
-          "$AGMSG_PROCESS_GENERATION" -- \
-          "$appserver_file" "$req_app_server" "$thread_file" "$thread_id"; then
+        ;;
+      held-unverified|degraded-live|unverified-live)
+        # Someone holds or may hold the claim: not ours to touch.
         poll_sleep
         continue
-      else
-        binding_rc=$?
-      fi
-      # Exit 1 means this same generation has a stale binding. Claim contention
-      # or a changed generation is only a transient snapshot, so never signal it.
-      [ "$binding_rc" -eq 1 ] || { poll_sleep; continue; }
-      stop_owned_bridge_and_cleanup_binding || true
-      # Let TERM release the lease before attempting the successor.
-      poll_sleep
-      continue
-    fi
+        ;;
+      legacy-exact-live|legacy-unverified-live)
+        # A bridge from before owner records. Its binding is unreadable, so it
+        # is replaced only through the proof-gated reaper and exit guard below.
+        need_kill="$bridge_pid"
+        need_kill_token="$(_start_token "$bridge_pid" 2>/dev/null || true)"
+        ;;
+      stale|legacy-dead|legacy-foreign-live|degraded-dead|unverified-dead)
+        # The recorded pid is gone or was reused by something else: drop the
+        # record without signalling whatever holds the pid now.
+        if ! agmsg_process_cleanup_observed "$pidfile" \
+            "$appserver_file" "$thread_file"; then
+          poll_sleep
+          continue
+        fi
+        ;;
+    esac
   fi
 
   # Bound the spawn rate first (a rate-limited tick changes nothing), then reap
@@ -894,6 +916,23 @@ EOF
     continue
   fi
 
+  # A pre-owner bridge must be proven GONE before we spawn its replacement, or we
+  # double-start a writer that still holds the thread through async shutdown
+  # (#935). The pidfile is a bare pid with no identity, so we do NOT signal it
+  # here, and we do NOT ask _agmsg_pid_alive to "confirm" it is gone: a false from
+  # that helper can be a transient ps failure (#954). The one positive proof we
+  # accept is the start token stashed at detection now reading a DIFFERENT
+  # process -- the old pid has been reused, so the old writer is gone. A token
+  # that still matches (alive), or cannot be read (unproven), keeps the binding
+  # and retries. A lease-less bridge that never dies simply lingers (orphan
+  # survival is acceptable; a wrong-kill or a double-start is not).
+  if [ -n "$need_kill" ]; then
+    _nk_now="$(_start_token "$need_kill" 2>/dev/null || true)"
+    if [ -z "$need_kill_token" ] || [ -z "$_nk_now" ] || [ "$_nk_now" = "$need_kill_token" ]; then
+      poll_sleep
+      continue
+    fi
+  fi
   # Committed to spawning now: clear the stale records immediately before writing
   # the new ones, so no gate can bail out between the wipe and the rewrite.
   rm -f "$pidfile" "$appserver_file" "$thread_file"
