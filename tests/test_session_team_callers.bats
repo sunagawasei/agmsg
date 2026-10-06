@@ -45,11 +45,12 @@ whoami.sh" ]
   [ "$status" -eq 0 ]
   # (i) own identity: ensure-headless.sh spawn.sh delivery.sh session-start.sh whoami.sh
   # (ii) other state, each also in the class list above: check-inbox.sh
-  #      lib/inbox-target.sh send.sh session-end.sh session-end-worker.sh
+  #      lib/inbox-target.sh lib/pending-teardown.sh send.sh session-end.sh session-end-worker.sh
   [ "$output" = "check-inbox.sh
 delivery.sh
 ensure-headless.sh
 lib/inbox-target.sh
+lib/pending-teardown.sh
 send.sh
 session-end-worker.sh
 session-end.sh
