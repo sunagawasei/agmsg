@@ -427,6 +427,12 @@ EOF2
   done
 }
 
+# Run-file path a real caller would use for (team, agent): id-keyed once join.sh
+# has minted team_id/member_id, so a test must not hardcode "<team>__<agent>".
+_ready_path() {   # <team> <agent>
+  ( SKILL_DIR="$TEST_SKILL_DIR"; source "$TEST_SKILL_DIR/scripts/lib/actas-lock.sh"; agmsg_ready_path "$1" "$2" )
+}
+
 teardown_test_env() {
   _reap_test_jobs || true
   # Try the plain rm FIRST, and only reap when it actually fails. The reaper's scan is a
