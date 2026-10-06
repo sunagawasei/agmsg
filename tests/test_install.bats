@@ -242,6 +242,8 @@ teardown() {
   # SessionStart/Stop hook, so the user is told to re-run delivery.sh set.
   [[ "$output" =~ "delivery.sh set" ]]
   [[ "$output" =~ "#133" ]]
+  # #74: the same re-run is what adds the SessionEnd hook's timeout.
+  [[ "$output" =~ "SessionEnd hook's timeout" ]]
 }
 
 # #963: a running sync engine either keeps executing the code it already

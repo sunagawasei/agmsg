@@ -480,6 +480,8 @@ if [ "$UPDATE_ONLY" = true ]; then
   echo "    manager that rewrites settings) can drop the SessionStart/Stop hook from"
   echo "    a project's settings, silently stopping delivery until it is re-registered."
   echo "    Check with 'delivery.sh status <type> <project>'. (#133)"
+  echo "    The same re-run adds the SessionEnd hook's timeout (claude-code, 5s) to a"
+  echo "    project registered before it existed. (#74)"
   echo ""
   echo "  ✓ Update complete"
   echo ""
