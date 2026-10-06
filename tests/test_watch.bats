@@ -246,8 +246,15 @@ _wait_for_file_contains() {
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" sess-us "$PROJ" claude-code \
     >"$TEST_SKILL_DIR/us.log" 2>/dev/null 3>&- &
   local w=$!
+  # Expected text is UTF-8 bytes: bash 3.2 (macOS) has no \u escape, and later bash leaves it literal outside a UTF-8 locale.
+  # Send only once the watcher is subscribed, as the other delivery tests do.
+  wait_for_file "$TEST_SKILL_DIR/run/watch.$(_iid sess-us).watermark" || { kill "$w" 2>/dev/null; return 1; }
   bash "$SCRIPTS/send.sh" team bob alice $'before\x1fafter\x1f' >/dev/null
-  wait_for_file_contains "$TEST_SKILL_DIR/us.log" $'bob \u2192 alice | before\u241fafter\u241f' || { kill "$w" 2>/dev/null; return 1; }
+  wait_for_file_contains "$TEST_SKILL_DIR/us.log" $'bob \xe2\x86\x92 alice | before\xe2\x90\x9fafter\xe2\x90\x9f' || {
+    od -c "$TEST_SKILL_DIR/us.log" >&2
+    kill "$w" 2>/dev/null
+    return 1
+  }
   _stop_watcher "$w"
 }
 
