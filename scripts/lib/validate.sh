@@ -104,8 +104,8 @@ agmsg_message_ids_sql_in_clause() {
 # Machine inbox row: id<US>from<US>body<US>ts (body may contain US). On success
 # prints four lines — id, from, body, ts — to stdout; exit status 1 if invalid.
 agmsg_parse_machine_inbox_row() {
-  local line="$1"
-  printf '%s' "$line" | awk -v FS="\x1f" '
+  local line="$1" us=$'\x1f'
+  printf '%s' "$line" | awk -F "$us" '
     NF >= 4 {
       id = $1
       from = $2

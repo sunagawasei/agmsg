@@ -506,7 +506,7 @@ compensate_inflight() {
 reject_poison_row() {
   local line="$1" rendered_bytes="$2" id sender _body _ts notice mark_rc=0
   id="${line%%$US*}"
-  sender="$(printf '%s' "$line" | awk -v FS="\x1f" 'NF>=4{print $2; exit}')"
+  sender="$(printf '%s' "$line" | awk -F"$US" 'NF>=4{print $2; exit}')"
   agmsg_validate_message_id "$id" || return 1
   [ -n "$sender" ] || return 1
 
