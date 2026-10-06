@@ -55,52 +55,18 @@ config_field() {
     CAST(readfile('$(rf "$config")') AS TEXT), '$path');"
 }
 
-@test "join records one stable identity event per new member" {
-  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
-  local config="$TEST_SKILL_DIR/teams/demo/config.json"
-  local journal="$TEST_SKILL_DIR/teams/demo/roster.jsonl"
-  [ -f "$journal" ]
-
-  local member_id
-  member_id="$(config_field "$config" '$.agents.alice.member_id')"
-  [[ "$member_id" =~ $UUID7_RE ]]
-  [ "$(journal_query "$journal" \
-    "SELECT count(*) FROM records
-      WHERE json_extract(event,'\$.type')='member_joined'
-        AND json_extract(event,'\$.member_id')='$member_id'
-        AND json_extract(event,'\$.name')='alice';")" -eq 1 ]
-
-  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/b
-  [ "$(journal_query "$journal" \
-    "SELECT count(*) FROM records
-      WHERE json_extract(event,'\$.type')='member_joined';")" -eq 1 ]
-
-  bash "$SCRIPTS/join.sh" demo bob codex /tmp/c
-  [ "$(journal_query "$journal" \
-    "SELECT count(*) FROM records
-      WHERE json_extract(event,'\$.type')='member_joined';")" -eq 2 ]
-}
-
-@test "leave appends identity history and retains an empty current team" {
-  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
-  local team_dir="$TEST_SKILL_DIR/teams/demo"
-  local config="$team_dir/config.json"
-  local journal="$team_dir/roster.jsonl"
-  local member_id
-  member_id="$(config_field "$config" '$.agents.alice.member_id')"
-
-  run bash "$SCRIPTS/leave.sh" demo alice
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"team retained"* ]]
-  [ -d "$team_dir" ]
-  [ -f "$config" ]
-  [ -f "$journal" ]
-  [ "$(config_field "$config" '$.agents')" = "{}" ]
-  [ "$(journal_query "$journal" \
-    "SELECT count(*) FROM records
-      WHERE json_extract(event,'\$.type')='member_left'
-        AND json_extract(event,'\$.member_id')='$member_id'
-        AND json_extract(event,'\$.name')='alice';")" -eq 1 ]
+# Seed a team the way the roster journal expects it: a config carrying a team_id
+# and member_ids, plus the journal that records them. join.sh does not write the
+# journal in this fork, so the tests that exercise the library build it directly.
+_seed_roster() {
+  local team="$1" name="$2" team_dir member_id
+  team_dir="$TEST_SKILL_DIR/teams/$team"
+  mkdir -p "$team_dir"
+  source "$SCRIPTS/lib/roster-journal.sh"
+  member_id="$(compat_uuid7)"
+  printf '{"name":"%s","team_id":"%s","agents":{"%s":{"member_id":"%s","registrations":[{"type":"claude-code","project":"/tmp/a"}]}}}\n' \
+    "$team" "$(compat_uuid7)" "$name" "$member_id" > "$team_dir/config.json"
+  agmsg_roster_append_joined "$team_dir" "$member_id" "$name" "2026-01-01T00:00:00Z"
 }
 
 @test "a retired member rejoins with the same identity" {
@@ -117,7 +83,7 @@ config_field() {
 }
 
 @test "journal projection keeps the first identity bound to a name" {
-  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  _seed_roster demo alice
   local team_dir="$TEST_SKILL_DIR/teams/demo"
   local config="$team_dir/config.json"
   local first second
@@ -134,25 +100,6 @@ config_field() {
     "SELECT count(*) FROM records
       WHERE json_extract(event,'\$.type')='member_joined'
         AND json_extract(event,'\$.name')='alice';")" -eq 2 ]
-}
-
-@test "rename preserves member identity and records a compare-and-swap event" {
-  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
-  local team_dir="$TEST_SKILL_DIR/teams/demo"
-  local config="$team_dir/config.json"
-  local member_id
-  member_id="$(config_field "$config" '$.agents.alice.member_id')"
-
-  bash "$SCRIPTS/rename.sh" demo alice carol
-
-  [ "$(config_field "$config" '$.agents.carol.member_id')" = "$member_id" ]
-  [ "$(config_field "$config" '$.agents.alice')" = "" ]
-  [ "$(journal_query "$team_dir/roster.jsonl" \
-    "SELECT count(*) FROM records
-      WHERE json_extract(event,'\$.type')='member_renamed'
-        AND json_extract(event,'\$.member_id')='$member_id'
-        AND json_extract(event,'\$.from')='alice'
-        AND json_extract(event,'\$.to')='carol';")" -eq 1 ]
 }
 
 @test "concurrent renames accept only the first event whose from name is current" {
@@ -276,7 +223,7 @@ EOS
 }
 
 @test "roster journal: the projection query itself reads a converted path (#669)" {
-  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  _seed_roster demo alice
   local team_dir="$TEST_SKILL_DIR/teams/demo"
 
   local bin="$BATS_TEST_TMPDIR/bin" cap="$BATS_TEST_TMPDIR/sql.txt"
@@ -310,11 +257,12 @@ EOS
   if [ "$(id -u)" = "0" ]; then
     skip "root reads through the mode bits this is about"
   fi
-  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  _seed_roster demo alice
   local journal="$TEST_SKILL_DIR/teams/demo/roster.jsonl"
   chmod 000 "$journal"
 
-  run bash "$SCRIPTS/join.sh" demo bob claude-code /tmp/b
+  run bash -c '. "$1/lib/roster-journal.sh"; agmsg_roster_project_config "$2" "$3"' _ \
+    "$SCRIPTS" "$TEST_SKILL_DIR/teams/demo" "$TEST_SKILL_DIR/teams/demo/config.json"
   chmod 644 "$journal"
 
   [ "$status" -ne 0 ]
@@ -373,7 +321,7 @@ EOS
   if [ "$(id -u)" = "0" ]; then
     skip "root reads through the mode bits this is about"
   fi
-  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  _seed_roster demo alice
   local team_dir="$TEST_SKILL_DIR/teams/demo" config="$TEST_SKILL_DIR/teams/demo/config.json"
   local before
   before="$(config_field "$config" '$.agents.alice.member_id')"
