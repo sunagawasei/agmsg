@@ -44,6 +44,26 @@ _agmsg_dump_signal_state() {
   grep -E '^(SigPnd|ShdPnd|SigBlk|SigIgn|SigCgt):' "/proc/$pid/status" >&2 || true
 }
 
+# When the displaced watcher is still there after the successor took the
+# pidfile: whom the pidfile names, each pid's state and command line, each
+# watcher's own stderr (the pids share one stream otherwise, so an error line
+# cannot be attributed), and the kernel's signal masks (#76). Masks are a
+# snapshot; they do not show whether a given TERM was delivered or discarded.
+_agmsg_dump_displace_state() {
+  local pidfile="$1" first="$2" second="$3" errdir="$4" pid name
+  echo "displacement failed: pidfile $pidfile holds '$(cat "$pidfile" 2>/dev/null || true)' (first=$first second=$second)" >&2
+  for name in first second; do
+    pid="${!name}"
+    echo "$name pid $pid: kill -0 rc=$(kill -0 "$pid" 2>/dev/null; echo $?), ps: $(/bin/ps -o stat=,args= -p "$pid" 2>&1 || true)" >&2
+    echo "$name stderr:" >&2
+    cat "$errdir/$name.err" >&2 2>/dev/null || true
+    if [ -r "/proc/$pid/status" ]; then
+      echo "$name signal masks (TERM is bit 0x4000):" >&2
+      grep -E '^(SigPnd|ShdPnd|SigBlk|SigIgn|SigCgt):' "/proc/$pid/status" >&2 || true
+    fi
+  done
+}
+
 teardown() {
   local pid expect cmd kill_rc
   while IFS=$'\t' read -r pid expect; do
@@ -441,7 +461,7 @@ PS1
 
   local watch_signature="$SK/scripts/watch.sh $sid"
 
-  bash "$SK/scripts/watch.sh" "$sid" /tmp/install-projA claude-code 3>&- &
+  bash "$SK/scripts/watch.sh" "$sid" /tmp/install-projA claude-code 3>&- 2>"$FAKE_HOME/first.err" &
   local first=$!
   # Registered right after the pid is known, before wait_for_pidfile_pid --
   # which can time out and end the test -- gets a chance to (#963 review,
@@ -450,7 +470,7 @@ PS1
   _agmsg_watch_pid "$first" "$watch_signature"
   wait_for_pidfile_pid "$SK/run/watch.$sid.pid" "$first"
 
-  bash "$SK/scripts/watch.sh" "$sid" /tmp/install-projA claude-code 3>&- &
+  bash "$SK/scripts/watch.sh" "$sid" /tmp/install-projA claude-code 3>&- 2>"$FAKE_HOME/second.err" &
   local second=$!
   _agmsg_watch_pid "$second" "$watch_signature"
   wait_for_pidfile_pid "$SK/run/watch.$sid.pid" "$second"
@@ -458,7 +478,10 @@ PS1
   # actually run — poll for its exit rather than checking the instant the
   # pidfile changes (a single check raced this and flaked, see #124; same
   # fix already applied to the equivalent check in test_watch.bats).
-  wait_for_pid_exit "$first"
+  wait_for_pid_exit "$first" || {
+    _agmsg_dump_displace_state "$SK/run/watch.$sid.pid" "$first" "$second" "$FAKE_HOME"
+    return 1
+  }
   run kill -0 "$first"
   [ "$status" -ne 0 ]
 
