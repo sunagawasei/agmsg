@@ -35,8 +35,17 @@ _agmsg_watch_pid() {
   WATCHED_PIDS="${WATCHED_PIDS}${WATCHED_PIDS:+$'\n'}${pid}"$'\t'"${expect}"
 }
 
+# On a watcher that outlived TERM, say how the kernel sees its signals: TERM is
+# bit 0x4000 in each mask (#76). No-op where /proc is absent.
+_agmsg_dump_signal_state() {
+  local pid="$1" kill_rc="${2:-?}"
+  [ -r "/proc/$pid/status" ] || return 0
+  echo "pid $pid survived TERM (kill rc=$kill_rc; TERM is bit 0x4000):" >&2
+  grep -E '^(SigPnd|ShdPnd|SigBlk|SigIgn|SigCgt):' "/proc/$pid/status" >&2 || true
+}
+
 teardown() {
-  local pid expect cmd
+  local pid expect cmd kill_rc
   while IFS=$'\t' read -r pid expect; do
     [ -n "$pid" ] || continue
     # A pid recorded from a pidfile only says where the number came from, not
@@ -54,8 +63,12 @@ teardown() {
       *"$expect"*)
         # Bounded: a watcher that survives TERM must not turn teardown into an
         # unbounded wait that holds the whole shard until its timeout.
-        kill "$pid" 2>/dev/null
-        wait_for_pid_exit "$pid" >/dev/null 2>&1 || kill -9 "$pid" 2>/dev/null
+        kill_rc=0
+        kill "$pid" 2>/dev/null || kill_rc=$?
+        wait_for_pid_exit "$pid" >/dev/null 2>&1 || {
+          _agmsg_dump_signal_state "$pid" "$kill_rc"
+          kill -9 "$pid" 2>/dev/null
+        }
         wait "$pid" 2>/dev/null || true ;;
     esac
   done <<< "$WATCHED_PIDS"
@@ -451,8 +464,12 @@ PS1
 
   # Bounded for the same reason as teardown: a bare `wait` here blocks forever
   # on a watcher that survives TERM (ubuntu shard 1/5 hung 30 minutes on it).
-  kill "$second" 2>/dev/null || true
-  wait_for_pid_exit "$second"
+  local kill_rc=0
+  kill "$second" 2>/dev/null || kill_rc=$?
+  wait_for_pid_exit "$second" || {
+    _agmsg_dump_signal_state "$second" "$kill_rc"
+    return 1
+  }
 }
 
 # --- Pipe-stdin guard: simulate a curl|bash entry path (#98) ---
