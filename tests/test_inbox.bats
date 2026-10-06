@@ -385,3 +385,60 @@ _codex_proj() {
   grep -q 'additive' <<<"$output"
   [ "$(pair_unread_count ctm alice)" -eq 0 ]
 }
+
+# --- machine / display row codec (T45) -----------------------------------------
+# Machine row (inbox.sh --format ids): id<US>from<US>body<US>at. Only LF and TAB
+# are escaped (\n, \t) and CR is dropped; US and backslash pass through raw. Display rows
+# (inbox.sh text, history.sh, check-inbox.sh, watch.sh) show a US in the body as
+# U+241F so the body cannot shift the fields or lose the id.
+
+@test "inbox --format ids: LF/TAB escaped, CR dropped, US/backslash raw, body kept between from and at" {
+  bash "$SCRIPTS/send.sh" testteam bob alice $'l1\nl2\ttab\\n lit\rcr\x1fus\x1f' --force >/dev/null
+  run bash "$SCRIPTS/inbox.sh" testteam alice --format ids
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" -eq 1 ]
+  local row="$output" us=$'\x1f' rest body
+  [ "${row#*"$us"}" != "$row" ]
+  rest="${row#*"$us"}"; [ "${rest%%"$us"*}" = "bob" ]
+  rest="${rest#*"$us"}"; body="${rest%"$us"*}"
+  [ "$body" = $'l1\\nl2\\ttab\\n litcr\x1fus\x1f' ]
+}
+
+@test "inbox --format ids: a legacy integer id and an empty body are kept as four fields" {
+  sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
+    "INSERT INTO messages (team,from_agent,to_agent,body,created_at) VALUES ('testteam','bob','alice','','2026-01-01T00:00:00Z');"
+  run bash "$SCRIPTS/inbox.sh" testteam alice --format ids
+  [ "$status" -eq 0 ]
+  [ "$output" = $'1\x1fbob\x1f\x1f2026-01-01T00:00:00Z' ]
+}
+
+@test "inbox text: a body with US shows whole and the message is marked read" {
+  bash "$SCRIPTS/send.sh" testteam bob alice $'a\x1fb\x1f' --force >/dev/null
+  run bash "$SCRIPTS/inbox.sh" testteam alice
+  [ "$status" -eq 0 ]
+  [[ "$output" == *$'bob: a␟b␟'* ]]
+  [ "$(unread_count alice)" -eq 0 ]
+}
+
+@test "history: a body with US shows whole with the unread marker" {
+  bash "$SCRIPTS/send.sh" testteam bob alice $'a\x1fb\x1f' --force >/dev/null
+  run bash "$SCRIPTS/history.sh" testteam alice
+  [ "$status" -eq 0 ]
+  [[ "$output" == *$'● ['*$'bob → alice: a␟b␟'* ]]
+}
+
+@test "check-inbox: a body with US is delivered whole and marked read" {
+  bash "$SCRIPTS/send.sh" testteam bob alice $'a\x1fb\x1f' --force >/dev/null
+  run delivered_to_operator
+  [[ "$output" == *$'bob: a␟b␟'* ]]
+  [ "$(unread_count alice)" -eq 0 ]
+}
+
+@test "check-inbox: control bytes in a body keep the hook JSON valid" {
+  bash "$SCRIPTS/send.sh" testteam bob alice $'a\x01b\x1b[0mc\rd' --force >/dev/null
+  run delivered_to_operator
+  # delivered_to_operator is empty when the JSON is invalid. sqlite3 renders
+  # control bytes as ^X, so only the printable parts are matched.
+  [[ "$output" == *"bob: a"*"b"*"[0mc"*"d"* ]]
+  [ "$(unread_count alice)" -eq 0 ]
+}

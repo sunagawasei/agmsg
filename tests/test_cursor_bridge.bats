@@ -190,6 +190,15 @@ turns_run() {  # number of -p cursor turns the stub has recorded so far
   grep -q -- "--output-format stream-json" "$FAKE_CURSOR_LOG"
 }
 
+@test "cursor-bridge: a body with the unit separator reaches the prompt whole" {
+  bash "$SCRIPTS/send.sh" team alice cur $'before\x1fafter\x1f' >/dev/null
+  bridge
+  [ "$status" -eq 0 ]
+  grep -qF $'alice: before\x1fafter\x1f' "$FAKE_CURSOR_PROMPT"
+  run bash "$SCRIPTS/inbox.sh" team cur --format ids
+  [ -z "$output" ]
+}
+
 @test "cursor-bridge: a pinned model is passed on every normal turn" {
   bash "$SCRIPTS/send.sh" team alice cur "one" >/dev/null
   bash "$SCRIPTS/send.sh" team bob cur "two" >/dev/null

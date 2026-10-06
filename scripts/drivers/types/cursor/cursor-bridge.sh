@@ -851,8 +851,14 @@ process_cycle() {
 
   while IFS= read -r sender; do
     [ -n "$sender" ] || continue
-    local ids="" body_block="" id from body ts ubody
-    while IFS="$US" read -r id from body ts; do
+    local ids="" body_block="" id from body ts ubody _row _rest
+    # Split by hand: `read` drops a trailing US from the last field, so a body
+    # ending in US would lose it. id first, ts last, body is what lies between.
+    while IFS= read -r _row; do
+      case "$_row" in *"$US"*"$US"*"$US"*) ;; *) continue ;; esac
+      id="${_row%%"$US"*}"; _rest="${_row#*"$US"}"
+      from="${_rest%%"$US"*}"; _rest="${_rest#*"$US"}"
+      ts="${_rest##*"$US"}"; body="${_rest%"$US"*}"
       [ "$from" = "$sender" ] || continue
       ids="${ids:+$ids,}$id"
       ubody="$(unescape "$body")"

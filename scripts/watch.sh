@@ -1514,7 +1514,7 @@ EOF
         printf "%s\n" "       COALESCE(json_extract(value,'\$.team'),'') || char(31) ||"
         printf "%s\n" "       COALESCE(json_extract(value,'\$.from'),'') || char(31) ||"
         printf "%s\n" "       COALESCE(json_extract(value,'\$.to'),'') || char(31) ||"
-        printf "%s\n" "       replace(replace(replace(COALESCE(json_extract(value,'\$.body'),''), char(13), ''), char(10), '\\n'), char(9), '\t') || char(31) ||"
+        printf "%s\n" "       replace(replace(replace(replace(COALESCE(json_extract(value,'\$.body'),''), char(13), ''), char(10), '\\n'), char(9), '\t'), char(31), char(9247)) || char(31) ||"
         printf "%s\n" "       COALESCE(json_extract(value,'\$.cursor'),'')"
         printf "FROM json_each('"
         printf '%s' "${_arr//$_AGMSG_SQ/$_AGMSG_SQ$_AGMSG_SQ}"

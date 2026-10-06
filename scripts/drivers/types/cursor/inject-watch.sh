@@ -295,7 +295,9 @@ inject_one() {
     resend_pending_consume "$id"
     return 0
   fi
-  IFS=$'\x1f' read -r from body_escaped <<<"$row"
+  # Not `read`: it drops a trailing US from the last field (a body ending in US).
+  local _us=$'\x1f'
+  from="${row%%"$_us"*}"; body_escaped="${row#*"$_us"}"
 
   case "$(pane_status)" in
     idle|done) ;;

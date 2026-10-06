@@ -98,11 +98,12 @@ if [ -z "$UNREAD_JSONL" ]; then
 fi
 
 # JSONL -> JSON array -> "from \x1f body \x1f at \x1f id" rows (newlines/tabs in
-# the body escaped so each message stays one display line).
+# the body escaped so each message stays one display line; a US in the body is
+# shown as U+241F so it cannot shift the fields or lose the id read below).
 _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
 ROWS=$(agmsg_sqlite ':memory:' "
   SELECT json_extract(value,'\$.from') || char(31) ||
-         replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
+         replace(replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t'), char(31), char(9247)) || char(31) ||
          json_extract(value,'\$.at') || char(31) ||
          json_extract(value,'\$.id')
   FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');

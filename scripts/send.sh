@@ -230,7 +230,7 @@ while true; do
   if [ -f "$DB" ]; then
     row="$(agmsg_sqlite -separator $'\x1f' "$DB" "
       SELECT id, created_at, team, from_agent, to_agent,
-             replace(replace(body, char(13), ''), char(10), '\\n')
+             replace(replace(replace(body, char(13), ''), char(10), '\\n'), char(31), char(9247))
       FROM messages
       WHERE $REPLY_WHERE
       ORDER BY id LIMIT 1;

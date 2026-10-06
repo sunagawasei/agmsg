@@ -221,6 +221,32 @@ that collapses redundant events (coalescing repeated `message_read` markers for
 the same `(msg_id, team, agent)`). v1 exposes this only internally; a user-facing
 CLI may follow.
 
+### 2.8 Machine inbox rows (`inbox.sh --format ids`)
+
+The headless bridges (claude-code, codex, cursor) and cursor's `inject-watch.sh`
+read unread messages through `inbox.sh <team> <agent> --format ids`, which the
+sqlite driver serves with `storage_list_unread_machine`. One message is one line:
+
+```
+<id> US <from> US <body> US <at>        # US = 0x1f
+```
+
+- `id` is a UUIDv7 or a legacy decimal id; consumers accept `[0-9a-fA-F-]+` only.
+- `body` has LF written as `\n` and TAB as `\t`; CR is dropped. Backslash and US
+  are **not** escaped, so a body may contain US, and a literal `\n` / `\t` cannot
+  be told apart from an escaped one (known limitation; consumers decode every
+  `\n` / `\t`). An empty body is an empty field.
+- A consumer takes `id` as the first field, `from` as the second and `at` as the
+  last; `body` is everything between, US included. `read` with `IFS=US` and a
+  fixed variable list drops a trailing US from a single-field last variable, so
+  consumers split by hand (parameter expansion or `awk`).
+- Reading never marks a message read; `inbox.sh --mark-read-ids` does.
+
+Display output (`inbox.sh` without `--format`, `history.sh`, `check-inbox.sh`,
+`watch.sh`) is not a codec: LF and TAB are escaped to keep one line per message,
+and a US in the body is shown as U+241F. The hook JSON from `check-inbox.sh`
+escapes every other control byte as `\u00XX`.
+
 ## 3. CLI mapping
 
 | User command | Driver function(s) |

@@ -241,6 +241,16 @@ _wait_for_file_contains() {
   ! grep -q "M1-before-stop" "$TEST_SKILL_DIR/out2.log"
 }
 
+@test "watch: a body with the unit separator prints whole on one line" {
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" sess-us "$PROJ" claude-code \
+    >"$TEST_SKILL_DIR/us.log" 2>/dev/null 3>&- &
+  local w=$!
+  bash "$SCRIPTS/send.sh" team bob alice $'before\x1fafter\x1f' >/dev/null
+  wait_for_file_contains "$TEST_SKILL_DIR/us.log" $'bob \u2192 alice | before\u241fafter\u241f' || { kill "$w" 2>/dev/null; return 1; }
+  _stop_watcher "$w"
+}
+
 @test "watch: a fresh session delivers the backlog past the read cursor and not what the cursor already passed" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
   # M0-consumed sits at or before alice's read cursor; M0-backlog arrives after

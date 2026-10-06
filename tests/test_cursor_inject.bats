@@ -368,6 +368,17 @@ _resend_pending_has_id() {  # <iid> <id>
   [ "$status" -eq 0 ]
 }
 
+@test "a body whose only unit separator is the last byte is injected whole" {
+  local sid="sess-us2" pane="paneUs2" iid="iid-us2"
+  pane_json "$pane" idle "$TEST_PROJECT" > "$HERDR_LIST_JSON"
+  local id; id="$(send_msg bob $'only-trailing\x1f')"
+
+  start_inject "$sid" "$pane" "$iid" >/dev/null
+  wait_until 60 _wait_read_at "$id"
+  run grep -F $'only-trailing\x1f' "$HERDR_LOG"
+  [ "$status" -eq 0 ]
+}
+
 @test "pane id reuse (same pane id, different project cwd): never injects" {
   local sid="sess-e" pane="paneE" iid="iid-e"
   pane_json "$pane" idle "/some/other/project" > "$HERDR_LIST_JSON"

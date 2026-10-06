@@ -372,7 +372,7 @@ for team in "${TEAM_LIST[@]}"; do
     _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
     agmsg_sqlite ':memory:' "
       SELECT json_extract(value,'\$.from') || char(31) ||
-             replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
+             replace(replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t'), char(31), char(9247)) || char(31) ||
              json_extract(value,'\$.at') || char(31) ||
              json_extract(value,'\$.id')
       FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
@@ -482,7 +482,12 @@ if [ -n "$OUTPUT" ]; then
     OUTPUT+="agmsg: teams after it were not checked; their messages stay unread and will be offered again."$'\n'
   fi
   # Escape for JSON: backslash, double-quote, newlines, tabs (macOS/Linux compatible)
-  ESCAPED=$(printf '%s' "$OUTPUT" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | awk '{if(NR>1) printf "\\n"; printf "%s",$0}')
+  # Other control bytes (CR, ESC, ...) become \u00XX: raw ones make the hook JSON invalid.
+  _ctl_sed=""
+  for _c in 1 2 3 4 5 6 7 8 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31; do
+    _ctl_sed+="s/$(printf "\\$(printf '%03o' "$_c")")/$(printf '\\\\u%04x' "$_c")/g;"
+  done
+  ESCAPED=$(printf '%s' "$OUTPUT" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | sed "$_ctl_sed" | awk '{if(NR>1) printf "\\n"; printf "%s",$0}')
   if [ "$EVENT" = "PostToolUse" ]; then
     # Mid-turn delivery (#1003). The shape is data, from the manifest — not a
     # type-name branch. codex-cli 0.149.1 requires a hookSpecificOutput object
