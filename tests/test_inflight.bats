@@ -33,9 +33,13 @@ ipath() {
   agmsg_inflight_path team worker "$1" "$BRIDGE_START"
 }
 
+# Through the reader, not messages.read_at: mark-read records a message_read
+# event and leaves the legacy messages row alone.
 unread_count() {
-  sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
-    "SELECT COUNT(*) FROM messages WHERE team='team' AND to_agent='worker' AND read_at IS NULL;"
+  local ids
+  ids="$(bash "$SCRIPTS/inbox.sh" team worker --format ids)" || return 1
+  [ -n "$ids" ] || { echo 0; return 0; }
+  printf '%s\n' "$ids" | wc -l | tr -d ' '
 }
 
 alice_notices() {
@@ -111,6 +115,8 @@ alice_notices() {
   local mid
   bash "$SCRIPTS/send.sh" team alice worker "doomed" >/dev/null
   mid="$(sqlite3 "$TEST_SKILL_DIR/db/messages.db" "SELECT id FROM messages WHERE team='team' AND to_agent='worker';")"
+  # The reader must see the message before the mark, or a zero after it proves nothing.
+  [ "$(unread_count)" -eq 1 ]
   bash "$SCRIPTS/inbox.sh" team worker --mark-read-ids "$mid" >/dev/null
   [ "$(unread_count)" -eq 0 ]
   write_consumers "$RUN/c" "$mid"
