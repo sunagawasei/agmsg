@@ -2,8 +2,8 @@
 
 # Regression tests for the watch.sh per-session watermark (#107): a Monitor
 # restart must deliver messages that arrived during the restart gap, without
-# re-delivering anything already streamed, while a fresh session still starts
-# from "now" rather than replaying history.
+# re-delivering anything already streamed, while a fresh session still receives
+# the messages already waiting past its pairs' read cursor.
 
 load test_helper
 
@@ -212,7 +212,7 @@ _wait_for_file_contains() {
   skip_on_windows "watcher background launch under Git Bash (#182)"
   local sid="sess-restart"
 
-  # First watcher: fresh session, takes its mark at MAX(id)=0, then streams M1.
+  # First watcher: fresh session, empty store, then streams M1.
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code \
     >"$TEST_SKILL_DIR/out1.log" 2>/dev/null 3>&- &
   local w1=$!
@@ -232,7 +232,7 @@ _wait_for_file_contains() {
   # A message arrives while NO watcher is running for this session.
   bash "$SCRIPTS/send.sh" team bob alice "M2-in-gap" >/dev/null
 
-  # Restart the SAME session_id — should resume from the persisted watermark.
+  # Restart the SAME session_id — should resume from the pair's read cursor.
   run_watcher_until_contains "$sid" "$TEST_SKILL_DIR/out2.log" "M2-in-gap"
 
   # In-gap message is delivered on restart...
@@ -241,27 +241,36 @@ _wait_for_file_contains() {
   ! grep -q "M1-before-stop" "$TEST_SKILL_DIR/out2.log"
 }
 
-@test "watch: a fresh session starts from now and does not replay history" {
+@test "watch: a fresh session delivers the backlog past the read cursor and not what the cursor already passed" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
-  skip "a fresh watcher streams the pair's unread backlog (delivery follows the read cursor, not the watermark seeded at the tip)"
-  # Pre-existing message before any watcher for this session ever runs.
-  bash "$SCRIPTS/send.sh" team bob alice "M0-history" >/dev/null
+  # M0-consumed sits at or before alice's read cursor; M0-backlog arrives after
+  # it, before any watcher for this session ever runs.
+  bash "$SCRIPTS/send.sh" team bob alice "M0-consumed" >/dev/null
+  local consumed_tip="$(_storage_tip)"
+  ( # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/storage.sh"
+    agmsg_storage_load
+    storage_read_cursor_consume team alice "$consumed_tip" >/dev/null )
+  _read_cursor_is "$consumed_tip"
+  bash "$SCRIPTS/send.sh" team bob alice "M0-backlog" >/dev/null
 
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-fresh" "$PROJ" claude-code \
     >"$TEST_SKILL_DIR/fresh.log" 2>/dev/null 3>&- &
   local w=$!
   wait_for_file "$TEST_SKILL_DIR/run/watch.$(_iid "sess-fresh").watermark"
   bash "$SCRIPTS/send.sh" team bob alice "M-live" >/dev/null
-  # M-live has a higher id than M0-history, so once it has been streamed the
-  # watcher has passed the history row too — which is what makes the "history
-  # is not replayed" assertion below meaningful rather than merely untimed.
+  # M-live has a later event sequence than both earlier rows, so once it has been streamed
+  # the watcher has passed the consumed row too — which is what makes the
+  # "not re-delivered" assertion below meaningful rather than merely untimed.
   wait_for_file_contains "$TEST_SKILL_DIR/fresh.log" "M-live"
   kill "$w" 2>/dev/null || true
   wait "$w" 2>/dev/null || true
 
-  # Live message after attach is delivered; pre-existing history is not replayed.
+  # The backlog past the cursor and the live message are delivered; the row the
+  # cursor already passed is not.
+  grep -q "M0-backlog" "$TEST_SKILL_DIR/fresh.log"
   grep -q "M-live" "$TEST_SKILL_DIR/fresh.log"
-  ! grep -q "M0-history" "$TEST_SKILL_DIR/fresh.log"
+  ! grep -q "M0-consumed" "$TEST_SKILL_DIR/fresh.log"
 }
 
 @test "watch: persists a watermark file for the session" {
@@ -300,10 +309,8 @@ _wait_for_file_contains() {
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >"$out" 2>"$err" 3>&- &
   local w=$!
   # Wait for the watermark file, not just the pidfile: the pidfile is written
-  # early (before the subscription is resolved and LAST is seeded), so sending a
-  # message right after it appears would race the seed and the row would land at
-  # or below the initial watermark and never be "new". The watermark file is
-  # written once the watcher is ready to receive.
+  # early, before the subscription is resolved and the watermark is seeded. The
+  # watermark file is written once the watcher is ready to receive.
   wait_for_file "$wm"
   [ -f "$pf" ]
 

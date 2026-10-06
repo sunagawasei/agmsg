@@ -24,12 +24,12 @@ ORIG_ARGS=("$@")
 #     of those pairs.
 #   - When [active_name] is given, narrows the subscription to only pairs
 #     whose agent name matches — useful for `actas` exclusive role mode.
-#   - A fresh session sets the high-water mark to the current MAX(id) at
-#     startup, so the stream begins with whatever arrives after launch — no
-#     replay of historical messages. The mark is persisted per session_id, so
-#     a restart of this session's watcher (actas/drop/clear/self-restart)
-#     resumes from the last delivered id and does not drop messages that
-#     arrived during the restart gap. See #107.
+#   - Delivery follows each pair's read cursor, not the session watermark: a
+#     new session's watcher also delivers messages that were already waiting
+#     for its pairs before it started, and never re-delivers ones at or before
+#     the cursor. A restart of this session's watcher (actas/drop/clear/
+#     self-restart) therefore resumes from the cursor and does not drop
+#     messages that arrived during the restart gap. See #107.
 #   - Polls the SQLite DB at AGMSG_WATCH_INTERVAL seconds (default 1, also
 #     overridable via the delivery.monitor.poll_interval config key).
 #   - Emits one line per new message:
@@ -1043,19 +1043,17 @@ done <<< "$PAIRS"
 
 # Determine the starting watermark.
 #
-# The watermark is persisted per session_id so that a *restart* of this
-# session's watcher resumes from the last delivered id instead of jumping to
-# the current MAX(id). Monitor restarts are routine — `actas`/`drop` do
-# TaskStop + relaunch, `/clear`/resume re-fires the SessionStart directive, and
-# a killed watcher self-restarts — and the old "start from MAX(id)" behavior
-# silently dropped every message that landed in the gap between the previous
-# watcher stopping and the new one taking its mark. Resuming from the persisted
-# watermark closes that gap; staying strictly after the last delivered id
-# avoids re-streaming anything already seen. See #107.
+# The watermark is persisted per session_id, but delivery does not filter on
+# it: the poll loop passes each pair's read cursor to storage_watch_after, so
+# what a watcher streams is whatever is past that cursor. Monitor restarts are
+# routine — `actas`/`drop` do TaskStop + relaunch, `/clear`/resume re-fires the
+# SessionStart directive, and a killed watcher self-restarts — and resuming
+# from the read cursor is what keeps messages that landed in the gap between
+# the previous watcher stopping and the new one starting. See #107.
 #
-# A *fresh* session (no persisted watermark) still starts from the current
-# MAX(id) — live push, no replay of history (the no-arg inbox check covers
-# historical unread, not this stream).
+# A *fresh* session (no persisted watermark) seeds the watermark at the current
+# tip, but that seed does not suppress delivery: a message already past the
+# pair's read cursor is streamed to the new session.
 # The watermark is now an OPAQUE delivery cursor (§2.2), not an integer id — the
 # active storage driver issues and interprets it; this script only persists the
 # latest token and passes it back unchanged.
@@ -1104,7 +1102,7 @@ if [ -f "$WATERMARK_FILE" ]; then
   LAST="$(tr -d '[:space:]' < "$WATERMARK_FILE" 2>/dev/null || true)"
 fi
 if [ -z "$LAST" ]; then
-  # A fresh watcher starts from the current tip (live push, no history replay).
+  # Seed the watermark at the current tip; delivery still follows the read cursor.
   LAST="$(storage_watch_tip ${SUB_PAIRS[@]+"${SUB_PAIRS[@]}"} 2>/dev/null || true)"
   case "$LAST" in '') LAST=0 ;; esac
   persist_watermark

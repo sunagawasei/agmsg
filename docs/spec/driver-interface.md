@@ -128,8 +128,9 @@ name, which a metadata consumer would otherwise misread.
 Live delivery (`watch.sh`, `check-inbox.sh`) resumes from a checkpoint instead of
 re-reading the whole log. That checkpoint is an **opaque, driver-issued cursor**
 — a position in the driver's global message order. Core treats it as an opaque
-string: it persists the latest cursor (per session — the successor to the old
-`watch.<sid>.watermark` file) and passes it back unchanged. **Core never parses,
+string: it persists the latest cursor (the per-session `watch.<sid>.watermark`
+file, and the per-pair read cursor that `watch.sh` passes to
+`storage_watch_after` to decide what to deliver) and passes it back unchanged. **Core never parses,
 compares, or orders cursors.** This is what lets one contract serve sqlite
 integer ids, UUIDv7, Redis stream ids, and JSONL byte offsets — the
 `id > watermark` integer assumption is removed from core entirely.
@@ -143,9 +144,10 @@ characters (e.g. a JSONL byte offset bundled with metadata) must encode it
 (base64url or similar) into a single safe token.
 
 - `storage_watch_tip <pairs...>` — print the cursor for "now" (the current tip of
-  the global order) as a single bare line. A fresh watcher starts here, so it
-  delivers only messages that arrive *after* it attached (no history replay; the
-  no-arg inbox check covers the backlog).
+  the global order) as a single bare line. A fresh watcher seeds its session
+  watermark here; this does not limit delivery, which follows the pair's read
+  cursor, so a message already past that cursor is still delivered to a new
+  watcher.
 - `storage_watch_after <cursor> <pairs...>` — print, as JSONL and in delivery
   order, every `message_sent` after `<cursor>` addressed to one of the
   subscription pairs; then print a final cursor record

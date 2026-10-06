@@ -1803,8 +1803,8 @@ JSON
 
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-sid "$TEST_PROJECT" claude-code bob > /tmp/agmsg-as-bob 2>&1 3>&- &
   local pid=$!
-  # The watcher seeds its cursor from the storage tip at startup, so prior
-  # messages aren't replayed. Send NEW messages through the facade (storage_send
+  # The two rows above went straight into the legacy messages table, which the
+  # event-log watcher does not scan. Send NEW messages through the facade (storage_send
   # writes the event log the watcher now streams) and wait for several polls.
   #
   # Wait for the readiness sentinel, not the pidfile: watch.sh writes its
