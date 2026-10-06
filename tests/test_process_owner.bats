@@ -655,6 +655,12 @@ while not os.path.exists(release):
 PY
 }
 
+# GNU stat reads `-f '%i' FILE` as filesystem mode, so its output reaches stdout before the
+# -c fallback runs; try -c first and leave -f to BSD stat, where -c is rejected.
+file_inode() {
+  stat -c '%i' "$1" 2>/dev/null || stat -f '%i' "$1"
+}
+
 @test "process-owner claim barrier keeps its inode while cleanup runs under the holder" {
   local python scope='watch|claim-continuity|project|claude-code' scope_hash
   python="$(command -v python3 2>/dev/null || true)"
@@ -710,13 +716,13 @@ PY
   lock_pid=$!
   test_fixture_register_owned_pid "$lock_pid"
   wait_for_file "$ready"
-  before_inode="$(stat -f '%i' "$claim" 2>/dev/null || stat -c '%i' "$claim")"
+  before_inode="$(file_inode "$claim")"
   before_pid="$(cat "$pidfile")"
   before_owner="$(cat "$owner")"
   before_lease="$(cat "$lease_file")"
-  before_pid_inode="$(stat -f '%i' "$pidfile" 2>/dev/null || stat -c '%i' "$pidfile")"
-  before_owner_inode="$(stat -f '%i' "$owner" 2>/dev/null || stat -c '%i' "$owner")"
-  before_lease_inode="$(stat -f '%i' "$lease_file" 2>/dev/null || stat -c '%i' "$lease_file")"
+  before_pid_inode="$(file_inode "$pidfile")"
+  before_owner_inode="$(file_inode "$owner")"
+  before_lease_inode="$(file_inode "$lease_file")"
   AGMSG_TEST_PROCESS_PIDFILE="$pidfile" AGMSG_TEST_PROCESS_PYTHON="$python" \
     AGMSG_TEST_PROCESS_SIGNAL_RECORD="$signal_record" \
     bash "$SCRIPTS/internal/process-owner-launch.sh" \
@@ -733,9 +739,9 @@ PY
   [ "$(cat "$pidfile")" = "$before_pid" ]
   [ "$(cat "$owner")" = "$before_owner" ]
   [ "$(cat "$lease_file")" = "$before_lease" ]
-  [ "$(stat -f '%i' "$pidfile" 2>/dev/null || stat -c '%i' "$pidfile")" = "$before_pid_inode" ]
-  [ "$(stat -f '%i' "$owner" 2>/dev/null || stat -c '%i' "$owner")" = "$before_owner_inode" ]
-  [ "$(stat -f '%i' "$lease_file" 2>/dev/null || stat -c '%i' "$lease_file")" = "$before_lease_inode" ]
+  [ "$(file_inode "$pidfile")" = "$before_pid_inode" ]
+  [ "$(file_inode "$owner")" = "$before_owner_inode" ]
+  [ "$(file_inode "$lease_file")" = "$before_lease_inode" ]
   [ -e "$pidfile" ]
   [ -e "$owner" ]
   [ -e "$lease_file" ]
@@ -758,7 +764,7 @@ PY
   test_fixture_register_owned_pid "$contender_pid"
   if wait "$contender_pid" 2>/dev/null; then probe_status=0; else probe_status=$?; fi
   [ "$probe_status" -eq 0 ]
-  after_inode="$(stat -f '%i' "$claim" 2>/dev/null || stat -c '%i' "$claim")"
+  after_inode="$(file_inode "$claim")"
   [ "$after_inode" = "$before_inode" ]
   local reentry_target="$TEST_PROCESS_ROOT/claim-reentry-target.sh"
   local reentry_ready="$TEST_PROCESS_ROOT/claim-reentry.ready"
@@ -774,7 +780,7 @@ PY
   [ ! -e "$pidfile" ]
   [ ! -e "$owner" ]
   [ -e "$claim" ]
-  final_inode="$(stat -f '%i' "$claim" 2>/dev/null || stat -c '%i' "$claim")"
+  final_inode="$(file_inode "$claim")"
   [ "$final_inode" = "$before_inode" ]
 }
 
