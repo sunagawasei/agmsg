@@ -3250,7 +3250,7 @@ function sendFrame(s, v) { const p = Buffer.from(JSON.stringify(v), "utf8"); let
 function handle(s, msg) {
   if (msg.method === "initialize") return sendFrame(s, {jsonrpc:"2.0", id:msg.id, result:{}});
   if (msg.method === "thread/resume") return sendFrame(s, {jsonrpc:"2.0", id:msg.id, result:{thread:{id:msg.params.threadId, status:{type:"idle"}}}});
-  if (msg.method === "turn/start") { sendFrame(s,{jsonrpc:"2.0",id:msg.id,result:{}}); setTimeout(()=>sendFrame(s,{jsonrpc:"2.0",method:"turn/completed",params:{threadId:msg.params.threadId,turn:{id:"t"}}}),5); return; }
+  if (msg.method === "turn/start") { fs.appendFileSync(logf, `${Date.now()} turn\n`); sendFrame(s,{jsonrpc:"2.0",id:msg.id,result:{}}); setTimeout(()=>sendFrame(s,{jsonrpc:"2.0",method:"turn/completed",params:{threadId:msg.params.threadId,turn:{id:"t"}}}),5); return; }
   if (msg.method === "process/spawn") { arms++; const { code, stdout } = nextExit(); fs.appendFileSync(logf, `${Date.now()} arm ${arms} exit ${code}\n`); sendFrame(s, {jsonrpc:"2.0", id:msg.id, result:{}}); setTimeout(()=>sendFrame(s,{jsonrpc:"2.0",method:"process/exited",params:{processHandle:msg.params.processHandle, exitCode:code, stdout, stderr:""}}), 5); return; }
 }
 function frames(s, st, chunk) { st.buffer = Buffer.concat([st.buffer, chunk]); while (st.buffer.length >= 2) { const op = st.buffer[0] & 0x0f; let len = st.buffer[1] & 0x7f; let off = 2; if (len === 126) { if (st.buffer.length < off+2) return; len = st.buffer.readUInt16BE(off); off+=2; } else if (len === 127) { if (st.buffer.length < off+8) return; len = st.buffer.readUInt32BE(off+4); off+=8; } const masked = (st.buffer[1] & 0x80) !== 0; const mo = off; if (masked) off += 4; if (st.buffer.length < off+len) return; let pl = st.buffer.slice(off, off+len); if (masked) { const mk = st.buffer.slice(mo, mo+4); pl = Buffer.from(pl.map((b,i)=>b^mk[i%4])); } st.buffer = st.buffer.slice(off+len); if (op === 0x1) handle(s, JSON.parse(pl.toString("utf8"))); } }
@@ -3259,33 +3259,39 @@ server.listen(sock);
 EOF
 }
 
-@test "codex-bridge: the failure cap reaches even when wakes interleave (#936)" {
+@test "codex-bridge: a benign 124 re-arm never accumulates into a fatal episode when wakes interleave (#936)" {
   run node -e 'const net=require("net"),crypto=require("crypto");if(!net||!crypto)process.exit(1);'
   [ "$status" -eq 0 ] || skip "node net/crypto not available"
   run node -e 'const fs=require("fs"),net=require("net");const s=process.argv[1];try{fs.unlinkSync(s)}catch(_){}const sv=net.createServer();sv.on("error",()=>process.exit(2));sv.listen(s,()=>sv.close(()=>{try{fs.unlinkSync(s)}catch(_){}process.exit(0)}));' "$TEST_SKILL_DIR/probe3.sock"
   [ "$status" -eq 0 ] || skip "unix socket listen not available"
 
   local fake="$TEST_SKILL_DIR/rearm-fake.js" sock="$TEST_SKILL_DIR/rearm.sock" flog="$TEST_SKILL_DIR/rearm.log"
+  local out="$TEST_SKILL_DIR/rearm-bridge.out"
   _write_rearm_fake "$fake"; : > "$flog"
   SCENARIO=alt124_0 node "$fake" "$sock" "$flog" 3>&- &
   local server_pid="$!"
-  for _ in {1..50}; do [ -S "$sock" ] && break; sleep 0.1; done
+  wait_until 10 test -S "$sock"
 
-  # fail, fail, wake, repeating: the old reset-to-0 held the counter below the
-  # limit forever. With the decay it climbs, so the bridge stops itself.
-  # Reaching the failure cap here means climbing through several fail/wake
-  # cycles (the decay this test exists to prove), each failure paying the
-  # production 5s re-arm backoff -- AGMSG_TEST_CODEX_BRIDGE_WATCH_REARM_MS
-  # shortens that wait; it is the cycle COUNT this test asserts on, not how
-  # long each cycle's backoff takes.
-  AGMSG_TEST_CODEX_BRIDGE_WATCH_REARM_MS=50 run node "$TYPES/codex/codex-bridge.js" \
+  # 124, 124, wake, repeating. Only ten minutes of continuous hard failure stop
+  # the bridge, so it must keep arming past the point where a failure count
+  # would have tripped.
+  node "$TYPES/codex/codex-bridge.js" \
     --project "$PROJ" --team team --name alice --thread thread-x \
-    --app-server "unix://$sock" --timeout 1 --interval 1
-  kill "$server_pid" 2>/dev/null || true
+    --app-server "unix://$sock" --timeout 1 --interval 1 >"$out" 2>&1 3>&- &
+  local bpid="$!"
+  # Past several 124 re-arms AND at least two processed wakes (each wake starts a turn).
+  arms_reached() {
+    [ "$(grep -c ' arm ' "$flog")" -ge 6 ] && [ "$(grep -c ' turn$' "$flog")" -ge 2 ]
+  }
+  wait_until 30 arms_reached
+  local alive=0
+  kill -0 "$bpid" 2>/dev/null && alive=1
+  kill "$bpid" "$server_pid" 2>/dev/null || true
+  wait "$bpid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
 
-  [ "$status" -ne 0 ]
-  grep -q "stopping after" <<<"$output"
-  grep -q "consecutive watch-once failure" <<<"$output"
+  [ "$alive" -eq 1 ]
+  refute grep -q "stopping after" "$out"
 }
 
 @test "codex-bridge: an invalid watch-rearm override falls back to the production delay, not an immediate re-arm" {
