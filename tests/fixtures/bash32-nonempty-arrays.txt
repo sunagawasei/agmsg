@@ -37,3 +37,4 @@ scripts/reset.sh|RESET_CONFIGS|a glob without nullglob stays one literal word
 scripts/session-end-worker.sh|argv|length checked before the loop
 scripts/spawn.sh|tmux_boot|literal non-empty initializer
 scripts/watchdog.sh|PIPESTATUS|bash always sets it
+scripts/watch.sh|PIPESTATUS|a pipeline always has at least one status
