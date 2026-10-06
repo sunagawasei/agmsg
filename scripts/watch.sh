@@ -528,6 +528,124 @@ if [ -z "$INTERVAL" ]; then
 fi
 case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=1 ;; esac
 
+# The watchdog is intentionally configured separately from the inbox poll:
+# it is a periodic health check for this watcher team's own worker. A malformed
+# or non-positive value falls back to a safe default so a bad config cannot
+# turn the normal poll loop into a busy loop.
+WATCHDOG_INTERVAL="$("$SCRIPT_DIR/config.sh" get watchdog.interval_s 60 2>/dev/null || echo 60)"
+case "$WATCHDOG_INTERVAL" in ''|*[!0-9]*) WATCHDOG_INTERVAL=60 ;; esac
+[ "$WATCHDOG_INTERVAL" -gt 0 ] || WATCHDOG_INTERVAL=60
+WATCHDOG_LAST_RUN=0
+WATCHDOG_DATE_ERROR_LAUNCHED=0
+WATCHDOG_TOMBSTONE="$RUN_DIR/watchdog.${TEAM_PIN}.tombstone"
+WATCHDOG_STAMP_MAX=256
+
+# A tombstone suppresses recovery only while it is a readable, single-line
+# owner stamp written recently by SessionEnd. Any ambiguity or filesystem
+# error fails open so a stale marker cannot disable recovery indefinitely.
+watchdog_tombstone_fresh() {
+  local now="$1" stamp extra mtime age mtime_status read_status extra_status valid=1
+  # Check the object before opening it. In particular, a FIFO must never be
+  # opened by the polling hook: no writer is expected and the read would block.
+  [ -f "$WATCHDOG_TOMBSTONE" ] || return 1
+  [ ! -L "$WATCHDOG_TOMBSTONE" ] || return 1
+  [ -O "$WATCHDOG_TOMBSTONE" ] || return 1
+  [ -r "$WATCHDOG_TOMBSTONE" ] || return 1
+
+  # INSTANCE_ID values are short path-safe strings. Read at most one extra byte
+  # beyond the documented maximum; never use wc/cat on an attacker-sized file.
+  # Bash read discards NUL bytes, so inspect the same bounded prefix separately
+  # before reading it into a shell variable.
+  dd if="$WATCHDOG_TOMBSTONE" bs=1 count=$((WATCHDOG_STAMP_MAX + 1)) 2>/dev/null \
+    | od -An -tx1 2>/dev/null \
+    | grep -Eq '(^|[[:space:]])00([[:space:]]|$)'
+  local -a probe_status=( "${PIPESTATUS[@]}" )
+  [ "${probe_status[0]:-1}" -eq 0 ] || return 1
+  [ "${probe_status[1]:-1}" -eq 0 ] || return 1
+  [ "${probe_status[2]:-1}" -eq 1 ] || return 1
+  exec 9<"$WATCHDOG_TOMBSTONE" 2>/dev/null || return 1
+  IFS= read -r -n $((WATCHDOG_STAMP_MAX + 1)) stamp <&9
+  read_status=$?
+  if [ "${#stamp}" -eq 0 ] || [ "${#stamp}" -gt "$WATCHDOG_STAMP_MAX" ]; then
+    valid=0
+  fi
+  # read -n consumes the newline delimiter. Any byte left after the first line
+  # therefore proves multiline or oversized content and fails closed.
+  if [ "$valid" -eq 1 ]; then
+    IFS= read -r -n 1 extra <&9
+    extra_status=$?
+    [ "$extra_status" -eq 1 ] || valid=0
+  fi
+  exec 9<&-
+  [ "$valid" -eq 1 ] || return 1
+  case "$read_status" in
+    0) ;;
+    1) [ -n "$stamp" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  case "$stamp" in *[![:graph:]]*) return 1 ;; esac
+  mtime_status=0
+  mtime="$(compat_file_mtime "$WATCHDOG_TOMBSTONE" 2>/dev/null)" || mtime_status=$?
+  [ "$mtime_status" -eq 0 ] || return 1
+  case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$now" -ge "$mtime" ] || return 1
+  age=$((now - mtime))
+  [ "$age" -le 600 ] || return 1
+  return 0
+}
+
+WATCHDOG_OWNER_START=""
+if agmsg_instance_is_composite "$SESSION_ID"; then
+  WATCHDOG_OWNER_START="$(agmsg_pid_start_token \
+    "${SESSION_ID##*.}" 2>/dev/null || true)"
+fi
+
+# Bash has no portable monotonic-clock builtin, so the watchdog cadence uses
+# wall-clock seconds. If the clock moves backward, resetting this process-local
+# baseline prevents a negative delta from wedging future watchdog runs.
+maybe_run_watchdog() {
+  [ -n "$TEAM_PIN" ] || return 0
+
+  local now date_status
+  date_status=0
+  now="$(date +%s 2>/dev/null)" || date_status=$?
+  if [ "$date_status" -ne 0 ]; then
+    if [ "$WATCHDOG_DATE_ERROR_LAUNCHED" -eq 0 ]; then
+      AGMSG_WATCHDOG_OWNER_INSTANCE="$SESSION_ID" \
+        AGMSG_WATCHDOG_OWNER_START="$WATCHDOG_OWNER_START" \
+        "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
+      WATCHDOG_DATE_ERROR_LAUNCHED=1
+    fi
+    return 0
+  fi
+  case "$now" in
+    ''|*[!0-9]*)
+      if [ "$WATCHDOG_DATE_ERROR_LAUNCHED" -eq 0 ]; then
+        AGMSG_WATCHDOG_OWNER_INSTANCE="$SESSION_ID" \
+          AGMSG_WATCHDOG_OWNER_START="$WATCHDOG_OWNER_START" \
+          "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
+        WATCHDOG_DATE_ERROR_LAUNCHED=1
+      fi
+      return 0
+      ;;
+  esac
+  WATCHDOG_DATE_ERROR_LAUNCHED=0
+
+  if [ "$now" -lt "$WATCHDOG_LAST_RUN" ]; then
+    WATCHDOG_LAST_RUN="$now"
+    return 0
+  fi
+  if [ $(( now - WATCHDOG_LAST_RUN )) -lt "$WATCHDOG_INTERVAL" ]; then
+    return 0
+  fi
+
+  WATCHDOG_LAST_RUN="$now"
+  watchdog_tombstone_fresh "$now" && return 0
+  AGMSG_WATCHDOG_OWNER_INSTANCE="$SESSION_ID" \
+    AGMSG_WATCHDOG_OWNER_START="$WATCHDOG_OWNER_START" \
+    "$SCRIPT_DIR/watchdog.sh" "$TEAM_PIN" 19>&- &
+}
+
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 
 # Sequential re-invocation of Monitor for this same session_id leaves the
@@ -1187,7 +1305,10 @@ while true; do
   # Not-yet-ready is handled by returning rather than exiting, so this falls
   # through to the rest of the loop body below on a cycle spent waiting --
   # delivery is not paused while an install is still in flight.
+  # A pending install may have left watchdog.sh and its libs half-copied.
+  WATCHDOG_INSTALL_PENDING=0
   if _install_changed; then
+    WATCHDOG_INSTALL_PENDING=1
     _handle_install_changed
   else
     # Reaching here means this cycle saw no change at all -- the "one clean
@@ -1219,6 +1340,7 @@ while true; do
     watch_log "session $SESSION_ID is no longer alive; stopping."
     exit 0
   fi
+  [ "$WATCHDOG_INSTALL_PENDING" -eq 0 ] && maybe_run_watchdog
   while IFS=$'\t' read -r pair_team pair_agent; do
     [ -z "$pair_team" ] && continue
     # Warm the actas-lock path cache as a PLAIN STATEMENT, never via $(...): a

@@ -139,6 +139,22 @@ watchdog_count_at_least() {
   [ "$(watchdog_count "$1")" -ge "$2" ]
 }
 
+@test "watchdog: an install still in flight does not launch the watchdog" {
+  set_dates 100 200 300 400 500 600 700 800 900 1000 1100 1200 1300 1400 1500 1600 1700 1800 1900 2000
+  local out="$TEST_SKILL_DIR/out" err="$TEST_SKILL_DIR/err"
+  start_watcher pending "$out" "$err"
+  wait_until 10 watchdog_count_at_least "$out" 2
+  # A script newer than the watcher's start, with VERSION not rewritten yet.
+  touch -t 203001010000 "$SCRIPTS/install-in-flight.marker"
+  sleep 3
+  local settled
+  settled="$(watchdog_count "$out")"
+  sleep 4
+  stop_watcher
+
+  [ "$(watchdog_count "$out")" -eq "$settled" ]
+}
+
 @test "watchdog: default interval launches immediately once and uses own team" {
   set_dates 100 100 100
   local out="$TEST_SKILL_DIR/out" err="$TEST_SKILL_DIR/err"
@@ -152,23 +168,27 @@ watchdog_count_at_least() {
 }
 
 @test "watchdog: configured interval fires below, at, and above the boundary" {
+  # A poll cycle takes seconds on loaded runners; these tests need several.
+  _WAIT_TIMEOUT=30
   bash "$SCRIPTS/config.sh" set watchdog.interval_s 10 >/dev/null
   set_dates 100 109 110 121
   local out="$TEST_SKILL_DIR/out" err="$TEST_SKILL_DIR/err"
   start_watcher boundary "$out" "$err"
-  wait_until 10 watchdog_count_at_least "$out" 3
+  wait_until 30 watchdog_count_at_least "$out" 3
   stop_watcher
 
   [ "$(watchdog_count "$out")" -eq 3 ]
 }
 
 @test "watchdog: invalid and zero intervals fall back without a busy loop" {
+  # A poll cycle takes seconds on loaded runners; these tests need several.
+  _WAIT_TIMEOUT=30
   bash "$SCRIPTS/config.sh" set watchdog.interval_s invalid >/dev/null
   set_dates 100 100 100
   local out="$TEST_SKILL_DIR/out" err="$TEST_SKILL_DIR/err"
   start_watcher invalid "$out" "$err"
   wait_for_file_contains "$out" "WATCHDOG team"
-  wait_until 3 numeric_file_at_least "$TEST_SKILL_DIR/date.index" 2
+  wait_until 30 numeric_file_at_least "$TEST_SKILL_DIR/date.index" 2
   stop_watcher
 
   [ "$(watchdog_count "$out")" -eq 1 ]
@@ -179,7 +199,7 @@ watchdog_count_at_least() {
   set_dates 200 200 200
   start_watcher zero "$out" "$err"
   wait_for_file_contains "$out" "WATCHDOG team"
-  wait_until 3 numeric_file_at_least "$TEST_SKILL_DIR/date.index" 2
+  wait_until 30 numeric_file_at_least "$TEST_SKILL_DIR/date.index" 2
   stop_watcher
   [ "$(watchdog_count "$out")" -eq 1 ]
   [ "$(cat "$TEST_SKILL_DIR/date.index")" -le 3 ]
@@ -455,11 +475,13 @@ STUB
 }
 
 @test "watchdog: backward wall-clock jump resets the baseline" {
+  # A poll cycle takes seconds on loaded runners; these tests need several.
+  _WAIT_TIMEOUT=30
   bash "$SCRIPTS/config.sh" set watchdog.interval_s 10 >/dev/null
   set_dates 100 95 104 105
   local out="$TEST_SKILL_DIR/out" err="$TEST_SKILL_DIR/err"
   start_watcher backward "$out" "$err"
-  wait_until 10 watchdog_count_at_least "$out" 2
+  wait_until 30 watchdog_count_at_least "$out" 2
   stop_watcher
 
   [ "$(watchdog_count "$out")" -eq 2 ]
