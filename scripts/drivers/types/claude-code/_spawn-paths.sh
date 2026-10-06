@@ -171,7 +171,7 @@ agmsg_claude_reviewer_root_guard() {
     echo "spawn: reviewer sandbox cannot verify project '$project': it is not an existing directory" >&2
     return 1
   fi
-  for root in "${AGMSG_CLAUDE_WRITE_ROOTS[@]}"; do
+  for root in ${AGMSG_CLAUDE_WRITE_ROOTS[@]+"${AGMSG_CLAUDE_WRITE_ROOTS[@]}"}; do
     [ -n "$root" ] || continue
     if ! phys_root="$(agmsg_claude_resolve_path "$root")"; then
       echo "spawn: reviewer sandbox cannot resolve writable root '$root' (symlink cycle?); refusing because containment in project '$project' is unproven" >&2

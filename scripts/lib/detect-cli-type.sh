@@ -31,7 +31,7 @@ agmsg_detect_cli_type() {
       continue
     fi
     read -ra _toks <<<"$_detect"
-    for _v in "${_toks[@]}"; do
+    for _v in ${_toks[@]+"${_toks[@]}"}; do
       if [ -n "${!_v:-}" ]; then
         echo "$_t"
         return 0
@@ -53,7 +53,7 @@ EOF
         _pats="$(agmsg_type_get "$_t" detect_proc)"
         [ -n "$_pats" ] || continue
         read -ra _toks <<<"$_pats"
-        for _pat in "${_toks[@]}"; do
+        for _pat in ${_toks[@]+"${_toks[@]}"}; do
           # $_pat is intentionally an UNQUOTED glob pattern matched against the
           # process name; read -ra already kept it out of pathname expansion.
           # shellcheck disable=SC2254

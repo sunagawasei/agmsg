@@ -935,7 +935,7 @@ _handle_install_changed() {
       # replace the process image (e.g. an interpreter it can no longer
       # exec); it is the fallback for that failure, not dead code.
       # shellcheck disable=SC2093
-      exec "$new_watch" "${ORIG_ARGS[@]}"
+      exec "$new_watch" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
       watch_report "exec of the updated watch.sh failed; exiting instead of running stale code."
       exit 1
     fi
@@ -1105,7 +1105,7 @@ if [ -f "$WATERMARK_FILE" ]; then
 fi
 if [ -z "$LAST" ]; then
   # A fresh watcher starts from the current tip (live push, no history replay).
-  LAST="$(storage_watch_tip "${SUB_PAIRS[@]}" 2>/dev/null || true)"
+  LAST="$(storage_watch_tip ${SUB_PAIRS[@]+"${SUB_PAIRS[@]}"} 2>/dev/null || true)"
   case "$LAST" in '') LAST=0 ;; esac
   persist_watermark
 fi
@@ -1198,7 +1198,7 @@ _watch_renew_or_stop() {
   [ "$elapsed" -ge "$WATCH_MAX_SECONDS" ] || return 0
   if [ "$_WATCH_DELIVERED" -gt 0 ] || [ -n "${AGMSG_CC_MONITOR_KEEP_ALIVE:-}" ]; then
     cmd="$(printf '%q' "$SCRIPT_DIR/watch.sh")"
-    for arg in "${ORIG_ARGS[@]}"; do
+    for arg in ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}; do
       cmd="$cmd $(printf '%q' "$arg")"
     done
     desc="agmsg inbox stream"

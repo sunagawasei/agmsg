@@ -83,7 +83,7 @@ agmsg_validate_message_id_csv() {
   local csv="$1" part
   case "$csv" in ''|,*|*,|*,,*) return 1 ;; esac
   IFS=',' read -r -a _agmsg_id_parts <<< "$csv"
-  for part in "${_agmsg_id_parts[@]}"; do
+  for part in ${_agmsg_id_parts[@]+"${_agmsg_id_parts[@]}"}; do
     agmsg_validate_message_id "$part" || return 1
   done
   return 0
@@ -94,7 +94,7 @@ agmsg_message_ids_sql_in_clause() {
   local csv="$1" out="" part esc
   agmsg_validate_message_id_csv "$csv" || return 1
   IFS=',' read -r -a _agmsg_id_sql_parts <<< "$csv"
-  for part in "${_agmsg_id_sql_parts[@]}"; do
+  for part in ${_agmsg_id_sql_parts[@]+"${_agmsg_id_sql_parts[@]}"}; do
     esc="$(printf '%s' "$part" | sed "s/'/''/g")"
     out="${out:+$out,}'$esc'"
   done

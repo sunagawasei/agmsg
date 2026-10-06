@@ -196,4 +196,4 @@ truncated_flag=()
 python3 "$SCRIPT_DIR/internal/team-list.py" \
   --entries "$work_file" --variants "$variants_file" \
   --scope "$scope" --max-config-bytes "$MAX_CONFIG_BYTES" --format "$format" \
-  "${truncated_flag[@]}"
+  ${truncated_flag[@]+"${truncated_flag[@]}"}

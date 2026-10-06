@@ -377,7 +377,7 @@ poll_new() {
   resolve_target || return 0
   local team rows id from body ts
   IFS=',' read -ra _teams <<< "$TARGET_TEAMS"
-  for team in "${_teams[@]}"; do
+  for team in ${_teams[@]+"${_teams[@]}"}; do
     [ -n "$team" ] || continue
     rows="$("$SCRIPT_DIR/inbox.sh" "$team" "$TARGET_AGENT" --format ids 2>/dev/null)"
     [ -n "$rows" ] || continue

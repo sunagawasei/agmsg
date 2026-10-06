@@ -372,7 +372,7 @@ agmsg_spawn_headless() {
   [ -n "$CLAUDE_CODE_MODEL" ] && runtime_policy_args+=(--model "$CLAUDE_CODE_MODEL")
   [ -n "$CLAUDE_CODE_EFFORT" ] && runtime_policy_args+=(--effort "$CLAUDE_CODE_EFFORT")
   runtime_policy_args+=(--settings "$settings_file")
-  for path in "${add_dirs[@]}"; do runtime_policy_args+=(--add-dir "$path"); done
+  for path in ${add_dirs[@]+"${add_dirs[@]}"}; do runtime_policy_args+=(--add-dir "$path"); done
   probe_policy_args=("${runtime_policy_args[@]}")
   # The reviewer probe deliberately omits this one outer removal layer so the
   # same settings must prove Edit/Write denial. Runtime is strictly tighter.

@@ -308,7 +308,7 @@ placement_dead() {
   identity_key="$(agmsg_identity_key "$TEAM" "$name")"
   args="$(compat_get_cmdline "$pid" 2>/dev/null || true)"
   read -r -a argv <<<"$args" || true
-  for arg in "${argv[@]}"; do
+  for arg in ${argv[@]+"${argv[@]}"}; do
     if [ "$expect_identity" -eq 1 ]; then
       [ "$arg" = "$identity_key" ] && identity_token=1
       expect_identity=0

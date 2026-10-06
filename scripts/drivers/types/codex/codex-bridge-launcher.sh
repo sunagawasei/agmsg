@@ -938,7 +938,7 @@ EOF
     --thread "$thread_id" \
     --app-server "$req_app_server" \
     --inline-inbox \
-    "${bridge_owner_args[@]}" \
+    ${bridge_owner_args[@]+"${bridge_owner_args[@]}"} \
     >>"$log" 2>&1 3>&- 4>&- &
   launched_pid=$!
   if [ -n "${AGMSG_CODEX_BRIDGE_CMD:-}" ]; then

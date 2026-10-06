@@ -1,0 +1,39 @@
+# Arrays that may be expanded as a bare "${a[@]}" under `set -u` because they
+# are never empty at that point. bash 3.2 (macOS /bin/bash) aborts on an empty
+# one, so every other array expansion must use ${a[@]+"${a[@]}"}.
+# Format: <path>|<array>|<why it is never empty>
+scripts/actas-claim.sh|_autostart_teams|length checked before the call
+scripts/api.sh|names|length checked before the loop
+scripts/check-inbox.sh|IDS|length checked before the call
+scripts/check-inbox.sh|TEAM_LIST|the script exits when it is empty
+scripts/check-inbox.sh|_ci_list|length checked before the copy
+scripts/despawn.sh|argv|length checked before the loop
+scripts/drivers/types/claude-code/_spawn-probe.sh|args|the only caller passes the settings flags
+scripts/drivers/types/claude-code/_spawn.sh|bridge_run|always assigned a command
+scripts/drivers/types/claude-code/_spawn.sh|inherited_dirs|length checked before the echo
+scripts/drivers/types/claude-code/_spawn.sh|probe_policy_args|copy of runtime_policy_args, which holds --settings
+scripts/drivers/types/claude-code/_spawn.sh|runtime_policy_args|always holds --settings
+scripts/drivers/types/claude-code/claude-code-bridge.sh|ADD_DIRS|loop runs only when ADD_DIRS_SET=1
+scripts/drivers/types/claude-code/claude-code-bridge.sh|CLAUDE_BRIDGE_ORIGINAL_ARGS|--team and --name are required
+scripts/drivers/types/claude-code/claude-code-bridge.sh|DISALLOWED_TOOLS|loop runs only when DISALLOWED_TOOLS_SET=1
+scripts/drivers/types/claude-code/claude-code-bridge.sh|args|always starts with -p
+scripts/drivers/types/codex/_session-start.sh|bridge_pairs|the read loop runs at least once
+scripts/drivers/types/codex/_session-start.sh|bridge_run|always assigned a command
+scripts/drivers/types/codex/_spawn-reviewer.sh|sandbox|literal non-empty initializer
+scripts/drivers/types/codex/_spawn.sh|runtime_root_args|literal non-empty initializer
+scripts/drivers/types/codex/codex-bridge-launcher.sh|bridge_pair_values|the read loop runs at least once
+scripts/drivers/types/codex/codex-bridge-launcher.sh|bridge_pairs|the read loop runs at least once
+scripts/drivers/types/codex/codex-bridge-launcher.sh|bridge_run|always assigned a command
+scripts/drivers/types/codex/codex-shim.sh|monitor_args|length checked before the exec
+scripts/drivers/types/cursor/_spawn.sh|bridge_run|always assigned a command
+scripts/drivers/types/cursor/cursor-bridge.sh|CURSOR_BRIDGE_ORIGINAL_ARGS|--team and --name are required
+scripts/drivers/types/cursor/inject-watch.sh|INJECT_ORIGINAL_ARGS|five positional arguments are required
+scripts/inbox.sh|IDS|length checked before the call
+scripts/inbox.sh|_mark_arr|--mark-read-ids is validated non-empty
+scripts/lib/inflight.sh|sender_lines|count > 0 is required before the write
+scripts/lib/pending-teardown.sh|despawn_args|literal non-empty initializer
+scripts/release/sync-version.sh|DERIVED|literal non-empty initializer
+scripts/reset.sh|RESET_CONFIGS|a glob without nullglob stays one literal word
+scripts/session-end-worker.sh|argv|length checked before the loop
+scripts/spawn.sh|tmux_boot|literal non-empty initializer
+scripts/watchdog.sh|PIPESTATUS|bash always sets it
