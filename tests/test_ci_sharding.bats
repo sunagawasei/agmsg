@@ -34,22 +34,32 @@ all_test_files() {
   find "$REPO_ROOT/tests" -maxdepth 1 -name '*.bats' -exec basename {} \; | LC_ALL=C sort
 }
 
-# shard-tests.sh costs one grep/basename exec per test file per call, so the
-# partition properties below read one precomputed run of every (total, index)
-# pair they need instead of re-running it per test.
+# The partition properties below read one precomputed run of every (total, index)
+# pair they need instead of re-running it per test. SHARD_OS is pinned to an
+# unknown value for the default runs so a CI runner's own RUNNER_OS cannot pick
+# which weight column they were computed with.
 SHARD_TOTALS="1 2 3 4 5 8"
 
 setup_file() {
-  local repo_root total i
+  local repo_root total i os
   repo_root="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
   export SHARD_CACHE="$BATS_FILE_TMPDIR/shards"
   mkdir -p "$SHARD_CACHE"
   for total in $SHARD_TOTALS; do
     for ((i = 1; i <= total; i++)); do
       local rc=0
-      (cd "$repo_root" && bash "$repo_root/.github/scripts/shard-tests.sh" "$i" "$total") \
+      (cd "$repo_root" && env SHARD_OS=combined bash "$repo_root/.github/scripts/shard-tests.sh" "$i" "$total") \
         > "$SHARD_CACHE/$total.$i.out" 2> "$SHARD_CACHE/$total.$i.err" || rc=$?
       printf '%s\n' "$rc" > "$SHARD_CACHE/$total.$i.rc"
+    done
+  done
+  # The split CI computes per runner OS, cached under "<OS>-<total>".
+  for os in macOS Linux; do
+    for ((i = 1; i <= 5; i++)); do
+      local rc=0
+      (cd "$repo_root" && env SHARD_OS="$os" bash "$repo_root/.github/scripts/shard-tests.sh" "$i" 5) \
+        > "$SHARD_CACHE/$os-5.$i.out" 2> "$SHARD_CACHE/$os-5.$i.err" || rc=$?
+      printf '%s\n' "$rc" > "$SHARD_CACHE/$os-5.$i.rc"
     done
   done
 }
@@ -76,8 +86,8 @@ cached_shard() {
 # index is checked on its own, so a failing shard cannot be masked by the
 # sort at the end of the pipeline.
 union_of_shards() {
-  local total="$1" i out all=""
-  for ((i = 1; i <= total; i++)); do
+  local total="$1" count="${2:-$1}" i out all=""
+  for ((i = 1; i <= count; i++)); do
     out="$(cached_shard "$total" "$i")" || return 1
     [ -z "$out" ] || all="$all$out"$'\n'
   done
@@ -267,7 +277,7 @@ union_of_shards() {
   # The cached run from setup_file is the first run; this is the second.
   local first second
   first="$(cached_shard 4 2)"
-  second="$(cd "$REPO_ROOT" && bash "$SHARD" 2 4)"
+  second="$(cd "$REPO_ROOT" && SHARD_OS=combined bash "$SHARD" 2 4)"
   [ "$first" = "$second" ]
 }
 
@@ -282,18 +292,157 @@ union_of_shards() {
 @test "the heaviest file does not share a shard with the second heaviest" {
   # Not a correctness property — a balance smoke test. Greedy LPT should never
   # put the two largest files together while lighter shards exist; if it does,
-  # the weighting has broken and CI is slower than it looks.
-  local counts heaviest second
-  counts="$(cd "$REPO_ROOT" && grep -c '^[[:space:]]*@test' tests/*.bats | sort -t: -k2 -rn)"
-  heaviest="$(sed -n '1s/:.*//p' <<<"$counts")"
-  second="$(sed -n '2s/:.*//p' <<<"$counts")"
-  local i shard_files
+  # the weighting has broken and CI is slower than it looks. Weights are the
+  # table's macOS+Linux seconds, the same ones the default (no OS) split uses.
+  local ranked heaviest second i shard_files placed
+  # Rows for files no longer in tests/ are skipped: the table may keep them.
+  ranked="$(grep -v '^[#*]' "$REPO_ROOT/.github/scripts/bats-weights.tsv" \
+    | awk -F '\t' '{ print $2 + $3 "\t" $1 }' | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2 \
+    | while IFS="$(printf '\t')" read -r _ name; do [ ! -f "$REPO_ROOT/tests/$name" ] || echo "$name"; done)"
+  heaviest="$(sed -n '1p' <<<"$ranked")"
+  second="$(sed -n '2p' <<<"$ranked")"
+  [ -n "$heaviest" ] && [ -n "$second" ]
+  placed=0
   for i in 1 2 3 4; do
     shard_files="$(cached_shard 4 "$i")"
     if [[ "$shard_files" == *"$heaviest"* ]]; then
+      placed=1
       [[ "$shard_files" != *"$second"* ]]
     fi
   done
+  [ "$placed" -eq 1 ]
+}
+
+@test "each runner OS's split covers every test file exactly once with no empty shard" {
+  local os i out
+  for os in macOS Linux; do
+    run union_of_shards "$os-5" 5
+    [ "$status" -eq 0 ]
+    [ "$output" = "$(all_test_files)" ] || {
+      echo "$os split did not reproduce the suite" >&2
+      return 1
+    }
+    for i in 1 2 3 4 5; do
+      out="$(cached_shard "$os-5" "$i")"
+      [ -n "$out" ]
+    done
+  done
+}
+
+# --- weight table behaviour, on small fixture directories ---------------------
+
+# make_fixture <dir> <name>=<tests>... : files with that many @test lines.
+make_fixture() {
+  local dir="$1" spec name n i
+  shift
+  mkdir -p "$dir"
+  for spec in "$@"; do
+    name="${spec%%=*}"; n="${spec#*=}"
+    : > "$dir/$name"
+    for ((i = 0; i < n; i++)); do printf '@test "t%s" { true; }\n' "$i" >> "$dir/$name"; done
+  done
+}
+
+# fixture_shard <os> <index> <total> <dir> <table> : basenames of one shard, one line.
+fixture_shard() {
+  local os="$1" index="$2" total="$3" dir="$4" table="$5"
+  env -u RUNNER_OS SHARD_OS="$os" SHARD_WEIGHTS="$table" bash "$SHARD" "$index" "$total" "$dir" \
+    | sed 's|.*/||' | tr '\n' ' '
+}
+
+weights_table() {
+  printf '%b' "$2" > "$1"
+}
+
+@test "the weight table column follows the runner OS" {
+  local dir="$BATS_TEST_TMPDIR/fx" table="$BATS_TEST_TMPDIR/w.tsv"
+  make_fixture "$dir" a.bats=1 b.bats=1 c.bats=1 d.bats=1
+  weights_table "$table" '*per-test\t1\t1\na.bats\t100\t1\nb.bats\t60\t1\nc.bats\t50\t1\nd.bats\t10\t100\n'
+
+  # macOS: a(100) | b(60) c(50) then d(10) goes to the lighter shard 1.
+  [ "$(fixture_shard macOS 1 2 "$dir" "$table")" = "a.bats d.bats " ]
+  [ "$(fixture_shard macOS 2 2 "$dir" "$table")" = "b.bats c.bats " ]
+  # Linux: d(100) alone, the three 1s together.
+  [ "$(fixture_shard Linux 1 2 "$dir" "$table")" = "d.bats " ]
+  [ "$(fixture_shard Linux 2 2 "$dir" "$table")" = "a.bats b.bats c.bats " ]
+  # Anything else sums the columns: d(110) | a(101) b(61), c(51) joins d.
+  [ "$(fixture_shard combined 1 2 "$dir" "$table")" = "d.bats c.bats " ]
+  [ "$(fixture_shard combined 2 2 "$dir" "$table")" = "a.bats b.bats " ]
+}
+
+@test "SHARD_OS takes precedence over RUNNER_OS, which is used when SHARD_OS is unset" {
+  local dir="$BATS_TEST_TMPDIR/fx" table="$BATS_TEST_TMPDIR/w.tsv" out
+  make_fixture "$dir" a.bats=1 b.bats=1 c.bats=1 d.bats=1
+  weights_table "$table" '*per-test\t1\t1\na.bats\t100\t1\nb.bats\t60\t1\nc.bats\t50\t1\nd.bats\t10\t100\n'
+
+  out="$(env -u SHARD_OS RUNNER_OS=Linux SHARD_WEIGHTS="$table" bash "$SHARD" 1 2 "$dir" | sed 's|.*/||' | tr '\n' ' ')"
+  [ "$out" = "d.bats " ]
+  out="$(env SHARD_OS=macOS RUNNER_OS=Linux SHARD_WEIGHTS="$table" bash "$SHARD" 1 2 "$dir" | sed 's|.*/||' | tr '\n' ' ')"
+  [ "$out" = "a.bats d.bats " ]
+}
+
+@test "a file missing from the table weighs its @test count times the *per-test seconds" {
+  local dir="$BATS_TEST_TMPDIR/fx" table="$BATS_TEST_TMPDIR/w.tsv"
+  make_fixture "$dir" big.bats=1 new.bats=5 small.bats=1
+  weights_table "$table" '*per-test\t5\t5\nbig.bats\t20\t20\nsmall.bats\t1\t1\n'
+
+  # new.bats = 5 tests x 5s = 25 > big.bats 20, so it takes a shard alone.
+  [ "$(fixture_shard macOS 1 2 "$dir" "$table")" = "new.bats " ]
+  [ "$(fixture_shard macOS 2 2 "$dir" "$table")" = "big.bats small.bats " ]
+}
+
+@test "a missing weight table warns and weighs every file by @test count x 2s" {
+  local dir="$BATS_TEST_TMPDIR/fx"
+  make_fixture "$dir" x.bats=10 y.bats=1
+  run env -u RUNNER_OS SHARD_OS=macOS SHARD_WEIGHTS="$BATS_TEST_TMPDIR/none.tsv" bash "$SHARD" 1 2 "$dir"
+  [ "$status" -eq 0 ]
+  grep -Fq "no weight table" <<<"$output"
+  grep -Fq "x.bats" <<<"$output"
+  run env -u RUNNER_OS SHARD_OS=macOS SHARD_WEIGHTS="$BATS_TEST_TMPDIR/none.tsv" bash "$SHARD" 2 2 "$dir"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"y.bats"* ]]
+}
+
+@test "a zero in the table is a weight, not a missing file" {
+  local dir="$BATS_TEST_TMPDIR/fx" table="$BATS_TEST_TMPDIR/w.tsv"
+  make_fixture "$dir" a.bats=2 b.bats=1 c.bats=1
+  weights_table "$table" '*per-test\t7\t7\na.bats\t0\t0\nb.bats\t5\t5\n'
+
+  # c.bats is unlisted: 1 test x 7s = 7 > b 5. A 0 misread as "missing" would
+  # make a.bats 2 x 7 = 14 and move it ahead of both.
+  [ "$(fixture_shard macOS 1 2 "$dir" "$table")" = "c.bats " ]
+  [ "$(fixture_shard macOS 2 2 "$dir" "$table")" = "b.bats a.bats " ]
+}
+
+@test "a *per-test of zero weighs an unlisted file at zero" {
+  local dir="$BATS_TEST_TMPDIR/fx" table="$BATS_TEST_TMPDIR/w.tsv"
+  make_fixture "$dir" b.bats=1 d.bats=9 e.bats=1
+  weights_table "$table" '*per-test\t0\t0\nb.bats\t5\t5\ne.bats\t3\t3\n'
+
+  # d.bats at 0 sorts last and joins the lighter shard (e); read as the built-in
+  # 2s default it would weigh 18 and take a shard alone.
+  [ "$(fixture_shard macOS 1 2 "$dir" "$table")" = "b.bats " ]
+  [ "$(fixture_shard macOS 2 2 "$dir" "$table")" = "e.bats d.bats " ]
+}
+
+@test "a malformed weight table is a hard error that names the table" {
+  local dir="$BATS_TEST_TMPDIR/fx" table="$BATS_TEST_TMPDIR/w.tsv" row
+  make_fixture "$dir" a.bats=1 b.bats=1
+  for row in 'a.bats\t1.5\t2\n' 'a.bats\t08\t2\n' 'a.bats\t-3\t2\n' 'a.bats\tx\t2\n' \
+             'a.bats\t1\n' 'a.bats\t1\t2\t3\n' 'a.bats\t1\t2\na.bats\t3\t4\n' \
+             '*per-test\t1.5\t2\n' '*per-test\t1\t2\n*per-test\t1\t2\n'; do
+    weights_table "$table" "$row"
+    run env -u RUNNER_OS SHARD_OS=macOS SHARD_WEIGHTS="$table" bash "$SHARD" 1 2 "$dir"
+    [ "$status" -eq 1 ] || { echo "row accepted: $row" >&2; return 1; }
+    [[ "$output" == *"$table"* ]]
+  done
+}
+
+@test "the checked-in weight table parses and carries a *per-test row" {
+  local table="$REPO_ROOT/.github/scripts/bats-weights.tsv"
+  grep -q "^\*per-test$(printf '\t')" "$table"
+  run env SHARD_OS=macOS bash "$SHARD" 1 5 "$REPO_ROOT/tests"
+  [ "$status" -eq 0 ]
 }
 
 @test "shard-tests.sh rejects out-of-range and non-numeric arguments" {
