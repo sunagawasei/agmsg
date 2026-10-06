@@ -28,5 +28,7 @@ process.kill(process.pid, "SIGTERM");
 setTimeout(() => process.exit(2), 1000);
 NODE
   [ "$status" -eq 0 ]
-  [ "$output" = "codex-bridge: received SIGTERM; shutting down" ]
+  # Every bridge log line carries the writing process's "[pid] " prefix.
+  printf '%s\n' "$output" | grep -Eq '^\[[0-9]+\] codex-bridge: received SIGTERM; shutting down$'
+  [ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" -eq 1 ]
 }
