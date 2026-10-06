@@ -575,3 +575,53 @@ _gc_forks_for() {   # <n records> -> prints "<date> <stat> <cat> <tr>"
   touch "$TEST_SKILL_DIR/run/basename.log"
   [ "$(grep -c basename "$TEST_SKILL_DIR/run/basename.log" || true)" -lt 6 ]
 }
+
+_stale_team() {   # <team> <touch -t stamp>
+  mkdir -p "$TEST_SKILL_DIR/teams/$1"
+  printf '{"name":"%s","agents":{}}\n' "$1" > "$TEST_SKILL_DIR/teams/$1/config.json"
+  touch -t "$2" "$TEST_SKILL_DIR/teams/$1" "$TEST_SKILL_DIR/teams/$1/config.json"
+}
+
+@test "session-start TTL GC deletes only the team dirs past the TTL" {
+  enable_session_team
+  _stale_team s-0D0001 202501010000
+  _stale_team s-0D0002 202501010000
+  mkdir -p "$TEST_SKILL_DIR/teams/s-0E0001"
+  printf '{"name":"s-0E0001","agents":{}}\n' > "$TEST_SKILL_DIR/teams/s-0E0001/config.json"
+  run run_session_start
+  [ "$status" -eq 0 ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-0D0001" ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-0D0002" ]
+  [ -d "$TEST_SKILL_DIR/teams/s-0E0001" ]
+}
+
+@test "session-start TTL GC still deletes a stale team when the batch find fails" {
+  enable_session_team
+  _stale_team s-0D0003 202501010000
+  mkdir -p "$TEST_SKILL_DIR/fail-bin"
+  printf '#!/bin/sh\nexit 1\n' > "$TEST_SKILL_DIR/fail-bin/xargs"
+  chmod +x "$TEST_SKILL_DIR/fail-bin/xargs"
+  export PATH="$TEST_SKILL_DIR/fail-bin:$PATH"
+  run run_session_start
+  [ "$status" -eq 0 ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-0D0003" ]
+}
+
+@test "session-start TTL GC starts one find for all team dirs, not one each" {
+  enable_session_team
+  local stub_bin="$TEST_SKILL_DIR/count-bin" real i n0 n1
+  mkdir -p "$stub_bin"
+  real="$(command -v find)"
+  printf '#!/usr/bin/env bash\necho find >> "$FORK_LOG"\nexec "%s" "$@"\n' "$real" > "$stub_bin/find"
+  chmod +x "$stub_bin/find"
+  export FORK_LOG="$TEST_SKILL_DIR/run/find.log" PATH="$stub_bin:$PATH"
+  run run_session_start
+  n0="$(grep -c find "$FORK_LOG" || true)"
+  rm -f "$FORK_LOG"
+  for i in 1 2 3 4 5 6 7 8; do mkdir -p "$TEST_SKILL_DIR/teams/s-AB1$i"; done
+  run run_session_start
+  [ "$status" -eq 0 ]
+  touch "$FORK_LOG"
+  n1="$(grep -c find "$FORK_LOG" || true)"
+  [ "$((n1 - n0))" -le 1 ]
+}
