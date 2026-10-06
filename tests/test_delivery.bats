@@ -3146,9 +3146,13 @@ EOF
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
   # Stand in for a live bridge with a real process we can check kill -0 against.
-  sleep 60 3>&- &
+  # It is started through the owner launcher: a bare pidfile carries no
+  # authority to signal.
+  bash "$SCRIPTS/internal/process-owner-launch.sh" \
+    --kind codex-bridge --pidfile "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid" \
+    --scope "codex-bridge|team.alice" -- sleep 60 3>&- >/dev/null 2>&1 &
   local bpid=$!
-  echo "$bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/codex-bridge.team.alice.owner"
   echo "pid=$bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta"
   : > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.log"
   # The launcher's stale-binding sidecar + the project's shared app-server record

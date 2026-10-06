@@ -638,9 +638,24 @@ stop_codex_bridge() {
       [ -n "$team" ] && [ -n "$name" ] || continue
       pidfile="$RUN_DIR/codex-bridge.$team.$name.pid"
       [ -f "$pidfile" ] || continue
-      bpid=$(cat "$pidfile" 2>/dev/null || true)
-      if [ -n "$bpid" ] && _agmsg_pid_alive "$bpid"; then
-        kill "$bpid" 2>/dev/null && killed=$((killed + 1))
+      agmsg_process_identity_state codex-bridge "$pidfile" \
+        "codex-bridge|$team.$name" codex-bridge "$team" "$name"
+      [ "$AGMSG_PROCESS_STATE" = owned ] || {
+        # Unknown/legacy/degraded ownership is not authority to signal or to
+        # discard the only record from which an operator can inspect it.
+        continue
+      }
+      observed_pid="$AGMSG_PROCESS_PID"
+      observed_generation="$AGMSG_PROCESS_GENERATION"
+      observed_scope="$AGMSG_PROCESS_SCOPE_HASH"
+      if agmsg_process_signal_owned codex-bridge "$pidfile" \
+          "codex-bridge|$team.$name" TERM \
+          --expected-owner "$observed_pid" "$observed_generation" \
+          "$observed_scope" --wait-release 5 \
+          codex-bridge "$team" "$name"; then
+        killed=$((killed + 1))
+      else
+        continue
       fi
       # .appserver records which app-server URL the bridge was bound to (the
       # launcher's stale-binding guard); drop it with the rest so it cannot
