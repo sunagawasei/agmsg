@@ -35,7 +35,7 @@ _state_snapshot() {
 @test "session-start.sh: AGMSG_CURSOR_BRIDGE=1 exits 0, emits nothing and touches no state (F1)" {
   local before after
   before="$(_state_snapshot)"
-  run env AGMSG_CURSOR_BRIDGE=1 bash "$SCRIPTS/session-start.sh" cursor "$TEST_PROJECT" </dev/null
+  run env AGMSG_CURSOR_BRIDGE=1 AGMSG_AGENT_PID=$$ bash "$SCRIPTS/session-start.sh" cursor "$TEST_PROJECT" </dev/null
   [ "$status" -eq 0 ]
   [ -z "$output" ]
   after="$(_state_snapshot)"
@@ -43,18 +43,18 @@ _state_snapshot() {
 }
 
 @test "session-start.sh: AGMSG_CURSOR_BRIDGE=1 starts no inject watcher (F1)" {
-  run env AGMSG_CURSOR_BRIDGE=1 bash "$SCRIPTS/session-start.sh" cursor "$TEST_PROJECT" </dev/null
+  run env AGMSG_CURSOR_BRIDGE=1 AGMSG_AGENT_PID=$$ bash "$SCRIPTS/session-start.sh" cursor "$TEST_PROJECT" </dev/null
   [ "$status" -eq 0 ]
   run bash -c "ls '$RUN_DIR'/inject-watch.*.pid 2>/dev/null | wc -l | tr -d ' '"
   [ "$output" = "0" ]
 }
 
 @test "session-start.sh: without the guard the same call is NOT inert (control)" {
-  # Proves the assertions above are actually gated on the env var rather than on
-  # the fixture being inert for some other reason.
+  # Same env as the guarded tests (AGMSG_AGENT_PID gives it an owner PID, so a cc-instance
+  # record is written) minus the guard; proves the assertions above are gated on it.
   local before after
   before="$(_state_snapshot)"
-  run bash -c "printf '{\"session_id\":\"guard-control\"}' | bash '$SCRIPTS/session-start.sh' cursor '$TEST_PROJECT' 2>/dev/null"
+  run bash -c "printf '{\"session_id\":\"guard-control\"}' | AGMSG_AGENT_PID=$$ bash '$SCRIPTS/session-start.sh' cursor '$TEST_PROJECT' 2>/dev/null"
   after="$(_state_snapshot)"
   [ "$before" != "$after" ]
 }
