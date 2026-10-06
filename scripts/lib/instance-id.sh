@@ -474,10 +474,9 @@ agmsg_cc_instance_current() {   # <pid>
 #                            session-start.sh's dedup overwrites cc-instance.
 #                            <pid> with the newest attaching token, so a stale
 #                            token's kill-0-only check would otherwise report
-#                            "alive" forever via the shared pid. No record at
-#                            all (codex: its SessionStart plug exits before
-#                            ever reaching that write) falls back to the plain
-#                            pid check, unchanged from before.
+#                            "alive" forever via the shared pid. A host with no
+#                            record is alive on pid alone; only lock-less codex
+#                            is one today, so revisit before codex takes a lock.
 #   bare "<sid>"            → some live cc-instance.<p> file references it. For
 #                            upgrade compatibility a cc-instance whose content
 #                            is either exactly "<sid>" or the composite

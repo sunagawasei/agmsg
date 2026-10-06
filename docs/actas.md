@@ -68,3 +68,5 @@ On Codex, `$agmsg actas <name>` is **send-side only** for this session. Codex sl
 The receive side isn't actually narrowed either: `check-inbox.sh` resolves identity through `whoami.sh` (which picks the first registered agent) and has no view of the agent's in-session actas role, so Codex keeps polling whichever pair it would have without actas. The check-inbox lock filter only skips pairs *another* session owns.
 
 Treat Codex actas as a from-line override until a Codex session-id story exists. Claude Code's `/agmsg actas` does claim the lock symmetrically and is the path that exercises the full exclusivity model.
+
+Codex never takes a role lock, so the "lock stays held after `/clear`" problem does not occur today. Before making Codex take one, decide how to tell the old conversation from the new one (for example by recording the thread id). At that point, check on a real Codex whether SessionStart fires again on `/clear` and whether the actual payload's `session_id` matches `CODEX_THREAD_ID`.
