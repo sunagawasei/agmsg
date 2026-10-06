@@ -8,10 +8,7 @@
 # real new message_sent row (a cursor-only page was still paying for it every
 # cycle), and cache the per-(team,agent) primitives behind the actas lock path
 # (team_id, member_id, the two name-encodings) instead of recomputing them via
-# a fresh sqlite3/tr fork on every single cycle. A team's own storage
-# partition driver is deliberately NOT cached this way -- see
-# _agmsg_partition_load's comment in lib/storage.sh for why (review, #1329
-# round 2: caching it missed a real migrate-team-store.sh scenario).
+# a fresh sqlite3/tr fork on every single cycle.
 
 load test_helper
 

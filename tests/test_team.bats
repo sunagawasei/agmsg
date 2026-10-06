@@ -494,49 +494,50 @@ EOF
   [[ "$output" =~ "hello" ]]
 }
 
-@test "rename-team: atomically migrates cursor and sync sidecars" {
+@test "rename-team: keeps the read cursor with the renamed team" {
+  bash "$SCRIPTS/join.sh" oldteam alice claude-code /tmp/proj-a
+  bash "$SCRIPTS/join.sh" oldteam bob   claude-code /tmp/proj-b
+  bash "$SCRIPTS/send.sh" oldteam alice bob "hello"
+  export SKILL_DIR="$TEST_SKILL_DIR" AGMSG_STORAGE_DRIVER=sqlite
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  storage_read_cursor_consume oldteam bob 999 >/dev/null
+  local pos
+  pos=$(storage_read_cursor_get oldteam bob)
+  [ "$pos" -gt 0 ]
+  bash "$SCRIPTS/rename-team.sh" oldteam newteam
+  [ "$(storage_read_cursor_get newteam bob)" = "$pos" ]
+  [ "$(storage_read_cursor_get oldteam bob)" = 0 ]
+}
+
+@test "rename-team: refuses a target name that still owns read cursors" {
   bash "$SCRIPTS/join.sh" oldteam alice claude-code /tmp/proj-a
   export SKILL_DIR="$TEST_SKILL_DIR" AGMSG_STORAGE_DRIVER=sqlite
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
-  storage_init oldteam >/dev/null
-  storage_read_cursor_consume oldteam alice 0 >/dev/null
-  _sqlite_sync_schema oldteam
-  local generation db renamed_db store_dir
-  generation=$(_sqlite_sync_generation oldteam)
-  # This team is on the default shared layout, so both names resolve to the same
-  # file and the rename rewrites columns rather than moving anything. A team that
-  # owns its store is covered separately, in the layout tests.
-  db=$(agmsg_db_path oldteam)
-  renamed_db="$db"
-  store_dir=$(agmsg_storage_dir)
-  agmsg_sqlite "$db" "INSERT INTO sync_bindings
-    (local_team,server_instance_id,remote_team_id,protocol_version,driver_generation)
-    VALUES('oldteam','018f3f7e-0000-7000-8000-000000000000',
-      '018f3f7e-0000-7000-8000-000000000001',1,'$generation');"
-  mkdir -p "$store_dir/remote-sync"
-  printf '{"local_team":"oldteam","binding":"fixture"}\n' \
-    > "$store_dir/remote-sync/oldteam.json"
-  chmod 600 "$store_dir/remote-sync/oldteam.json"
-  bash "$SCRIPTS/rename-team.sh" oldteam newteam
-  [ "$(agmsg_sqlite "$renamed_db" "SELECT team FROM read_cursors;" | tr -d '\r')" = newteam ]
-  [ "$(agmsg_sqlite "$renamed_db" "SELECT local_team FROM sync_bindings;" | tr -d '\r')" = newteam ]
-  [ ! -e "$store_dir/remote-sync/oldteam.json" ]
-  [ "$(jq -r '.local_team' "$store_dir/remote-sync/newteam.json")" = newteam ]
+  storage_init >/dev/null
+  agmsg_sqlite "$(agmsg_db_path)" "INSERT INTO read_cursors(team,agent,local_position) VALUES('newteam','bob',0);"
+  run bash "$SCRIPTS/rename-team.sh" oldteam newteam
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "not merged" ]]
+  [ -f "$TEST_SKILL_DIR/teams/oldteam/config.json" ]
+  [ ! -f "$TEST_SKILL_DIR/teams/newteam/config.json" ]
 }
 
-@test "rename-team: JSONL keeps the cursor with the renamed event stream" {
-  export SKILL_DIR="$TEST_SKILL_DIR" AGMSG_STORAGE_DRIVER=jsonl
+@test "rename-team: a failing cursor update fails the rename and rolls the message update back" {
   bash "$SCRIPTS/join.sh" oldteam alice claude-code /tmp/proj-a
+  bash "$SCRIPTS/join.sh" oldteam bob   claude-code /tmp/proj-b
+  bash "$SCRIPTS/send.sh" oldteam alice bob "hello"
+  export SKILL_DIR="$TEST_SKILL_DIR" AGMSG_STORAGE_DRIVER=sqlite
   source "$SCRIPTS/lib/storage.sh"
   agmsg_storage_load
-  local id tip
-  id=$(storage_send oldteam bob alice hello)
-  tip=$(storage_watch_tip oldteam:alice)
-  storage_read_cursor_consume oldteam alice "$tip" "$id" >/dev/null
-  bash "$SCRIPTS/rename-team.sh" oldteam newteam
-  [ "$(storage_read_cursor_get newteam alice)" = "$tip" ]
-  [ "$(storage_history newteam | jq -r '.team')" = newteam ]
+  storage_read_cursor_consume oldteam bob 999 >/dev/null
+  local db; db=$(agmsg_db_path)
+  agmsg_sqlite "$db" "CREATE TRIGGER block_cursor_move BEFORE UPDATE ON read_cursors
+    BEGIN SELECT RAISE(ABORT, 'blocked'); END;" >/dev/null
+  run bash "$SCRIPTS/rename-team.sh" oldteam newteam
+  [ "$status" -ne 0 ]
+  [ "$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM events WHERE team='newteam';" | tr -d '\r')" = 0 ]
 }
 
 @test "rename-team: fails when old team is missing" {
@@ -594,6 +595,40 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" =~ "hello" ]]
   [[ "$output" =~ "claude-orchestrator" ]]
+}
+
+@test "rename: keeps the read cursor and read events with the renamed agent" {
+  bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/proj-a
+  bash "$SCRIPTS/join.sh" myteam bob   claude-code /tmp/proj-b
+  export SKILL_DIR="$TEST_SKILL_DIR" AGMSG_STORAGE_DRIVER=sqlite
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  local id pos
+  id=$(storage_send myteam alice bob hello)
+  storage_read_cursor_consume myteam bob 999 "$id" >/dev/null
+  pos=$(storage_read_cursor_get myteam bob)
+  [ "$pos" -gt 0 ]
+  bash "$SCRIPTS/rename.sh" myteam bob robert
+  [ "$(storage_read_cursor_get myteam robert)" = "$pos" ]
+  [ "$(storage_read_cursor_get myteam bob)" = 0 ]
+  [ "$(agmsg_sqlite "$(agmsg_db_path)" "SELECT agent FROM events WHERE type='message_read';" | tr -d '\r')" = robert ]
+  run bash "$SCRIPTS/inbox.sh" myteam robert
+  [ "$status" -eq 0 ]
+  [[ ! "$output" =~ "hello" ]]
+}
+
+@test "rename: refuses a new name that still owns a read cursor" {
+  bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/proj-a
+  export SKILL_DIR="$TEST_SKILL_DIR" AGMSG_STORAGE_DRIVER=sqlite
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  storage_init >/dev/null
+  agmsg_sqlite "$(agmsg_db_path)" "INSERT INTO read_cursors(team,agent,local_position) VALUES('myteam','bob',0);"
+  run bash "$SCRIPTS/rename.sh" myteam alice bob
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "not merged" ]]
+  run bash "$SCRIPTS/team.sh" myteam
+  [[ "$output" =~ "alice" ]]
 }
 
 @test "rename: fails when old agent is missing" {

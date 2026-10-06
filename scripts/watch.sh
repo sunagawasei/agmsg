@@ -1352,9 +1352,7 @@ while true; do
     # through a $(...) of their own, so warming it here, in this loop's own
     # top-level (non-subshell) frame, is what makes the warmth actually
     # survive to the NEXT cycle instead of being rebuilt from scratch every
-    # single call (#1321 first-stage follow-up). Storage's own partition
-    # driver is deliberately NOT cached this way — see
-    # _agmsg_partition_load's comment in lib/storage.sh (#1329 round 2).
+    # single call (#1321 first-stage follow-up).
     _actas_lock_primitives_into "$pair_team" "$pair_agent"
     # Ownership is re-read every cycle, because it can change under a running
     # watcher and nothing else notices. The subscription set and the startup

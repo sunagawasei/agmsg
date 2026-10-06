@@ -45,28 +45,35 @@ json_field() {
   [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.remote_team_id');")" = "" ]
 }
 
+# team-list reads binding_state and remote_team_id from the team's config.json
+# alone, so the tests write the binding directly. The secret-looking field is
+# there to prove it never reaches the output.
+_write_remote_binding() {
+  python3 - "$TEST_SKILL_DIR/teams/myteam/config.json" "$1" <<'PY'
+import json, sys
+path, disconnected = sys.argv[1], sys.argv[2] == "disconnected"
+cfg = json.load(open(path))
+binding = {
+    "remote_team_id": "018f3f7e-0000-7000-8000-000000000001",
+    "connected_at": "2026-01-01T00:00:00Z",
+    "session_credential": "session-credential-secret",
+}
+if disconnected:
+    binding["disconnected_at"] = "2026-01-02T00:00:00Z"
+cfg["remote_binding"] = binding
+json.dump(cfg, open(path, "w"))
+PY
+}
+
 @test "team list --json: an actively connected team has binding_state=active and a real remote_team_id" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
-
-  MOCK_REVOKE_FAIL="${MOCK_REVOKE_FAIL:-}" python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
-    > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
-  local mock_pid=$!
-  for _ in $(seq 1 50); do
-    [ -s "$TEST_SKILL_DIR/server.port" ] && break
-    sleep 0.05
-  done
-  local mock_port; mock_port="$(cat "$TEST_SKILL_DIR/server.port")"
-  local endpoint="http://127.0.0.1:$mock_port"
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$endpoint" good-token myteam
-  local committed_remote_team_id
-  committed_remote_team_id=$(python3 -c "import json; print(json.load(open('$SCRIPTS/../teams/myteam/config.json'))['remote_binding']['remote_team_id'])")
+  _write_remote_binding active
 
   run bash "$SCRIPTS/team-list.sh" --json
-  kill "$mock_pid" 2>/dev/null || true
   [ "$status" -eq 0 ]
   local escaped; escaped="$(printf %s "$(sqlite_mem "SELECT json_extract('$(printf %s "$(json_field "$output" teams)" | sed "s/'/''/g")', '\$[0]');")" | sed "s/'/''/g")"
   [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.binding_state');")" = "active" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.remote_team_id');")" = "$committed_remote_team_id" ]
+  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.remote_team_id');")" = "018f3f7e-0000-7000-8000-000000000001" ]
   # No secret and no absolute filesystem path anywhere in the output.
   [[ "$output" != *"session-credential"* ]]
   [[ "$output" != *"/tmp/project-a"* ]]
@@ -74,24 +81,13 @@ json_field() {
 
 @test "team list --json: a disconnected team has binding_state=disconnected, remote_team_id retained" {
   bash "$SCRIPTS/join.sh" myteam alice claude-code /tmp/project-a
-  python3 "$BATS_TEST_DIRNAME/helpers/mock_remote_server.py" 0 \
-    > "$TEST_SKILL_DIR/server.port" 2>"$TEST_SKILL_DIR/server.log" &
-  local mock_pid=$!
-  for _ in $(seq 1 50); do
-    [ -s "$TEST_SKILL_DIR/server.port" ] && break
-    sleep 0.05
-  done
-  local mock_port; mock_port="$(cat "$TEST_SKILL_DIR/server.port")"
-  local endpoint="http://127.0.0.1:$mock_port"
-  bash "$SCRIPTS/remote.sh" connect --endpoint "$endpoint" good-token myteam
-  bash "$SCRIPTS/remote.sh" disconnect myteam
-  kill "$mock_pid" 2>/dev/null || true
+  _write_remote_binding disconnected
 
   run bash "$SCRIPTS/team-list.sh" --json
   [ "$status" -eq 0 ]
   local escaped; escaped="$(printf %s "$(sqlite_mem "SELECT json_extract('$(printf %s "$(json_field "$output" teams)" | sed "s/'/''/g")', '\$[0]');")" | sed "s/'/''/g")"
   [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.binding_state');")" = "disconnected" ]
-  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.remote_team_id');")" != "" ]
+  [ "$(sqlite_mem "SELECT json_extract('$escaped', '\$.remote_team_id');")" = "018f3f7e-0000-7000-8000-000000000001" ]
 }
 
 @test "team list --scope project: only includes teams registered for the given project" {

@@ -42,14 +42,6 @@ After this runs once, `~/.agents/skills/agmsg/` is populated and you can skip St
 
 ### Step 2a: If not in a team — join one
 
-Before first-time setup, inspect the user's request. If they ask to join,
-import, or bring in a team that already exists on a server, do not run
-`join.sh`. Go directly to the `remote pull` command under Step 2b. Before
-pulling, run `team-list.sh --json --scope all`; if a same-named local team has
-`binding_state` `none` or `disconnected`, stop and ask the user how to proceed.
-After pull succeeds, return here so the user can register a new local agent in
-the team that pull just created.
-
 Ask the user for a team name. If it's an existing team, run `team.sh <team>` first to see the current roster and note the names already in use. Look for a naming convention already in play (e.g. a shared base name with role and number suffixes (`<base>-<role><n>`), or names derived from the team name) and, when one exists, propose 2-3 unused names that extend it; otherwise propose 2-3 short, distinctive identity names (not a bare tool-type label like `codex`/`cc`). Either way, names must not collide with the roster. For a brand-new team, skip the roster check and just ask. Then run:
 
 ```bash
@@ -232,7 +224,7 @@ If argument starts with "rename-team":
 3. Run: `bash ~/.agents/skills/agmsg/scripts/rename-team.sh <old_team> <new_team>`
 4. Show the result.
 
-### Remote sync
+### Permissions
 
 Every agmsg step above runs through the host's Bash tool, so on Claude Code each call is gated by the permission system until you allowlist the script directory. Add these to `~/.claude/settings.json` (or project-level `.claude/settings.local.json`):
 
@@ -248,62 +240,6 @@ Every agmsg step above runs through the host's Bash tool, so on Claude Code each
   }
 }
 ```
-
-If argument starts with "remote pull":
-1. When the user asks to join or bring in a team that already exists on a
-   server, NEVER use `join.sh`, create a team, or create a same-named local
-   team. Always use remote pull.
-2. Before pulling, check for a same-named local team. If one already exists
-   without an active remote connection, stop and ask the user how to proceed;
-   do not overwrite, merge, connect, or rename it on your own.
-3. Parse the required `--endpoint <url>` and `<team>`, plus optional
-   `--team-id <uuid>`.
-4. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh pull --endpoint <url> [--team-id <uuid>] <team>`
-5. Show the output to the user.
-
-Machine B needs its own install, not just its own environment variables.
-Only `remote.sh`, `remote-sync.sh`, `key.sh` and the two internal helpers read
-`AGMSG_SYNC_CONNECTION_DIR`; `send.sh`, `history.sh`, `team.sh` and `inbox.sh`
-resolve the team config from the install directory. So a pull driven by
-environment variables alone succeeds, and the send that is supposed to confirm
-it then reports the team as missing — the failure lands one step after the
-cause. See "Use a separate install for testing" in `docs/remote-setup.md`.
-
-If argument starts with "remote unlock":
-1. Parse `<team>`, `--bundle <file>`, and `--confirm-digest <sha256>`.
-2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh unlock <team> --bundle <file> --confirm-digest <sha256>`
-3. The snapshot digest must be compared over a separate live channel. Never
-   infer or auto-confirm it. The bundle is permanent secret key material; tell
-   the user to transfer and handle it only through their own trusted channel,
-   never by pasting it into agent chat.
-4. Show the complete result, including the imported-envelope count and engine
-   PID.
-5. The advanced form with repeatable `--snapshot` plus `--identity` or
-   `--identity-stdin` remains available when explicitly requested.
-
-If argument starts with "remote status":
-1. Parse an optional `<team>` and `--json`.
-2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh status [<team>] [--json]`
-3. Show the output to the user.
-
-If argument starts with "remote sync start":
-1. Parse the required `<team>`.
-2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh sync start <team>`
-3. Show the output to the user.
-
-If argument starts with "remote disconnect":
-1. Parse the required `<team>`.
-2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh disconnect <team>`
-3. Show the output to the user.
-
-If argument starts with "remote forget":
-1. Parse the required `<team>`. This permanently deletes that team's local
-   roster, history, keys, trust, and sync state, but never changes the server.
-2. Do not add `--yes` yourself. Run:
-   `bash ~/.agents/skills/agmsg/scripts/remote.sh forget <team>`
-3. The command requires the user to confirm in their terminal. If this agent
-   has no interactive terminal, show the deletion summary and tell the user to
-   rerun the displayed command directly; never bypass confirmation for them.
 
 ### End-to-end encryption
 

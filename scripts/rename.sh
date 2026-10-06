@@ -91,6 +91,16 @@ if [ -n "$NEW_VAL" ] && [ "$NEW_VAL" != "null" ]; then
   exit 1
 fi
 
+# A name that left the team keeps its read cursor in the shared store. Moving
+# this agent's cursor onto it would overwrite one of the two read positions, and
+# either choice hides or resurrects messages, so the rename is refused instead.
+if [ -f "$DB" ] \
+  && [ "$(agmsg_sqlite "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='read_cursors';" | tr -d '\r')" = 1 ] \
+  && [ "$(agmsg_sqlite "$DB" "SELECT COUNT(*) FROM read_cursors WHERE team='$(_agmsg_sqlesc "$TEAM")' AND agent='$NEW_NAME_SQL';" | tr -d '\r')" != 0 ]; then
+  echo "Agent $NEW_NAME still has read state from an earlier registration in team $TEAM; its history is not merged." >&2
+  exit 1
+fi
+
 # Rename: set new key with old value, remove old key
 UPDATED=$(agmsg_sqlite_mem \
   "SELECT json_remove(json_set('$CONFIG_ESCAPED', '\$.agents.' || '$NEW_NAME_SQL', json_extract('$CONFIG_ESCAPED', '\$.agents.' || '$OLD_NAME_SQL')), '\$.agents.' || '$OLD_NAME_SQL');")
@@ -118,9 +128,30 @@ UPDATED=$(agmsg_sqlite_mem \
 agmsg_write_atomic "$TEAM_CONFIG" "$UPDATED"
 
 # --- Update messages in DB ---
+# Rewrite the agent name in the event log (where storage_send writes), its read
+# cursors, and the legacy messages table. Without the events/cursor updates a
+# rename orphans every message sent since the storage flip and resets the
+# agent's read position.
 if [ -f "$DB" ]; then
-  agmsg_sqlite "$DB" "UPDATE messages SET from_agent='$(_agmsg_sqlesc "$NEW_NAME")' WHERE team='$(_agmsg_sqlesc "$TEAM")' AND from_agent='$(_agmsg_sqlesc "$OLD_NAME")';"
-  agmsg_sqlite "$DB" "UPDATE messages SET to_agent='$(_agmsg_sqlesc "$NEW_NAME")' WHERE team='$(_agmsg_sqlesc "$TEAM")' AND to_agent='$(_agmsg_sqlesc "$OLD_NAME")';"
+  TEAM_LIT=$(_agmsg_sqlesc "$TEAM")
+  OLD_LIT=$(_agmsg_sqlesc "$OLD_NAME")
+  NEW_LIT=$(_agmsg_sqlesc "$NEW_NAME")
+  RENAME_SQL=""
+  if [ "$(agmsg_sqlite "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='events';" | tr -d '\r')" = 1 ]; then
+    RENAME_SQL="$RENAME_SQL
+      UPDATE events SET from_agent='$NEW_LIT' WHERE team='$TEAM_LIT' AND from_agent='$OLD_LIT';
+      UPDATE events SET to_agent='$NEW_LIT' WHERE team='$TEAM_LIT' AND to_agent='$OLD_LIT';
+      UPDATE events SET agent='$NEW_LIT' WHERE type='message_read' AND team='$TEAM_LIT' AND agent='$OLD_LIT';"
+  fi
+  if [ "$(agmsg_sqlite "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='read_cursors';" | tr -d '\r')" = 1 ]; then
+    RENAME_SQL="$RENAME_SQL
+      UPDATE read_cursors SET agent='$NEW_LIT' WHERE team='$TEAM_LIT' AND agent='$OLD_LIT';"
+  fi
+  agmsg_sqlite "$DB" "BEGIN IMMEDIATE;
+    UPDATE messages SET from_agent='$NEW_LIT' WHERE team='$TEAM_LIT' AND from_agent='$OLD_LIT';
+    UPDATE messages SET to_agent='$NEW_LIT' WHERE team='$TEAM_LIT' AND to_agent='$OLD_LIT';
+    $RENAME_SQL
+    COMMIT;"
 fi
 
 agmsg_lock_release

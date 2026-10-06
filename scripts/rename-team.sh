@@ -115,6 +115,15 @@ if [ "$MOVES_STORE" = true ] && [ -e "$NEW_STORE_DIR" ]; then
   exit 1
 fi
 
+# Same for read cursors: a target name left behind by an earlier team still owns
+# its cursors in the shared store, and they cannot be merged with this team's.
+if [ "$MOVES_STORE" = false ] && [ -f "$DB" ] \
+  && [ "$(agmsg_sqlite "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='read_cursors';" | tr -d '\r')" = 1 ] \
+  && [ "$(agmsg_sqlite "$DB" "SELECT COUNT(*) FROM read_cursors WHERE team='$(_agmsg_sqlesc "$NEW_TEAM")';" | tr -d '\r')" != 0 ]; then
+  echo "Read state already exists for $NEW_TEAM in the shared store; it is not merged." >&2
+  exit 1
+fi
+
 # Move the config into the locked, reserved target dir. Move the file (not the
 # dir) because the target dir already exists — we created and locked it.
 mv "$OLD_DIR/config.json" "$NEW_DIR/config.json"
@@ -152,14 +161,25 @@ if [ -f "$NEW_CONFIG" ]; then
 fi
 
 # --- Update messages in DB ---
-# Rewrite the team name in BOTH stores: the event log (where storage_send now
-# writes) and the legacy messages table (pre-event-log installs). Without the
-# events update a rename would orphan every message sent after the storage flip.
+# Rewrite the team name in the event log (where storage_send now writes), the
+# read cursors, and the legacy messages table, in one transaction. Without the
+# events update a rename would orphan every message sent after the storage flip;
+# without the cursors every consumed message reads as unread again.
 if [ -f "$DB" ]; then
-  agmsg_sqlite "$DB" "UPDATE messages SET team='$(_agmsg_sqlesc "$NEW_TEAM")' WHERE team='$(_agmsg_sqlesc "$OLD_TEAM")';"
-  # events may not exist yet on an install that has not sent since the storage
-  # flip — best-effort, never abort the rename over a missing optional table.
-  agmsg_sqlite "$DB" "UPDATE events SET team='$(_agmsg_sqlesc "$NEW_TEAM")' WHERE team='$(_agmsg_sqlesc "$OLD_TEAM")';" 2>/dev/null || true
+  OLD_LIT=$(_agmsg_sqlesc "$OLD_TEAM")
+  NEW_LIT=$(_agmsg_sqlesc "$NEW_TEAM")
+  RENAME_SQL=""
+  for _tbl in events read_cursors; do
+    # An install that has not sent since the storage flip has neither table.
+    if [ "$(agmsg_sqlite "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='$_tbl';" | tr -d '\r')" = 1 ]; then
+      RENAME_SQL="$RENAME_SQL
+        UPDATE $_tbl SET team='$NEW_LIT' WHERE team='$OLD_LIT';"
+    fi
+  done
+  agmsg_sqlite "$DB" "BEGIN IMMEDIATE;
+    UPDATE messages SET team='$NEW_LIT' WHERE team='$OLD_LIT';
+    $RENAME_SQL
+    COMMIT;"
 fi
 
 agmsg_lock_release
