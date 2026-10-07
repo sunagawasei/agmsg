@@ -769,7 +769,7 @@ _agmsg_placement_split() {   # <ref>
 #   then undecidable and the caller must not name or record (fail-closed).
 _agmsg_placement_claimed_by() {
   local ref="$1" team="$2" agent="$3" dir f first mine enc_agent t is_mine
-  local want_term want_id want_sock
+  local want_term want_id want_sock own_paths=""
   _agmsg_placement_split "$ref" || return 1          # undecidable, not "unclaimed"
   want_term="$_AGMSG_PS_TERM"; want_id="$_AGMSG_PS_ID"; want_sock="$_AGMSG_PS_SOCK"
   mine="$(agmsg_spawn_path "$team" "$agent")" || return 1
@@ -788,11 +788,17 @@ _agmsg_placement_claimed_by() {
     is_mine=0
     case "$f" in
       *"__$enc_agent")
-        for t in "$(dirname "$dir")"/teams/*/; do
-          [ -d "$t" ] || continue
-          t="${t%/}"; t="${t##*/}"
-          [ "$f" = "$(agmsg_spawn_path "$t" "$agent")" ] && { is_mine=1; break; }
-        done ;;
+        # Built once per call: agmsg_spawn_path forks sqlite3 per team, so
+        # resolving it per record x team took ~50s with many stale records.
+        if [ -z "$own_paths" ]; then
+          own_paths=$'\n'
+          for t in "$(dirname "$dir")"/teams/*/; do
+            [ -d "$t" ] || continue
+            t="${t%/}"; t="${t##*/}"
+            own_paths+="$(agmsg_spawn_path "$t" "$agent" 2>/dev/null)"$'\n'
+          done
+        fi
+        case "$own_paths" in *$'\n'"$f"$'\n'*) is_mine=1 ;; esac ;;
     esac
     [ "$is_mine" -eq 1 ] && continue
     IFS="$(printf '\t')" read -r first _ < "$f" 2>/dev/null || first=""
