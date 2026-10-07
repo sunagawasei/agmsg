@@ -57,6 +57,10 @@ source "$SCRIPT_DIR/lib/team-lifecycle.sh"
 source "$SCRIPT_DIR/lib/type-registry.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/session-team.sh"
+# This run reads delivery.session_team several times. unset first: an inherited
+# export would keep the attribute and leak the memo into children.
+unset _AGMSG_SESSION_TEAM_MEMO _AGMSG_SESSION_TEAM_VAL
+_AGMSG_SESSION_TEAM_MEMO=1
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/role-session.sh"  # role->session reverse lookup (#339)
 # shellcheck disable=SC1091

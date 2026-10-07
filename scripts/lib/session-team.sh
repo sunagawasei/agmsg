@@ -40,12 +40,21 @@ agmsg_session_team_scripts_dir() {
 
 # Return 0 when session-team mode is enabled in config (delivery.session_team).
 agmsg_session_team_enabled() {
-  local sd
+  local sd on=1
+  # A caller that runs once and reads this many times (session-start.sh) opts in
+  # with a plain, unexported _AGMSG_SESSION_TEAM_MEMO=1; a long-lived process
+  # must keep re-reading the config.
+  if [ "${_AGMSG_SESSION_TEAM_MEMO:-}" = 1 ] && [ -n "${_AGMSG_SESSION_TEAM_VAL:-}" ]; then
+    [ "$_AGMSG_SESSION_TEAM_VAL" = 1 ]
+    return
+  fi
   sd="$(agmsg_session_team_scripts_dir)" || return 1
   case "$("$sd/config.sh" get delivery.session_team false 2>/dev/null || echo false)" in
-    true|1|yes|on) return 0 ;;
-    *) return 1 ;;
+    true|1|yes|on) ;;
+    *) on=0 ;;
   esac
+  [ "${_AGMSG_SESSION_TEAM_MEMO:-}" = 1 ] && _AGMSG_SESSION_TEAM_VAL="$on"
+  [ "$on" = 1 ]
 }
 
 # --- host manifest ---------------------------------------------------------
