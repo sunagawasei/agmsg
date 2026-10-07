@@ -28,34 +28,37 @@ PROJECT_SQL_IN=$(agmsg_project_sql_in_list "$PROJECT_PATH")
 
 [ -d "$TEAMS_DIR" ] || exit 0
 
+# One sqlite3 process for every team: a fork per team (two before) made this
+# scan scale with the number of teams that session-start runs it against.
+FILES_SQL=""
+n=0
 for config_file in "$TEAMS_DIR"/*/config.json; do
   [ -f "$config_file" ] || continue
-  cfg_sql=$(agmsg_sql_readfile_path "$config_file")
-  TEAM_NAME=$(agmsg_sqlite_mem "
-    WITH raw(json) AS (SELECT CAST(readfile('$cfg_sql') AS TEXT)),
-    cfg(json) AS (SELECT CASE WHEN json_valid(json) THEN json END FROM raw)
-    SELECT json_extract(json, '\$.name') FROM cfg;
-  ")
-  [ -z "$TEAM_NAME" ] && continue
-  [ "$TEAM_NAME" = "null" ] && continue
-  TEAM_SQL=$(printf '%s' "$TEAM_NAME" | sed "s/'/''/g")
-
-  sqlite3 -separator $'\t' :memory: "
-    WITH raw(json) AS (SELECT CAST(readfile('$cfg_sql') AS TEXT)),
-    cfg(json) AS (SELECT CASE WHEN json_valid(json) THEN json END FROM raw),
-    agents AS (
-      SELECT
-        key AS name,
-        CASE
-          WHEN json_type(json_extract(value, '\$.registrations')) = 'array' THEN json_extract(value, '\$.registrations')
-          ELSE json_array(json_object('type', json_extract(value, '\$.type'), 'project', json_extract(value, '\$.project')))
-        END AS registrations
-      FROM cfg, json_each(json_extract(cfg.json, '\$.agents'))
-    )
-    SELECT DISTINCT '$TEAM_SQL' AS team, name
-    FROM agents, json_each(agents.registrations) AS r
-    WHERE json_extract(r.value, '\$.project') IN ($PROJECT_SQL_IN)
-      AND json_extract(r.value, '\$.type') = '$AGENT_TYPE_SQL'
-    ORDER BY team, name;
-  " | tr -d '\r'
+  n=$((n + 1))
+  FILES_SQL="${FILES_SQL:+$FILES_SQL,}($n,'$(agmsg_sql_readfile_path "$config_file")')"
 done
+[ "$n" -gt 0 ] || exit 0
+
+sqlite3 -separator $'\t' :memory: "
+  WITH files(idx, path) AS (VALUES $FILES_SQL),
+  raw(idx, json) AS (SELECT idx, CAST(readfile(path) AS TEXT) FROM files),
+  cfg(idx, json) AS (SELECT idx, CASE WHEN json_valid(json) THEN json END FROM raw),
+  agents AS (
+    SELECT
+      cfg.idx AS idx,
+      json_extract(cfg.json, '\$.name') AS team,
+      key AS name,
+      CASE
+        WHEN json_type(json_extract(value, '\$.registrations')) = 'array' THEN json_extract(value, '\$.registrations')
+        ELSE json_array(json_object('type', json_extract(value, '\$.type'), 'project', json_extract(value, '\$.project')))
+      END AS registrations
+    FROM cfg, json_each(json_extract(cfg.json, '\$.agents'))
+    WHERE json_extract(cfg.json, '\$.name') IS NOT NULL
+      AND json_extract(cfg.json, '\$.name') != ''
+  )
+  SELECT DISTINCT team, name
+  FROM agents, json_each(agents.registrations) AS r
+  WHERE json_extract(r.value, '\$.project') IN ($PROJECT_SQL_IN)
+    AND json_extract(r.value, '\$.type') = '$AGENT_TYPE_SQL'
+  ORDER BY idx, name;
+" | tr -d '\r'
