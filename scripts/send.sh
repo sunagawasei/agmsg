@@ -151,6 +151,23 @@ if [ "${AGMSG_ALLOW_CROSS_TEAM:-0}" != 1 ]; then
   fi
 fi
 
+# A reaped session team has no dir; a row written to its name now would land in
+# the next generation of the same session id on resume. --force skips the roster
+# check, so refuse a dir-less name that agmsg_session_team_class calls a session
+# team. For claude-code that is s-<1-128 chars of [0-9A-Za-z_-]>, no marker needed,
+# so a dir-less project team named like that (s-foo) is refused too: the s- prefix
+# is reserved. Other project team names still get pre-registration sends.
+if [ "$FORCE" -eq 1 ]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/lib/session-team.sh"
+  if agmsg_session_team_enabled \
+     && [ "$(agmsg_session_team_class "$TEAM")" = session ] \
+     && [ ! -d "$SCRIPT_DIR/../teams/$TEAM" ]; then
+    echo "send: session team '$TEAM' has no live directory — refusing --force send to a reaped session team." >&2
+    exit 1
+  fi
+fi
+
 # Keep the full-schema bootstrap (registry + storage tables) for a first-ever
 # command; the message write itself goes through the storage facade below.
 [ -f "$DB" ] || bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null

@@ -191,7 +191,7 @@ delivery:
   # codex is spawned lazily and torn down on session end. Off by default; enable:
   #   agmsg config set delivery.session_team true
   # session_team: false
-  # Days before a dead session's team dir is garbage-collected (default 7):
+  # No longer read: a session team is removed as soon as its owner is gone.
   # session_team_ttl_days: 7
   # Days a finished session team's messages are kept (default 7). Only teams
   # marked as session teams are deleted automatically; see

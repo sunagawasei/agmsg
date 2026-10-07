@@ -51,18 +51,24 @@ assert_claude_code_artifacts_absent() {
   [ ! -e "$TEST_SKILL_DIR/run/claude-code-$team-$name-cwd" ]
 }
 
-@test "session-start TTL GC reaps stale claude-code artifacts and cwd, keeps fresh ones" {
+@test "session-start GC reaps marked dead-owner claude-code artifacts and cwd regardless of age, keeps unmarked ones" {
   enable_session_team
 
   local stale_team='s-CAFE-001'
-  local fresh_team='s-CAFE-002'
+  local fresh_team='s-CAFE-002'   # unmarked: not provably a session team
+  local recent_team='s-CAFE-004'  # marked, dead owner, fresh mtime
   local name
-  mkdir -p "$TEST_SKILL_DIR/teams/$stale_team" "$TEST_SKILL_DIR/teams/$fresh_team"
+  mkdir -p "$TEST_SKILL_DIR/teams/$stale_team" "$TEST_SKILL_DIR/teams/$fresh_team" \
+    "$TEST_SKILL_DIR/teams/$recent_team"
+  : > "$TEST_SKILL_DIR/teams/$stale_team/session-team"
+  : > "$TEST_SKILL_DIR/teams/$recent_team/session-team"
+  printf '{"name":"%s","agents":{}}\n' "$recent_team" > "$TEST_SKILL_DIR/teams/$recent_team/config.json"
   printf '{"name":"%s","agents":{}}\n' "$stale_team" > "$TEST_SKILL_DIR/teams/$stale_team/config.json"
   printf '{"name":"%s","agents":{}}\n' "$fresh_team" > "$TEST_SKILL_DIR/teams/$fresh_team/config.json"
   for name in worker-one worker-two; do
     make_claude_code_artifacts "$stale_team" "$name" stale
     make_claude_code_artifacts "$fresh_team" "$name" fresh
+    make_claude_code_artifacts "$recent_team" "$name" recent
   done
   touch -t 202501010000 \
     "$TEST_SKILL_DIR/teams/$stale_team/config.json" \
@@ -73,6 +79,10 @@ assert_claude_code_artifacts_absent() {
   [ ! -d "$TEST_SKILL_DIR/teams/$stale_team" ]
   for name in worker-one worker-two; do
     assert_claude_code_artifacts_absent "$stale_team" "$name"
+  done
+  [ ! -d "$TEST_SKILL_DIR/teams/$recent_team" ]
+  for name in worker-one worker-two; do
+    assert_claude_code_artifacts_absent "$recent_team" "$name"
   done
   [ -d "$TEST_SKILL_DIR/teams/$fresh_team" ]
   for name in worker-one worker-two; do
@@ -87,6 +97,7 @@ assert_claude_code_artifacts_absent() {
   local owner_pid name
   mkdir -p "$TEST_SKILL_DIR/teams/$live_team"
   printf '{"name":"%s","agents":{}}\n' "$live_team" > "$TEST_SKILL_DIR/teams/$live_team/config.json"
+  : > "$TEST_SKILL_DIR/teams/$live_team/session-team"
   for name in live-one live-two; do
     make_claude_code_artifacts "$live_team" "$name" live
   done

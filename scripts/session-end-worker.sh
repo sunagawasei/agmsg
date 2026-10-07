@@ -34,6 +34,10 @@ source "$SCRIPT_DIR/lib/team-lifecycle.sh"
 source "$SCRIPT_DIR/lib/pending-teardown.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/inflight.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/storage.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/session-retention.sh"
 
 duration_config() {
   local env_name="$1" key="$2" default="$3" raw
@@ -405,6 +409,19 @@ cleanup_session_artifacts() {
   actas_lock_release_all "$INSTANCE_ID" 2>/dev/null || true
 }
 
+# Reap vetoes (live owner, bridge, inflight) re-check under the team lock, so a
+# failed reap only leaves the team to the TTL sweep. A handed-over instance
+# keeps its team.
+reap_own_team() {
+  local result
+  [ "$SUPERSEDED_SEEN" -eq 0 ] || return 0
+  result="$(agmsg_session_team_reap_dead "$STEAM" 2>/dev/null)" || true
+  printf 'session-end-worker: team reap instance=%s team=%s result=%s\n' \
+    "$(agmsg_pending_log_sanitize "$INSTANCE_ID")" \
+    "$(agmsg_pending_log_sanitize "$STEAM")" \
+    "$(agmsg_pending_log_sanitize "${result:-unknown}")" >&2
+}
+
 # Success means the embedded owner PID still identifies the generation seen at
 # worker startup. A missing start token cannot prove replacement and therefore
 # fails closed as "same" while the PID remains live.
@@ -560,6 +577,7 @@ fi
 
 if [ "$SNAPSHOT_COUNT" -eq 0 ]; then
   cleanup_session_artifacts
+  reap_own_team
   exit 0
 fi
 
@@ -677,4 +695,5 @@ if [ "$DRAIN_ABORTED" -eq 0 ]; then
 fi
 
 cleanup_session_artifacts
+reap_own_team
 exit 0

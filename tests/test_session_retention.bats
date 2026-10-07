@@ -11,6 +11,8 @@ setup() {
   export SKILL_DIR="$TEST_SKILL_DIR"
   DB="$TEST_SKILL_DIR/db/messages.db"
   mkdir -p "$TEST_SKILL_DIR/run"
+  # the schema is created by the first send; seed with direct inserts after it
+  bash "$SCRIPTS/send.sh" schema-init a b init --force >/dev/null
   bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/null
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/actas-lock.sh"
@@ -36,36 +38,40 @@ make_team() {
   if [ "${2:-}" = marked ]; then touch -t 202501010000 "$TEST_SKILL_DIR/teams/$1/session-team"; fi
 }
 
-# seed_rows <team> <age_days> [count]: rows in events and the legacy mirror.
+# seed_row <team> <body> <age_days>: one row in events and the legacy mirror,
+# inserted directly so no send.sh rule about dir-less teams applies.
+seed_row() {
+  sqlite3 "$DB" "INSERT INTO events(type,id,team,from_agent,to_agent,body,at) VALUES('message_sent','id-$1-$2-$RANDOM','$1','a','b','$2',strftime('%Y-%m-%dT%H:%M:%SZ','now','-$3 days'));
+                 INSERT INTO messages(team,from_agent,to_agent,body,created_at) VALUES('$1','a','b','$2',strftime('%Y-%m-%dT%H:%M:%SZ','now','-$3 days'));"
+}
+
+# seed_rows <team> <age_days> [count]
 seed_rows() {
   local team="$1" age="$2" n="${3:-1}" i
-  bash "$SCRIPTS/send.sh" "$team" a b seed --force >/dev/null
-  for ((i = 1; i < n; i++)); do bash "$SCRIPTS/send.sh" "$team" a b "seed$i" --force >/dev/null; done
-  sqlite3 "$DB" "UPDATE events SET at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-$age days') WHERE team='$team';
-                 UPDATE messages SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-$age days') WHERE team='$team';"
+  seed_row "$team" seed "$age"
+  for ((i = 1; i < n; i++)); do seed_row "$team" "seed$i" "$age"; done
 }
 
 rows() {
   sqlite3 "$DB" "SELECT (SELECT COUNT(*) FROM events WHERE team='$1') + (SELECT COUNT(*) FROM messages WHERE team='$1');"
 }
 
-@test "a marked team whose dir the TTL GC removes loses its old rows and leaves a tombstone" {
+@test "a marked team whose owner is gone loses its dir and every row, with no tombstone" {
   make_team s-AAA-1 marked
   seed_rows s-AAA-1 30 2
   run run_session_start
   [ "$status" -eq 0 ]
   [ ! -d "$TEST_SKILL_DIR/teams/s-AAA-1" ]
   [ "$(rows s-AAA-1)" = 0 ]
-  [ -f "$TEST_SKILL_DIR/run/session-tombstone.s-AAA-1" ]
+  [ ! -f "$TEST_SKILL_DIR/run/session-tombstone.s-AAA-1" ]
 }
 
-@test "rows inside the window survive the dir GC and are deleted by a later sweep" {
-  make_team s-AAA-2 marked
+@test "a tombstone sweep keeps rows inside the window and deletes them once old" {
   seed_rows s-AAA-2 1
+  : > "$TEST_SKILL_DIR/run/session-tombstone.s-AAA-2"
   run run_session_start
   [ "$status" -eq 0 ]
   [ "$(rows s-AAA-2)" != 0 ]
-  [ -f "$TEST_SKILL_DIR/run/session-tombstone.s-AAA-2" ]
   sqlite3 "$DB" "UPDATE events SET at='2025-01-01T00:00:00Z' WHERE team='s-AAA-2'; UPDATE messages SET created_at='2025-01-01T00:00:00Z' WHERE team='s-AAA-2';"
   run run_session_start
   [ "$status" -eq 0 ]
@@ -77,10 +83,10 @@ rows() {
   [ ! -f "$TEST_SKILL_DIR/run/session-tombstone.s-AAA-2" ]
 }
 
-@test "the delete is scoped by age: a row newer than the window stays" {
-  make_team s-AAA-3 marked
+@test "a tombstone sweep scopes the delete by age: a row newer than the window stays" {
   seed_rows s-AAA-3 30
-  bash "$SCRIPTS/send.sh" s-AAA-3 a b fresh --force >/dev/null
+  seed_row s-AAA-3 fresh 0
+  : > "$TEST_SKILL_DIR/run/session-tombstone.s-AAA-3"
   run run_session_start
   [ "$status" -eq 0 ]
   [ "$(sqlite3 "$DB" "SELECT COUNT(*) FROM messages WHERE team='s-AAA-3' AND body='fresh'")" = 1 ]
@@ -95,28 +101,43 @@ rows() {
   [ "$(rows s-BBB-1)" = 0 ]
 }
 
-@test "a dir GC'd without a marker keeps its rows, and so does s-manual" {
+@test "an unmarked dir is not removed and keeps its rows, and so does s-manual" {
   make_team s-CCC-1
   seed_rows s-CCC-1 30
   seed_rows s-manual 30
   run run_session_start
   [ "$status" -eq 0 ]
-  [ ! -d "$TEST_SKILL_DIR/teams/s-CCC-1" ]
+  [ -d "$TEST_SKILL_DIR/teams/s-CCC-1" ]
   [ "$(rows s-CCC-1)" != 0 ]
   [ "$(rows s-manual)" != 0 ]
   [ ! -f "$TEST_SKILL_DIR/run/session-tombstone.s-CCC-1" ]
 }
 
-@test "a failed rm -rf keeps the rows" {
+@test "a failed rename keeps the dir and the marker, the rows are already gone" {
   make_team s-DDD-1 marked
   seed_rows s-DDD-1 30
   mkdir "$TEST_SKILL_DIR/shim"
-  printf '#!/bin/sh\ncase "$*" in *s-DDD-1*) exit 1 ;; esac\nexec /bin/rm "$@"\n' > "$TEST_SKILL_DIR/shim/rm"
-  chmod +x "$TEST_SKILL_DIR/shim/rm"
+  printf '#!/bin/sh\ncase "$*" in *s-DDD-1*) exit 1 ;; esac\nexec /bin/mv "$@"\n' > "$TEST_SKILL_DIR/shim/mv"
+  chmod +x "$TEST_SKILL_DIR/shim/mv"
   PATH="$TEST_SKILL_DIR/shim:$PATH" run run_session_start
   [ -d "$TEST_SKILL_DIR/teams/s-DDD-1" ]
-  [ "$(rows s-DDD-1)" != 0 ]
+  [ -f "$TEST_SKILL_DIR/teams/s-DDD-1/session-team" ]
+  [ "$(rows s-DDD-1)" = 0 ]
   [ ! -f "$TEST_SKILL_DIR/run/session-tombstone.s-DDD-1" ]
+}
+
+@test "a failed removal of the renamed dir leaves only run/reaping.*, which the next sweep collects" {
+  make_team s-DDD-2 marked
+  seed_rows s-DDD-2 30
+  mkdir "$TEST_SKILL_DIR/shim"
+  printf '#!/bin/sh\ncase "$*" in *reaping.s-DDD-2*) exit 1 ;; esac\nexec /bin/rm "$@"\n' > "$TEST_SKILL_DIR/shim/rm"
+  chmod +x "$TEST_SKILL_DIR/shim/rm"
+  PATH="$TEST_SKILL_DIR/shim:$PATH" run run_session_start
+  [ ! -d "$TEST_SKILL_DIR/teams/s-DDD-2" ]
+  [ "$(rows s-DDD-2)" = 0 ]
+  [ -d "$(echo "$TEST_SKILL_DIR"/run/reaping.s-DDD-2.*)" ]
+  run run_session_start
+  [ ! -e "$(echo "$TEST_SKILL_DIR"/run/reaping.s-DDD-2.*)" ]
 }
 
 @test "a failing delete rolls everything back and keeps the tombstone" {
@@ -130,7 +151,7 @@ rows() {
   [ -f "$TEST_SKILL_DIR/run/session-tombstone.s-EEE-1" ]
 }
 
-@test "TTL GC removes cursor-bridge files of the reaped team" {
+@test "the reap removes cursor-bridge files of the team" {
   make_team s-FFF-1 marked
   : > "$TEST_SKILL_DIR/run/cursor-bridge.s-FFF-1.cursor.log"
   : > "$TEST_SKILL_DIR/run/cursor-bridge.s-FFF-1.cursor.meta"
@@ -216,7 +237,7 @@ veto_case() {   # <kind>
 @test "marker is written for a cursor session through the same path" {
   # cursor's plug reaches the shared join in session-start.sh (type.conf: session_team=yes)
   grep -q '^session_team=yes' "$SCRIPTS/drivers/types/cursor/type.conf"
-  grep -q 'agmsg_retention_marker_path' "$SCRIPTS/session-start.sh"
+  grep -q 'AGMSG_JOIN_MARK_SESSION_TEAM=1' "$SCRIPTS/session-start.sh"
 }
 
 # --- storage driver ----------------------------------------------------------
@@ -250,7 +271,7 @@ veto_case() {   # <kind>
   seed_rows s-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee 30
   seed_rows s-manual 30
   seed_rows s-11111111-2222-3333-4444-555555555555 30
-  bash "$SCRIPTS/send.sh" s-11111111-2222-3333-4444-555555555555 a b fresh --force >/dev/null
+  seed_row s-11111111-2222-3333-4444-555555555555 fresh 0
   seed_rows s-99999999-2222-3333-4444-555555555555 30
   mkdir -p "$TEST_SKILL_DIR/teams/s-99999999-2222-3333-4444-555555555555"
   run bash "$SCRIPTS/gc-session-orphans.sh" --apply
@@ -274,7 +295,7 @@ veto_case() {   # <kind>
 
 @test "strict delete keeps every row when one is inside the window" {
   seed_rows s-kkkkkkkk-bbbb-cccc-dddd-eeeeeeeeeeee 30
-  bash "$SCRIPTS/send.sh" s-kkkkkkkk-bbbb-cccc-dddd-eeeeeeeeeeee a b fresh --force >/dev/null
+  seed_row s-kkkkkkkk-bbbb-cccc-dddd-eeeeeeeeeeee fresh 0
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/storage.sh"; source "$SCRIPTS/lib/session-retention.sh"
   agmsg_retention_delete_rows s-kkkkkkkk-bbbb-cccc-dddd-eeeeeeeeeeee 7 strict
@@ -312,42 +333,6 @@ veto_case() {   # <kind>
   make_team s-LLL-2
   AGMSG_JOIN_MARK_SESSION_TEAM=1 AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" s-LLL-2 claude claude-code "$PROJ" >/dev/null
   [ ! -f "$TEST_SKILL_DIR/teams/s-LLL-2/session-team" ]
-}
-
-@test "a sweep running while an unmarked dir is reaped cannot use the old tombstone" {
-  seed_rows s-MMM-1 30
-  : > "$TEST_SKILL_DIR/run/session-tombstone.s-MMM-1"
-  make_team s-MMM-1
-  mkdir "$TEST_SKILL_DIR/shim"
-  cat > "$TEST_SKILL_DIR/shim/rm" <<SH
-#!/bin/sh
-case "\$*" in *teams/s-MMM-1*)
-  /bin/rm "\$@"
-  AGMSG_LIFECYCLE_LOCK_TIMEOUT=1 /bin/bash -c '
-    SCRIPT_DIR="$SCRIPTS"; SKILL_DIR="$TEST_SKILL_DIR"; RUN_DIR="$TEST_SKILL_DIR/run"
-    for l in compat actas-lock storage team-lifecycle instance-id process-identity pending-teardown inflight session-retention; do . "\$SCRIPT_DIR/lib/\$l.sh"; done
-    agmsg_retention_sweep'
-  exit 0 ;;
-esac
-exec /bin/rm "\$@"
-SH
-  chmod +x "$TEST_SKILL_DIR/shim/rm"
-  PATH="$TEST_SKILL_DIR/shim:$PATH" run run_session_start
-  [ ! -d "$TEST_SKILL_DIR/teams/s-MMM-1" ]
-  [ ! -f "$TEST_SKILL_DIR/run/session-tombstone.s-MMM-1" ]
-  [ "$(rows s-MMM-1)" != 0 ]
-}
-
-@test "an unmarked dir stays when its stale tombstone cannot be removed" {
-  seed_rows s-NNN-1 30
-  : > "$TEST_SKILL_DIR/run/session-tombstone.s-NNN-1"
-  make_team s-NNN-1
-  mkdir "$TEST_SKILL_DIR/shim"
-  printf '#!/bin/sh\ncase "$*" in *session-tombstone.s-NNN-1*) exit 1 ;; esac\nexec /bin/rm "$@"\n' > "$TEST_SKILL_DIR/shim/rm"
-  chmod +x "$TEST_SKILL_DIR/shim/rm"
-  PATH="$TEST_SKILL_DIR/shim:$PATH" run run_session_start
-  [ -d "$TEST_SKILL_DIR/teams/s-NNN-1" ]
-  [ "$(rows s-NNN-1)" != 0 ]
 }
 
 @test "veto unverified-placement: a spawn record that cannot be read keeps the team" {

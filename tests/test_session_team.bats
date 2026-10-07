@@ -896,18 +896,25 @@ STUB
 
 # --- PR3: stale session-team TTL GC ------------------------------------------
 
-@test "session-start: TTL GC reaps a stale (old + dead-owner) session team, keeps recent" {
+@test "session-start: dead-owner GC reaps a marked session team at once, keeps an unmarked one" {
   enable_st
-  # Old + dead owner → reaped.
+  # Marked + dead owner + old mtime → reaped.
   mkdir -p "$TEST_SKILL_DIR/teams/s-OLDGC"
   echo '{"name":"s-OLDGC","agents":{}}' > "$TEST_SKILL_DIR/teams/s-OLDGC/config.json"
+  : > "$TEST_SKILL_DIR/teams/s-OLDGC/session-team"
   touch -t 202501010000 "$TEST_SKILL_DIR/teams/s-OLDGC/config.json" "$TEST_SKILL_DIR/teams/s-OLDGC"
-  # Recent (dead owner but fresh mtime) → kept.
+  # Marked + dead owner + fresh mtime → reaped too (no TTL window).
   mkdir -p "$TEST_SKILL_DIR/teams/s-RECENTGC"
   echo '{"name":"s-RECENTGC","agents":{}}' > "$TEST_SKILL_DIR/teams/s-RECENTGC/config.json"
+  : > "$TEST_SKILL_DIR/teams/s-RECENTGC/session-team"
+  # No marker → kept even when old and ownerless.
+  mkdir -p "$TEST_SKILL_DIR/teams/s-UNMARKEDGC"
+  echo '{"name":"s-UNMARKEDGC","agents":{}}' > "$TEST_SKILL_DIR/teams/s-UNMARKEDGC/config.json"
+  touch -t 202501010000 "$TEST_SKILL_DIR/teams/s-UNMARKEDGC/config.json" "$TEST_SKILL_DIR/teams/s-UNMARKEDGC"
 
   printf '{"session_id":"sess-ttl-self"}' | bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
 
-  [ ! -d "$TEST_SKILL_DIR/teams/s-OLDGC" ]      # old + dead → reaped
-  [ -d "$TEST_SKILL_DIR/teams/s-RECENTGC" ]     # too recent → kept
+  [ ! -d "$TEST_SKILL_DIR/teams/s-OLDGC" ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-RECENTGC" ]
+  [ -d "$TEST_SKILL_DIR/teams/s-UNMARKEDGC" ]
 }

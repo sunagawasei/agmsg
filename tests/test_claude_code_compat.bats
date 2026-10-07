@@ -476,11 +476,13 @@ EOF
   [[ "$start_output" == *"agmsg: orphan candidate team=$orphan_team worker=$orphan_name bridge_pid=$orphan_pid spawn_age_s="* ]]
 }
 
-@test "session-start TTL GC reaps stale claude-code artifacts and preserves fresh and interactive state" {
+@test "session-start GC reaps marked dead-owner claude-code artifacts and preserves unmarked and interactive state" {
   local ttl_team='s-C0DE-102' fresh_team='s-C0DE-103' interactive_team='s-C0DE-104'
   local ttl_name='stale-worker' fresh_name='fresh-worker'
+  # Only ttl_team is marked; the unmarked teams are not provably session teams.
   mkdir -p "$TEST_SKILL_DIR/teams/$ttl_team" "$TEST_SKILL_DIR/teams/$fresh_team" \
     "$TEST_SKILL_DIR/teams/$interactive_team"
+  : > "$TEST_SKILL_DIR/teams/$ttl_team/session-team"
   printf '{"name":"%s","agents":{}}\n' "$ttl_team" > "$TEST_SKILL_DIR/teams/$ttl_team/config.json"
   printf '{"name":"%s","agents":{}}\n' "$fresh_team" > "$TEST_SKILL_DIR/teams/$fresh_team/config.json"
   printf '{"name":"%s","agents":{}}\n' "$interactive_team" > "$TEST_SKILL_DIR/teams/$interactive_team/config.json"

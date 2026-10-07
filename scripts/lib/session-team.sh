@@ -12,7 +12,8 @@
 # delivery, history, actas locks, the codex worker) already keys on team, so
 # this isolates concurrent / resumed sessions that share a directory without
 # adding any per-message axis. The bare id is stable across --continue/--resume,
-# so a resumed session returns to the same team and its persisted history, as long as that history is inside the retention window (delivery.message_retention_days, default 7 days after the team dir is reaped).
+# so a resume names the same team, but the previous generation's team is removed
+# when its owner dies and the resume starts it empty (no history carried over).
 # Disabled (or no id) => callers fall back to the normal project->team
 # resolution.
 #

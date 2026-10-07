@@ -590,6 +590,18 @@ if [ -n "$CC_PID" ]; then
     fi
     exit 0
   fi
+  # A resume re-fires SessionStart with the same session id: the previous
+  # generation's team is removed here, before cc-instance is published, so the
+  # join below makes an empty one. The same pid and sid again (/compact) is the
+  # live generation; a live same-sid instance of another pid vetoes in the reap.
+  if [ -n "$SESSION_TEAM" ] && [ "$SESSION_TEAM" = "$_lifecycle_team" ] \
+      && [ "$(agmsg_cc_instance_current "$CC_PID" 2>/dev/null || true)" != "$INSTANCE_ID" ]; then
+    if [ -d "$SKILL_DIR/teams/$_lifecycle_team" ]; then
+      agmsg_session_team_reap_dead "$_lifecycle_team" held >/dev/null || true
+    else
+      agmsg_session_team_purge_orphan_rows "$_lifecycle_team" >/dev/null || true
+    fi
+  fi
   printf '%s\n' "$INSTANCE_ID" > "$STATE"
   rm -f "$RUN_DIR/session-start-lock-failed.$CC_PID"
   # Recover this team under the same lock that published cc-instance so a
@@ -730,129 +742,16 @@ if agmsg_session_team_enabled; then
   done
 fi
 
-# --- Stale session-team GC (session-team mode). ---
-# Session teams accumulate one dir per session. Reap teams/s-<uuid> whose owner
-# session is no longer alive AND whose dir has been untouched past the TTL
-# (delivery.session_team_ttl_days, default 7). A resume re-joins and bumps the
-# mtime, so active/recent sessions are safe, and the liveness check guards
-# in-flight ones. Scratch cwd, pidfiles, placement and logs go too. The team's
-# messages go separately, once older than delivery.message_retention_days
-# (lib/session-retention.sh), and only for a team marked as a session team.
+# --- Dead session-team GC (session-team mode). ---
+# A session team whose owner instance is gone is removed at once (dir, run state,
+# rows); a resume starts an empty team. Only marked teams are touched.
 if agmsg_session_team_enabled; then
-  _ttl="$("$SCRIPT_DIR/config.sh" get delivery.session_team_ttl_days 7 2>/dev/null || echo 7)"
-  case "$_ttl" in ''|*[!0-9]*) _ttl=7 ;; esac
-  # Which team dirs are past the TTL, asked once for all of them (one find per
-  # xargs batch) so the many recent ones cost nothing each. A name with a TAB or
-  # LF could forge a neighbouring line of the output, and a failed batch proves
-  # nothing about any dir: both take the per-team find below.
-  _ttl_old_map=$'\n'
-  _ttl_batch_ok=1
-  _ttl_batch_dirs=()
-  for _d in "$SKILL_DIR"/teams/s-*/; do
-    [ -d "$_d" ] || continue
-    case "$_d" in *$'\t'*|*$'\n'*) continue ;; esac
-    _ttl_batch_dirs+=("$_d")
-  done
-  if [ "${#_ttl_batch_dirs[@]}" -gt 0 ]; then
-    _ttl_old_map="$(printf '\n'
-      printf '%s\0' "${_ttl_batch_dirs[@]}" \
-        | { xargs -0 sh -c 't=$1; shift; find "$@" -maxdepth 0 -mtime +"$t"' sh "$_ttl" 2>/dev/null \
-            || printf '__batch_failed__\n'; }
-      printf 'x')"
-    _ttl_old_map="${_ttl_old_map%x}"
-    case "$_ttl_old_map" in *$'\n__batch_failed__\n'*) _ttl_batch_ok=0 ;; esac
-  fi
   for _d in "$SKILL_DIR"/teams/s-*/; do
     [ -d "$_d" ] || continue
     _tn="${_d%/}"; _tn="${_tn##*/}"                               # s-<uuid>
-    _ttl_log_team="$(agmsg_pending_log_sanitize "$_tn")"
-    if agmsg_instance_alive "${_tn#s-}" 2>/dev/null; then
-      printf 'agmsg: session-team TTL GC skipped team=%s reason=bare-owner-alive\n' \
-        "$_ttl_log_team" >&2
-      continue
-    fi
-    # A live bridge recorded by this exact team is an independent veto.
-    # Malformed or unverifiable pid: placements also veto: they must not grant
-    # deletion the way HEAD's unverified despawn used to keep the team.
-    _ttl_live_bridge_pid=""
-    _ttl_unverified_placement=0
-    for _ttl_rec in "$RUN_DIR/spawn.${_tn}__"*; do
-      [ -f "$_ttl_rec" ] || continue
-      _ttl_line=""
-      # A failed read of a non-empty record is unknown, not "no placement".
-      IFS= read -r _ttl_line <"$_ttl_rec" 2>/dev/null || [ -n "$_ttl_line" ] \
-        || [ ! -s "$_ttl_rec" ] || { _ttl_unverified_placement=1; break; }
-      _ttl_placement="${_ttl_line%%$'\t'*}"
-      case "$_ttl_placement" in
-        pid:*)
-          _ttl_pid="${_ttl_placement#pid:}"
-          case "$(agmsg_session_bridge_pid_state "$_ttl_pid")" in
-            alive) _ttl_live_bridge_pid="$_ttl_pid"; break ;;
-            dead) ;;
-            *) _ttl_unverified_placement=1; break ;;
-          esac
-          ;;
-        %*|@*|herdr:*) ;;
-        *)
-          [ -n "$_ttl_line" ] || continue
-          _ttl_unverified_placement=1
-          break
-          ;;
-      esac
-    done
-    if [ -n "$_ttl_live_bridge_pid" ]; then
-      printf 'agmsg: session-team TTL GC skipped team=%s reason=live-bridge bridge_pid=%s\n' \
-        "$_ttl_log_team" "$_ttl_live_bridge_pid" >&2
-      continue
-    fi
-    if [ "$_ttl_unverified_placement" -eq 1 ]; then
-      printf 'agmsg: session-team TTL GC skipped team=%s reason=unverified-placement\n' \
-        "$_ttl_log_team" >&2
-      continue
-    fi
-    # `find -mtime` exits 0 whether or not the dir matches, so gate on its
-    # OUTPUT (non-empty == older than the TTL), not its exit code.
-    # The batch only rules dirs OUT: one it did not list was recent when it ran,
-    # and keeping it is the safe answer. A listed one is asked again here, after
-    # this team's owner and bridge checks, as before: a dir touched since the
-    # batch must not be deleted on the batch's word.
-    _ttl_is_old=""
-    _ttl_ask=1
-    case "$_d" in
-      *$'\t'*|*$'\n'*) ;;
-      *)
-        if [ "$_ttl_batch_ok" = 1 ]; then
-          case "$_ttl_old_map" in *$'\n'"$_d"$'\n'*) ;; *) _ttl_ask=0 ;; esac
-        fi
-        ;;
-    esac
-    [ "$_ttl_ask" = 0 ] || _ttl_is_old="$(find "$_d" -maxdepth 0 -mtime +"$_ttl" 2>/dev/null || true)"
-    [ -n "$_ttl_is_old" ] || continue  # too recent → keep
-    # Live/unverified inflight is independent proof of a still-consumed turn.
-    # Spawn may already be gone, so the live-bridge veto above cannot see it.
-    # Reap dead generations first; if any record remains, keep the whole team.
-    if ! agmsg_inflight_gc_team "$_tn"; then
-      printf 'agmsg: session-team TTL GC skipped team=%s reason=live-inflight\n' \
-        "$_ttl_log_team" >&2
-      continue
-    fi
-    _ttl_had_marker=0
-    [ -f "$(agmsg_retention_marker_path "$_tn")" ] && _ttl_had_marker=1
-    if [ "$_ttl_had_marker" = 1 ]; then
-      rm -rf "$_d" 2>/dev/null || true
-    else
-      # Proof invalidation and dir removal are one step under the lifecycle lock.
-      agmsg_retention_reap_unmarked_dir "$_tn" "$_d" || continue
-    fi
-    agmsg_retention_after_dir_reap "$_tn" "$_ttl_had_marker" || true
-    rm -rf "$SKILL_DIR/run/codex-$_tn-cwd" 2>/dev/null || true
-    rm -f "$SKILL_DIR/run/codex-bridge.$_tn".* 2>/dev/null || true
-    rm -rf "$SKILL_DIR/run/claude-code-$_tn-"*-cwd 2>/dev/null || true
-    rm -f "$SKILL_DIR/run/claude-code-bridge.$_tn".* 2>/dev/null || true
-    rm -f "$SKILL_DIR/run/cursor-bridge.$_tn".* 2>/dev/null || true
-    rm -f "$SKILL_DIR/run/spawn.$_tn"__* 2>/dev/null || true
-    rm -f "$SKILL_DIR/run/pending-teardown.$_tn"__* 2>/dev/null || true
-    rm -rf "$SKILL_DIR/run/placement.$_tn"__*.lock 2>/dev/null || true
+    # Without a cc-instance this session cannot prove itself alive.
+    [ -n "${CC_PID:-}" ] || [ "$_tn" != "${SESSION_TEAM:-}" ] || continue
+    agmsg_session_team_reap_dead "$_tn" >/dev/null || true
   done
   agmsg_retention_sweep || true
 fi

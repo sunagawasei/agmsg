@@ -33,6 +33,7 @@ callers() {  # callers <function-name-regexp>  -> sorted unique relative paths
   [ "$output" = "check-inbox.sh
 lib/inbox-target.sh
 lib/pending-teardown.sh
+lib/session-retention.sh
 send.sh
 session-end-worker.sh
 session-end.sh

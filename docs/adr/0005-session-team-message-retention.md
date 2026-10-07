@@ -2,6 +2,8 @@
 
 Status: Accepted
 
+Decisions 1 (history inside the window returns on resume) and 5 (rows outlive the dir) are Superseded by [0007](0007-session-team-immediate-reap.md); decisions 2-4 remain in force.
+
 ## Context
 
 `teams/s-<uuid>/` is removed by the TTL GC (`delivery.session_team_ttl_days`), but the team's rows in the sqlite event log (`events`, the legacy `messages` mirror, `read_cursors`) stayed forever, as did `run/cursor-bridge.<team>.*`. Resuming a session used to return to its whole history.

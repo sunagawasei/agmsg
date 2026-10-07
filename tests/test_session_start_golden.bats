@@ -191,7 +191,12 @@ assert_sides_match() {
   [ ! -e "$NEW_DIR/run/cc-instance.$pid1" ]
   [ -e "$NEW_DIR/run/cc-instance.$pid2" ]
 
-  assert_sides_match
+  # The resume removes the dead generation's team and joins a new one, so the
+  # old side's skip log and join event legitimately differ; stdout and exit
+  # code still match.
+  [ "$(cat "$OLD_DIR/rc")" = "$(cat "$NEW_DIR/rc")" ]
+  [ "$(sed "s#$OLD_DIR#<DIR>#g" "$OLD_DIR/out")" = "$(sed "s#$NEW_DIR#<DIR>#g" "$NEW_DIR/out")" ]
+  [ -f "$NEW_DIR/teams/s-$sid/session-team" ]
 }
 
 # --- Fixture 3: dedup skip when a watcher is already alive for this instance ---

@@ -23,7 +23,13 @@ enable_session_team() {
   bash "$SCRIPTS/config.sh" set delivery.session_team true >/dev/null
 }
 
+# Only a team marked as a session team is reaped; the fixtures below are
+# unmarked dirs, so the marker is added right before each run.
 run_session_start() {
+  local _d
+  for _d in "$TEST_SKILL_DIR"/teams/s-*/; do
+    [ -d "$_d" ] && : > "${_d}session-team"
+  done
   printf '{"session_id":"gc-current"}' \
     | bash "$SCRIPTS/session-start.sh" claude-code "$PROJ"
 }
@@ -77,7 +83,8 @@ run_session_start() {
   local team='s-C0DE-7EA'
   local name='race-worker'
   local rec marker real_stat stub_bin
-  mkdir -p "$TEST_SKILL_DIR/run" "$TEST_SKILL_DIR/teams/$team"
+  # no team dir: a dead team with only a pane placement is reaped, record included
+  mkdir -p "$TEST_SKILL_DIR/run"
   rec="$(agmsg_spawn_path "$team" "$name")"
   test_fixture_start_reaped_process sleep 300
   local worker_pid="$TEST_REAPED_PID"
@@ -218,7 +225,7 @@ EOF
   kill "$stale_pid" "$live_pid" "$owner_pid" 2>/dev/null || true
 }
 
-@test "session-start orphan GC leaves TTL GC behavior unchanged" {
+@test "session-start orphan GC removes dead teams whatever their age" {
   enable_session_team
 
   mkdir -p "$TEST_SKILL_DIR/teams/s-OLD-TTL" "$TEST_SKILL_DIR/teams/s-RECENT-TTL"
@@ -229,7 +236,7 @@ EOF
   run run_session_start
   [ "$status" -eq 0 ]
   [ ! -d "$TEST_SKILL_DIR/teams/s-OLD-TTL" ]
-  [ -d "$TEST_SKILL_DIR/teams/s-RECENT-TTL" ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-RECENT-TTL" ]
 }
 
 @test "session-start orphan GC reports one candidate and live bridge veto preserves TTL artifacts" {
@@ -249,7 +256,7 @@ EOF
   run run_session_start
   [ "$status" -eq 0 ]
   [ "$(printf '%s\n' "$output" | grep -c "^agmsg: orphan candidate team=$team worker=$name ")" -eq 1 ]
-  [[ "$output" == *"session-team TTL GC skipped team=$team reason=live-bridge bridge_pid=$worker_pid"* ]]
+  [[ "$output" == *"session-team TTL GC skipped team=$team reason=live-bridge"* ]]
   [ -f "$rec" ]
   [ -d "$TEST_SKILL_DIR/teams/$team" ]
   kill "$worker_pid" 2>/dev/null || true
@@ -286,28 +293,17 @@ EOF
   done
 }
 
-@test "session-start TTL GC sanitizes both skip-log team fields" {
+@test "session-start TTL GC leaves a team whose name is not a valid session id, and logs nothing raw" {
   enable_session_team
 
   local owner_team=$'s-A11CE\nOWNER' bridge_team=$'s-B71D6E\nBRIDGE'
-  local owner_pid bridge_pid raw_bridge_rec
-  mkdir -p "$TEST_SKILL_DIR/teams/$owner_team" \
-    "$TEST_SKILL_DIR/teams/$bridge_team"
-  test_fixture_start_reaped_process sleep 300
-  owner_pid="$TEST_REAPED_PID"
-  printf '%s\n' "${owner_team#s-}" > "$TEST_SKILL_DIR/run/cc-instance.$owner_pid"
-  test_fixture_start_reaped_process sleep 300
-  bridge_pid="$TEST_REAPED_PID"
-  raw_bridge_rec="$TEST_SKILL_DIR/run/spawn.${bridge_team}__worker"
-  printf 'pid:%s\t%s\tcodex\n' "$bridge_pid" "$PROJ" > "$raw_bridge_rec"
+  mkdir -p "$TEST_SKILL_DIR/teams/$owner_team" "$TEST_SKILL_DIR/teams/$bridge_team"
 
   run run_session_start
   [ "$status" -eq 0 ]
-  [ "$(printf '%s\n' "$output" | grep -c '^agmsg: session-team TTL GC skipped team=s-A11CEOWNER reason=bare-owner-alive$')" -eq 1 ]
-  [ "$(printf '%s\n' "$output" | grep -c "^agmsg: session-team TTL GC skipped team=s-B71D6EBRIDGE reason=live-bridge bridge_pid=$bridge_pid$")" -eq 1 ]
-  [ "$(printf '%s\n' "$output" | grep -Ec '^(OWNER|BRIDGE) reason=')" -eq 0 ]
-  kill -0 "$owner_pid" 2>/dev/null
-  kill -0 "$bridge_pid" 2>/dev/null
+  [ -d "$TEST_SKILL_DIR/teams/$owner_team" ]
+  [ -d "$TEST_SKILL_DIR/teams/$bridge_team" ]
+  [ "$(printf '%s\n' "$output" | grep -Ec '^(OWNER|BRIDGE)')" -eq 0 ]
 }
 
 @test "session-start TTL GC keeps a live bridge and deletes only an all-dead team" {
@@ -333,7 +329,7 @@ EOF
   [ -f "$live_rec" ]
   [ ! -d "$TEST_SKILL_DIR/teams/$dead_team" ]
   [ ! -e "$dead_rec" ]
-  [[ "$output" == *"session-team TTL GC skipped team=$live_team reason=live-bridge bridge_pid=$bridge_pid"* ]]
+  [[ "$output" == *"session-team TTL GC skipped team=$live_team reason=live-bridge"* ]]
   kill "$bridge_pid" 2>/dev/null || true
 }
 
@@ -582,7 +578,7 @@ _stale_team() {   # <team> <touch -t stamp>
   touch -t "$2" "$TEST_SKILL_DIR/teams/$1" "$TEST_SKILL_DIR/teams/$1/config.json"
 }
 
-@test "session-start TTL GC deletes only the team dirs past the TTL" {
+@test "session-start TTL GC deletes every dead team dir, old or new" {
   enable_session_team
   _stale_team s-0D0001 202501010000
   _stale_team s-0D0002 202501010000
@@ -592,64 +588,5 @@ _stale_team() {   # <team> <touch -t stamp>
   [ "$status" -eq 0 ]
   [ ! -d "$TEST_SKILL_DIR/teams/s-0D0001" ]
   [ ! -d "$TEST_SKILL_DIR/teams/s-0D0002" ]
-  [ -d "$TEST_SKILL_DIR/teams/s-0E0001" ]
-}
-
-@test "session-start TTL GC still deletes a stale team when the batch find fails" {
-  enable_session_team
-  _stale_team s-0D0003 202501010000
-  mkdir -p "$TEST_SKILL_DIR/fail-bin"
-  printf '#!/bin/sh\nexit 1\n' > "$TEST_SKILL_DIR/fail-bin/xargs"
-  chmod +x "$TEST_SKILL_DIR/fail-bin/xargs"
-  export PATH="$TEST_SKILL_DIR/fail-bin:$PATH"
-  run run_session_start
-  [ "$status" -eq 0 ]
-  [ ! -d "$TEST_SKILL_DIR/teams/s-0D0003" ]
-}
-
-@test "session-start TTL GC starts one find for all team dirs, not one each" {
-  enable_session_team
-  local stub_bin="$TEST_SKILL_DIR/count-bin" real i n0 n1
-  mkdir -p "$stub_bin"
-  real="$(command -v find)"
-  printf '#!/usr/bin/env bash\necho find >> "$FORK_LOG"\nexec "%s" "$@"\n' "$real" > "$stub_bin/find"
-  chmod +x "$stub_bin/find"
-  export FORK_LOG="$TEST_SKILL_DIR/run/find.log" PATH="$stub_bin:$PATH"
-  run run_session_start
-  n0="$(grep -c find "$FORK_LOG" || true)"
-  rm -f "$FORK_LOG"
-  for i in 1 2 3 4 5 6 7 8; do mkdir -p "$TEST_SKILL_DIR/teams/s-AB1$i"; done
-  run run_session_start
-  [ "$status" -eq 0 ]
-  touch "$FORK_LOG"
-  n1="$(grep -c find "$FORK_LOG" || true)"
-  [ "$((n1 - n0))" -le 1 ]
-}
-
-@test "session-start TTL GC keeps a team dir touched after the batch listed it as old" {
-  enable_session_team
-  _stale_team s-0D0004 202501010000
-  local real
-  real="$(command -v xargs)"
-  mkdir -p "$TEST_SKILL_DIR/touch-bin"
-  # the batch answers first, then the dir is written to, before the per-team check
-  printf '#!/usr/bin/env bash\n"%s" "$@"; rc=$?\ntouch "%s"\nexit $rc\n' \
-    "$real" "$TEST_SKILL_DIR/teams/s-0D0004" > "$TEST_SKILL_DIR/touch-bin/xargs"
-  chmod +x "$TEST_SKILL_DIR/touch-bin/xargs"
-  export PATH="$TEST_SKILL_DIR/touch-bin:$PATH"
-  run run_session_start
-  [ "$status" -eq 0 ]
-  [ -d "$TEST_SKILL_DIR/teams/s-0D0004" ]
-}
-
-@test "session-start TTL GC survives a find that fails and keeps the team" {
-  enable_session_team
-  _stale_team s-0D0005 202501010000
-  mkdir -p "$TEST_SKILL_DIR/fail-bin"
-  printf '#!/bin/sh\nexit 1\n' > "$TEST_SKILL_DIR/fail-bin/find"
-  chmod +x "$TEST_SKILL_DIR/fail-bin/find"
-  export PATH="$TEST_SKILL_DIR/fail-bin:$PATH"
-  run run_session_start
-  [ "$status" -eq 0 ]
-  [ -d "$TEST_SKILL_DIR/teams/s-0D0005" ]
+  [ ! -d "$TEST_SKILL_DIR/teams/s-0E0001" ]
 }
