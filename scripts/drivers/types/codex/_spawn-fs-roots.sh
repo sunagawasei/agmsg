@@ -2,25 +2,36 @@
 # codex spawn plug: reviewer execpolicy-home roots and extra filesystem read/write roots.
 # Sourced by _spawn.sh after its libs; do not source standalone.
 
-# Canonical root of per-launch reviewer CODEX_HOME directories under SKILL_DIR.
+# Runtime homes contain plugin caches and must stay outside skill discovery.
+agmsg_reviewer_execpolicy_home_base() {
+  printf '%s/.local/state/agmsg/reviewer-codex-home' "$HOME"
+}
+
+# Resolve even before the state directory has been created.
 agmsg_reviewer_execpolicy_home_root() {
-  local private_home="$SKILL_DIR/reviewer-codex-home"
-  if [ -d "$private_home" ]; then
-    (cd "$private_home" && pwd -P)
-  else
-    printf '%s/reviewer-codex-home' "$(cd "$SKILL_DIR" && pwd -P)"
-  fi
+  local prefix="${1:-$(agmsg_reviewer_execpolicy_home_base)}" suffix="" resolved
+  while [ ! -e "$prefix" ] && [ ! -L "$prefix" ]; do
+    suffix="/$(basename "$prefix")$suffix"
+    prefix="$(dirname "$prefix")"
+  done
+  resolved="$(cd "$prefix" && pwd -P)" || return 1
+  printf '%s%s' "$resolved" "$suffix"
 }
 
 # True when a filesystem grant for $1 would expose any launch home (existing path,
 # not-yet-created path under the tree, or a literal path under SKILL_DIR/...).
 agmsg_reviewer_path_conflicts_execpolicy_home() {
-  local d="$1" real_ph cand="" prefix suffix="" literal_root="$SKILL_DIR/reviewer-codex-home"
+  agmsg_reviewer_path_conflicts_execpolicy_root "$1" "$(agmsg_reviewer_execpolicy_home_base)" ||
+    agmsg_reviewer_path_conflicts_execpolicy_root "$1" "$SKILL_DIR/reviewer-codex-home"
+}
+
+agmsg_reviewer_path_conflicts_execpolicy_root() {
+  local d="$1" real_ph cand="" prefix suffix="" literal_root="$2"
   case "$d" in
     "~") d="$HOME" ;;
     "~/"*) d="$HOME/${d#\~/}" ;;
   esac
-  real_ph="$(agmsg_reviewer_execpolicy_home_root)"
+  real_ph="$(agmsg_reviewer_execpolicy_home_root "$literal_root")" || return 0
   case "$d" in
     "$literal_root"|"$literal_root"/*) return 0 ;;
   esac

@@ -88,7 +88,7 @@ agmsg_codex_reviewer_assert_network() {
 # Sets AGMSG_REVIEWER_EXEC_HOME to a per-spawn directory so concurrent spawns
 # for the same team/name do not race on rules, auth links, or config.
 agmsg_codex_reviewer_execpolicy_home_path() {
-  local dest launch_id="$$.$RANDOM"
+  local dest root skills_root launch_id="$$.$RANDOM"
   case "$TEAM" in
     *[!A-Za-z0-9._-]*)
       die "spawn: reviewer team name cannot be used in the execpolicy home: $TEAM" ;;
@@ -101,8 +101,14 @@ agmsg_codex_reviewer_execpolicy_home_path() {
     *[!A-Za-z0-9._-]*)
       die "spawn: reviewer execpolicy launch id is not path-safe: $launch_id" ;;
   esac
-  dest="$SKILL_DIR/reviewer-codex-home/$TEAM/$NAME/launch.$launch_id"
-  case "$dest" in
+  dest="$(agmsg_reviewer_execpolicy_home_base)/$TEAM/$NAME/launch.$launch_id"
+  root="$(agmsg_reviewer_execpolicy_home_root)" || die "spawn: cannot resolve reviewer execpolicy home"
+  skills_root="$(agmsg_reviewer_execpolicy_home_root "$HOME/.agents/skills")" || die "spawn: cannot resolve skills root"
+  case "$root" in
+    "$skills_root"|"$skills_root"/*|*/.agents/skills|*/.agents/skills/*|*/.codex/skills|*/.codex/skills/*)
+      die "spawn: reviewer execpolicy home must be outside skill discovery: $root" ;;
+  esac
+  case "$dest$root" in
     *[!A-Za-z0-9._/+-]*)
       die "spawn: reviewer execpolicy home path cannot be spliced safely: $dest" ;;
   esac
@@ -123,7 +129,7 @@ agmsg_codex_reviewer_prepare_execpolicy_home() {
   local source_home dest parent
   source_home="${CODEX_HOME:-$HOME/.codex}"
   dest="$AGMSG_REVIEWER_EXEC_HOME"
-  parent="$SKILL_DIR/reviewer-codex-home"
+  parent="$(agmsg_reviewer_execpolicy_home_base)"
   if [ -L "$parent" ] || [ -L "$parent/$TEAM" ] || [ -L "$parent/$TEAM/$NAME" ] || [ -L "$dest" ]; then
     die "spawn: reviewer execpolicy home is a symlink; refusing to launch ($dest)"
   fi

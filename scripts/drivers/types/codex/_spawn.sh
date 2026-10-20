@@ -187,6 +187,11 @@ agmsg_spawn_headless() {
     # spawn's directory. Unlisted paths are writable; without this, one worker
     # could read or rewrite another launch's auth link or rules.
     fs_base="$fs_base, \"$SKILL_DIR/reviewer-codex-home\"=\"none\""
+    local execpolicy_root; execpolicy_root="$(agmsg_reviewer_execpolicy_home_root)"
+    fs_base="$fs_base, \"$(agmsg_reviewer_execpolicy_home_base)\"=\"none\""
+    if [ "$execpolicy_root" != "$(agmsg_reviewer_execpolicy_home_base)" ]; then
+      fs_base="$fs_base, \"$execpolicy_root\"=\"none\""
+    fi
     # Additively grant READ on the Claude session's /add-dir directories (gated;
     # see agmsg_reviewer_add_dir_roots). Purely additive and fail-open: pre-flight
     # the augmented profile with a trivial sandboxed command, and if it fails to

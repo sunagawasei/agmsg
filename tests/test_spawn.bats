@@ -14,7 +14,7 @@ _reviewer_home_from_capture() {
 }
 
 _reviewer_newest_launch_home() {
-  find "$TEST_SKILL_DIR/reviewer-codex-home/${1:-myteam}/${2:-rv}" \
+  find "$HOME/.local/state/agmsg/reviewer-codex-home/${1:-myteam}/${2:-rv}" \
     -maxdepth 1 -type d -name 'launch.*' 2>/dev/null | sort | tail -1
 }
 
@@ -1278,6 +1278,7 @@ EOF
   [ "$(printf '%s\n' "$output" | grep -o '="allow"' | wc -l | tr -d ' ')" -eq 7 ]
   [[ "$output" =~ CODEX_HOME=\'([^\']+)\' ]]
   home="${BASH_REMATCH[1]}"
+  [[ "$output" == *"\"$HOME/.local/state/agmsg/reviewer-codex-home\"=\"none\""* ]]
   [[ "$output" == *"\"$TEST_SKILL_DIR/reviewer-codex-home\"=\"none\""* ]]
   [ "$(printf '%s\n' "$output" | grep -o "$home" | wc -l | tr -d ' ')" -eq 1 ]
   [ -d "$home/rules" ]
@@ -1503,8 +1504,30 @@ EOF
   wait_until 10 _capture_nonempty
   _reviewer_home_from_capture
   local home="$REVIEWER_HOME"
+  [[ "$home" == "$HOME/.local/state/agmsg/reviewer-codex-home/"* ]]
+  [ ! -e "$TEST_SKILL_DIR/reviewer-codex-home" ]
   [ ! -e "$home/config.toml" ]
   [ -z "$(ls -A "$home/rules")" ]
+}
+
+@test "spawn: reviewer state directory cannot alias the skills tree" {
+  _reviewer_source_codex_spawn_plug
+  mkdir -p "$HOME/.local" "$HOME/.agents/skills"
+  ln -s "$HOME/.agents/skills" "$HOME/.local/state"
+  run agmsg_codex_reviewer_execpolicy_home_path
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"outside skill discovery"* ]]
+}
+
+@test "spawn: reviewer still protects legacy homes from explicit filesystem grants" {
+  _reviewer_source_codex_spawn_plug
+  local legacy="$TEST_SKILL_DIR/reviewer-codex-home/old-team/worker/launch.1"
+  mkdir -p "$legacy"
+  run agmsg_reviewer_path_conflicts_execpolicy_home "$legacy"
+  [ "$status" -eq 0 ]
+  ln -s "$TEST_SKILL_DIR/reviewer-codex-home" "$TEST_SKILL_DIR/legacy-alias"
+  run agmsg_reviewer_path_conflicts_execpolicy_home "$TEST_SKILL_DIR/legacy-alias/future-home"
+  [ "$status" -eq 0 ]
 }
 
 @test "spawn: reviewer refuses a symlinked execpolicy home" {
@@ -1513,8 +1536,8 @@ EOF
   local victim="$TEST_SKILL_DIR/victim-home"
   mkdir -p "$victim/rules"
   printf 'keep-me\n' > "$victim/rules/keep.rules"
-  mkdir -p "$TEST_SKILL_DIR/reviewer-codex-home/myteam"
-  ln -s "$victim" "$TEST_SKILL_DIR/reviewer-codex-home/myteam/rv"
+  mkdir -p "$HOME/.local/state/agmsg/reviewer-codex-home/myteam"
+  ln -s "$victim" "$HOME/.local/state/agmsg/reviewer-codex-home/myteam/rv"
   run env AGMSG_CODEX_BRIDGE_CMD="$STUB_BIN/fake-bridge.sh" \
     bash "$SCRIPTS/spawn.sh" codex rv --project "$PROJ" --headless --reviewer
   [ "$status" -ne 0 ]
@@ -1533,7 +1556,7 @@ EOF
     TEAM=myteam NAME=rv SKILL_DIR="'"$TEST_SKILL_DIR"'" SCRIPT_DIR="'"$SCRIPTS"'"
     die() { echo "spawn: $*" >&2; exit 1; }
     source "$SCRIPT_DIR/drivers/types/codex/_spawn.sh"
-    AGMSG_REVIEWER_EXEC_HOME="'"$TEST_SKILL_DIR"'/reviewer-codex-home/myteam/rv/launch.auth-probe"
+    AGMSG_REVIEWER_EXEC_HOME="'"$HOME"'/.local/state/agmsg/reviewer-codex-home/myteam/rv/launch.auth-probe"
     CODEX_HOME="'"$with_auth"'"
     agmsg_codex_reviewer_prepare_execpolicy_home
     [ -L "$AGMSG_REVIEWER_EXEC_HOME/auth.json" ]
@@ -1682,7 +1705,7 @@ CODEX_STUB
 @test "spawn: a second reviewer spawn does not rewrite a live worker's execpolicy home" {
   bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
   _make_fake_bridge
-  local home="$TEST_SKILL_DIR/reviewer-codex-home/myteam/rv"
+  local home="$HOME/.local/state/agmsg/reviewer-codex-home/myteam/rv"
   local idkey
   idkey="$(agmsg_identity_key myteam rv)"
   mkdir -p "$home/rules"
@@ -1721,7 +1744,7 @@ STUB
   _make_fake_bridge
   local idkey home
   idkey="$(agmsg_identity_key myteam rv)"
-  home="$TEST_SKILL_DIR/reviewer-codex-home/myteam/rv/launch.stale-pid"
+  home="$HOME/.local/state/agmsg/reviewer-codex-home/myteam/rv/launch.stale-pid"
   mkdir -p "$home/rules"
   printf 'leave-me\n' > "$home/marker"
   local pidfile="$TEST_SKILL_DIR/run/codex-bridge.myteam.rv.pid"
@@ -1794,7 +1817,7 @@ STUB
     TEAM=myteam NAME=rv SKILL_DIR="'"$TEST_SKILL_DIR"'" SCRIPT_DIR="'"$SCRIPTS"'"
     die() { echo "spawn: $*" >&2; exit 1; }
     source "$SCRIPT_DIR/drivers/types/codex/_spawn.sh"
-    AGMSG_REVIEWER_EXEC_HOME="'"$TEST_SKILL_DIR"'/reviewer-codex-home/myteam/rv/launch.markerprobe"
+    AGMSG_REVIEWER_EXEC_HOME="'"$HOME"'/.local/state/agmsg/reviewer-codex-home/myteam/rv/launch.markerprobe"
     mkdir -p "$AGMSG_REVIEWER_EXEC_HOME"
     ln -s "'"$victim"'" "$AGMSG_REVIEWER_EXEC_HOME/marker"
     CODEX_HOME=/dev/null
@@ -2226,7 +2249,7 @@ CODEX_STUB
 @test "spawn: codex reviewer skips /add-dir paths under reviewer-codex-home" {
   bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
   bash "$SCRIPTS/config.sh" set spawn.codex_inherit_add_dirs true
-  local sibling="$TEST_SKILL_DIR/reviewer-codex-home/other-team/w/launch.1"
+  local sibling="$HOME/.local/state/agmsg/reviewer-codex-home/other-team/w/launch.1"
   mkdir -p "$sibling/rules"
   printf 'secret-rule\n' > "$sibling/rules/leak.rules"
   mkdir -p "$PROJ/.claude"
@@ -2239,7 +2262,7 @@ CODEX_STUB
   wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"\"$sibling\"=\"read\""* ]]
-  [[ "$output" == *"\"$TEST_SKILL_DIR/reviewer-codex-home\"=\"none\""* ]]
+  [[ "$output" == *"\"$HOME/.local/state/agmsg/reviewer-codex-home\"=\"none\""* ]]
 }
 
 # --- reviewer gh CLI config (spawn.codex_gh_config_dir.<name>) ---
@@ -2277,7 +2300,7 @@ CODEX_STUB
 
 @test "spawn: codex reviewer ignores GH config dir under reviewer-codex-home" {
   bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
-  local sibling="$TEST_SKILL_DIR/reviewer-codex-home/other-team/w/launch.1"
+  local sibling="$HOME/.local/state/agmsg/reviewer-codex-home/other-team/w/launch.1"
   mkdir -p "$sibling"
   printf '{}\n' > "$sibling/auth.json"
   bash "$SCRIPTS/config.sh" set spawn.codex_gh_config_dir.rv "$sibling"
@@ -2296,7 +2319,7 @@ CODEX_STUB
 
 @test "spawn: codex reviewer skips extra fs roots under reviewer-codex-home" {
   bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
-  local sibling="$TEST_SKILL_DIR/reviewer-codex-home/other-team/w/launch.1"
+  local sibling="$HOME/.local/state/agmsg/reviewer-codex-home/other-team/w/launch.1"
   mkdir -p "$sibling/rules"
   bash "$SCRIPTS/config.sh" set spawn.codex_extra_fs_roots "$sibling=read"
   _make_fake_bridge
@@ -2308,13 +2331,13 @@ CODEX_STUB
   wait_until 10 _capture_nonempty
   run cat "$CAPTURE"
   [[ "$output" != *"\"$sibling\"=\"read\""* ]]
-  [[ "$output" == *"\"$TEST_SKILL_DIR/reviewer-codex-home\"=\"none\""* ]]
+  [[ "$output" == *"\"$HOME/.local/state/agmsg/reviewer-codex-home\"=\"none\""* ]]
 }
 
 @test "spawn: codex reviewer skips extra fs roots aliasing reviewer-codex-home" {
   bash "$SCRIPTS/join.sh" myteam existing codex "$PROJ"
   local private_alias="$TEST_SKILL_DIR/private-alias" future="$TEST_SKILL_DIR/private-alias/not-yet/child"
-  ln -sfn "$TEST_SKILL_DIR/reviewer-codex-home" "$private_alias"
+  ln -sfn "$HOME/.local/state/agmsg/reviewer-codex-home" "$private_alias"
   bash "$SCRIPTS/config.sh" set spawn.codex_extra_fs_roots "$future=read"
   _make_fake_bridge
 
