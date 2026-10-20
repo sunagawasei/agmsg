@@ -49,6 +49,9 @@ The three axes are fully orthogonal — any combination is valid.
 
 **Runtime install location:** `~/.agents/skills/agmsg/` — scripts read their own paths relative to `$0` or `BASH_SOURCE[0]`, not the repo.
 
+Reviewer `CODEX_HOME` lives at `$HOME/.local/state/agmsg/reviewer-codex-home`, outside skill discovery; plugin caches can exhaust the skill traversal limit.
+Do not place runtime homes or relocation symlinks under skills roots. See [ADR 0008](docs/adr/0008-reviewer-codex-runtime-homes.md).
+
 ## Shell script conventions
 
 Every script must begin with `set -euo pipefail`. Drivers expose functions prefixed by axis name to avoid namespace collisions (`storage_*`, `agent_*`, `delivery_*`). Scripts source shared helpers via `source "$SCRIPT_DIR/lib/storage.sh"` (or the equivalent lib file); they never hard-code `~/.agents/`.
