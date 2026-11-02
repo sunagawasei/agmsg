@@ -1,6 +1,7 @@
 # Agent types
 
-agmsg supports several agent runtimes — claude-code, codex, and cursor — and each is described by a small **manifest** so that the rest
+agmsg supports several agent runtimes — claude-code, codex, gemini, antigravity,
+copilot, opencode, hermes, cursor, devin, grok-build — plus `agmsg-app` and `ext-tool` for members that are not CLI agents — and each is described by a small **manifest** so that the rest
 of agmsg (detection, the join whitelist, spawn, and delivery routing) discovers it
 from data instead of hardcoded `case` arms.
 
@@ -18,20 +19,23 @@ a manifest cannot execute code. Multi-value keys are whitespace-separated.
 |---|---|---|
 | `name` | yes | the type name (matches the directory) |
 | `template` | yes | the `/agmsg` command template filename, relative to the type dir (e.g. `template.md`); becomes `SKILL.md` |
+| `priority` | — | numeric auto-detection priority; lower values are checked first, with 50 as the default |
 | `detect` | — | env-var names whose presence selects this type. `explicit` = never auto-detected from the environment |
+| `detect_fallback` | — | weaker env-var names checked only after process detection, for shared credentials that are not reliable runtime markers |
 | `detect_proc` | — | parent-process-name glob patterns that select this type (e.g. `codex codex-*`) |
+| `session_env` | — | the single env-var name that carries this runtime's current session id. `join` passes its value to terminal self-naming; omitted means the type publishes no session id |
 | `cli` | spawnable types | the launch command. Usually a single binary name, but may be a fixed multi-word prefix (subcommand and/or flags a CLI needs ahead of its own options) — only the first word is resolved/checked as the executable; the rest are passed through as-is. Safe because this is manifest data agmsg ships, not runtime user input |
 | `spawnable` | — | `yes` if `spawn.sh` can launch this type |
 | `spawn` | — | a `.mjs` node-launcher (beside the manifest) `spawn.sh` runs via Node; also marks the type spawnable |
 | `model_arg` | — | the `--model`/`-m`-style flag `spawn --model <id>` passes through to the CLI; a type with no `model_arg` refuses `--model` |
-| `prompt_arg` | — | for a CLI that does not accept the actas prompt as a bare positional argument, the named flag whose value IS the prompt — `spawn.sh` inserts it immediately before the (already-quoted) prompt. Unset = bare positional, the default |
+| `prompt_arg` | — | for a CLI that does not accept the actas prompt as a bare positional argument, the named flag whose value IS the prompt (e.g. antigravity's `--prompt-interactive`, copilot's `--interactive`, opencode's `--prompt`) — `spawn.sh` inserts it immediately before the (already-quoted) prompt. Unset = bare positional, the default |
 | `hooks_file` | yes | project-relative delivery hooks file (e.g. `.codex/hooks.json`) |
-| `monitor` | — | `yes` if the type exposes a native Monitor tool; `spawn` skips the readiness wait when `no` |
+| `readiness_sentinel` | — | `yes` if the type produces a spawn-awaitable readiness sentinel; `spawn` skips the readiness wait when `no`. It says nothing about which delivery modes the type supports (that is `delivery_modes`): codex has `readiness_sentinel=no` and still supports `monitor`. The older name `monitor=` is read only as a fallback for manifests installed before the rename |
 | `delivery_modes` | — | space-separated delivery modes the type's CLI accepts (e.g. `monitor turn off`); `delivery.sh`'s gate rejects anything else. Defaults to `monitor turn both off` when omitted |
-| `stop_output` | — | output protocol for the Stop/turn inbox check — `json` (codex), `followup` (cursor: a stdout `{"followup_message":...}` re-injects the reply as the next turn) vs. plain text (default) |
+| `stop_output` | — | output protocol for the Stop/turn inbox check — `json` (codex, copilot) vs. plain text (default) |
 | `hook_windows_wrap` | — | `yes` if JSON hook entries also need a Windows-native `commandWindows` variant (codex) |
-| `hook_session_end_timeout` | — | seconds (1-60) written as the `timeout` of the registered SessionEnd hook entry (claude-code: 5). Existing installs pick it up when `delivery.sh set` is re-run for the project |
-| `session_team` | — | `yes` if the type can host its own per-session team (cursor) |
+
+Other keys (`spawn_wrapper`, `resume_arg`, `name_arg`, `rename_cmd`, `session_name_source`, `cmd_prefix`, `posttooluse_output`, …) are described in the comments of the shipped `type.conf` files.
 
 > The reader does not fail-fast: an omitted key reads as the empty string, so
 > "required" above means "needed for the type to actually work", not "validated at
@@ -41,17 +45,21 @@ a manifest cannot execute code. Multi-value keys are whitespace-separated.
 
 `whoami.sh` auto-detects the running type when none is passed:
 
-1. **Environment** — the manifests' `detect=` env vars, evaluated in sorted type
-   order, which preserves the precedence claude-code < codex.
-   `detect=explicit` types are never selected here.
+1. **Strong environment** — the manifests' `detect=` env vars, evaluated by
+   ascending `priority` (then type name). `detect=explicit` types are never
+   selected here.
 2. **Process tree** — walking up from the current process, the first type whose
-   `detect_proc=` glob matches the ancestor's name wins.
-3. Falls back to `claude-code`.
+   `detect_proc=` glob matches the ancestor's name wins, using the same priority
+   order.
+3. **Fallback environment** — `detect_fallback=` vars are checked only now.
+   This keeps shared credentials such as `GEMINI_API_KEY` from hiding a stronger
+   process marker for another CLI; `GEMINI_CLI` remains a strong Gemini marker.
+4. Falls back to `claude-code`.
 
-> Precedence note: env detection iterates types in **sorted name order**, so when
-> two types' `detect=` vars are both present the alphabetically-earlier type wins.
-> Keep `detect=` vars runtime-exclusive (a runtime's own session var, not a shared
-> SDK var) so ties don't arise.
+> Precedence note: detection iterates types in ascending `priority`, then by name.
+> Keep strong `detect=` vars runtime-exclusive (a runtime's own session marker,
+> not a shared SDK credential) so ties do not arise. Shared credentials belong in
+> `detect_fallback=` and are considered only after process evidence.
 
 ### Delivery
 
@@ -61,7 +69,7 @@ a manifest cannot execute code. Multi-value keys are whitespace-separated.
 `delivery.sh` defines the default behavior (JSON event-hooks) and a type's optional
 `scripts/drivers/types/<name>/_delivery.sh` plug overrides any of
 `agmsg_delivery_apply` / `on_enable` / `on_disable` / `status`. Rule-file types
-(external plugin types; no bundled type uses it) delegate to the shared `rulefile_apply`; codex's plug adds
+(gemini, antigravity, …) delegate to the shared `rulefile_apply`; codex's plug adds
 its bridge/shim lifecycle. No per-type `case` arms remain in `delivery.sh`.
 
 ### Node-launcher types (external add-ons)
@@ -100,7 +108,7 @@ registry with no further edits.
 
 ## Worked example
 
-The six built-in manifests under `scripts/drivers/types/` are the reference. For
+The built-in manifests under `scripts/drivers/types/` are the reference. For
 instance `scripts/drivers/types/codex/type.conf`:
 
 ```
@@ -109,9 +117,10 @@ template=template.md
 cli=codex
 spawnable=yes
 detect=CODEX_SANDBOX CODEX_THREAD_ID
+session_env=CODEX_THREAD_ID
 detect_proc=codex codex-*
 hooks_file=.codex/hooks.json
-monitor=no
+readiness_sentinel=no
 stop_output=json
 hook_windows_wrap=yes
 delivery_modes=monitor turn off

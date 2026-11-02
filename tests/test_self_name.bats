@@ -18,7 +18,7 @@
 #   - order independence: a boot path first, then the action; the action
 #     first, then a boot path -- same key, one terminal call in total
 #   - herdr identifies its pane from HERDR_PANE_ID with no session id
-#   - the action commands (send / inbox / history) run the hook, and a failure
+#   - the action commands (send / inbox) run the hook, and a failure
 #     to name never fails the command
 
 setup() {
@@ -113,6 +113,9 @@ _install_fake_herdr() {
 state='$FAKE_HERDR_STATE'
 if [ "\$1" = agent ] && [ "\$2" = list ]; then
   printf '{"id":"1","result":{"type":"list","agents":[]}}\n'
+elif [ "\$1" = agent ] && [ "\$2" = get ]; then
+  # This fixture exercises naming marks with an initially unnamed agent.
+  printf '{"result":{"agent":{"pane_id":"%s"}}}\n' "\$3"
 elif [ "\$1" = pane ] && [ "\$2" = rename ]; then
   grep -v "^\$3	" "\$state" > "\$state.n" 2>/dev/null || : > "\$state.n"
   printf '%s\t%s\n' "\$3" "\$4" >> "\$state.n"; mv "\$state.n" "\$state"
@@ -199,6 +202,7 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   # "No calls at all" is therefore gone. What must still hold -- what the old
   # assertion was protecting -- is that a settled seat does no WORK: it does not
   # relabel, rekey or rewrite anything, and it does not go listing panes.
+  _join_unnamed team alice   # registered, so #1391's type-resolution refuses nothing here
   _install_fake_tmux; _under_tmux /tmp/s 4242 %3
   agmsg_self_name_on_action team alice
   : > "$ARGV_LOG"
@@ -238,6 +242,7 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   # could not know, and the case was left to `team --fix` / `rename`. The #1130
   # read closes it for free: the pane is asked, and the pane says it carries no
   # agmsg label.
+  _join_unnamed team alice   # registered, so #1391's type-resolution refuses nothing here
   _install_fake_tmux; _under_tmux /tmp/s 4242 %3
   agmsg_self_name_on_action team alice
   [ "$(_name_calls)" -eq 1 ]
@@ -270,6 +275,7 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   # message says who holds the pane and how to release it (drop or despawn).
   # The guard is kept alongside #1112's label-first resolution; this test goes
   # only if the guard does, as a separate decision, and the old one returns.
+  _join_unnamed team alice   # registered, so #1391's type-resolution refuses nothing here
   _install_fake_tmux; _under_tmux /tmp/s 4242 %3
   agmsg_self_name_on_action team alice
   [ "$(_placement team alice)" = 'tmux:/tmp/s:%3' ]
@@ -280,11 +286,84 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   refute grep -q '\[team:bob\]' "$ARGV_LOG"
   [ -z "$(_mark team bob)" ]
   [ -z "$(_placement team bob)" ]
-  grep -q 'already recorded as team__alice' <<<"$output"
+  # The claimant is named by whatever id/path scheme this pair currently
+  # resolves through (legacy team__agent or, once registered like this
+  # fixture now is via _join_unnamed, an id-keyed UUID pair) -- not this
+  # test's concern, so it checks the message says SOMEONE already holds it
+  # and how to release them, not which literal spelling names them.
+  grep -q 'already recorded as' <<<"$output"
   grep -q 'drop or despawn' <<<"$output"
   # alice keeps everything.
   [ "$(_mark team alice)" = $'tmux:/tmp/s:%3\tpid=4242' ]
   [ "$(_placement team alice)" = 'tmux:/tmp/s:%3' ]
+
+  # An actas is different: the session is declaring that it now acts as bob, and
+  # alice was the name it acted as in this very pane a moment ago. Her record
+  # would otherwise refuse bob forever, so the claim retires it -- but only the
+  # records that point at THIS pane and belong to no other live session.
+  #   - alice in another team has a record for another pane: untouched
+  #   - a seat that another session holds, in another pane: its record stays and
+  #     it still refuses whoever acts from that pane
+  #   - a seat held by ANOTHER PROCESS OF THE SAME SESSION ID (the lock owner is
+  #     "<sid>.<pid>", and only the whole thing says whose it is): kept
+  #   - a record of ANOTHER TEAM that points at the same pane and has no lock:
+  #     kept, so the name acting from there is still refused
+  _join_unnamed team bob
+  _join_unnamed team2 alice
+  _join_unnamed team eve
+  _join_unnamed team frank
+  source "$SKILL_DIR/scripts/lib/actas-lock.sh"
+  agmsg_write_atomic "$(agmsg_spawn_path team2 alice)" "$(printf 'tmux:/tmp/s:%%9\t/tmp/p\tclaude-code')"
+  agmsg_write_atomic "$(agmsg_spawn_path team eve)" "$(printf 'tmux:/tmp/s:%%5\t/tmp/p\tclaude-code')"
+  printf 'other-session.99999\n' > "$(actas_lock_path team eve)"
+
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p claude-code bob sid-bob
+  [ "$status" -eq 0 ]
+  grep -q 'status=ok' <<<"$output"
+  [ "$(_placement team bob)" = 'tmux:/tmp/s:%3' ]       # bob is named and recorded here now
+  [ -z "$(_placement team alice)" ]                     # alice's record for this pane is gone
+  [ -z "$(_mark team alice)" ]                          # and so is the mark that said she was named here
+  [ "$(_placement team2 alice)" = 'tmux:/tmp/s:%9' ]    # her other placement stays
+
+  _under_tmux /tmp/s 4242 %5
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p claude-code frank sid-frank
+  grep -q 'already recorded as' <<<"$output"            # held by another session: still a rival
+  [ -z "$(_placement team frank)" ]
+  [ "$(_placement team eve)" = 'tmux:/tmp/s:%5' ]
+
+  # Same bare session id, another live process: the lock owner differs only in
+  # its pid, and that is enough for the seat to stay.
+  _join_unnamed team gina
+  _join_unnamed team hank
+  agmsg_write_atomic "$(agmsg_spawn_path team gina)" "$(printf 'tmux:/tmp/s:%%6\t/tmp/p\tclaude-code')"
+  printf 'sid-hank.12345\n' > "$(actas_lock_path team gina)"
+  _under_tmux /tmp/s 4242 %6
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p claude-code hank sid-hank
+  grep -q 'already recorded as' <<<"$output"
+  [ -z "$(_placement team hank)" ]
+  [ "$(_placement team gina)" = 'tmux:/tmp/s:%6' ]
+
+  # A record of another team for the same pane, no lock: not this team's, so not
+  # retired, and it still refuses.
+  _join_unnamed team jack
+  _join_unnamed team2 iris
+  agmsg_write_atomic "$(agmsg_spawn_path team2 iris)" "$(printf 'tmux:/tmp/s:%%7\t/tmp/p\tclaude-code')"
+  _under_tmux /tmp/s 4242 %7
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p claude-code jack sid-jack
+  grep -q 'already recorded as' <<<"$output"
+  [ -z "$(_placement team jack)" ]
+  [ "$(_placement team2 iris)" = 'tmux:/tmp/s:%7' ]
+
+  # Owner and instance both BARE: equal, and so no proof of whose the lock is.
+  _join_unnamed team lena
+  _join_unnamed team mark
+  agmsg_write_atomic "$(agmsg_spawn_path team lena)" "$(printf 'tmux:/tmp/s:%%8\t/tmp/p\tclaude-code')"
+  printf 'shared\n' > "$(actas_lock_path team lena)"
+  _under_tmux /tmp/s 4242 %8
+  run agmsg_terminal_name_self_safe shared team mark /tmp/p claude-code record retire_previous shared
+  grep -q 'already recorded as' <<<"$output"
+  [ -z "$(_placement team mark)" ]
+  [ "$(_placement team lena)" = 'tmux:/tmp/s:%8' ]
 }
 
 # --- order independence with the existing paths -------------------------------------
@@ -326,6 +405,7 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
 # --- #1109: the action records placement, so a hand-started seat is reachable -------
 
 @test "a hand-started seat: the action RECORDS its placement, not only the label (#1109)" {
+  _join_unnamed team alice   # registered, so #1391's type-resolution refuses nothing here
   _install_fake_tmux; _under_tmux /tmp/s 4242 %3
   # No prior naming and no record -- a seat someone started by hand that has just
   # sent its first message.
@@ -339,6 +419,12 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
 }
 
 @test "a hand-started seat's record carries project and type, not the two empty fields arrange.sh refuses (#1137)" {
+  # Registered first (join.sh, no terminal in the environment yet -- its own
+  # naming attempt has nothing to resolve and leaves no mark), so the type
+  # this test's action fills in is READ from that registration (#1391), not
+  # guessed: this is the common, correct case #1137 exists to cover, not the
+  # unregistered/undetectable one (see the dedicated #1391 test below).
+  _join_unnamed team alice
   _install_fake_tmux; _under_tmux /tmp/s 4242 %3
   # None of send.sh/inbox.sh/history.sh pass project or type -- this call
   # shape (2 args) is exactly what they do.
@@ -352,7 +438,22 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   IFS=$'\t' read -r ref project type < "$rec"
   [ "$ref" = 'tmux:/tmp/s:%3' ]
   [ -n "$project" ]
-  [ -n "$type" ]
+  [ "$type" = claude-code ]
+}
+
+@test "a hand-started, UNREGISTERED seat whose type cannot be detected either: no record, not a wrong one (#1391)" {
+  # No _join_unnamed here -- this (team, agent) has no registration at all,
+  # and setup()'s fake ps makes the process-tree guess fall through to
+  # detect-cli-type.sh's own hardcoded default every time. Before #1391 this
+  # wrote a placement record with type=claude-code regardless of the seat's
+  # real type; now it writes no record at all, since a record poke/despawn
+  # will trust is worse wrong than absent.
+  _install_fake_tmux; _under_tmux /tmp/s 4242 %3
+  [ -z "$(_placement team alice)" ]
+  agmsg_self_name_on_action team alice
+  [ -z "$(_placement team alice)" ]
+  # The pane is still named/labeled -- only the placement claim is withheld.
+  [ "$(_name_calls)" -eq 1 ]
 }
 
 @test "a caller that already supplies project and type is never second-guessed (#1137)" {
@@ -368,6 +469,7 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
 }
 
 @test "named once but never recorded: the next action writes the missing record (#1109)" {
+  _join_unnamed team alice   # registered, so #1391's type-resolution refuses nothing here
   _install_fake_tmux; _under_tmux /tmp/s 4242 %3
   # A mark-only prior naming (watch.sh names with five args, no record): the mark
   # matches this pane, but no placement record exists. The old fast half trusted
@@ -386,13 +488,19 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
 
 @test "no pane in the environment: nothing is recorded, so an un-named seat stays unreachable (#1109)" {
   _install_fake_tmux                                                # a tmux binary exists, but
-  unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH    # no pane in the environment
+  unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH TERM_PROGRAM ORCA_TERMINAL_HANDLE
   agmsg_self_name_on_action team seat1
   # self_env resolves nothing -> no name, no record. This is the contrast case: a
   # real seat that never named itself (neither a naming record nor a placement one)
   # must keep reading as unreachable, not be made falsely addressable. Making
   # everything reachable would turn "cannot reach" into "said it could and could
   # not", which is worse.
+  [ "$(_terminal_calls)" -eq 0 ]
+  [ -z "$(_placement team seat1)" ]
+
+  # A present but unidentifiable driver environment is also not a pane to name.
+  export TERM_PROGRAM=Orca
+  agmsg_self_name_on_action team seat1
   [ "$(_terminal_calls)" -eq 0 ]
   [ -z "$(_placement team seat1)" ]
 }
@@ -411,6 +519,7 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
 }
 
 @test "herdr: mark matching -> no call; socket recreated (server restart) -> named again" {
+  _join_unnamed team alice   # registered, so #1391's type-resolution refuses nothing here
   _install_fake_herdr; _under_herdr w1:pB
   agmsg_self_name_on_action team alice
   : > "$ARGV_LOG"
@@ -490,13 +599,12 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   [ "$status" -eq 0 ]
   grep -q '\[@agmsg_agent\] \[team:alice\]' "$ARGV_LOG"
   [ "$(_mark team alice)" = $'tmux:/tmp/s:%3\tpid=4242' ]
-  # Order independence end to end: a boot path (join, kept as it was: it
-  # names unconditionally) writes the SAME key, and the send after it finds
-  # the mark and makes no call of its own.
+  # Re-registering does not adopt the identity or name the caller. The mark
+  # from the first send remains valid, so the next send needs no naming call.
   : > "$ARGV_LOG"
   bash "$SKILL_DIR/scripts/join.sh" team alice claude-code /tmp/p >/dev/null
-  [ "$(_name_calls)" -eq 1 ]
-  grep -q '\[-t\] \[%3\] \[@agmsg_agent\] \[team:alice\]' "$ARGV_LOG"
+  [ "$(_name_calls)" -eq 0 ]
+  refute grep -q '\[@agmsg_agent\]' "$ARGV_LOG"
   : > "$ARGV_LOG"
   run bash "$SKILL_DIR/scripts/send.sh" team alice bob 'hello twice'
   [ "$status" -eq 0 ]
@@ -508,7 +616,7 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   [ "$status" -eq 0 ]
 }
 
-@test "inbox.sh and history.sh (with an agent) name the reader's pane; history without an agent does not" {
+@test "inbox.sh names the reader's pane; history.sh never does, with or without an agent" {
   _install_fake_tmux; _under_tmux /tmp/s 4242 %3
   _join_unnamed team alice
   : > "$ARGV_LOG"
@@ -518,9 +626,29 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   : > "$ARGV_LOG"
   _under_tmux /tmp/s 4242 %4
   bash "$SKILL_DIR/scripts/history.sh" team alice 5 >/dev/null 2>&1 || true
-  grep -q '\[-t\] \[%4\] \[@agmsg_agent\] \[team:alice\]' "$ARGV_LOG"
+  [ "$(_terminal_calls)" -eq 0 ]
   : > "$ARGV_LOG"
   bash "$SKILL_DIR/scripts/history.sh" team >/dev/null 2>&1 || true
+  [ "$(_terminal_calls)" -eq 0 ]
+}
+
+# #1756: history's <agent> is a filter. Reading another seat's history from a
+# different pane used to rewrite that seat's pane record to the reader's pane.
+@test "history.sh <team> <other-agent> from another pane leaves the other seat's records alone" {
+  _install_fake_tmux; _under_tmux /tmp/s 4242 %3
+  _join_unnamed team alice
+  _join_unnamed team bob
+  bash "$SKILL_DIR/scripts/inbox.sh" team alice >/dev/null 2>&1 || true
+  [ "$(_placement team alice)" = 'tmux:/tmp/s:%3' ]
+  before_mark="$(_mark team alice)"
+  [ -n "$before_mark" ]
+  : > "$ARGV_LOG"
+  _under_tmux /tmp/s 4242 %7
+  run bash "$SKILL_DIR/scripts/history.sh" team alice 5
+  [ "$status" -eq 0 ]
+  [ "$(_placement team alice)" = 'tmux:/tmp/s:%3' ]
+  [ "$(_mark team alice)" = "$before_mark" ]
+  [ -z "$(_placement team bob)" ]
   [ "$(_terminal_calls)" -eq 0 ]
 }
 
@@ -597,6 +725,7 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   #
   # Every existing test here starts from a CORRECT seat and asks that it stays
   # correct. All of them were green while this shipped. This one starts broken.
+  _join_unnamed team alice   # registered, so #1391's type-resolution refuses nothing here
   _install_fake_herdr; _under_herdr w1:pDAEMON
 
   # Act once under the wrong environment: this is how the bad state was made.
@@ -628,6 +757,7 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   # The partner. "Never short-circuit" also passes the test above, and it would
   # cost every seat a full re-resolution on every action; this is what stops that
   # from being the fix.
+  _join_unnamed team alice   # registered, so #1391's type-resolution refuses nothing here
   _install_fake_herdr; _under_herdr w1:pB
   agmsg_self_name_on_action team alice
   [ "$(_placement team alice)" = "herdr:$HERDR_SOCKET_PATH:w1:pB" ]

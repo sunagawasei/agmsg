@@ -113,6 +113,9 @@ agmsg_delivery_apply() {
   local type="$1"
   local project="$2"
   local mode="$3"
+  # Refuse before any write: an empty SKILL_DIR would render broken command
+  # paths into the hooks file (#1234 review).
+  [ -n "${SKILL_DIR:-}" ] || { echo "agmsg_delivery_apply (cursor): SKILL_DIR is not set; refusing rather than writing broken hook commands" >&2; return 1; }
 
   local hooks_file
   hooks_file=$(resolve_hooks_file "$type" "$project")

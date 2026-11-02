@@ -15,12 +15,89 @@
 # full order is env > config > default. Keep that logic here so call sites
 # stay unchanged.
 
+# Guard against double-source. This used to be genuinely harmless to skip
+# (every top-level assignment below was a pure function definition, so
+# re-running them just redefined the same functions) -- resolve-project.sh's
+# own comment on its unconditional ". storage.sh" says so explicitly. That
+# stopped being true once this file gained STATEFUL per-process caches
+# (agmsg_storage_dir, _agmsg_partition_load): re-sourcing reset them to their
+# initial empty state, silently discarding whatever a caller had already
+# warmed (measured: watch.sh's own top-level warm of agmsg_storage_dir was
+# being wiped by resolve-project.sh's re-source moments later, #1330 second
+# stage). Every existing caller already tolerates a no-op re-source (that
+# was the whole premise); this guard just makes that no-op literal instead
+# of a same-effect-so-far redefinition that quietly stopped being one.
+[ -n "${_AGMSG_STORAGE_SH:-}" ] && return 0
+_AGMSG_STORAGE_SH=1
+
+# Ordinary operations on a non-daemon install pay only a file-existence check.
+# Watchers suppress this entry check in themselves and all child operations.
+_agmsg_entry_dir="${0%/*}"
+[ "$_agmsg_entry_dir" != "$0" ] || _agmsg_entry_dir=.
+if [ "${AGMSG_DAEMON_NOTICE_SKIP:-0}" != 1 ] && [ -f "$_agmsg_entry_dir/../run/install.db" ]; then
+  case "${0##*/}" in daemon.sh|doctor.sh|delivery.sh|watch.sh|session-start.sh|session-end.sh|check-inbox.sh) ;; *)
+    if [ -f "$_agmsg_entry_dir/lib/daemon-state.sh" ]; then
+      # shellcheck disable=SC1091
+      source "$_agmsg_entry_dir/lib/daemon-state.sh"
+      agmsg_daemon_warn_if_stopped || true
+    fi
+    ;;
+  esac
+fi
+unset _agmsg_entry_dir
+
+# agmsg_db_path turns the team selector into a path segment, so it cannot do its
+# job without the shared name validator. Sourced here rather than left to each
+# caller: watch.sh already reached the store without validate.sh in scope, and a
+# caller that forgets it would build an unchecked path rather than fail.
+# validate.sh guards against double-sourcing, so a caller that sources it too is
+# unaffected. If neither locator resolves, the validator is simply absent and
+# agmsg_db_path fails on the call — never silently unvalidated.
+if ! declare -F agmsg_validate_team_name >/dev/null 2>&1; then
+  if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    # shellcheck disable=SC1091
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/validate.sh"
+  elif [ -n "${SKILL_DIR:-}" ]; then
+    # BASH_SOURCE empty — see agmsg_storage_dir for when that happens.
+    # shellcheck disable=SC1091
+    source "$SKILL_DIR/scripts/lib/validate.sh"
+  fi
+fi
+
+# Built-in storage drivers use the shared UUIDv7 generator. Keep it available
+# through the storage facade so direct and registry-driven loads use one
+# implementation on every platform.
+if ! declare -F compat_uuid7 >/dev/null 2>&1; then
+  if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    # shellcheck disable=SC1091
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compat.sh"
+  elif [ -n "${SKILL_DIR:-}" ]; then
+    # shellcheck disable=SC1091
+    source "$SKILL_DIR/scripts/lib/compat.sh"
+  fi
+fi
+
 # Echo the directory that holds (or will hold) the message store.
+#
+# Memoized for the life of the process (_AGMSG_STORAGE_DIR_CACHE): every
+# input this depends on -- AGMSG_STORAGE_PATH, this script's own on-disk
+# location -- is fixed for as long as the process runs, unlike a team's
+# storage driver choice (see _agmsg_partition_load's own comment for that
+# distinction). A caller that overrides AGMSG_STORAGE_PATH mid-process
+# (tests do, between cases) is expected to unset this cache too — see
+# test_helper.bash's teardown, which starts each test in a fresh process
+# anyway, so no test needs to.
+_AGMSG_STORAGE_DIR_CACHE=""
 agmsg_storage_dir() {
+  if [ -n "$_AGMSG_STORAGE_DIR_CACHE" ]; then
+    printf '%s\n' "$_AGMSG_STORAGE_DIR_CACHE"
+    return 0
+  fi
   if [ -n "${AGMSG_STORAGE_PATH:-}" ]; then
     # Strip a single trailing slash for a stable join with the filename.
-    printf '%s\n' "${AGMSG_STORAGE_PATH%/}"
-    return
+    _AGMSG_STORAGE_DIR_CACHE="${AGMSG_STORAGE_PATH%/}"
+    printf '%s\n' "$_AGMSG_STORAGE_DIR_CACHE"
+    return 0
   fi
   local lib_dir skill_dir
   if [ -n "${BASH_SOURCE[0]:-}" ]; then
@@ -35,10 +112,148 @@ agmsg_storage_dir() {
     echo "Error: cannot resolve storage dir (BASH_SOURCE and SKILL_DIR both empty)" >&2
     return 1
   fi
-  printf '%s\n' "$skill_dir/db"
+  _AGMSG_STORAGE_DIR_CACHE="$skill_dir/db"
+  printf '%s\n' "$_AGMSG_STORAGE_DIR_CACHE"
 }
 
-# Echo the full path to the message store, in a form sqlite3 can open.
+# Echo the full path to a team's message store, in a form sqlite3 can open.
+#
+# WHICH store depends on the team's partition driver, and teams choose separately:
+# `shared` (the default) puts every team in one file, `per-team` gives the team
+# its own. A team only leaves the default when connecting requires it, because
+# external programs read the shared store directly and lose sight of any team
+# that moves out. See scripts/drivers/partition/.
+#
+# Without a selector it resolves to the shared store: callers written before the
+# partition driver existed meant that one file, and the default partition is it.
+#
+# The selector reaches the filesystem as a path segment under per-team, so it is
+# validated here rather than in the driver: this is the last point that can
+# refuse to build a path it cannot vouch for.
+agmsg_db_path() {
+  local team="${1-}"
+  if [ -z "$team" ]; then
+    _agmsg_db_file
+    return
+  fi
+  agmsg_validate_team_name "$team" || return 1
+  _agmsg_partition_load "$team" || return 1
+  _agmsg_db_file "$(partition_store_relpath "$team")"
+}
+
+# Bumped by watch.sh's poll loop ONCE per cycle, as a PLAIN STATEMENT (see
+# that loop's own comment) — never via $(...), the same subshell hazard
+# documented on the actas-lock cache in lib/actas-lock.sh. A caller that
+# never bumps this (every one-shot script: spawn/despawn/send/inbox/etc.,
+# and any test that calls a cached function directly without going through
+# watch.sh's loop) stays at epoch 0 forever, which is exactly the "always
+# re-check" behavior those callers already had — the epoch only starts
+# distinguishing "cycle N" from "cycle N+1" for a caller that advances it.
+_AGMSG_POLL_CYCLE_EPOCH=0
+
+# Source the partition driver this team uses, memoized so repeated resolution in
+# one process costs nothing. Re-sources when a caller moves between teams on
+# different partitions — watch.sh loops over a subscription that can contain both.
+#
+# agmsg_driver_for_team's own answer (which driver a team uses) is cached per
+# team, but ONLY for the current poll cycle (_AGMSG_POLL_CYCLE_EPOCH above),
+# not for the life of the process: a team's partition CAN change under a
+# running watcher, via an ordinary operation (internal/migrate-team-store.sh,
+# reached mid remote-connect) that flips a team from shared to per-team and
+# then removes its row from the shared store. Caching this for the whole
+# process life shipped exactly that regression (review, #1329 round 2) — a
+# watcher that had cached "shared" kept reading the now-stale shared store
+# forever. Scoping the cache to one cycle keeps the redundant re-read within
+# a single cycle (the same pair's storage_init/read_cursor_get/watch_after/
+# read_cursor_consume each resolving it independently) from forking
+# sqlite3+tr several times over, while still re-reading fresh at the start of
+# the NEXT cycle — so a migration is noticed on the very next poll, same as
+# an uncached read always noticed it, just not mid-cycle.
+_AGMSG_PARTITION_LOADED=""
+_AGMSG_PARTITION_TEAM_KEYS=()
+_AGMSG_PARTITION_TEAM_VALS=()
+_AGMSG_PARTITION_TEAM_EPOCH=()
+_AGMSG_PARTITION_TEAM_MAX=64
+_agmsg_partition_load() {
+  # The registry may not be sourced yet — agmsg_db_path is reachable without
+  # going through agmsg_storage_load. Same guarded pull-in that uses.
+  if ! command -v agmsg_driver_for_team >/dev/null 2>&1; then
+    local _lib
+    _lib="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    # shellcheck disable=SC1091
+    [ -n "$_lib" ] && . "$_lib/driver-registry.sh"
+  fi
+  local name team="$1" _i _n _slot=-1
+  _n=${#_AGMSG_PARTITION_TEAM_KEYS[@]}
+  name=""
+  for ((_i = 0; _i < _n; _i++)); do
+    if [ "${_AGMSG_PARTITION_TEAM_KEYS[$_i]}" = "$team" ]; then
+      _slot=$_i
+      # Epoch 0 is never a valid cache hit, even against itself: it is the
+      # value every caller that never advances _AGMSG_POLL_CYCLE_EPOCH sits
+      # at forever (every one-shot script, every test), and two such calls
+      # in the same process both stamped "epoch 0" would otherwise compare
+      # equal and the second would wrongly reuse the first's answer for the
+      # rest of that process's life (review, #1333 round 2) -- reviving the
+      # exact process-lifetime staleness this cache exists to avoid, just
+      # for callers outside watch.sh's own loop instead of inside it. Only
+      # watch.sh's loop ever bumps this past 0, so gating the HIT on that is
+      # what keeps every other caller's behavior unchanged (always fresh).
+      if [ "$_AGMSG_POLL_CYCLE_EPOCH" -gt 0 ] && [ "${_AGMSG_PARTITION_TEAM_EPOCH[$_i]}" = "$_AGMSG_POLL_CYCLE_EPOCH" ]; then
+        name="${_AGMSG_PARTITION_TEAM_VALS[$_i]}"
+      fi
+      break
+    fi
+  done
+  if [ -z "$name" ]; then
+    name="$(agmsg_driver_for_team partition "$team" shared)"
+    if [ "$_slot" -ge 0 ]; then
+      _AGMSG_PARTITION_TEAM_VALS[$_slot]="$name"
+      _AGMSG_PARTITION_TEAM_EPOCH[$_slot]="$_AGMSG_POLL_CYCLE_EPOCH"
+    elif [ "$_n" -lt "$_AGMSG_PARTITION_TEAM_MAX" ]; then
+      _AGMSG_PARTITION_TEAM_KEYS[$_n]="$team"
+      _AGMSG_PARTITION_TEAM_VALS[$_n]="$name"
+      _AGMSG_PARTITION_TEAM_EPOCH[$_n]="$_AGMSG_POLL_CYCLE_EPOCH"
+    fi
+  fi
+  [ "$name" = "$_AGMSG_PARTITION_LOADED" ] && return 0
+  local base kind file found=""
+  while IFS="$(printf '\t')" read -r kind base; do
+    [ -n "$base" ] || continue
+    file="$base/partition/$name.sh"
+    [ -f "$file" ] || continue
+    # Externals stay gated by the same opt-in every other axis uses.
+    if [ "$kind" = external ] && ! agmsg_driver_is_trusted partition "$name" "$file"; then
+      continue
+    fi
+    found="$file"
+  done <<EOF
+$(agmsg_driver_bases)
+EOF
+  if [ -z "$found" ]; then
+    # Loud rather than falling back to shared: a team recorded a partition, and
+    # quietly reading a different store than the one it names is the exact
+    # failure this axis exists to make impossible.
+    echo "Error: no partition driver '$name' for team '$1'" >&2
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  . "$found" || return 1
+  _AGMSG_PARTITION_LOADED="$name"
+}
+
+# The store that is NOT team-scoped, and the only resolver allowed to take no
+# selector. Two things live here that are not message data: the runtime `locks`
+# table (its resources are project-scoped — there is no team to pass), and the
+# pre-split store that migration reads from.
+#
+# Runtime state deliberately did not follow the messages when they split: a lock
+# on a project is not a fact about any one team, and per-team lock files would
+# let two teams in the same project take the same lock.
+_agmsg_runtime_db_path() { _agmsg_db_file; }
+
+# Join a store-relative path onto the storage directory. Defaults to the
+# pre-split shared file, which is what the runtime store still is.
 #
 # On Windows, sqlite3.exe is a native binary that cannot open a Git Bash path
 # like /c/Users/.../db/messages.db: open() fails, so inbox/send/watch all fail
@@ -47,13 +262,38 @@ agmsg_storage_dir() {
 # the shell's `[ -f "$db" ]` test AND sqlite3.exe accept — unlike -w's backslash
 # form (C:\Users\...), which the surrounding shell quoting/tests mishandle.
 # No-op off Windows (cygpath absent). Mirrors agmsg_sql_readfile_path's pattern.
-agmsg_db_path() {
+_agmsg_db_file() {
   local db
-  db="$(agmsg_storage_dir)/messages.db"
+  db="$(agmsg_storage_dir)/${1:-messages.db}"
   if command -v cygpath >/dev/null 2>&1; then
     db=$(cygpath -m "$db" 2>/dev/null || printf '%s' "$db")
   fi
   printf '%s\n' "$db"
+}
+
+# The storage selector for a list of <team>:<agent> pairs, shared by every
+# driver so one rule has one implementation.
+#
+# All pairs must name the SAME team. That is not a limitation being introduced
+# here — the only production caller has always passed exactly one pair — but it
+# is enforced rather than assumed, because the multi-team form has no answer
+# once stores are actually split: a per-team store has no single monotonic
+# cursor for a watch call to return. Choosing between a single-team ABI and a
+# composite cursor belongs to that change, and failing loudly here stops a
+# multi-team caller from appearing meanwhile and settling it by default.
+agmsg_pair_team() {
+  local p first="" t
+  for p in "$@"; do
+    t="${p%%:*}"
+    [ -n "$t" ] && [ "$t" != "$p" ] || { echo "storage: not a team:agent pair: $p" >&2; return 1; }
+    if [ -z "$first" ]; then first="$t"
+    elif [ "$t" != "$first" ]; then
+      echo "storage: one call cannot span teams ($first, $t)" >&2
+      return 1
+    fi
+  done
+  [ -n "$first" ] || { echo "storage: no team:agent pair given" >&2; return 1; }
+  printf '%s' "$first"
 }
 
 # Run sqlite3 against the message store with a busy_timeout, so a writer that
@@ -89,6 +329,59 @@ _agmsg_escape_flag() {
   printf '%s' "$_AGMSG_ESCAPE_FLAG"
 }
 
+# Run the escape probe in THIS shell, before a pipeline starts.
+#
+# `agmsg_sqlite` memoises the probe so it costs one sqlite3 process per shell
+# rather than one per call (#462). The right-hand side of a pipeline is a
+# subshell: it inherits the memo, but a memo it sets there dies with it. So a
+# process whose FIRST database access is piped records nothing, and every piped
+# call after it probes again -- measured at two sqlite3 processes per call, and
+# it never converges.
+#
+# A REDIRECTION IS NOT A PIPE. `agmsg_sqlite db < file` runs in the current
+# shell and memoises normally; only `... | agmsg_sqlite ...` needs this. Call it
+# on the line before the pipeline, not inside it.
+agmsg_sqlite_warm() {
+  [ -n "$_AGMSG_ESCAPE_PROBED" ] || _agmsg_escape_flag >/dev/null
+}
+
+# Is $1 (sqlite3's full stderr, possibly several lines) a real lock-timeout
+# giveup -- never a statement whose own error text happens to MENTION
+# "database is locked", e.g. a table or column named that, or a failed
+# statement displayed verbatim in a parse error. A plain substring test
+# cannot tell the two apart (review on #1645/#1654: a `SELECT` against a
+# table literally named "database is locked" read as busy and got the
+# busy diagnostic, when it was really "no such table"). Matched instead
+# against the exact whole lines sqlite3 itself emits for SQLITE_BUSY,
+# collected by reproducing a real lock timeout on both argv and stdin input
+# and on both supported CLI generations:
+#   3.51.0, argv:  Error: in prepare, database is locked (5)
+#   3.51.0, argv:  Error: stepping, database is locked (5)
+#   3.51.0, stdin: Parse error near line N: database is locked (5)
+#   3.53.4, argv:  Parse error in Nth command line argument: database is locked (5)
+#   3.53.4, argv:  Error in Nth command line argument: database is locked
+#   3.53.4, stdin: Parse error near line N: database is locked (5)
+# Anchored start-to-end per line, with no wildcard around "database is
+# locked" itself, so a line that embeds extra text around it (the
+# counter-example above renders as "...: no such table: database is
+# locked") fails every alternative and is correctly left unclassified.
+#
+# Windows' sqlite3.exe ends stderr lines with \r\n, not \n (the same CRLF
+# behaviour as its stdout, see agmsg_sqlite()'s own CRLF comment above) --
+# left in, the trailing \r sits between "locked" and the `$` anchor and
+# every alternative misses, so a real busy timeout goes unclassified on
+# Windows (review on #1654). Stripped with a builtin substitution, not an
+# external command, matching ONLY the string this match is run against;
+# the original stderr this function was handed is still re-emitted to the
+# caller's stderr unchanged by agmsg_sqlite() itself.
+_agmsg_sqlite_err_is_busy() {
+  local _err="${1//$'\r'/}"
+  printf '%s\n' "$_err" | grep -Eq \
+    '^Error: (in prepare|stepping), database is locked( \([0-9]+\))?$'\
+'|^(Error|Parse error) in [0-9]+(st|nd|rd|th) command line argument: database is locked( \([0-9]+\))?$'\
+'|^(Error|Parse error) near line [0-9]+: database is locked( \([0-9]+\))?$'
+}
+
 agmsg_sqlite() {
   # Probe in THIS shell, not in a command substitution. `$(_agmsg_escape_flag)`
   # ran the function in a subshell, so the memo it set was discarded on exit and
@@ -97,8 +390,181 @@ agmsg_sqlite() {
   # shell. Note it is once per SHELL, not once per machine: a call made from
   # inside a command substitution still probes in that subshell.
   [ -n "$_AGMSG_ESCAPE_PROBED" ] || _agmsg_escape_flag >/dev/null
-  # shellcheck disable=SC2086  # intentional split: "-escape off" → two args, or none
-  sqlite3 $_AGMSG_ESCAPE_FLAG -cmd ".timeout ${AGMSG_BUSY_TIMEOUT:-5000}" "$@"
+  if [ -n "${AGMSG_SQLITE_OUTCOME_FILE:-}" ]; then
+    _agmsg_sqlite_recording "$@"
+    return
+  fi
+  # Windows' sqlite3.exe (measured: 3.53.4) ends each row of a multi-row
+  # result with \r\n, not \n -- confirmed by piping a three-row SELECT
+  # through `od -c` on real Windows hardware. This is independent of the
+  # `-escape` probe above (#102/#143: that is sqlite3 >= 3.50's own caret-
+  # notation rendering, fixed by `-escape off`, and reproduces on Linux too
+  # -- this CRLF ending does not reproduce here). HYPOTHESIS (unverified):
+  # the Windows C runtime's stdio text-mode translation rewrites sqlite3's
+  # own LF terminators to CRLF on the way out; what is actually confirmed is
+  # only the \r\n on the wire, not this mechanism.
+  #
+  # `ROWS=$(agmsg_sqlite ...)` strips only the trailing newline of the WHOLE
+  # captured output (bash command substitution), so every row but the last
+  # keeps a \r stuck to its final field -- typically an id, since every
+  # multi-field row built by this codebase's callers puts id/cursor/at last
+  # and body earlier (never in scope for this fix, but worth naming: it is
+  # why this hazard has not already shown up as corrupted message bodies).
+  # `IFS=$'\x1f' read` does not split on \r, so that \r rides along into
+  # the field value. Reported and measured on real Windows hardware: a
+  # 100-message backlog lost 99 of 100 mark-as-read updates in one
+  # inbox.sh run, because storage_mark_read_batch's ids no longer matched
+  # any real msg_id.
+  #
+  # The fix normalizes ONLY a \r immediately before the line-ending \n --
+  # not every \r in the stream. `tr -d '\r'` (used by _sqlite_data /
+  # _sqlite_data_stdin in drivers/storage/sqlite.sh, wrapping calls to THIS
+  # function) would also be correct for THIS symptom, but it deletes every
+  # \r anywhere in the output, including one that is a message body's own
+  # content (char(13) is not replaced the way char(10) already is in every
+  # row-building SELECT in this codebase) -- so it is not used here. `sed`'s
+  # `$` anchor matches only end-of-line, so a \r elsewhere in a row
+  # (mid-body) is left untouched.
+  #
+  # Wrapped in a subshell with its own `set -o pipefail` so the pipeline's
+  # status is sqlite3's, not sed's, without changing pipefail for the
+  # calling script (same shape as _sqlite_data / _sqlite_data_stdin in
+  # drivers/storage/sqlite.sh).
+  # stderr is captured into a variable, not a temp file: this function is on
+  # the hot path (every send/receive/watch.sh cycle), so mktemp+cat+rm on
+  # EVERY call -- including the common all-ok case -- would add 3 processes
+  # per call for the busy-text check below alone, the same class of per-cycle
+  # process cost #1627/#1630/#1652 were about removing, and the kind of
+  # leftover-temp-file risk #1580 just fixed. The classic fd-juggle instead:
+  # `3>&1` on the outer group saves this function's real stdout onto fd 3;
+  # inside the command substitution, `1>&3` then points the pipeline's
+  # stdout back at that real stdout (bypassing the substitution's own
+  # capture), while `2>&1` (evaluated first, while fd 1 still means the
+  # substitution's capture) sends the pipeline's stderr there instead. Net
+  # effect: stdout streams straight through to the caller as before, stderr
+  # lands in $_agmsg_sqlite_err, and no process beyond sqlite3/sed is forked.
+  local _agmsg_sqlite_rc=0 _agmsg_sqlite_err
+  {
+    _agmsg_sqlite_err=$(
+      set -o pipefail
+      # shellcheck disable=SC2086  # intentional split: "-escape off" → two args, or none
+      { sqlite3 $_AGMSG_ESCAPE_FLAG -cmd ".timeout ${AGMSG_BUSY_TIMEOUT:-5000}" "$@" | sed $'s/\r$//'; } 2>&1 1>&3 3>&-
+    )
+  } 3>&1 || _agmsg_sqlite_rc=$?
+  [ -z "$_agmsg_sqlite_err" ] || printf '%s\n' "$_agmsg_sqlite_err" >&2
+  # SQLite 3.53.4/3.54.0's CLI returns the generic 1 for a lock-timeout
+  # giveup instead of 5, on the same failure 3.51.0 reports as 5 (#1645) --
+  # so rc alone can no longer tell a busy timeout from any other failure on
+  # every supported CLI. _agmsg_sqlite_err_is_busy() recognizes the exact
+  # lines sqlite3 itself emits for this, so a real lock timeout still
+  # normalizes to the historical 5 (keeping every existing rc==5 caller,
+  # including the diagnostic below, working unchanged on either CLI
+  # generation), while an ordinary error that merely mentions "database is
+  # locked" in a table/column name or an echoed statement does not.
+  if [ "$_agmsg_sqlite_rc" -ne 0 ] && [ "$_agmsg_sqlite_rc" -ne 5 ] &&
+     _agmsg_sqlite_err_is_busy "$_agmsg_sqlite_err"; then
+    _agmsg_sqlite_rc=5
+  fi
+  # SQLITE_BUSY after the full timeout used to pass in silence: the caller saw
+  # a non-zero it often swallowed, and the operator saw a command that hung
+  # for the timeout and said nothing (#1001 -- two people diagnosed two
+  # different commands as broken). One line on stderr turns "hung" into
+  # "waited and gave up", names the likely writer, and costs nothing when
+  # there is no contention.
+  if [ "$_agmsg_sqlite_rc" -eq 5 ]; then
+    echo "agmsg: the message store is busy: this call waited ${AGMSG_BUSY_TIMEOUT:-5000}ms behind another writer (a sync engine cycle may be running) and gave up (#1001)" >&2
+  fi
+  return "$_agmsg_sqlite_rc"
+}
+
+# The same call, recording how it ended. With AGMSG_SQLITE_OUTCOME_FILE set,
+# every call overwrites that file with one word: `ok`; `busy` when the busy
+# timeout above ran out (sqlite3 said "database is locked"); `failed` for
+# anything else.
+#
+# Only the sync driver adapter sets it (scripts/internal/storage-sync-driver.sh),
+# and this is what it is for: the driver's functions return 13 for every failed
+# check with the statement's stderr discarded at the call site, so their caller
+# could not tell "the input was refused" from "another writer held the store past
+# the timeout". The second is the one failure that is a fact about the moment
+# rather than about the input -- the same call succeeds once that writer is done
+# -- and the adapter reports it as its own exit status so the engine can wait
+# and retry instead of giving up (#910). The word is the LAST call's outcome on
+# purpose: a check-failing function returns right after the statement that
+# failed, so "the operation failed and the last statement was busy" names it.
+#
+# stderr is captured to classify it and re-emitted unchanged, so a caller that
+# reads or silences it sees what it saw before; stdout is the data stream, now
+# passed through the same trailing-CR normalization as agmsg_sqlite()'s own
+# non-recording path above (Windows' sqlite3.exe row-separator \r\n; see that
+# comment for the full writeup -- this path bypasses it entirely via the early
+# `return` above, so it needs its own copy of the fix, not a call into it: this
+# function's stdout/stderr routing exists for a different purpose, classifying
+# ok/busy/failed for the sync driver adapter, and folding the two together
+# would tangle two independent concerns). The exit status is still passed
+# through, unaffected either way.
+#
+# The original fd-3 passthrough trick (sqlite3's own fd 1 repointed at
+# whatever fd 1 was outside this function, with no process in between) cannot
+# survive inserting `sed`: stdout now goes through an actual pipe, so a temp
+# file replaces the `err=$(...)` capture for stderr, and the exit status comes
+# from `${PIPESTATUS[0]}` (sqlite3's, not sed's) rather than the substitution's
+# own `$?`. Stderr is still read back whole and re-emitted verbatim afterward,
+# so a caller that reads or silences it sees the same bytes as before.
+#
+# The pipeline is wrapped in an `if`, same as the original, and for the same
+# reason: this is a plain function call, not a subshell, so it runs in the
+# CALLING script's own shell -- and several callers set both `-e` and
+# `-o pipefail`. A command tested by `if` is exempt from `set -e` on a
+# non-zero exit (POSIX), so the pipeline cannot abort the caller here
+# regardless of its pipefail setting.
+#
+# `${PIPESTATUS[0]}` (sqlite3's exit status, not sed's) is read in BOTH
+# branches, not once after the `if` -- and specifically not guarded with
+# `|| true` the way the CRLF fix above is, because `|| true` is not safe
+# here. `PIPESTATUS` is overwritten by the NEXT command this shell
+# executes, of any kind, including a trivial one: `pipeline || true` runs
+# `true` whenever the pipeline's own exit status is non-zero, and reading
+# `${PIPESTATUS[0]}` after that reads back `true`'s status (0), not
+# sqlite3's. The CRLF fix's own `|| true` above is fine BECAUSE that call
+# site never reads PIPESTATUS at all. This one silently turned every
+# failure here into rc=0 whenever pipefail was already active in the
+# caller -- and only there: storage-sync-driver.sh sets `-o pipefail`
+# itself, so a plain `bash -c` probe without it stayed green while the
+# real busy-timeout contract test (test_remote_sync.bats, "a store
+# another writer holds is busy") got 0 where it expected 11. Reading
+# PIPESTATUS inside the `if`'s own branches, before anything else runs,
+# is what keeps it correct either way.
+_agmsg_sqlite_recording() {
+  local err rc errfile
+  # A mktemp failure degrades stderr capture to /dev/null rather than failing
+  # the operation outright: worse diagnostics (an unclassifiable error reads
+  # as "failed", never as "busy"), not worse correctness, and the same
+  # "environment problem, not a bad input" class of failure the busy/failed
+  # distinction exists to tell apart from an ordinary refusal.
+  errfile=$(mktemp "${TMPDIR:-/tmp}/agmsg-sqlite-recording-err.XXXXXX" 2>/dev/null) || errfile=/dev/null
+  # shellcheck disable=SC2086  # same intentional split as above
+  if sqlite3 $_AGMSG_ESCAPE_FLAG -cmd ".timeout ${AGMSG_BUSY_TIMEOUT:-5000}" "$@" 2>"$errfile" | sed $'s/\r$//'; then
+    rc=${PIPESTATUS[0]}
+  else
+    rc=${PIPESTATUS[0]}
+  fi
+  if [ "$errfile" = /dev/null ]; then
+    err=""
+  else
+    err="$(cat "$errfile" 2>/dev/null)"
+    rm -f "$errfile"
+  fi
+  [ -z "$err" ] || printf '%s\n' "$err" >&2
+  if [ "$rc" -eq 0 ]; then
+    printf 'ok\n' > "$AGMSG_SQLITE_OUTCOME_FILE"
+  else
+    case "$err" in
+      *"database is locked"*) printf 'busy\n' > "$AGMSG_SQLITE_OUTCOME_FILE" ;;
+      *) printf 'failed\n' > "$AGMSG_SQLITE_OUTCOME_FILE" ;;
+    esac
+  fi
+  return "$rc"
 }
 
 # Runtime ownership seam. This is the first run/-state-in-storage primitive for
@@ -123,7 +589,7 @@ agmsg_runtime_lock_acquire() {
   resource="$1"; owner_pid="$2"; expected_owner="${3:-}"
   case "$owner_pid:$expected_owner" in *[!0-9:]*) return 1 ;; esac
   agmsg_storage_ensure_initialized || return 1
-  db="$(agmsg_db_path)"
+  db="$(_agmsg_runtime_db_path)"
   resource_sql="$(_agmsg_runtime_lock_resource_sql "$resource")"
   agmsg_sqlite "$db" <<SQL | tr -d '\r'
 CREATE TABLE IF NOT EXISTS locks (
@@ -143,7 +609,7 @@ SQL
 agmsg_runtime_lock_owner() {
   local resource_sql
   resource_sql="$(_agmsg_runtime_lock_resource_sql "$1")"
-  agmsg_sqlite "$(agmsg_db_path)" \
+  agmsg_sqlite "$(_agmsg_runtime_db_path)" \
     "SELECT owner_pid FROM locks WHERE resource = '$resource_sql';" 2>/dev/null \
     | tr -d '\r'
 }
@@ -157,7 +623,7 @@ agmsg_runtime_lock_release() {
   local resource_sql
   case "$2" in *[!0-9]*|'') return 1 ;; esac
   resource_sql="$(_agmsg_runtime_lock_resource_sql "$1")"
-  agmsg_sqlite "$(agmsg_db_path)" \
+  agmsg_sqlite "$(_agmsg_runtime_db_path)" \
     "DELETE FROM locks WHERE resource = '$resource_sql' AND owner_pid = $2;" \
     >/dev/null 2>&1 || true
 }
@@ -249,7 +715,9 @@ agmsg_storage_load() {
       continue
     fi
     # shellcheck disable=SC1090
-    . "$file"
+    . "$file" || return 1
+    . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bridge-read-guard.sh" || return 1
+    agmsg_bridge_guard_install || return 1
     _AGMSG_STORAGE_LOADED="$name"
     return 0
   done < <(agmsg_driver_bases)

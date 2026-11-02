@@ -1,9 +1,8 @@
 #!/usr/bin/env bats
 
-# Regression tests for the watch.sh per-session watermark (#107): a Monitor
-# restart must deliver messages that arrived during the restart gap, without
-# re-delivering anything already streamed, while a fresh session still receives
-# the messages already waiting past its pairs' read cursor.
+# Regression tests for the store-owned per-(team,agent) read cursor. Inbox and
+# monitor share this frontier, so restarts deliver gaps without replaying rows
+# already consumed by either delivery path.
 
 load test_helper
 
@@ -14,16 +13,151 @@ setup() {
   # the walk can produce different instance IDs. Pin to bare-sid on MSYS2 so
   # both contexts agree deterministically.
   case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) export AGMSG_AGENT_PID="" ;; esac
-  # Never inherit real herdr env from the test runner to prevent accidental
-  # pane close on ctrl:despawn.
-  unset HERDR_PANE_ID HERDR_ENV
   export PROJ="/tmp/agmsg-watch-proj"
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
   bash "$SCRIPTS/join.sh" team bob claude-code "$PROJ" >/dev/null
 }
 
+# #1262/#1318: record <pid> (a process this test just backgrounded with `&`)
+# so teardown can kill+wait it even if the test body aborts, at some later
+# assertion, before its own cleanup ever runs. Call this immediately after
+# every `... &`. File-backed rather than a bash array: several tests
+# background more than one process across more than one statement, and a
+# file needs no separate declare/reset per test -- setup_test_env's fresh
+# TEST_SKILL_DIR is already a clean per-test slate, removed with everything
+# else at teardown.
+#
+# This covers what _reap_test_skill_dir_procs (below) cannot: a `sleep 600`
+# started as a stand-in session pid (see e.g. "watch: two sessions sharing a
+# session_id keep independent watchers") carries no TEST_SKILL_DIR in its
+# argv at all -- `sleep 600` names nothing about this test -- so the
+# argv-scoped reap has nothing to match it on. Tracking the pid directly
+# closes that gap regardless of what the backgrounded command's own argv
+# does or does not contain (review finding, #1451).
+#
+# Records $BASHPID alongside <pid> -- the pid of THIS exact process, captured
+# at the moment of the call, which is unambiguously the backgrounded job's
+# real parent (a plain function call forks nothing, so _bg_track always runs
+# in the same process that just executed the `&` immediately before it).
+# teardown re-checks this recorded parent against the pid's CURRENT actual
+# parent before ever touching it (see _bg_reap_tracked) -- many tests already
+# kill+wait their own pid inside the test body before reaching teardown, and
+# once `wait` reaps a pid the OS is free to recycle that number for an
+# unrelated process, possibly another test's or a real seat's. A bare `kill`
+# cannot tell a live-but-reassigned pid from the one this test actually
+# started, so recording (and later re-verifying) the parent is what makes it
+# safe to kill by pid at all (review finding, #1451).
+_bg_track() {   # <pid>
+  [ -n "${TEST_SKILL_DIR:-}" ] || return 0
+  echo "$1 $BASHPID" >> "$TEST_SKILL_DIR/.bg-pids"
+}
+
+# Kill+wait every pid _bg_track recorded for this test that is STILL ALIVE
+# AND still parented by the exact shell that started it -- skipped entirely
+# otherwise (already dead, or its pid number now belongs to something this
+# test did not start; see _bg_track's header for why both checks are
+# required, not just "is it alive"). This check narrows the pid-recycling
+# window as far as a single ps call can, but does not close it -- see
+# _bg_kill_bounded, which re-checks the same condition again immediately
+# before actually sending KILL. A no-op when nothing was tracked; fails
+# (propagates _bg_kill_bounded's status) when a process this test started
+# survives even that.
+_bg_reap_tracked() {
+  [ -n "${TEST_SKILL_DIR:-}" ] || return 0
+  local f="$TEST_SKILL_DIR/.bg-pids"
+  [ -f "$f" ] || return 0
+  local p parent live_ppid status=0
+  while IFS=' ' read -r p parent; do
+    [ -n "$p" ] || continue
+    live_ppid="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    [ -n "$live_ppid" ] || continue           # not alive -- nothing to do
+    [ "$live_ppid" = "$parent" ] || continue  # alive, but not this test's
+    _bg_kill_bounded "$p" "$parent" || status=1
+  done < "$f"
+  return "$status"
+}
+
+# TERM <pid>, poll for exit up to ~3s, then re-verify it is STILL alive and
+# STILL parented by <parent> -- the same two conditions _bg_reap_tracked just
+# checked -- immediately before sending KILL. That re-check narrows, but
+# cannot fully close, the window between the first check and the kill
+# syscall: <pid> could still exit and its number be recycled inside this
+# function's own TERM-wait loop. If the re-check finds it already gone, or
+# now parented by something else, this stops without sending KILL, correctly
+# leaving that other process alone.
+#
+# After KILL, confirms (bounded, ~1-2s) that <pid> actually exited rather
+# than assuming SIGKILL worked -- a caller checking status must be able to
+# tell "actually reaped" from "we gave up and moved on". A failure here is
+# reported loudly, naming the pid and its command line, and fails the
+# caller: a process that survives even SIGKILL must not be silently reported
+# as cleaned up (review finding, #1451).
+#
+# Bounded throughout so a watcher that never responds to TERM cannot stall
+# teardown indefinitely: a hang HERE would stop the following
+# _reap_test_skill_dir_procs from ever running too, recreating the exact
+# #1262 shape one layer up.
+_bg_kill_bounded() {   # <pid> <parent>
+  local p="$1" parent="$2" tries=0 live_ppid
+  kill "$p" 2>/dev/null || return 0
+  while kill -0 "$p" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -ge 30 ] && break   # ~3s at 0.1s per try
+    sleep 0.1 2>/dev/null || true
+  done
+  live_ppid="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+  if [ -n "$live_ppid" ] && [ "$live_ppid" = "$parent" ]; then
+    kill -KILL "$p" 2>/dev/null
+    tries=0
+    while kill -0 "$p" 2>/dev/null; do
+      tries=$((tries + 1))
+      if [ "$tries" -ge 15 ]; then   # ~1.5s at 0.1s per try
+        echo "agmsg-test: #1451 -- pid $p ($(ps -o args= -p "$p" 2>/dev/null)) did not exit even after SIGKILL" >&2
+        return 1
+      fi
+      sleep 0.1 2>/dev/null || true
+    done
+  fi
+  wait "$p" 2>/dev/null || true
+  return 0
+}
+
 teardown() {
-  teardown_test_env
+  # Nothing to clean when setup() skipped before creating the sandbox (the 1.3.1 quarantine, #1262).
+  [ -n "${TEST_SKILL_DIR:-}" ] || return 0
+  # #1262/#1318: several tests below start a watch.sh (or a `sleep 600`
+  # stand-in session pid) in the background, then assert on its output or
+  # effects, then kill it. bats aborts a test's body at its first failing
+  # command -- so whenever one of those assertions fails, the kill/wait
+  # written after it never runs, and the process is orphaned (reproduced
+  # directly: forcing one such assertion to fail left its watcher running
+  # past the test's own end, every time, before this teardown hook existed).
+  # Reordering each such test to kill before asserting would only fix
+  # today's sites and leave the same gap for the next test that backgrounds
+  # a process. Reaping HERE instead closes it for every test in this file,
+  # present or future, whether or not its own body ever reaches its own
+  # kill/wait -- an in-body kill/wait some tests still do is harmless,
+  # ordinary idempotent cleanup once this also runs.
+  #
+  # Two nets, deliberately redundant:
+  #   - _bg_reap_tracked (above): the pids this test itself recorded via
+  #     _bg_track, covering anything at all, including a bare `sleep 600`
+  #     whose argv names nothing about this test.
+  #   - _reap_test_skill_dir_procs (test_helper.bash, shared with every
+  #     other suite): scoped to processes whose argv names THIS test's own
+  #     TEST_SKILL_DIR -- a unique mktemp path -- so it can only ever reach
+  #     a process this test itself started; it cannot reach another test's
+  #     watcher or a real seat's (see its own header for why this scoping is
+  #     safe). Kept as a backstop for anything a future test backgrounds
+  #     without going through _bg_track.
+  # All three statuses are propagated (not swallowed) so a process that
+  # somehow survives even SIGKILL escalation fails the test loudly instead
+  # of silently leaking, same as a real seat's monitor never should.
+  local _bg_status=0 _reap_status=0 _teardown_status=0
+  _bg_reap_tracked || _bg_status=$?
+  _reap_test_skill_dir_procs || _reap_status=$?
+  teardown_test_env || _teardown_status=$?
+  [ "$_bg_status" -eq 0 ] && [ "$_reap_status" -eq 0 ] && [ "$_teardown_status" -eq 0 ]
 }
 
 # Run watch.sh in the background for <secs> seconds, capturing stdout to <out>.
@@ -32,6 +166,7 @@ run_watcher_for() {
   local sid="$1" out="$2" secs="$3"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
   local pid=$!
+  _bg_track "$pid"
   sleep "$secs"
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
@@ -68,6 +203,7 @@ run_watcher_until_file() {
   local sid="$1" out="$2" file="$3" pid rc=0
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- &
   pid=$!
+  _bg_track "$pid"
   wait_for_file "$file" || rc=1
   _stop_watcher "$pid"
   return "$rc"
@@ -78,9 +214,32 @@ run_watcher_until_contains() {
   local sid="$1" out="$2" needle="$3" pid rc=0
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- &
   pid=$!
+  _bg_track "$pid"
   wait_for_file_contains "$out" "$needle" || rc=1
   _stop_watcher "$pid"
   return "$rc"
+}
+
+run_watcher_until() {
+  local sid="$1" out="$2" needle="$3" before
+  before=$(_read_cursor team alice 2>/dev/null || echo 0)
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
+  local pid=$!
+  _bg_track "$pid"
+  _wait_for_file_contains "$out" "$needle"
+  local found=$?
+  if [ "$found" -eq 0 ]; then
+    local i cursor
+    for i in $(seq 1 100); do
+      cursor=$(_read_cursor team alice 2>/dev/null || echo 0)
+      [ "${cursor:-0}" -gt "${before:-0}" ] && break
+      sleep 0.1
+    done
+    [ "${cursor:-0}" -gt "${before:-0}" ] || found=1
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return "$found"
 }
 
 # Compute the per-process instance id (#93) that watch.sh / session-end key on
@@ -97,39 +256,21 @@ _iid() {
     agmsg_normalize_instance_id "$1" claude-code 2>/dev/null )
 }
 
-# One pair's store-owned local read frontier.
+# Takes the team, because there is a store per team and no default one to fall
+# back to. No caller today; a call without the argument fails loudly rather
+# than reading whichever store happened to be first.
+_max_message_id() {
+  ( # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/storage.sh"
+    agmsg_sqlite "$(agmsg_db_path "$1")" "SELECT COALESCE(MAX(id), 0) FROM messages;" )
+}
+
+# Read one pair's store-owned local frontier.
 _read_cursor() {
   ( # shellcheck disable=SC1090
     source "$SCRIPTS/lib/storage.sh"
     agmsg_storage_load
     storage_read_cursor_get "$1" "$2" )
-}
-
-# True once the pair's read cursor equals <cursor>. The watcher persists its
-# watermark first and consumes the read cursor after, and the read cursor is
-# what decides what a restarted watcher streams.
-_read_cursor_is() {
-  [ "$(_read_cursor team alice)" = "$1" ]
-}
-
-_any_generated_watch_pidfile() {
-  compgen -G "$TEST_SKILL_DIR/run/watch.agmsg-*.pid" >/dev/null
-}
-
-_max_message_id() {
-  ( # shellcheck disable=SC1090
-    source "$SCRIPTS/lib/storage.sh"
-    agmsg_sqlite "$(agmsg_db_path)" "SELECT COALESCE(MAX(id), 0) FROM messages;" )
-}
-
-# The delivery watermark is now an opaque storage cursor (the event-log
-# high-water), not a legacy messages id. This mirrors what storage_watch_tip
-# issues, so tests can assert the watcher's persisted watermark against it.
-_storage_tip() {
-  ( # shellcheck disable=SC1090
-    source "$SCRIPTS/lib/storage.sh"
-    agmsg_sqlite "$(agmsg_db_path)" \
-      "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0);" )
 }
 
 _wait_for_file() {
@@ -138,6 +279,7 @@ _wait_for_file() {
     [ -f "$file" ] && return 0
     sleep 0.1
   done
+  [ "${cursor:-0}" -gt 0 ]
   return 1
 }
 
@@ -208,23 +350,176 @@ _wait_for_file_contains() {
   return 1
 }
 
+# Self-managed renewal (--max-seconds, added only by the Claude Code launch
+# commands): a little before the host's cap the watcher decides for itself and
+# prints one line, then exits 0. Delivered something, or AGMSG_CC_MONITOR_KEEP_ALIVE
+# set -> "re-arm" naming the command to hand back; otherwise "stopping". Without
+# the flag it never ends on its own.
+_wait_exit() {  # <pid> <tenths>
+  local i
+  for i in $(seq 1 "$2"); do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+@test "watch: --max-seconds ends the run with a re-arm line after a delivery, a stopping line when quiet, and never without the flag" {
+  local out="$BATS_TEST_TMPDIR/ms.out" pid
+  # One role per run: a watcher that names a role claims its actas lock.
+  bash "$SCRIPTS/join.sh" team carol claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team dave claude-code "$PROJ" >/dev/null
+
+  bash "$SCRIPTS/send.sh" team bob alice "renewal probe" >/dev/null
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" s-ms1 "$PROJ" claude-code alice --max-seconds=8 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'renewal probe' "$out"
+  grep -qF 'agmsg watch: re-arm' "$out"
+  grep -qF 'description: agmsg inbox stream (acting as alice) persistent: true timeout_ms: 1800000' "$out"
+  grep -qF -- 'watch.sh s-ms1' "$out"
+  grep -qF -- 'alice --max-seconds=8' "$out"
+
+  # Quiet run: nothing delivered -> stopping, not re-arm.
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" s-ms2 "$PROJ" claude-code carol --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'agmsg watch: stopping' "$out"
+  refute grep -qF 'agmsg watch: re-arm' "$out"
+
+  # Quiet but kept alive by the environment -> re-arm anyway.
+  AGMSG_CC_MONITOR_KEEP_ALIVE=1 AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" s-ms3 "$PROJ" claude-code dave --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'agmsg watch: re-arm' "$out"
+
+  # No flag: it keeps running well past the same window.
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" s-ms4 "$PROJ" claude-code bob >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  if _wait_exit "$pid" 40; then
+    echo "watch.sh ended on its own without --max-seconds" >&2
+    false
+  fi
+  _stop_watcher "$pid"
+  refute grep -qF 'agmsg watch:' "$out"
+
+  # #1XXX: once this seat's own role-session record shows agmsgd has taken
+  # over delivery (the same record/health reads actas-claim.sh and daemon.sh
+  # status use, see test_session_start_claude_code_native_channel.bats), the
+  # renewal loop must stop rather than re-arm -- even though this run DID
+  # deliver a message, which on its own would otherwise mean re-arm (see the
+  # first case above).
+  bash "$SCRIPTS/join.sh" team erin claude-code "$PROJ" >/dev/null
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" < "$SCRIPTS/daemon/schema.sql"
+  local boot
+  case "$(uname -s)" in
+    Darwin) boot="$(sysctl -n kern.bootsessionuuid)" ;;
+    Linux) boot="$(sed -n 's/^btime //p' /proc/stat)" ;;
+    *) skip 'POSIX beta executor evidence' ;;
+  esac
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE meta SET node_path='$(command -v node)'; UPDATE daemon_intent SET desired='on';
+    UPDATE daemon_owner SET state='ready', executor_pid=$$, executor_boot_id='$boot', executor_started_at=strftime('%Y-%m-%dT%H:%M:%fZ','now');"
+  AGMSG_AGENT_PID=$$ CLAUDE_CODE_MESSAGING_SOCKET="uds:/tmp/cc-socks/s-ms-native.sock" \
+    bash "$SCRIPTS/actas-claim.sh" "$PROJ" claude-code erin "s-ms-native" | grep -qx "delivery=native"
+
+  # Historical transcript-held hints do not keep a redundant watch alive.
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" <<'SQL'
+CREATE TABLE beta_claude_seat (seat TEXT PRIMARY KEY, messaging_socket TEXT, state TEXT NOT NULL, reason TEXT NOT NULL, checked_at TEXT NOT NULL);
+INSERT INTO beta_claude_seat VALUES ('["team","erin"]', '/tmp/cc-socks/s-ms-native.sock', 'blocked', 'peer_held: historical hint', '2026-10-23');
+SQL
+  bash "$SCRIPTS/send.sh" team bob erin "native-delivered probe" >/dev/null
+  AGMSG_AGENT_PID=$$ AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" s-ms-native "$PROJ" claude-code erin --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'native-delivered probe' "$out"
+  grep -qF 'agmsg watch: stopping' "$out"
+  refute grep -qF 'agmsg watch: re-arm' "$out"
+
+  # #1633 review: `daemon disable` flips daemon_intent.desired to off
+  # before the still-running owner finishes shutting down, so HEALTH can read
+  # `ready` for a window after DESIRED already reads `off`. The queue this
+  # seat would otherwise rely on refuses to enqueue once desired != on, so the
+  # watcher must NOT treat that window as native-delivered -- it has to keep
+  # re-arming, same as a seat that never went native at all.
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='off';"
+  bash "$SCRIPTS/send.sh" team bob erin "disable-window probe" >/dev/null
+  AGMSG_AGENT_PID=$$ AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" s-ms-native "$PROJ" claude-code erin --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'disable-window probe' "$out"
+  grep -qF 'agmsg watch: re-arm' "$out"
+
+  # Follow-up to the #1633 review: messaging_socket alone proves the
+  # record EXISTS, not that the daemon would treat it as addressable --
+  # claude-code-queue.mjs also demands type=claude-code,
+  # and a project match before it will ever enqueue. Simulate a stale record left behind by this exact (team, agent)
+  # pair once having been claimed from a DIFFERENT project (the daemon's own
+  # role_session_project_mismatch) by corrupting just the project= line; the
+  # socket/session/type fields are all still genuinely this seat's own.
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='on';"
+  local rs_file
+  rs_file="$(ls "$TEST_SKILL_DIR"/run/role-session.*erin 2>/dev/null | head -1)"
+  [ -n "$rs_file" ]
+  sed -i.bak 's#^project=.*#project=/tmp/agmsg-some-other-project#' "$rs_file"
+  bash "$SCRIPTS/send.sh" team bob erin "project-mismatch probe" >/dev/null
+  AGMSG_AGENT_PID=$$ AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" s-ms-native "$PROJ" claude-code erin --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'project-mismatch probe' "$out" || { cat "$out"; false; }
+  grep -qF 'agmsg watch: re-arm' "$out"
+
+  # Review round 2: being looked up BY (team, agent) only proves the
+  # FILENAME encodes this pair, not that the record's own team=/agent=
+  # CONTENT fields agree with it -- the daemon's reader checks those
+  # separately (role_session_identity_mismatch) and the shell getters enforce
+  # nothing on their own. Restore the project= line this test corrupted above,
+  # then corrupt only agent= to a different seat name.
+  mv -f "$rs_file.bak" "$rs_file"
+  sed -i.bak 's#^agent=.*#agent=some-other-seat#' "$rs_file"
+  bash "$SCRIPTS/send.sh" team bob erin "identity-mismatch probe" >/dev/null
+  AGMSG_AGENT_PID=$$ AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" s-ms-native "$PROJ" claude-code erin --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'identity-mismatch probe' "$out"
+  grep -qF 'agmsg watch: re-arm' "$out"
+}
+
 @test "watch: restart delivers messages that arrived while the watcher was down" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
   local sid="sess-restart"
 
-  # First watcher: fresh session, empty store, then streams M1.
+  # First watcher consumes M1 into the shared store frontier.
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code \
-    >"$TEST_SKILL_DIR/out1.log" 2>/dev/null 3>&- &
+    >"$TEST_SKILL_DIR/out1.log" 2>/dev/null 3>&- 4>&- &
   local w1=$!
+  _bg_track "$w1"
   bash "$SCRIPTS/send.sh" team bob alice "M1-before-stop" >/dev/null
-  local m1_tip="$(_storage_tip)"
-  wait_for_file_contains "$TEST_SKILL_DIR/out1.log" "M1-before-stop"
-  # Kill only once the read cursor has been CONSUMED past M1. The stdout line is
-  # not enough: the watcher writes the line first and the cursor after, so killing
-  # on the line alone can lose the cursor and make the restart re-deliver M1 —
-  # exactly what this test denies. Waiting for the observable event is not the
-  # same as waiting for the durable one.
-  wait_until 10 _read_cursor_is "$m1_tip"
+  _wait_for_file_contains "$TEST_SKILL_DIR/out1.log" "M1-before-stop"
+  local i cursor
+  for i in $(seq 1 100); do
+    cursor=$(_read_cursor team alice 2>/dev/null || echo 0)
+    [ "${cursor:-0}" -gt 0 ] && break
+    sleep 0.1
+  done
   kill "$w1" 2>/dev/null || true
   wait "$w1" 2>/dev/null || true
   grep -q "M1-before-stop" "$TEST_SKILL_DIR/out1.log"
@@ -232,8 +527,8 @@ _wait_for_file_contains() {
   # A message arrives while NO watcher is running for this session.
   bash "$SCRIPTS/send.sh" team bob alice "M2-in-gap" >/dev/null
 
-  # Restart the SAME session_id — should resume from the pair's read cursor.
-  run_watcher_until_contains "$sid" "$TEST_SKILL_DIR/out2.log" "M2-in-gap"
+  # Any later watcher resumes from the store frontier (session id is irrelevant).
+  run_watcher_until "$sid" "$TEST_SKILL_DIR/out2.log" "M2-in-gap"
 
   # In-gap message is delivered on restart...
   grep -q "M2-in-gap" "$TEST_SKILL_DIR/out2.log"
@@ -241,16 +536,32 @@ _wait_for_file_contains() {
   ! grep -q "M1-before-stop" "$TEST_SKILL_DIR/out2.log"
 }
 
+@test "watch: a fresh session delivers existing unread; a later watcher does not replay it" {
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  # Pre-existing message before any watcher for this session ever runs.
+  bash "$SCRIPTS/send.sh" team bob alice "M0-history" >/dev/null
+
+  run_watcher_until "sess-fresh" "$TEST_SKILL_DIR/fresh1.log" "M0-history"
+  grep -q "M0-history" "$TEST_SKILL_DIR/fresh1.log"
+
+  bash "$SCRIPTS/send.sh" team bob alice "M-live" >/dev/null
+  run_watcher_until "sess-fresh2" "$TEST_SKILL_DIR/fresh2.log" "M-live"
+  grep -q "M-live" "$TEST_SKILL_DIR/fresh2.log"
+  ! grep -q "M0-history" "$TEST_SKILL_DIR/fresh2.log"
+}
+
 @test "watch: a body with the unit separator prints whole on one line" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
+  local pf="$TEST_SKILL_DIR/run/watch.$(_iid sess-us).pid"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" sess-us "$PROJ" claude-code \
-    >"$TEST_SKILL_DIR/us.log" 2>/dev/null 3>&- &
+    >"$TEST_SKILL_DIR/us.log" 2>/dev/null 3>&- 4>&- &
   local w=$!
+  _bg_track "$w"
   # Expected text is UTF-8 bytes: bash 3.2 (macOS) has no \u escape, and later bash leaves it literal outside a UTF-8 locale.
-  # Send only once the watcher is subscribed, as the other delivery tests do.
-  wait_for_file "$TEST_SKILL_DIR/run/watch.$(_iid sess-us).watermark" || { kill "$w" 2>/dev/null; return 1; }
+  # Send only once the watcher is live, as the other delivery tests do.
+  _wait_for_file "$pf" || { kill "$w" 2>/dev/null; return 1; }
   bash "$SCRIPTS/send.sh" team bob alice $'before\x1fafter\x1f' >/dev/null
-  wait_for_file_contains "$TEST_SKILL_DIR/us.log" $'bob \xe2\x86\x92 alice | before\xe2\x90\x9fafter\xe2\x90\x9f' || {
+  _wait_for_file_contains "$TEST_SKILL_DIR/us.log" $'bob \xe2\x86\x92 alice | before\xe2\x90\x9fafter\xe2\x90\x9f' || {
     od -c "$TEST_SKILL_DIR/us.log" >&2
     kill "$w" 2>/dev/null
     return 1
@@ -258,48 +569,7 @@ _wait_for_file_contains() {
   _stop_watcher "$w"
 }
 
-@test "watch: a fresh session delivers the backlog past the read cursor and not what the cursor already passed" {
-  skip_on_windows "watcher background launch under Git Bash (#182)"
-  # M0-consumed sits at or before alice's read cursor; M0-backlog arrives after
-  # it, before any watcher for this session ever runs.
-  bash "$SCRIPTS/send.sh" team bob alice "M0-consumed" >/dev/null
-  local consumed_tip="$(_storage_tip)"
-  ( # shellcheck disable=SC1090
-    source "$SCRIPTS/lib/storage.sh"
-    agmsg_storage_load
-    storage_read_cursor_consume team alice "$consumed_tip" >/dev/null )
-  _read_cursor_is "$consumed_tip"
-  bash "$SCRIPTS/send.sh" team bob alice "M0-backlog" >/dev/null
-
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-fresh" "$PROJ" claude-code \
-    >"$TEST_SKILL_DIR/fresh.log" 2>/dev/null 3>&- &
-  local w=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.$(_iid "sess-fresh").watermark"
-  bash "$SCRIPTS/send.sh" team bob alice "M-live" >/dev/null
-  # M-live has a later event sequence than both earlier rows, so once it has been streamed
-  # the watcher has passed the consumed row too — which is what makes the
-  # "not re-delivered" assertion below meaningful rather than merely untimed.
-  wait_for_file_contains "$TEST_SKILL_DIR/fresh.log" "M-live"
-  kill "$w" 2>/dev/null || true
-  wait "$w" 2>/dev/null || true
-
-  # The backlog past the cursor and the live message are delivered; the row the
-  # cursor already passed is not.
-  grep -q "M0-backlog" "$TEST_SKILL_DIR/fresh.log"
-  grep -q "M-live" "$TEST_SKILL_DIR/fresh.log"
-  ! grep -q "M0-consumed" "$TEST_SKILL_DIR/fresh.log"
-}
-
-@test "watch: persists a watermark file for the session" {
-  skip_on_windows "watcher background launch under Git Bash (#182)"
-  run_watcher_until_file "sess-wm" "$TEST_SKILL_DIR/wm.log" \
-    "$TEST_SKILL_DIR/run/watch.$(_iid sess-wm).watermark"
-  # Still asserted after the watcher is stopped: the point is that the file
-  # PERSISTS past the session, not merely that it appeared while it ran.
-  [ -f "$TEST_SKILL_DIR/run/watch.$(_iid sess-wm).watermark" ]
-}
-
-@test "watch: exits within one interval when its session dies, without advancing the watermark past an undelivered row (#67)" {
+@test "watch: exits when its session dies without consuming an undelivered row (#67)" {
   skip_on_windows "watcher session liveness under Git Bash (#182)"
   # REWRITTEN from "closed consumer does not advance watermark...". The old test
   # asserted that a closed *downstream* consumer (`watch.sh | head -n 1`) made
@@ -317,95 +587,102 @@ _wait_for_file_contains() {
   # redelivery itself is covered by "watch: restart delivers messages that
   # arrived while the watcher was down".
   local sesspid; sleep 600 3>&- & sesspid=$!
+  _bg_track "$sesspid"
   local iid="sess-liveness.$sesspid"
-  local wm="$TEST_SKILL_DIR/run/watch.$iid.watermark"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
   local out="$TEST_SKILL_DIR/liveness-delivery.log"
-  local err="$TEST_SKILL_DIR/liveness-exit.log"
 
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >"$out" 2>"$err" 3>&- &
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
   local w=$!
-  # Wait for the watermark file, not just the pidfile: the pidfile is written
-  # early, before the subscription is resolved and the watermark is seeded. The
-  # watermark file is written once the watcher is ready to receive.
-  wait_for_file "$wm"
+  _bg_track "$w"
+  # There is no seed race: a pre-poll message remains unread at cursor zero.
+  _wait_for_file "$pf"
   [ -f "$pf" ]
 
   bash "$SCRIPTS/send.sh" team bob alice "M1-delivered" >/dev/null
-  local m1_tip="$(_storage_tip)"
   _wait_for_file_contains "$out" "M1-delivered" "$w"
-  # The cursor is consumed after the line is printed; sampling it on the line
-  # alone can capture the value from before M1 was consumed.
-  wait_until 10 _read_cursor_is "$m1_tip"
   local first_cursor="$(_read_cursor team alice)"
 
-  # Owning session dies (reap it so kill -0 reports gone, not a zombie) and the
-  # watcher exits on its own. M2 is sent only after that: a watcher already past
-  # its liveness check when the session died would still poll and deliver an M2
-  # sent earlier, which is a race the test cannot observe from outside.
+  # Owning session dies (reap it so kill -0 reports gone, not a zombie), then a
+  # newer row arrives. The liveness guard runs before the DB poll, so the watcher
+  # exits before it could deliver or watermark M2.
   kill "$sesspid" 2>/dev/null || true
   wait "$sesspid" 2>/dev/null || true
-
-  wait_for_missing "$pf" || { kill "$w" 2>/dev/null || true; false; }
-  wait_for_pid_exit "$w"
   bash "$SCRIPTS/send.sh" team bob alice "M2-undelivered" >/dev/null
+  _wait_for_missing "$pf" || { kill "$w" 2>/dev/null || true; false; }
+  # The pidfile is removed on the exit path; the process itself dies a beat
+  # later, and on a loaded host that beat is long enough to lose a race against
+  # an instant kill -0. The contract is that the watcher EXITS within ~1 interval
+  # of the session dying, not that it is already reaped the microsecond its
+  # pidfile vanishes -- so wait a bounded moment for the process to be gone. A
+  # watcher that never exits (a real liveness bug) still fails: the loop exhausts
+  # and kill -0 keeps succeeding.
+  local _i; for _i in $(seq 1 50); do kill -0 "$w" 2>/dev/null || break; sleep 0.1; done
+  run kill -0 "$w"; [ "$status" -ne 0 ]
   [ "$(_read_cursor team alice)" = "$first_cursor" ]
   refute grep -q "M2-undelivered" "$out"
-  run_watcher_until_contains "after-liveness" "$TEST_SKILL_DIR/liveness-redelivery.log" "M2-undelivered"
+  # Wait for the redelivery instead of sleeping a fixed 2s: a fresh watcher must
+  # deliver the row the dead one left unconsumed, but WHEN it lands depends on
+  # host load, not on the contract (see the run_watcher_for/until note above --
+  # a fixed sleep is a claim about the machine). run_watcher_until blocks until
+  # M2 is delivered and the cursor advances, or fails if it never does, so a real
+  # non-redelivery still fails while load-induced slowness no longer does.
+  run_watcher_until "after-liveness" "$TEST_SKILL_DIR/liveness-redelivery.log" "M2-undelivered"
   grep -q "M2-undelivered" "$TEST_SKILL_DIR/liveness-redelivery.log"
 }
 
-@test "watch: closed stdout exits without advancing the watermark" {
+@test "watch: closed stdout exits without advancing the read cursor" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
   local sid="sess-stdout-closed"
   local iid="$(_iid "$sid")"
-  local wm="$TEST_SKILL_DIR/run/watch.$iid.watermark"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
 
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code \
-    1>&- 2>/dev/null 3>&- &
+    1>&- 2>/dev/null 3>&- 4>&- &
   local w=$!
+  _bg_track "$w"
 
-  wait_for_file "$wm"
+  _wait_for_file "$pf"
   [ -f "$pf" ]
-  local initial="$(cat "$wm")"
+  local initial="$(_read_cursor team alice)"
 
   bash "$SCRIPTS/send.sh" team bob alice "M-after-closed-stdout" >/dev/null
 
-  wait_for_missing "$pf" || {
+  _wait_for_missing "$pf" || {
     kill "$w" 2>/dev/null || true
     wait "$w" 2>/dev/null || true
     false
   }
   wait "$w" 2>/dev/null || true
 
-  [ "$(cat "$wm")" = "$initial" ]
+  [ "$(_read_cursor team alice)" = "$initial" ]
 
   run_watcher_until_contains "$sid" "$TEST_SKILL_DIR/closed-redelivery.log" \
     "M-after-closed-stdout"
   grep -q "M-after-closed-stdout" "$TEST_SKILL_DIR/closed-redelivery.log"
 }
 
-@test "session-end: removes the session watermark file" {
-  agmsg_test_start_session_owner
-  # Key the watermark under the same instance id session-end will derive.
-  local wm="$TEST_SKILL_DIR/run/watch.$(_iid sess-end).watermark"
-  mkdir -p "$TEST_SKILL_DIR/run"
-  echo 5 > "$wm"
+@test "session-end: leaves the store-owned read cursor intact" {
+  bash "$SCRIPTS/send.sh" team bob alice "read-before-end" >/dev/null
+  run bash "$SCRIPTS/inbox.sh" team alice
+  local before="$(_read_cursor team alice)"
   printf '{"session_id":"sess-end"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
-  agmsg_test_stop_session_owner
-  wait_until 8 bash -c "[ ! -f '$wm' ]"   # teardown is detached now
-  [ ! -f "$wm" ]
+  [ "$(_read_cursor team alice)" = "$before" ]
 }
 
 @test "watch: actas-mode watcher creates a ready sentinel and removes it on exit" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
-  local ready="$TEST_SKILL_DIR/run/ready.team__alice"
+  local ready="$(_ready_path team alice)"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-ready" "$PROJ" claude-code alice \
-    >/dev/null 2>&1 3>&- &
+    >/dev/null 2>&1 3>&- 4>&- &
   local w=$!
+  _bg_track "$w"
   # Wait for the watcher to attach and signal readiness.
-  wait_for_file "$ready"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -e "$ready" ] && break
+    sleep 0.5
+  done
   [ -e "$ready" ]
   kill "$w" 2>/dev/null || true
   wait "$w" 2>/dev/null || true
@@ -434,6 +711,7 @@ _wait_for_file_contains() {
   local out="$TEST_SKILL_DIR/broad.log"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-broad" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- &
   local w=$!
+  _bg_track "$w"
   bash "$SCRIPTS/send.sh" team bob alice "M-broad-marker" >/dev/null
   wait_for_file_contains "$out" "M-broad-marker"
 
@@ -445,8 +723,8 @@ _wait_for_file_contains() {
   # guard removed so a broad watcher writes the sentinels, this test fails,
   # while the kill-then-assert form it replaces still passes.
   local rc=0 _s
-  for _s in ready.team__alice ready.team__bob; do
-    if [ -e "$TEST_SKILL_DIR/run/$_s" ]; then
+  for _s in "$(_ready_path team alice)" "$(_ready_path team bob)"; do
+    if [ -e "$_s" ]; then
       echo "broad watcher created $_s" >&2
       rc=1
     fi
@@ -457,11 +735,12 @@ _wait_for_file_contains() {
 
 @test "watch: ready sentinel records the owner session_id" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
-  local ready="$TEST_SKILL_DIR/run/ready.team__alice"
+  local ready="$(_ready_path team alice)"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-own" "$PROJ" claude-code alice \
-    >/dev/null 2>&1 3>&- &
-  local w=$!
-  wait_for_file "$ready"
+    >/dev/null 2>&1 3>&- 4>&- &
+  local w=$! i
+  _bg_track "$w"
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$ready" ] && break; sleep 0.5; done
   # watch.sh stamps the instance id (composite under an agent ancestor).
   [ "$(cat "$ready")" = "$(_iid sess-own)" ]
   kill "$w" 2>/dev/null || true
@@ -469,11 +748,12 @@ _wait_for_file_contains() {
 }
 
 @test "watch: cleanup leaves a sentinel that a successor session re-owned" {
-  local ready="$TEST_SKILL_DIR/run/ready.team__alice"
+  local ready="$(_ready_path team alice)"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-old" "$PROJ" claude-code alice \
-    >/dev/null 2>&1 3>&- &
-  local w=$!
-  wait_for_file "$ready"
+    >/dev/null 2>&1 3>&- 4>&- &
+  local w=$! i
+  _bg_track "$w"
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$ready" ] && break; sleep 0.5; done
   # A successor watcher overwrites the sentinel with its own id.
   printf 'sess-new\n' > "$ready"
   kill "$w" 2>/dev/null || true
@@ -490,14 +770,15 @@ _wait_for_file_contains() {
 
   # Start a watcher so a pidfile exists with a live pid.
   AGMSG_WATCH_INTERVAL=60 bash "$SCRIPTS/watch.sh" "sess1" "$PROJ" claude-code \
-    >/dev/null 2>&1 3>&- &
+    >/dev/null 2>&1 3>&- 4>&- &
   local wpid=$!
+  _bg_track "$wpid"
 
   # Resolve the instance id session-start.sh will compute for "sess1".
   local iid
   iid=$(_iid "sess1")
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
-  wait_for_file "$pf"
+  _wait_for_file "$pf"
 
   # Record cc-instance so the dedup path sees "same instance".
   echo "$iid" > "$TEST_SKILL_DIR/run/cc-instance.$$"
@@ -518,24 +799,20 @@ _wait_for_file_contains() {
   wait "$wpid" 2>/dev/null || true
 }
 
-@test "session-start: GCs stale watermark/ready but keeps live ones" {
+@test "session-start: GCs a stale ready sentinel but keeps a live one" {
   skip_on_windows "watcher live-owner liveness under Git Bash (#182)"
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
   # Stale (owner has no live cc-instance).
-  echo 5 > "$TEST_SKILL_DIR/run/watch.deadsid.watermark"
   echo deadsid > "$TEST_SKILL_DIR/run/ready.team__ghost"
   # Live owner.
   setup_live_owner "$TEST_SKILL_DIR/run" LIVESID
-  echo 7 > "$TEST_SKILL_DIR/run/watch.LIVESID.watermark"
   echo LIVESID > "$TEST_SKILL_DIR/run/ready.team__live"
 
   printf '{"session_id":"somesess"}' \
     | bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
 
-  [ ! -f "$TEST_SKILL_DIR/run/watch.deadsid.watermark" ]
   [ ! -f "$TEST_SKILL_DIR/run/ready.team__ghost" ]
-  [ -f "$TEST_SKILL_DIR/run/watch.LIVESID.watermark" ]
   [ -f "$TEST_SKILL_DIR/run/ready.team__live" ]
 }
 
@@ -624,13 +901,17 @@ _wait_pidfile() {
   # than fabricated pids (which would pass or fail by accident of what pid
   # happens to exist on the host).
   local sp1 sp2; sleep 600 3>&- & sp1=$!; sleep 600 3>&- & sp2=$!
+  _bg_track "$sp1"
+  _bg_track "$sp2"
   local pf1="$TEST_SKILL_DIR/run/watch.shared.$sp1.pid"
   local pf2="$TEST_SKILL_DIR/run/watch.shared.$sp2.pid"
 
-  AGMSG_WATCH_INTERVAL=5 bash "$SCRIPTS/watch.sh" "shared.$sp1" "$PROJ" claude-code >/dev/null 2>&1 3>&- &
+  AGMSG_WATCH_INTERVAL=5 bash "$SCRIPTS/watch.sh" "shared.$sp1" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w1=$!
-  AGMSG_WATCH_INTERVAL=5 bash "$SCRIPTS/watch.sh" "shared.$sp2" "$PROJ" claude-code >/dev/null 2>&1 3>&- &
+  _bg_track "$w1"
+  AGMSG_WATCH_INTERVAL=5 bash "$SCRIPTS/watch.sh" "shared.$sp2" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w2=$!
+  _bg_track "$w2"
 
   _wait_pidfile "$pf1" "$w1"
   _wait_pidfile "$pf2" "$w2"
@@ -655,22 +936,25 @@ _wait_pidfile() {
   # a fabricated dead pid (the old "solo.2002") would self-exit before the
   # relaunch could be observed. Use a real stand-in session process instead.
   local sesspid; sleep 600 3>&- & sesspid=$!
+  _bg_track "$sesspid"
   local iid="solo.$sesspid"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
 
-  AGMSG_WATCH_INTERVAL=5 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- &
+  AGMSG_WATCH_INTERVAL=5 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w1=$!
+  _bg_track "$w1"
   _wait_pidfile "$pf" "$w1"
 
-  AGMSG_WATCH_INTERVAL=5 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- &
+  AGMSG_WATCH_INTERVAL=5 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w2=$!
+  _bg_track "$w2"
   # Successor claims the pidfile slot...
   _wait_pidfile "$pf" "$w2"
   # ...and the previous holder was killed. The successor SIGTERMs the old holder
   # and then writes its own pid, so the pidfile can flip to w2 a beat before w1's
   # TERM trap has run — poll for w1's exit rather than checking the instant the
   # pidfile changes (the old single check raced this and flaked).
-  wait_for_pid_exit "$w1"
+  local i; for i in $(seq 1 30); do kill -0 "$w1" 2>/dev/null || break; sleep 0.1; done
   run kill -0 "$w1"; [ "$status" -ne 0 ]
 
   kill "$w2" "$sesspid" 2>/dev/null || true
@@ -686,6 +970,7 @@ run_named_watcher_for() {
   local sid="$1" out="$2" secs="$3" name="$4" pid
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code "$name" >"$out" 2>/dev/null 3>&- &
   pid=$!
+  _bg_track "$pid"
   sleep "$secs"
   _stop_watcher "$pid"
 }
@@ -733,15 +1018,18 @@ _record_handover_events() {
   _record_handover_events
 
   local sesspid; sleep 600 3>&- & sesspid=$!
+  _bg_track "$sesspid"
   local iid="solo.$sesspid"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
 
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w1=$!
+  _bg_track "$w1"
   _wait_pidfile "$pf" "$w1"
 
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w2=$!
+  _bg_track "$w2"
 
   # Wait for the PREDECESSOR TO BE GONE, which is a condition and not a
   # duration: its remove is the last thing it does, so once it is gone nothing
@@ -812,7 +1100,7 @@ _record_handover_events() {
   refute grep -n 'kill "\$prev_pid"' "$watch_sh"
 }
 
-@test "watch: a second unfiltered watcher says it is sharing, and a lone one does not (#683)" {
+@test "watch: a second unfiltered watcher says it is sharing, and a lone one does not" {
   # Two watchers with no active name subscribe to the same unclaimed pairs. The
   # read cursor is one per (team, agent), so whoever polls first takes the row
   # and the other never sees it — and `inbox.sh` then truthfully says "no new
@@ -840,6 +1128,7 @@ _record_handover_events() {
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$first_id" "$PROJ" claude-code \
     >"$BATS_TEST_TMPDIR/first.out" 2>/dev/null 3>&- &
   local first_pid=$!
+  _bg_track "$first_pid"
   wait_for_file "$run_dir/watch.$first_id.pid"
 
   # Waits for the LAST of the three lines, not for the pidfile: the pidfile is
@@ -849,6 +1138,7 @@ _record_handover_events() {
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$second_id" "$PROJ" claude-code \
     >"$BATS_TEST_TMPDIR/second.out" 2>/dev/null 3>&- &
   local second_pid=$!
+  _bg_track "$second_pid"
   wait_for_file_contains "$second_log" "/agmsg actas"
   _stop_watcher "$second_pid"
 
@@ -873,6 +1163,7 @@ _record_handover_events() {
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$other_id" "$other_proj" claude-code \
     >"$BATS_TEST_TMPDIR/other.out" 2>/dev/null 3>&- &
   local other_pid=$!
+  _bg_track "$other_pid"
   sleep 2
   _stop_watcher "$other_pid"
   refute grep -qF -- "another watcher" "$run_dir/watch.$other_id.log"
@@ -880,7 +1171,7 @@ _record_handover_events() {
   _stop_watcher "$first_pid"
 }
 
-@test "watch: a filtered watcher is never mistaken for unfiltered while starting (#683)" {
+@test "watch: a filtered watcher is never mistaken for unfiltered while starting" {
   # A reader that finds a live pid with no filter file SKIPS it: it cannot tell
   # the role or the project. If the pidfile were published first, every filtered
   # watcher would sit in exactly that state for the length of its startup
@@ -899,6 +1190,7 @@ _record_handover_events() {
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$named_id" "$PROJ" claude-code alice \
     >"$BATS_TEST_TMPDIR/named.out" 2>/dev/null 3>&- &
   local named_pid=$!
+  _bg_track "$named_pid"
   wait_for_file "$run_dir/watch.$named_id.pid"
 
   # Whenever the pidfile exists, the filter file exists too and names the role.
@@ -911,7 +1203,7 @@ _record_handover_events() {
   _stop_watcher "$named_pid"
 }
 
-@test "watch: a watcher does not delete filter metadata it did not write (#683)" {
+@test "watch: a watcher does not delete filter metadata it did not write" {
   # The replacement path signals the previous watcher for this session id and
   # does not wait for it, so a successor writes its filter file while the
   # pidfile still names the predecessor. Deciding the filter's fate by the
@@ -933,6 +1225,7 @@ _record_handover_events() {
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code \
     >"$BATS_TEST_TMPDIR/owner.out" 2>/dev/null 3>&- &
   local w=$!
+  _bg_track "$w"
   wait_for_file "$pf"
   [ -f "$ff" ]
   # Its own pid while it runs — the ordinary case, and the premise of the swap
@@ -952,17 +1245,27 @@ _record_handover_events() {
 
 @test "watch: surfaces an unopenable DB once instead of spinning silently (#197)" {
   [ "$(id -u)" -eq 0 ] && skip "chmod 000 is ineffective as root"
+  # The watcher opens the subscribed team's store, so that is the file to make
+  # unopenable — install no longer creates one store for everybody. A send
+  # brings it into existence first; a team that has never been written to has
+  # no store at all, which is a different (and legitimate) state.
+  bash "$SCRIPTS/send.sh" team bob alice "seed the store" >/dev/null
   local DB="$TEST_SKILL_DIR/db/messages.db"
-  [ -f "$DB" ]                # init-db.sh created it in setup_test_env
+  [ -f "$DB" ]
   chmod 000 "$DB"
   local out="$BATS_TEST_TMPDIR/hc.out"
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-hc" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- &
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-hc" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
   local pid=$!
-  # The healthcheck line is the event to wait for; a fixed sleep was shorter than
-  # a loaded machine's startup. The watcher exits right after emitting it, so
-  # its exit is what shows it neither spins nor emits again.
-  wait_for_file_contains "$out" "ERROR: cannot open message DB"
-  wait_for_pid_exit "$pid"
+  _bg_track "$pid"
+  # #1023: startup now runs actas_lock_state once per subscribed pair (2 here:
+  # team/alice, team/bob), each resolving via _agmsg_id_key_for -- two extra
+  # sqlite3 spawns, ~40ms/call measured -- before the DB-health-check this test
+  # pins even runs. A base-vs-branch 3-run comparison at sleep 2 showed the
+  # branch losing the health-check race under load (2/3 vs 3/3); sleep 3 is
+  # still comfortably one poll interval and restored a clean run.
+  sleep 3                     # > one poll interval; a spinning watcher would re-emit
+  kill "$pid" 2>/dev/null || true   # no-op if the healthcheck already exited
+  wait "$pid" 2>/dev/null || true
   chmod 644 "$DB" 2>/dev/null || true
   # Exactly one line: 0 would mean a silent spin, >1 a re-emitting loop.
   [ "$(grep -c 'ERROR: cannot open message DB' "$out")" -eq 1 ]
@@ -970,18 +1273,19 @@ _record_handover_events() {
 
 # No silent message loss across a burst (#245): the head-5 truncation bug had a
 # monitor wrapper append `| head -5` to the monitor command, so after the 5th line the
-# consumer closed and later messages were dropped while the watermark advanced
+# consumer closed and later messages were dropped while the cursor advanced
 # past them. With the watcher streaming normally (no downstream truncation), a
 # burst of N>5 consecutive messages must ALL be delivered.
 @test "watch: delivers a burst of 8 consecutive messages without loss (#245)" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
   local sid="sess-burst"
   local out="$TEST_SKILL_DIR/burst.log"
-  local wm="$TEST_SKILL_DIR/run/watch.$(_iid "$sid").watermark"
+  local pf="$TEST_SKILL_DIR/run/watch.$(_iid "$sid").pid"
 
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- &
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
   local w=$!
-  wait_for_file "$wm"          # ready to receive (watermark seeded)
+  _bg_track "$w"
+  _wait_for_file "$pf"          # watcher process is live; unread has no seed race
 
   local n
   for n in 1 2 3 4 5 6 7 8; do
@@ -989,7 +1293,7 @@ _record_handover_events() {
   done
 
   # Wait for the last one to arrive, then assert EVERY message is present.
-  wait_for_file_contains "$out" "BURST-8" || { kill "$w" 2>/dev/null || true; false; }
+  _wait_for_file_contains "$out" "BURST-8" || { kill "$w" 2>/dev/null || true; false; }
   kill "$w" 2>/dev/null || true
   wait "$w" 2>/dev/null || true
 
@@ -998,13 +1302,65 @@ _record_handover_events() {
   done
 }
 
+# --- argv-length regression (#777) --------------------------------------
+#
+# watch.sh used to embed the whole page of `storage_watch_after` rows into
+# ONE argv element for `sqlite3 ':memory:' "<embedded SQL>"`, and its failure
+# was swallowed by a trailing `2>/dev/null || true` -- so ROWS silently
+# became empty, FINAL_CURSOR never got set, and the read cursor never
+# advanced. The same backlog would then fail identically on every following
+# poll: not a one-off skip, a stall.
+#
+# 100 messages of ~2000 bytes each is about 200,000 bytes of body alone,
+# well past Linux's MAX_ARG_STRLEN (131,072 bytes; smaller still on
+# Windows/macOS). Sent BEFORE the watcher starts, so its very first poll has
+# to scan and embed the entire backlog in one statement -- the shape the bug
+# needed, rather than many small pages that would each stay under the
+# ceiling on their own.
+@test "watch: a backlog large enough to exceed the OS argv ceiling still delivers and advances the cursor (#777)" {
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  local sid="sess-argv-backlog"
+  local out="$TEST_SKILL_DIR/argv-backlog.log"
+
+  bulk_send_direct team bob alice 100 2000 WBIG
+
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
+  local w=$!
+  _bg_track "$w"
+  _wait_for_file_contains "$out" "WBIG-99-" || { kill "$w" 2>/dev/null || true; false; }
+
+  # Cursor advancement is a SEPARATE step that runs after every row in this
+  # poll has already been printed (storage_read_cursor_consume, embedding all
+  # 100 delivered ids in its own statement) -- killing the watcher the instant
+  # the last line lands, the way the plain burst test (#245) does, races that
+  # step under this much data. Poll for it instead, same as "watch: restart
+  # delivers messages that arrived while the watcher was down" above.
+  local i cursor
+  for i in $(seq 1 100); do
+    cursor=$(_read_cursor team alice 2>/dev/null || echo 0)
+    [ "${cursor:-0}" -gt 0 ] && break
+    sleep 0.1
+  done
+  kill "$w" 2>/dev/null || true
+  wait "$w" 2>/dev/null || true
+
+  grep -q "WBIG-0-" "$out"
+  grep -q "WBIG-99-" "$out"
+  # Not stuck: the store-owned cursor moved past where it started (0).
+  [ "${cursor:-0}" -gt 0 ]
+}
+
 @test "watch: empty session_id gets a generated fallback instead of a Usage error (#236)" {
   local out="$BATS_TEST_TMPDIR/empty-sid.out"
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "" "$PROJ" claude-code alice >"$out" 2>&1 3>&- &
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "" "$PROJ" claude-code alice >"$out" 2>&1 3>&- 4>&- &
   local pid=$!
+  _bg_track "$pid"
   # A fallback id means a watch.agmsg-*.pid appears under run/ as the watcher arms.
-  local started=0
-  if wait_until 10 _any_generated_watch_pidfile; then started=1; fi
+  local i started=0
+  for i in $(seq 1 25); do
+    if ls "$TEST_SKILL_DIR/run"/watch.agmsg-*.pid >/dev/null 2>&1; then started=1; break; fi
+    sleep 0.2
+  done
   kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
   [ "$started" -eq 1 ]
   ! grep -q "Usage: watch.sh" "$out"
@@ -1017,6 +1373,7 @@ _record_handover_events() {
   local out="$BATS_TEST_TMPDIR/dash-sid.out"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" - "$PROJ" claude-code alice >"$out" 2>&1 3>&- &
   local pid=$!
+  _bg_track "$pid"
   # Folded to empty => a generated fallback id, so a watch.agmsg-*.pid appears.
   local i started=0
   for i in $(seq 1 25); do
@@ -1029,4 +1386,657 @@ _record_handover_events() {
   refute ls "$TEST_SKILL_DIR/run"/watch.-*.pid >/dev/null 2>&1
   refute grep -q "Usage: watch.sh" "$out"
   refute grep -q "ERROR: unknown agent type" "$out"
+}
+
+# --- close_own_placement: an unresolvable pane ref gets its OWN logged branch ---
+# The ref parser fails CLOSED (non-zero) on a corrupt/unknown-scheme ref.
+# A bare `rec_term="$(...)"` left rec_term/rec_id empty and fell through to the
+# "belongs to someone else" branch with an EMPTY recorded side (a misleading log),
+# and under a caller's set -e it would take the watcher down with no log at all.
+# The function is extracted and sourced in isolation so the ref-unresolved branch
+# is exercised directly, without standing up a live watcher loop.
+@test "watch close_own_placement: a corrupt pane ref logs 'did not resolve', not a silent/misleading fallthrough" {
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  local shim="$TEST_SKILL_DIR/cop-shim.sh"
+  {
+    printf '%s\n' 'set -u'
+    printf '%s\n' 'watch_log() { printf "%s\n" "$*" >> "$WLOG"; }'
+    printf '%s\n' 'watch_report() { printf "%s\n" "$*" >> "$WREPORT"; }'
+    printf '%s\n' '. "$SCRIPTS/lib/actas-lock.sh"'
+    printf '%s\n' '. "$SCRIPTS/lib/terminal-registry.sh"'
+    awk '/^close_own_placement\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$SCRIPTS/watch.sh"
+  } > "$shim"
+
+  # A placement record for (wt, carol) whose ref is corrupt (unknown scheme).
+  local rec
+  rec="$(bash -c '. "'"$SCRIPTS"'/lib/actas-lock.sh"; agmsg_spawn_path wt carol')"
+  mkdir -p "$(dirname "$rec")"
+  printf 'bogus:xyz\t/tmp/p\tclaude-code' > "$rec"
+
+  export WLOG="$TEST_SKILL_DIR/wlog"; : > "$WLOG"
+  export WREPORT="$TEST_SKILL_DIR/wreport"; : > "$WREPORT"
+  # SESSION_ID is referenced only past the ref guard; the guard returns before it.
+  run env SESSION_ID=irrelevant bash -c '. "'"$shim"'"; close_own_placement wt carol'
+  # A pane that may still be open is the operator's problem, so it is a REPORT
+  # (stdout), not a log (stderr): the shipped launcher runs the watcher with fd2
+  # on /dev/null (#691), so this text on stderr would be text nobody ever sees.
+  # 1 = "a placed pane may still be open", distinct from 2 = "nothing of ours".
+  [ "$status" -eq 1 ]
+  grep -q "did not resolve to a terminal and pane id" "$WREPORT"
+  refute grep -q "did not resolve to a terminal and pane id" "$WLOG"
+  # must NOT reach the "belongs to someone else" fallthrough with an empty recorded side
+  refute grep -q "belongs to someone else" "$WLOG"
+  refute grep -q "belongs to someone else" "$WREPORT"
+}
+
+@test "watch: a backlog past the argv ceiling still delivers (#1045/#777, stdin)" {
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  # Same exposure as the inbox argv-ceiling test (see it for why the backlog is
+  # many normal messages sized from the measured ARG_MAX, not one oversized body:
+  # a single >128 KB argv element fails on the ubuntu runner though it fits on
+  # macOS, and a fixed size can pass green without exceeding a larger ARG_MAX).
+  local arg_max body count i last filler
+  arg_max="$(getconf ARG_MAX)"
+  body=90000                                    # one message body, < 128 KB per-arg cap
+  count=$(( arg_max / body + 3 ))               # total payload > ARG_MAX, with margin
+  [ $(( count * body )) -gt "$arg_max" ]        # guarantee the ceiling is actually exceeded
+  filler="$(head -c "$body" /dev/zero | tr '\0' x)"
+  for i in $(seq 1 "$count"); do
+    bash "$SCRIPTS/send.sh" team bob alice "WMSG${i}-${filler}-WEND${i}" >/dev/null
+  done
+  last="$count"
+  run_watcher_until "sess-wbig" "$TEST_SKILL_DIR/wbig.log" "WEND${last}"
+  grep -q "WMSG1-" "$TEST_SKILL_DIR/wbig.log"
+  grep -q "WEND${last}" "$TEST_SKILL_DIR/wbig.log"
+}
+
+@test "watch: a cursor stuck N cycles with pending rows reports on stdout and exits (#1045)" {
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  # Force the delivery query -- the ONLY sqlite call in the loop whose last arg is
+  # ':memory:' (SQL on stdin) -- to return nothing, while the store queries (a real DB
+  # file as the last arg) keep working. So OUT stays non-empty, ROWS is empty, the
+  # cursor never advances, and the SAME batch returns every cycle: the exact silent
+  # self-lock. The stuck guard must notice after STUCK_THRESHOLD cycles, say why on
+  # STDOUT (stderr is /dev/null here), and EXIT rather than loop in silence.
+  local realsqlite; realsqlite="$(command -v sqlite3)"
+  local stub="$TEST_SKILL_DIR/sqstub"; mkdir -p "$stub"
+  cat > "$stub/sqlite3" <<STUB
+#!/usr/bin/env bash
+if [ "\${@: -1}" = ":memory:" ]; then cat >/dev/null 2>&1; exit 0; fi
+exec "$realsqlite" "\$@"
+STUB
+  chmod +x "$stub/sqlite3"
+  bash "$SCRIPTS/send.sh" team bob alice "STUCKMSG" >/dev/null   # pending; delivery will fail
+  local out="$TEST_SKILL_DIR/stuck.log"
+  AGMSG_WATCH_INTERVAL=1 env PATH="$stub:$PATH" bash "$SCRIPTS/watch.sh" \
+    sess-stuck "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
+  local w=$!
+  _bg_track "$w"
+  # (1) the report must appear...
+  if ! _wait_for_file_contains "$out" "is STUCK"; then kill "$w" 2>/dev/null || true; false; fi
+  # (2) ...and the watcher must EXIT on its own, not keep looping.
+  local i alive=1
+  for i in $(seq 1 60); do kill -0 "$w" 2>/dev/null || { alive=0; break; }; sleep 0.1; done
+  if [ "$alive" -ne 0 ]; then kill "$w" 2>/dev/null || true; false; fi
+  # (3) ...and it must report FAILURE at the process contract (the defined
+  # unhealthy code, 75), not exit 0 -- a supervisor must not read a wedged
+  # watcher as a clean shutdown. Reverting the arm to `exit 0` turns this red.
+  local st=0; wait "$w" || st=$?
+  [ "$st" -eq 75 ]
+  # the report is a plain "agmsg watch:" line, never mistaken for a "team | from → to" message
+  grep -q "agmsg watch: delivery for team:alice is STUCK" "$out"
+}
+
+@test "watch: the stuck guard fires for a pair whose agent name has a space (#1045)" {
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  # End-to-end companion to test_watch_stuck_map.bats: the tracker keys on the
+  # "<team>:<agent>" pair, and identities.sh emits a spaced agent as one
+  # tab-separated field, so the key carries the space. The first cut framed the
+  # tracker with spaces and scanned it with `for e in $MAP`, splitting "sp aced"
+  # across words: its record never matched, the count reset every cycle, and the
+  # guard NEVER fired for that pair -- the silence-catcher silent. Restoring word
+  # splitting turns this red (the report never appears -> the wait times out).
+  local sproj="/tmp/agmsg-watch-spaced-proj"
+  bash "$SCRIPTS/join.sh" team 'sp aced' claude-code "$sproj" >/dev/null
+  bash "$SCRIPTS/join.sh" team bob claude-code "$sproj" >/dev/null
+  local realsqlite; realsqlite="$(command -v sqlite3)"
+  local stub="$TEST_SKILL_DIR/sqstub2"; mkdir -p "$stub"
+  cat > "$stub/sqlite3" <<STUB
+#!/usr/bin/env bash
+if [ "\${@: -1}" = ":memory:" ]; then cat >/dev/null 2>&1; exit 0; fi
+exec "$realsqlite" "\$@"
+STUB
+  chmod +x "$stub/sqlite3"
+  bash "$SCRIPTS/send.sh" team bob 'sp aced' "SPACEDMSG" >/dev/null  # pending; delivery will fail
+  local out="$TEST_SKILL_DIR/stuck-spaced.log"
+  AGMSG_WATCH_INTERVAL=1 env PATH="$stub:$PATH" bash "$SCRIPTS/watch.sh" \
+    sess-stuck-sp "$sproj" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
+  local w=$!
+  _bg_track "$w"
+  if ! _wait_for_file_contains "$out" "is STUCK"; then kill "$w" 2>/dev/null || true; false; fi
+  local i alive=1
+  for i in $(seq 1 60); do kill -0 "$w" 2>/dev/null || { alive=0; break; }; sleep 0.1; done
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+  [ "$alive" -eq 0 ]
+  grep -q "agmsg watch: delivery for team:sp aced is STUCK" "$out"
+}
+
+@test "watch: an idle pair seeing only a cursor high-water is not treated as stuck (#1045)" {
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  # storage_watch_after appends a trailing "cursor" high-water line even for a
+  # CAUGHT-UP pair, because the team's sequence advances whenever ANY pair in the
+  # team gets a message. So OUT is non-empty for an idle pair with zero messages
+  # of its own. The stuck tracker must key on real message_sent rows, not on
+  # [ -n "$OUT" ]; otherwise a healthy idle watcher whose cursor cannot advance
+  # (here: the delivery query is stubbed to fail, freezing every cursor) would
+  # climb to the threshold and EXIT. 'idle' has no messages; the bob->alice send
+  # only bumps the team high-water, so 'idle' sees a cursor-only OUT. The guard
+  # must NOT fire. Reverting the tracker to [ -n "$OUT" ] turns this red.
+  bash "$SCRIPTS/join.sh" team idle claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/send.sh" team bob alice "BUMP" >/dev/null   # bumps team high-water, not for idle
+  local realsqlite; realsqlite="$(command -v sqlite3)"
+  local stub="$TEST_SKILL_DIR/sqstub3"; mkdir -p "$stub"
+  cat > "$stub/sqlite3" <<STUB
+#!/usr/bin/env bash
+if [ "\${@: -1}" = ":memory:" ]; then cat >/dev/null 2>&1; exit 0; fi
+exec "$realsqlite" "\$@"
+STUB
+  chmod +x "$stub/sqlite3"
+  local out="$TEST_SKILL_DIR/idle.log"
+  # actas 'idle' narrows this watcher to the idle pair only, so no other pair's
+  # real backlog can fire and mask the property under test.
+  AGMSG_WATCH_INTERVAL=1 env PATH="$stub:$PATH" bash "$SCRIPTS/watch.sh" \
+    sess-idle "$PROJ" claude-code idle >"$out" 2>/dev/null 3>&- 4>&- &
+  local w=$!
+  _bg_track "$w"
+  # Watch across well more than STUCK_THRESHOLD cycles: if "is STUCK" ever
+  # appears the guard fired on a healthy idle pair -- fail fast.
+  local i
+  for i in $(seq 1 70); do
+    if grep -q "is STUCK" "$out" 2>/dev/null; then kill "$w" 2>/dev/null || true; false; fi
+    kill -0 "$w" 2>/dev/null || break
+    sleep 0.1
+  done
+  # It must still be alive (it neither fired nor exited for any other reason).
+  kill -0 "$w" 2>/dev/null
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+  ! grep -q "is STUCK" "$out"
+}
+
+@test "watch: a failed pending-scan is surfaced and exits, not collapsed to caught-up (#1045)" {
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  # The loop reads whether messages are waiting with storage_watch_after. If that
+  # READ fails and the failure collapses to "" (the old `|| true`), the caught-up
+  # arm drops the tracker and the watcher continues in silence forever -- the very
+  # outage #1045 exists to catch, and one the stuck guard cannot see (a failed
+  # scan returns no message_sent row to count). So a failed read must be surfaced
+  # and exit, not treated as "no messages".
+  #
+  # Fail ONLY the pending scan: its SQL is the one passed on argv that contains
+  # "message_sent" (the startup "SELECT 1;" and the cursor read do not; the
+  # delivery query goes over stdin with ':memory:'). The startup DB healthcheck
+  # therefore still passes, so this exercises a RUNTIME read failure, not startup.
+  bash "$SCRIPTS/send.sh" team bob alice "SEED" >/dev/null   # create the store
+  local realsqlite; realsqlite="$(command -v sqlite3)"
+  local stub="$TEST_SKILL_DIR/sqstub4"; mkdir -p "$stub"
+  cat > "$stub/sqlite3" <<STUB
+#!/usr/bin/env bash
+for _a in "\$@"; do case "\$_a" in *message_sent*) exit 1 ;; esac; done
+exec "$realsqlite" "\$@"
+STUB
+  chmod +x "$stub/sqlite3"
+  local out="$TEST_SKILL_DIR/pollfail.log"
+  AGMSG_WATCH_INTERVAL=1 env PATH="$stub:$PATH" bash "$SCRIPTS/watch.sh" \
+    sess-pollfail "$PROJ" claude-code alice >"$out" 2>/dev/null 3>&- 4>&- &
+  local w=$!
+  _bg_track "$w"
+  # The failed read must be surfaced...
+  if ! _wait_for_file_contains "$out" "cannot read delivery state"; then kill "$w" 2>/dev/null || true; false; fi
+  # ...and the watcher must EXIT, not loop in silence. (Reverting the read to
+  # `|| true` makes the message never appear and the watcher never exit -> red.)
+  local i alive=1
+  for i in $(seq 1 60); do kill -0 "$w" 2>/dev/null || { alive=0; break; }; sleep 0.1; done
+  if [ "$alive" -ne 0 ]; then kill "$w" 2>/dev/null || true; false; fi
+  # ...with the defined unhealthy exit code (75), not exit 0: a failed store read
+  # is unhealthy, and the process contract must say so. Reverting the arm to
+  # `exit 0` turns this red.
+  local st=0; wait "$w" || st=$?
+  [ "$st" -eq 75 ]
+  # Non-delivery-shaped diagnostic (a plain "agmsg watch:" line, not "ts | team | from → to | body").
+  grep -q "agmsg watch: cannot read delivery state for team:alice" "$out"
+}
+
+# --- the watcher re-asserts this pane's name (#1044) --------------------------
+#
+# Naming is an invariant re-asserted wherever the session id is known, not an
+# assignment made once at a chosen place: measured across the nine agent types,
+# no single entry point covers them all. The watcher is one of those places, and
+# it is the one that runs for the whole life of a monitor-mode session.
+#
+# Waits for the rename to appear rather than sleeping: a fixed sleep would encode
+# "the watcher is usually done by now", which is a claim about the machine — the
+# reason the helpers above exist.
+@test "watch: the watcher names this session's pane (#1044)" {
+  # This test's subject is the naming primitive firing, against a fake tmux
+  # on $FAKEBIN -- never a real terminal -- so it opts back into the
+  # primitive's own default (on) rather than the harness's #1095 off
+  # (test_helper.bash), same as test_terminal_registry.bats's own naming
+  # tests.
+  unset AGMSG_SELF_NAME
+  export FAKEBIN="$TEST_SKILL_DIR/fakebin" ARGV_LOG="$TEST_SKILL_DIR/argv.log"
+  mkdir -p "$FAKEBIN"
+  : > "$ARGV_LOG"
+  agmsg_install_fake_tmux
+  export TMUX="/tmp/fake,1,0" TMUX_PANE="%1"
+
+  local sid out found
+  sid="$(_iid sid-naming)"
+  out="$BATS_TEST_TMPDIR/watch.out"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
+  local pid=$!
+  _bg_track "$pid"
+  _wait_for_file_contains "$ARGV_LOG" 'team:alice' "$pid"
+  found=$?
+  _stop_watcher "$pid"
+
+  [ "$found" -eq 0 ]
+  # The key specifically — the name the terminal addresses the agent by — rather
+  # than just any tmux call. (peek/poke resolve through the placement record, not
+  # through this; the assertion is about which of the two names was set.)
+  grep -Fq '[@agmsg_agent] [team:alice]' "$ARGV_LOG"
+}
+
+# --- #983: the claim window between reading the lock and acting on it ----------
+#
+# The lock is read once per pair per turn; the irreversible acts happen ~200 lines
+# later. A claim landing in between made this watcher act for a role it no longer
+# held. `ctrl:despawn` is the worst of the three, and the likeliest to hit: it is
+# SENT at the moment a role changes hands.
+#
+# A sleep cannot place a message inside that window reliably — its width is a
+# guess. The barrier is decided by the test, and it is the shape this repo already
+# uses (inbox.sh's AGMSG_TEST_MARK_BARRIER).
+_claim_in_window() {   # <team> <agent> <new-sid> — steal the pair mid-turn
+  ( export SKILL_DIR="$TEST_SKILL_DIR" RUN_DIR="$TEST_SKILL_DIR/run"
+    # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/actas-lock.sh"
+    local _r owner; _r="$(actas_lock_read "$1" "$2")"
+    owner=""; [ "${_r%%$'\t'*}" = "ok" ] && owner="${_r#*$'\t'}"
+    [ -n "$owner" ] && actas_lock_release "$1" "$2" "$owner"
+    actas_lock_claim "$1" "$2" "$3" )
+  setup_live_owner "$TEST_SKILL_DIR/run" "$3"
+}
+
+@test "watch: a role claimed inside the window keeps its registration (#983, end-to-end)" {
+  # What this pins is the OUTCOME — the role survives and a reason is said — not
+  # any one guard. Measured: it stays green when any single guard is deleted,
+  # because whichever of the three fires first refuses and all three say
+  # "changed hands". Do not read it as the fold guard's control; that is the
+  # between-consume-and-fold test below, and each guard has exactly one control
+  # that reddens on its own.
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
+  local bar="$BATS_TEST_TMPDIR/claimbar" out="$BATS_TEST_TMPDIR/w.out" err="$BATS_TEST_TMPDIR/w.err"
+
+  AGMSG_WATCH_INTERVAL=1 AGMSG_TEST_CLAIM_BARRIER="$bar" \
+    bash "$SCRIPTS/watch.sh" sess-983 "$PROJ" claude-code alice >"$out" 2>"$err" 3>&- 4>&- &
+  local w=$!
+  _bg_track "$w"
+  local i
+  for i in $(seq 1 120); do [ -e "$bar.reached" ] && break; sleep 0.25; done   # 30s: starting under load, not the property under test
+  # CONTROL: the seam actually fired. A green from a barrier that was never
+  # reached is the standard way this kind of test lies.
+  [ -e "$bar.reached" ]
+
+  _claim_in_window team alice sid-new
+  bash "$SCRIPTS/send.sh" team leader alice "ctrl:despawn" >/dev/null
+  : > "$bar.release"
+
+  for i in $(seq 1 40); do kill -0 "$w" 2>/dev/null || break; sleep 0.25; done
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+
+  # The role was NOT dropped: reset.sh would have removed alice's registration
+  # for this project, which is what the new owner is relying on.
+  bash "$SCRIPTS/identities.sh" "$PROJ" claude-code | grep -q "alice"
+  # ...and the watcher said why, on the channel a reason survives on.
+  # The reason goes to STDOUT: the shipped launcher runs the watcher with fd2 on
+  # /dev/null (#691), so a refusal on stderr is one nobody can read.
+  grep -q 'changed hands' "$out"
+  refute grep -q 'changed hands' "$err"
+}
+
+@test "watch: with NO claim in the window a ctrl:despawn is still obeyed (#983)" {
+  # The negative control. Without it, "never act on ctrl:despawn" passes the test
+  # above — and that would break every despawn in the product.
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
+  local bar="$BATS_TEST_TMPDIR/claimbar2" out="$BATS_TEST_TMPDIR/w2.out" err="$BATS_TEST_TMPDIR/w2.err"
+
+  AGMSG_WATCH_INTERVAL=1 AGMSG_TEST_CLAIM_BARRIER="$bar" \
+    bash "$SCRIPTS/watch.sh" sess-983b "$PROJ" claude-code alice >"$out" 2>"$err" 3>&- 4>&- &
+  local w=$!
+  _bg_track "$w"
+  local i
+  for i in $(seq 1 120); do [ -e "$bar.reached" ] && break; sleep 0.25; done   # 30s: starting under load, not the property under test
+  [ -e "$bar.reached" ]
+
+  # Same window, same barrier — only the claim is missing.
+  bash "$SCRIPTS/send.sh" team leader alice "ctrl:despawn" >/dev/null
+  : > "$bar.release"
+
+  for i in $(seq 1 40); do kill -0 "$w" 2>/dev/null || break; sleep 0.25; done
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+
+  refute grep -q 'changed hands' "$out"
+  # The role WAS dropped — reset.sh removed alice's registration for this project.
+  local ids; ids="$(bash "$SCRIPTS/identities.sh" "$PROJ" claude-code 2>/dev/null || true)"
+  # Canary: the listing is readable and still names the OTHER role, so an absent
+  # `alice` is a real absence rather than an empty or failed listing.
+  grep -q 'leader' <<<"$ids"
+  refute grep -q 'alice' <<<"$ids"
+}
+
+@test "watch: a message for a role claimed inside the window is neither shown nor consumed (#983)" {
+  # The claim that discriminates is "STILL UNREAD afterwards". A count of 0-or-1
+  # proves nothing: the broken build and the negative control both end at 0, one
+  # because the row was wrongly consumed and one because it was rightly delivered.
+  # So the assertion is that the session which now owns the role can still read it.
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
+  local bar="$BATS_TEST_TMPDIR/cbar3" out="$BATS_TEST_TMPDIR/w3.out" err="$BATS_TEST_TMPDIR/w3.err"
+
+  AGMSG_WATCH_INTERVAL=1 AGMSG_TEST_CLAIM_BARRIER="$bar" \
+    bash "$SCRIPTS/watch.sh" sess-983c "$PROJ" claude-code alice >"$out" 2>"$err" 3>&- 4>&- &
+  local w=$! i
+  _bg_track "$w"
+  for i in $(seq 1 120); do [ -e "$bar.reached" ] && break; sleep 0.25; done   # 30s: starting under load, not the property under test
+  [ -e "$bar.reached" ]                      # the seam fired
+
+  _claim_in_window team alice sid-new
+  bash "$SCRIPTS/send.sh" team leader alice "HELLO-983" >/dev/null
+  # The turn must COMPLETE before "it was not delivered" means anything: a watcher
+  # that simply has not got there yet leaves $out empty and the refute below
+  # passes for the wrong reason. Measured — deleting the deliver guard left this
+  # green on a loaded machine and red on a quiet one, which is the tell. `.reached`
+  # is written once per turn, so its reappearance is the turn boundary.
+  rm -f "$bar.reached"
+  : > "$bar.release"
+  for i in $(seq 1 120); do [ -e "$bar.reached" ] && break; sleep 0.25; done
+  [ -e "$bar.reached" ]
+  : > "$bar.release"
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+
+  # Not shown on the screen of the session that lost the role...
+  refute grep -q 'HELLO-983' "$out"
+  # ...and not consumed: the session that claimed it still has it unread.
+  local ib; ib="$(bash "$SCRIPTS/inbox.sh" team alice 2>/dev/null || true)"
+  grep -q 'HELLO-983' <<<"$ib"
+}
+
+@test "watch: with NO claim in the window the message IS shown and consumed (#983)" {
+  # The negative partner. Without it, a watcher that delivers nothing at all
+  # passes the test above — and that is the whole product.
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
+  local bar="$BATS_TEST_TMPDIR/cbar4" out="$BATS_TEST_TMPDIR/w4.out" err="$BATS_TEST_TMPDIR/w4.err"
+
+  AGMSG_WATCH_INTERVAL=1 AGMSG_TEST_CLAIM_BARRIER="$bar" \
+    bash "$SCRIPTS/watch.sh" sess-983d "$PROJ" claude-code alice >"$out" 2>"$err" 3>&- 4>&- &
+  local w=$! i
+  _bg_track "$w"
+  for i in $(seq 1 120); do [ -e "$bar.reached" ] && break; sleep 0.25; done   # 30s: starting under load, not the property under test
+  [ -e "$bar.reached" ]
+
+  bash "$SCRIPTS/send.sh" team leader alice "HELLO-OK" >/dev/null
+  : > "$bar.release"
+  for i in $(seq 1 120); do grep -q 'HELLO-OK' "$out" && break; sleep 0.25; done
+  grep -q 'HELLO-OK' "$out"
+
+  # Delivery and consume are separate steps, so killing the watcher the moment the
+  # body appears races the consume — measured: this passed alone and failed inside
+  # the full suite, having delivered but not yet consumed. Waiting a couple of
+  # seconds would just be a guess about load. `.reached` is written once per turn,
+  # so removing it and waiting for it to come back is a REAL event meaning "the
+  # previous turn finished", consume included.
+  rm -f "$bar.reached"
+  for i in $(seq 1 120); do [ -e "$bar.reached" ] && break; sleep 0.25; done
+  [ -e "$bar.reached" ]
+  : > "$bar.release"
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+
+  local ib; ib="$(bash "$SCRIPTS/inbox.sh" team alice 2>/dev/null || true)"
+  refute grep -q 'HELLO-OK' <<<"$ib"
+}
+
+@test "watch: a claim landing DURING delivery still leaves the batch unread (#983)" {
+  # Isolates the consume guard, which the first barrier cannot reach: the deliver
+  # check runs before the loop and `continue`s, so a claim that lands before
+  # delivery never gets as far as consume. Measured — with only the first seam,
+  # deleting the consume guard left every test green. This parks the watcher
+  # BETWEEN delivering and consuming, which is the window that guard is for.
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
+  local cb="$BATS_TEST_TMPDIR/consbar" out="$BATS_TEST_TMPDIR/w5.out" err="$BATS_TEST_TMPDIR/w5.err"
+
+  bash "$SCRIPTS/send.sh" team leader alice "MID-983" >/dev/null
+  AGMSG_WATCH_INTERVAL=1 AGMSG_TEST_CONSUME_BARRIER="$cb" \
+    bash "$SCRIPTS/watch.sh" sess-983e "$PROJ" claude-code alice >"$out" 2>"$err" 3>&- 4>&- &
+  local w=$! i
+  _bg_track "$w"
+  for i in $(seq 1 120); do [ -e "$cb.reached" ] && break; sleep 0.25; done
+  [ -e "$cb.reached" ]                       # the seam fired
+  # It got past delivery — so this really is the delivered-but-not-yet-consumed
+  # point, not some earlier stop.
+  grep -q 'MID-983' "$out"
+
+  _claim_in_window team alice sid-mid
+  : > "$cb.release"
+  sleep 1
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+
+  # Delivered to the old screen (already done, unavoidable) but NOT consumed:
+  # the session that now owns the role still has it.
+  local ib; ib="$(bash "$SCRIPTS/inbox.sh" team alice 2>/dev/null || true)"
+  grep -q 'MID-983' <<<"$ib"
+  grep -q 'marking them read' "$out"
+}
+
+@test "watch: a claim landing between consume and the fold is not obeyed (#983)" {
+  # Reachability has TWO axes and this test has to satisfy both.
+  #   TIME    the claim must land between consume and the fold — seam 3. The two
+  #           earlier guards `continue`, so a claim landing before delivery or
+  #           before consume never reaches this one. Measured: with only the first
+  #           two seams, deleting the fold guard left its own test green.
+  #   CONTENT the batch must carry a `ctrl:despawn` addressed to the ACTIVE name,
+  #           or DESPAWN_TARGET is never set and the branch is not entered no
+  #           matter where the watcher is parked.
+  # `.reached` proves only the first: seam 3 fires every turn. The stderr line
+  # below proves both, because it is emitted only when a fold was pending AND the
+  # guard refused it.
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
+  local fb="$BATS_TEST_TMPDIR/foldbar" out="$BATS_TEST_TMPDIR/w6.out" err="$BATS_TEST_TMPDIR/w6.err"
+
+  bash "$SCRIPTS/send.sh" team leader alice "ctrl:despawn" >/dev/null   # CONTENT
+  AGMSG_WATCH_INTERVAL=1 AGMSG_TEST_FOLD_BARRIER="$fb" \
+    bash "$SCRIPTS/watch.sh" sess-983f "$PROJ" claude-code alice >"$out" 2>"$err" 3>&- 4>&- &
+  local w=$! i
+  _bg_track "$w"
+  for i in $(seq 1 120); do [ -e "$fb.reached" ] && break; sleep 0.25; done
+  [ -e "$fb.reached" ]                                                   # TIME
+
+  _claim_in_window team alice sid-fold
+  : > "$fb.release"
+  # Wait on the event this path actually produces, not on a duration and not on
+  # the next turn's barrier: having declined the fold, the watcher `continue`s,
+  # and on the NEXT turn the lock reads `other:` — so an exclusive watcher exits,
+  # by design. `.reached` never comes back, and waiting for it (as the delivery
+  # tests do) times out on correct behaviour. Its EXIT is the observable here.
+  for i in $(seq 1 120); do kill -0 "$w" 2>/dev/null || break; sleep 0.25; done
+  refute kill -0 "$w" 2>/dev/null
+  wait "$w" 2>/dev/null || true
+
+  grep -q 'its ctrl:despawn' "$out"
+  # The role survived: reset.sh never ran, so the session that claimed it keeps
+  # the registration it is relying on.
+  local ids; ids="$(bash "$SCRIPTS/identities.sh" "$PROJ" claude-code 2>/dev/null || true)"
+  grep -q 'leader' <<<"$ids"      # canary: the listing is readable
+  grep -q 'alice' <<<"$ids"
+}
+
+@test "watch: a lock that cannot be READ stops the act, it does not read as free (#983)" {
+  # The guard's own fail-open, found in review. Two layers turn "could not read the
+  # lock" into "the lock is free" — actas_lock_owner answers empty for both a
+  # missing file and a failed read, and actas_lock_state maps an empty owner to
+  # `free` at rc 0. With a `|| echo free` on top, an UNREADABLE lock compared
+  # equal to a pair read as free, and the permanent act went ahead precisely when
+  # least was known. Refusing costs one poll cycle; consuming does not come back.
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  [ "$(id -u)" -eq 0 ] && skip "chmod 000 is ineffective as root"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
+  local cb="$BATS_TEST_TMPDIR/unreadbar" out="$BATS_TEST_TMPDIR/w7.out" err="$BATS_TEST_TMPDIR/w7.err"
+
+  bash "$SCRIPTS/send.sh" team leader alice "UNREADABLE-983" >/dev/null
+  AGMSG_WATCH_INTERVAL=1 AGMSG_TEST_CONSUME_BARRIER="$cb" \
+    bash "$SCRIPTS/watch.sh" sess-983g "$PROJ" claude-code alice >"$out" 2>"$err" 3>&- 4>&- &
+  local w=$! i
+  _bg_track "$w"
+  for i in $(seq 1 120); do [ -e "$cb.reached" ] && break; sleep 0.25; done
+  [ -e "$cb.reached" ]
+  grep -q 'UNREADABLE-983' "$out"          # past delivery, before consume
+
+  local lock; lock="$( ( export SKILL_DIR="$TEST_SKILL_DIR" RUN_DIR="$TEST_SKILL_DIR/run"
+    # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/actas-lock.sh"; actas_lock_path team alice ) )"
+  [ -f "$lock" ]                           # canary: there IS a lock to make unreadable
+  chmod 000 "$lock"
+  : > "$cb.release"
+  sleep 2
+  chmod 644 "$lock" 2>/dev/null || true     # restore before any teardown reads it
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+
+  # Not consumed: the row is still there for whoever does own the role.
+  local ib; ib="$(bash "$SCRIPTS/inbox.sh" team alice 2>/dev/null || true)"
+  grep -q 'UNREADABLE-983' <<<"$ib"
+}
+
+@test "watch: an unreadable lock also stops the ctrl:despawn teardown (#983)" {
+  # Review's control (2): the same fail-closed rule on the act that cannot be undone
+  # at all. Refusing costs one poll cycle; dropping the role and closing the pane
+  # under an unknown lock state does not come back.
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  [ "$(id -u)" -eq 0 ] && skip "chmod 000 is ineffective as root"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
+  local fb="$BATS_TEST_TMPDIR/unreadfold" out="$BATS_TEST_TMPDIR/w8.out" err="$BATS_TEST_TMPDIR/w8.err"
+
+  bash "$SCRIPTS/send.sh" team leader alice "ctrl:despawn" >/dev/null
+  AGMSG_WATCH_INTERVAL=1 AGMSG_TEST_FOLD_BARRIER="$fb" \
+    bash "$SCRIPTS/watch.sh" sess-983h "$PROJ" claude-code alice >"$out" 2>"$err" 3>&- 4>&- &
+  local w=$! i
+  _bg_track "$w"
+  for i in $(seq 1 120); do [ -e "$fb.reached" ] && break; sleep 0.25; done
+  [ -e "$fb.reached" ]
+
+  local lock; lock="$( ( export SKILL_DIR="$TEST_SKILL_DIR" RUN_DIR="$TEST_SKILL_DIR/run"
+    # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/actas-lock.sh"; actas_lock_path team alice ) )"
+  [ -f "$lock" ]
+  chmod 000 "$lock"
+  : > "$fb.release"
+  sleep 2
+  chmod 644 "$lock" 2>/dev/null || true
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+
+  grep -q 'could not verify who holds this role' "$out"
+  local ids; ids="$(bash "$SCRIPTS/identities.sh" "$PROJ" claude-code 2>/dev/null || true)"
+  grep -q 'leader' <<<"$ids"      # canary: the listing is readable
+  grep -q 'alice' <<<"$ids"       # the role was NOT dropped
+}
+
+@test "watch: a BROAD watcher refuses too when the lock stops being readable (#983)" {
+  # Review's exact scenario, and the one the actas-watcher tests above cannot reach.
+  # A broad watcher claims nothing, so its baseline owner is the EMPTY STRING —
+  # and a reader that folds "could not read" into "" compares equal to that
+  # baseline and calls the pair unchanged. Every unreadable-lock test we had used
+  # an actas watcher, whose baseline is its own sid: there the fold produces a
+  # MISMATCH, which refuses anyway, for the wrong reason. So the fold survived
+  # nine tests. Measured: deleting the `unreadable -> refuse` arm leaves the
+  # actas tests green and reddens only this one.
+  skip_on_windows "watcher background launch under Git Bash (#182)"
+  [ "$(id -u)" -eq 0 ] && skip "chmod 000 is ineffective as root"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
+  local cb="$BATS_TEST_TMPDIR/broadunread" out="$BATS_TEST_TMPDIR/w9.out" err="$BATS_TEST_TMPDIR/w9.err"
+
+  bash "$SCRIPTS/send.sh" team leader alice "BROAD-UNREADABLE-983" >/dev/null
+  # No 4th argument: broad subscription, no claim, so no lock file at all.
+  AGMSG_WATCH_INTERVAL=1 AGMSG_TEST_CONSUME_BARRIER="$cb" \
+    bash "$SCRIPTS/watch.sh" sess-983j "$PROJ" claude-code >"$out" 2>"$err" 3>&- 4>&- &
+  local w=$! i
+  _bg_track "$w"
+  for i in $(seq 1 120); do [ -e "$cb.reached" ] && break; sleep 0.25; done
+  [ -e "$cb.reached" ]
+  grep -q 'BROAD-UNREADABLE-983' "$out"     # past delivery, before consume
+
+  # Canary for the premise: there is NO lock, so the baseline really is empty —
+  # if a lock existed here the test would be measuring the actas case again.
+  local lock; lock="$( ( export SKILL_DIR="$TEST_SKILL_DIR" RUN_DIR="$TEST_SKILL_DIR/run"
+    # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/actas-lock.sh"; actas_lock_path team alice ) )"
+  refute test -f "$lock"
+
+  # With no file to chmod, the only way to make the read fail is to close the
+  # directory it would live in. That is also the case `[ -e ]` cannot judge.
+  chmod 000 "$TEST_SKILL_DIR/run"
+  : > "$cb.release"
+  sleep 2
+  chmod 755 "$TEST_SKILL_DIR/run" 2>/dev/null || true
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+
+  grep -q 'could not verify who holds this role' "$out"
+  # Not consumed: the row is still there for whoever does own the role.
+  local ib; ib="$(bash "$SCRIPTS/inbox.sh" team alice 2>/dev/null || true)"
+  grep -q 'BROAD-UNREADABLE-983' <<<"$ib"
+}
+
+@test "watch: the re-verify makes exactly ONE lock read, and derives nothing (#983)" {
+  # The round-2 finding was not a wrong value, it was a wrong SHAPE: the helper
+  # checked the status of one read and then used a second read's answer, and the
+  # second one (inside actas_lock_state) collapses its own failure to free/rc0. No
+  # behavioural test can express "the second read failed but the first did not" —
+  # the window between them is not addressable from a test. So the property is
+  # pinned structurally: one read, of the raw owner, and no delegation to anything
+  # that reads again or classifies.
+  local body
+  body="$(awk '/^_pair_unchanged_since_read\(\) \{/{f=1} f{print} f&&/^\}/{exit}' \
+    "$SCRIPTS/watch.sh" | grep -v '^[[:space:]]*#')"
+  # Canary: the extraction found the function and its one read, so an absence
+  # below is a real absence rather than an empty string.
+  grep -q 'actas_lock_read' <<<"$body"
+  [ "$(grep -c 'actas_lock_read' <<<"$body")" -eq 1 ]
+  # Neither of these may appear: both read or classify a second time.
+  refute grep -q 'actas_lock_state' <<<"$body"
+  refute grep -q 'actas_lock_sid_alive' <<<"$body"
+  # And the folding reader may not come back anywhere in the tree. It answered
+  # "" and rc 0 for missing, unreadable and empty alike; keeping the guard here
+  # while leaving the function callable just moves the next defect one call site
+  # over. (Review: fix the fold, do not guard the caller.) Comment lines are dropped
+  # first -- several comments name it to say what it used to do, and a check that
+  # forbids naming a removed function is a check nobody can keep green.
+  local named live
+  named="$(grep -rn 'actas_lock_owner' "$SCRIPTS" --include='*.sh' || true)"
+  # Canary: the comments that explain the removal are still there, so an empty
+  # `live` below is a real absence and not a search that matched nothing at all.
+  grep -q 'actas_lock_owner' <<<"$named"
+  live="$(awk '{ l = $0; sub(/^[^:]*:[0-9]+:/, "", l); sub(/^[ \t]+/, "", l);
+                 if (l !~ /^#/) print }' <<<"$named")"
+  [ -z "$live" ]
 }

@@ -102,6 +102,7 @@ Options:
   --name <agent>          Limit wakeups to one agent name.
   --timeout <sec>         watch-once timeout before re-arming (default: 300).
   --interval <sec>        watch-once poll interval (default: 2).
+  --owner <id>            actas owner token used to retain this session's locks.
   --max-wakes <n>         Stop after n wakeups, useful for tests.
   --stale-wake-limit <n>  Stop after n repeated unchanged wakeups (default: 1).
   --connect-timeout-ms <ms>
@@ -258,6 +259,7 @@ function parseArgs(argv) {
     pairs: [],
     workspaceRoots: [],
     turnTimeout: Number(process.env.AGMSG_CODEX_BRIDGE_TURN_TIMEOUT || 60),
+    ownerId: process.env.AGMSG_CODEX_OWNER_ID || "",
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -288,6 +290,8 @@ function parseArgs(argv) {
       opts.timeout = Number(argv[++i]);
     } else if (arg === "--interval") {
       opts.interval = Number(argv[++i]);
+    } else if (arg === "--owner") {
+      opts.ownerId = argv[++i];
     } else if (arg === "--max-wakes") {
       opts.maxWakes = Number(argv[++i]);
     } else if (arg === "--stale-wake-limit") {
@@ -1342,6 +1346,7 @@ class CodexBridge {
         "drain_capable=1",
       ].join("\n") + "\n",
     );
+    this.writeLease();
   }
 
   // The reaper's authority. It is published atomically (temp + rename) so a
@@ -1403,7 +1408,7 @@ class CodexBridge {
   }
 
   leaseHashes() {
-    const projectHash = crypto.createHash("sha1").update(this.opts.project).digest("hex");
+    const projectHash = crypto.createHash("sha1").update(toPosixPath(this.opts.project)).digest("hex");
     // Canonicalize the pair SET before hashing: hash each "team\tname" pair, then
     // sort the hex hashes (pure ASCII, so a byte sort in the launcher and a JS
     // code-unit sort here agree even for non-ASCII names) and hash the joined
@@ -1630,6 +1635,7 @@ class CodexBridge {
       "--interval",
       String(this.opts.interval),
     ];
+    if (this.opts.ownerId) command.push("--owner", this.opts.ownerId);
     for (const pair of this.identities) command.push("--pair", `${pair.team}\t${pair.name}`);
     try {
       await this.client.request("process/spawn", {
@@ -2255,8 +2261,10 @@ class CodexBridge {
     // that *some* eligible identity woke; ownership can change before this
     // turn starts, so never let a stale bridge membership mark another
     // session's messages read.
-    const eligible = spawnSync(BASH_BIN, [path.join(SCRIPT_DIR, "eligible-pairs.sh"), toPosixPath(this.opts.project), this.opts.type,
-      ...this.identities.flatMap((pair) => ["--pair", `${pair.team}\t${pair.name}`])], { cwd: this.opts.project, encoding: "utf8" });
+    const eligibleArgs = [path.join(SCRIPT_DIR, "eligible-pairs.sh"), toPosixPath(this.opts.project), this.opts.type];
+    if (this.opts.ownerId) eligibleArgs.push("--owner", this.opts.ownerId);
+    eligibleArgs.push(...this.identities.flatMap((pair) => ["--pair", `${pair.team}\t${pair.name}`]));
+    const eligible = spawnSync(BASH_BIN, eligibleArgs, { cwd: this.opts.project, encoding: "utf8" });
     if (eligible.error || eligible.status !== 0) {
       console.error("codex-bridge: could not resolve eligible identities before reading inbox");
       return "";
@@ -2278,6 +2286,10 @@ class CodexBridge {
         { cwd: this.opts.project, encoding: "utf8" },
       );
       if (result.error || result.status !== 0) {
+        // A team can disappear after eligibility was resolved. Skip that stale
+        // pair silently; other failures still deserve the bridge diagnostic.
+        if (!result.error && result.status === 1 &&
+            (result.stderr || "").trim() === `agmsg: team not found: ${pair.team}`) continue;
         console.error(`codex-bridge: inbox.sh failed for ${pair.team}/${pair.name}`);
         continue;
       }

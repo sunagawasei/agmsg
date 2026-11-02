@@ -12,8 +12,6 @@
 # file only makes the first.
 
 setup() {
-  QUARANTINED=1
-  skip "quarantined: scripts/lib/self-proof.sh is not in this repo; restore when it lands with the terminal driver (#72)"
   load 'test_helper'
   setup_test_env
   export SKILL_DIR="$TEST_SKILL_DIR"
@@ -25,7 +23,15 @@ setup() {
   mkdir -p "$BATS_TEST_TMPDIR/bin"
   cat > "$BATS_TEST_TMPDIR/bin/ps" <<'PSEOF'
 #!/usr/bin/env bash
-# A process table that the test writes. Only the two forms this code uses.
+# A process table that the test writes. Only the two `-p <pid>` forms below are
+# faked. A `-A ...` whole-table snapshot (what _agmsg_pid_alive_local uses to
+# find its own pid as a canary alongside the target) goes to the real ps
+# instead: what this test needs is a genuinely-dead pid to look genuinely
+# absent, not a fabricated process table that would have to keep this script's
+# own live pid in it to mean anything.
+for _psarg in "$@"; do
+  case "$_psarg" in -A|-A?*) exec /bin/ps "$@" ;; esac
+done
 field=""; pid=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -104,8 +110,6 @@ PSEOF
   done
 }
 teardown() {
-  # setup() skipped before load/setup_test_env, so there is nothing to clean.
-  [ -z "${QUARANTINED:-}" ] || return 0
   # Reaped right here, not left for the shell to notice later (#1187): a
   # killed background job's exit status (143) and bash's own asynchronous
   # "Terminated" notice both surface at whatever point the shell next checks
@@ -547,10 +551,16 @@ w1:pX	$PANE_PID"
 # --- the recorded owner is verified, not just parsed ---------------------------
 
 @test "an owner whose process is gone is undetermined, not a proof about it (#1152)" {
+  skip_on_ci "flaky pid-reuse race under CI's shared runners (#1187)"
   # A lock outlives the process that wrote it. Parsing a pid out of the file says
   # the file holds a number, not that the number is still this session.
   sleep 60 >/dev/null 2>&1 3>&- & local dead=$!
-  kill "$dead" 2>/dev/null; wait "$dead" 2>/dev/null || true
+  # `|| true` on BOTH calls, not just wait's: bats runs test bodies under
+  # errexit by default, and kill returns non-zero (ESRCH) if $dead has
+  # already exited on its own by the time this runs. Left bare, that aborts
+  # the test here -- before the pid-reuse guard below ever gets to decide
+  # whether this run is even measuring what it claims to (#1187).
+  kill "$dead" 2>/dev/null || true; wait "$dead" 2>/dev/null || true
   # The precondition is that the pid is GONE. On a loaded runner the number can
   # be handed to a new process between the wait and the read below (#1187,
   # seen twice on macOS); then this test is not measuring what it says, and a
@@ -579,7 +589,12 @@ w1:pX	$PANE_PID"
   _edge "$$" "$stranger"; _edge "$stranger" "$PANE_PID"; _edge "$PANE_PID" 1
   _driver_returns "w1:p9	$PANE_PID"
   run agmsg_self_proof agmsg seat w1:p9
-  kill "$stranger" 2>/dev/null; wait "$stranger" 2>/dev/null || true
+  # Same reason as the "dead owner" test above: bare under errexit (which
+  # `run` only suspends for the command it wraps, not for what follows), a
+  # kill failure here would abort the test on cleanup -- discarding a result
+  # `run` had already captured -- rather than ever reaching the assertions
+  # below.
+  kill "$stranger" 2>/dev/null || true; wait "$stranger" 2>/dev/null || true
   [ "$status" -eq 2 ]
   [ "$output" = "undetermined"$'\t'"owner_marker_absent" ]
 }

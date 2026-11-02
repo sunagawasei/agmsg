@@ -52,11 +52,11 @@ fi
 # the cache rather than reading a stale path.
 #
 # IMPORTANT: a cache entry is only kept when the helper runs in the caller's own
-# shell. `path="$(_agmsg_role_session_path ...)"` computes the entry inside a
-# command substitution and throws it away with the subshell, so a caller that
-# only ever invokes it that way pays full price every time. Use the _into form
-# below from a long-lived shell; subshells forked afterwards inherit the warm
-# cache and read from it.
+# shell. A stdout wrapper called as `path="$(... )"` would compute the entry
+# inside a command substitution and throw it away with the subshell, so a
+# caller that only ever invoked it that way would pay full price every time.
+# Use this _into form from a long-lived shell; subshells forked afterwards
+# inherit the warm cache and read from it.
 #
 # Parallel arrays, not an associative array: macOS ships bash 3.2, which has
 # none. The pair count is a handful, so the linear scan is cheaper than the
@@ -87,15 +87,10 @@ _agmsg_role_session_path_into() {
   return 0
 }
 
-# stdout form, for callers that are not in a hot loop.
-_agmsg_role_session_path() {
-  _agmsg_role_session_path_into "$1" "$2"
-  printf '%s' "$_AGMSG_ROLE_SESSION_PATH"
-}
-
-# Read the two fields the codex bridge launcher needs in ONE pass, into the
-# caller's shell: AGMSG_ROLE_SESSION_UUID and AGMSG_ROLE_SESSION_PROJECT. Both
-# are empty when the record or the field is absent. This exists so the poll path
+# Read the fields the codex bridge launcher needs in ONE pass, into the caller's
+# shell: AGMSG_ROLE_SESSION_UUID, AGMSG_ROLE_SESSION_PROJECT, and
+# AGMSG_ROLE_SESSION_OWNER. All are empty when the record or field is absent.
+# This exists so the poll path
 # can resolve a role without a single command substitution -- the getters below
 # are fine one-shot, but each one costs a subshell and its own read of the same
 # file, and the launcher wants both fields for the same pair several times a
@@ -104,6 +99,7 @@ agmsg_role_session_load() {
   local team="$1" agent="$2" line path have_uuid=0 have_project=0
   AGMSG_ROLE_SESSION_UUID=""
   AGMSG_ROLE_SESSION_PROJECT=""
+  AGMSG_ROLE_SESSION_OWNER=""
   _agmsg_role_session_path_into "$team" "$agent"
   path="$_AGMSG_ROLE_SESSION_PATH"
   [ -f "$path" ] || return 0
@@ -114,6 +110,9 @@ agmsg_role_session_load() {
         ;;
       project=*)
         [ "$have_project" = "1" ] || { AGMSG_ROLE_SESSION_PROJECT="${line#project=}"; have_project=1; }
+        ;;
+      owner=*)
+        [ -n "$AGMSG_ROLE_SESSION_OWNER" ] || AGMSG_ROLE_SESSION_OWNER="${line#owner=}"
         ;;
     esac
   done < "$path" 2>/dev/null
@@ -137,13 +136,48 @@ agmsg_role_session_load() {
 #                          (PR-D) needs it to rebuild the role's boot command
 #                          from the type manifest. Empty when unknown.
 #   project=<project>      the resolved project root
+#   owner=<instance_id>    the actas owner token written by actas-claim
+#   codex_home=<path>      the effective absolute Codex profile directory
 #   updated_at=<iso8601>   best-effort timestamp (empty if date(1) unavailable)
+# All read/modify/write operations share this lock. In particular, startup's
+# inactive-owner check and replacement must be one transaction with every writer.
+_agmsg_role_session_write() (
+  local dir
+  dir="$(_actas_lock_dir)"
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 1
+  AGMSG_HELD_LOCKS=''
+  source "$SKILL_DIR/scripts/lib/registry-lock.sh" || return 1
+  agmsg_lock_acquire "$dir" || return 1
+  trap agmsg_lock_release EXIT
+  "$@"
+)
+
 agmsg_role_session_record() {
-  local team="$1" agent="$2" bare_sid="$3" project="${4:-}" type="${5:-}" owner="${6:-}"
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] && [ -n "${3:-}" ] || return 0
+  if _agmsg_role_session_write _agmsg_role_session_record_unlocked "$@"; then return 0; fi
+  # Existing callers use best-effort recording; automatic takeover needs a verdict.
+  [ "${8:-}" != inactive ]
+}
+
+_agmsg_role_session_record_unlocked() {
+  local team="$1" agent="$2" bare_sid="$3" project="${4:-}" type="${5:-}" owner="${6:-}" codex_home="${7:-}"
   [ -n "$team" ] && [ -n "$agent" ] && [ -n "$bare_sid" ] || return 0
   local path dir tmp ts named_ref="" named_epoch="" named_at=""
   _agmsg_role_session_path_into "$team" "$agent"
   path="$_AGMSG_ROLE_SESSION_PATH"
+  if [ "${8:-}" = inactive ]; then
+    agmsg_role_session_load "$team" "$agent"
+    if [ "$AGMSG_ROLE_SESSION_UUID" != "$bare_sid" ] \
+      && agmsg_instance_is_composite "${AGMSG_ROLE_SESSION_OWNER:-}"; then
+      local alive=0
+      agmsg_instance_alive "$AGMSG_ROLE_SESSION_OWNER" || alive=$?
+      [ "$alive" = 1 ] || return 1
+    fi
+  fi
+  # The naming mark (named_ref / named_at, see agmsg_role_session_mark_named)
+  # survives a re-record: this function rewrites the session fields, and the
+  # mark is a fact about the PANE, not about the session. Dropping it here
+  # would cost one terminal round trip on the seat's next action for nothing.
   named_ref="$(_agmsg_role_session_field "$path" named_ref)"
   named_epoch="$(_agmsg_role_session_field "$path" named_epoch)"
   named_at="$(_agmsg_role_session_field "$path" named_at)"
@@ -159,6 +193,7 @@ agmsg_role_session_record() {
     printf 'type=%s\n' "$type"
     printf 'project=%s\n' "$project"
     [ -z "$owner" ] || printf 'owner=%s\n' "$owner"
+    [ -z "$codex_home" ] || printf 'codex_home=%s\n' "$codex_home"
     printf 'updated_at=%s\n' "$ts"
     [ -z "$named_ref" ] || printf 'named_ref=%s\n' "$named_ref"
     [ -z "$named_ref" ] || printf 'named_epoch=%s\n' "$named_epoch"
@@ -168,36 +203,129 @@ agmsg_role_session_record() {
   return 0
 }
 
-# Read a single field from a role's record by (team, agent). Empty if absent.
-# Convenience getter used by consumers that need one field (e.g. the resurrect
-# hook reading `type`); mirrors agmsg_role_session_uuid's read of `session`.
-agmsg_role_session_get() {
-  local team="$1" agent="$2" key="$3" path
-  _agmsg_role_session_path_into "$team" "$agent"
-  _agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" "$key"
+# The naming mark: "agmsg named the pane <ref> for this (team, agent)". It is a
+# record of what agmsg DID, not a guarantee of what the terminal shows now --
+# a pane can be closed and reused by another seat, and a terminal can restart
+# and forget the name while the mark survives. So a reader compares named_ref
+# with the pane it is in NOW (see agmsg_self_name_on_action) and treats any
+# difference as "not named"; a reference that carries the terminal server's
+# identity (tmux: $TMUX, with the server pid inside) invalidates itself on a
+# restart, one that does not (herdr: the pane id alone) cannot, and that case
+# is named as a blind spot where the hook is documented.
+#
+# Every other field of the record is preserved; a record that does not exist
+# yet (a seat that never went through actas/session-start, e.g. one started by
+# hand) is created with the identity fields and no session line -- every
+# reader of this file is fail-open on a missing field.
+#
+#   agmsg_role_session_mark_named <team> <agent> <ref> <epoch> [<project>] [<type>]
+#
+# <epoch> is the terminal server's generation as the environment shows it
+# (tmux: the server pid inside $TMUX; herdr: inode and ctime of the socket at
+# $HERDR_SOCKET_PATH, which the server recreates when it starts). A restarted
+# server changes it, so a mark made against the old server no longer matches
+# even when the pane reference is reused unchanged.
+# Overwrite ONLY messaging_socket/claude_config_dir, leaving every other
+# field (session, project, owner, named_ref, ...) untouched — unlike
+# agmsg_role_session_record, this never creates a fresh record: SessionStart
+# calls this for every pair in PAIRS on every start/resume, and most of those
+# pairs already have a record from actas-claim.sh; one that does not is a
+# seat that was never claimed, and writing messaging-only fields for it would
+# fabricate a role-session record session-start.sh itself never establishes
+# (#339 stays actas-claim's job). A record that lacks these fields reads back
+# as empty, which the daemon treats exactly like Codex's role_session_missing
+# -- never as a fatal read error.
+#
+# <messaging_socket> is the this-session's uds: peer address with the prefix
+# stripped (empty if invalid/absent -- see _session-start.sh's own guard,
+# which mirrors codex_home's). <claude_config_dir> is CLAUDE_CONFIG_DIR, or
+# ~/.claude when unset -- the base this session's own Claude Code build
+# actually uses, never assumed by this function.
+# <bare_sid>, when given, replaces the record's own session= line (#1577
+# review): a record's session= is only ever written at actas-claim time, so
+# after /clear -- which keeps the same socket/process but hands this session
+# a brand-new Claude Code session id -- it would otherwise go stale right as
+# this function refreshes the fields that matter for finding its transcript
+# (the daemon derives the transcript path from BOTH claude_config_dir and
+# this session id together). Empty means "leave session= as it is" (every
+# other existing caller passes none).
+agmsg_role_session_set_messaging() {
+  _agmsg_role_session_write _agmsg_role_session_set_messaging_unlocked "$@" || true
 }
 
-# Read a single field from a record file. Empty if file/field absent.
-#
-# Builtins only. This was `sed -n | head -1`, i.e. two processes per field, and
-# the codex bridge launcher reads two fields per role on every poll iteration.
-# The record is a handful of short key=value lines, so reading it in the shell
-# is both cheaper and exactly equivalent: first match wins, and the value is
-# everything after the first '='.
-_agmsg_role_session_field() {
-  local path="$1" key="$2" line
+_agmsg_role_session_set_messaging_unlocked() {   # <team> <agent> <messaging_socket> <claude_config_dir> [<bare_sid> [<messaging_token>]]
+  local team="$1" agent="$2" socket="$3" config_dir="$4" bare_sid="${5:-}" token="${6:-}"
+  # The token is a credential for posting to this session's own inbox: kept
+  # only when it is a plain word, and the record (mktemp: owner-only) is never
+  # made readable by anyone else.
+  case "$token" in ''|*[!A-Za-z0-9._-]*) token="" ;; esac
+  [ -n "$team" ] && [ -n "$agent" ] || return 0
+  local path dir tmp line
+  _agmsg_role_session_path_into "$team" "$agent"
+  path="$_AGMSG_ROLE_SESSION_PATH"
   [ -f "$path" ] || return 0
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      "$key"=*) printf '%s\n' "${line#"$key"=}"; return 0 ;;
-    esac
-  done < "$path" 2>/dev/null
+  dir="$(_actas_lock_dir)"
+  tmp="$(mktemp "$dir/.role-session.XXXXXX" 2>/dev/null)" || return 0
+  {
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        messaging_socket=*|claude_config_dir=*|messaging_token=*|messaging_blocked=*) ;;
+        session=*) [ -z "$bare_sid" ] && printf '%s\n' "$line" ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$path"
+    [ -z "$bare_sid" ] || printf 'session=%s\n' "$bare_sid"
+    [ -z "$socket" ] || printf 'messaging_socket=%s\n' "$socket"
+    [ -z "$config_dir" ] || printf 'claude_config_dir=%s\n' "$config_dir"
+    [ -z "$token" ] || printf 'messaging_token=%s\n' "$token"
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
   return 0
 }
 
-# Persist that agmsg named the current terminal reference for this role while
-# preserving all session/owner fields already present in the record.
+# The SessionStart hook could not publish this session's delivery destination
+# (<reason>, a short snake_case word). Drop the old destination, which belongs to
+# a process that is gone, and record why, so agmsgd reports the seat as
+# unaddressable for that reason instead of keeping an out-of-date address.
+# <expected_bare_sid> is checked under the same lock as the write: a session that
+# published in between keeps its destination, and rc 1 says nothing was changed.
+agmsg_role_session_mark_messaging_blocked() {   # <team> <agent> <reason> <expected_bare_sid>
+  _agmsg_role_session_write _agmsg_role_session_mark_messaging_blocked_unlocked "$@"
+}
+
+_agmsg_role_session_mark_messaging_blocked_unlocked() {
+  local team="$1" agent="$2" reason="$3" expect="${4:-}" path dir tmp line current=""
+  case "$reason" in ''|*[!a-z_]*) return 1 ;; esac
+  [ -n "$team" ] && [ -n "$agent" ] && [ -n "$expect" ] || return 1
+  _agmsg_role_session_path_into "$team" "$agent"
+  path="$_AGMSG_ROLE_SESSION_PATH"
+  [ -f "$path" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in session=*) current="${line#session=}"; break ;; esac
+  done < "$path"
+  [ "$current" = "$expect" ] || return 1
+  dir="$(_actas_lock_dir)"
+  tmp="$(mktemp "$dir/.role-session.XXXXXX" 2>/dev/null)" || return 1
+  {
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        messaging_socket=*|claude_config_dir=*|messaging_token=*|messaging_blocked=*) ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$path"
+    printf 'messaging_blocked=%s\n' "$reason"
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$path" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
 agmsg_role_session_mark_named() {
+  _agmsg_role_session_write _agmsg_role_session_mark_named_unlocked "$@" || true
+}
+
+_agmsg_role_session_mark_named_unlocked() {
   local team="$1" agent="$2" ref="$3" epoch="${4:-}" project="${5:-}" type="${6:-}"
   [ -n "$team" ] && [ -n "$agent" ] && [ -n "$ref" ] || return 0
   local path dir tmp ts line
@@ -228,6 +356,38 @@ agmsg_role_session_mark_named() {
   return 0
 }
 
+# Drop the naming mark without touching any other field (#1485): a pane taken
+# over from a dead session's record must stop asserting that OLD (team, agent)
+# still holds it, while the role itself (every other line in the file) stays
+# registered exactly as it was. No-op, successfully, when there is no record or
+# no mark -- this is cleanup, never something a caller needs to react to.
+#
+# BY PATH, unlike every other public function here: the one caller (the
+# placement guard's dead-claimant takeover) finds the record from a spawn
+# record's file NAME, and #1114's own comment already covers why team/agent
+# cannot be decoded back out of that name ("__" is legal inside a name). This
+# takes the same role-session PATH the guard already computed by substituting
+# "spawn." for "role-session." in that file name, rather than asking every
+# caller to re-derive team/agent just to hand them back in for re-encoding.
+agmsg_role_session_clear_named_at() {
+  _agmsg_role_session_write _agmsg_role_session_clear_named_at_unlocked "$@" || true
+}
+
+_agmsg_role_session_clear_named_at_unlocked() {   # <role-session-record-path>
+  local path="$1" dir tmp line
+  [ -n "$path" ] && [ -f "$path" ] || return 0
+  dir="$(_actas_lock_dir)"
+  tmp="$(mktemp "$dir/.role-session.XXXXXX" 2>/dev/null)" || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in named_ref=*|named_epoch=*|named_at=*) ;; *) printf '%s\n' "$line" ;; esac
+  done < "$path" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# The mark as "<ref>\t<epoch>", or empty when there is none. Two reads of one
+# small file, no process; this is the common-case cost of "am I named?"
+# (measured 0.22 ms), which is what lets a seat ask on every action.
 agmsg_role_session_named() {
   local team="$1" agent="$2" ref epoch
   _agmsg_role_session_path_into "$team" "$agent"
@@ -237,32 +397,95 @@ agmsg_role_session_named() {
   printf '%s\t%s\n' "$ref" "$epoch"
 }
 
+# The self-RENAME mark (#1081), separate from the naming mark above because it
+# records a different cell (the CLI session name) and, unlike naming, it MUST fire
+# at most once per (seat, pane, server generation): typing `/rename` into a live
+# session is invasive, so the mark is what stops a second attempt -- on the next
+# action AND in the next process, since it is persisted here. <result> is the
+# outcome the seat reached: attempted | ok | poked_unverified | failed |
+# skipped:<why>. <ref>/<epoch> key it to the pane+generation, so a reused pane or
+# a restarted server is a NEW attempt, exactly as the naming mark is.
+#   agmsg_role_session_mark_renamed <team> <agent> <ref> <epoch> <result> [project] [type]
+agmsg_role_session_mark_renamed() {
+  _agmsg_role_session_write _agmsg_role_session_mark_renamed_unlocked "$@" || true
+}
+
+_agmsg_role_session_mark_renamed_unlocked() {
+  local team="$1" agent="$2" ref="$3" epoch="${4:-}" result="${5:-}" project="${6:-}" type="${7:-}"
+  [ -n "$team" ] && [ -n "$agent" ] && [ -n "$ref" ] || return 0
+  local path dir tmp ts line
+  _agmsg_role_session_path_into "$team" "$agent"
+  path="$_AGMSG_ROLE_SESSION_PATH"
+  dir="$(_actas_lock_dir)"
+  mkdir -p "$dir" 2>/dev/null || true
+  tmp="$(mktemp "$dir/.role-session.XXXXXX" 2>/dev/null)" || return 0
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+  {
+    if [ -f "$path" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in renamed_ref=*|renamed_epoch=*|rename_result=*|renamed_at=*) ;; *) printf '%s\n' "$line" ;; esac
+      done < "$path"
+    else
+      printf 'name=%s-%s\n' "$team" "$agent"
+      printf 'team=%s\n' "$team"
+      printf 'agent=%s\n' "$agent"
+      printf 'type=%s\n' "$type"
+      printf 'project=%s\n' "$project"
+      printf 'updated_at=%s\n' "$ts"
+    fi
+    printf 'renamed_ref=%s\n' "$ref"
+    printf 'renamed_epoch=%s\n' "$epoch"
+    printf 'rename_result=%s\n' "$result"
+    printf 'renamed_at=%s\n' "$ts"
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# The rename mark as "<ref>\t<epoch>\t<result>", or empty when there is none.
+agmsg_role_session_renamed() {
+  local team="$1" agent="$2" ref epoch result
+  _agmsg_role_session_path_into "$team" "$agent"
+  ref="$(_agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" renamed_ref)"
+  [ -n "$ref" ] || return 0
+  epoch="$(_agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" renamed_epoch)"
+  result="$(_agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" rename_result)"
+  printf '%s\t%s\t%s\n' "$ref" "$epoch" "$result"
+}
+
+# Read a single field from a role's record by (team, agent). Empty if absent.
+# Convenience getter used by consumers that need one field (e.g. the resurrect
+# hook reading `type`); mirrors agmsg_role_session_uuid's read of `session`.
+agmsg_role_session_get() {
+  local team="$1" agent="$2" key="$3" path
+  _agmsg_role_session_path_into "$team" "$agent"
+  _agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" "$key"
+}
+
+# Read a single field from a record file. Empty if file/field absent.
+#
+# Builtins only. This was `sed -n | head -1`, i.e. two processes per field, and
+# the codex bridge launcher reads two fields per role on every poll iteration.
+# The record is a handful of short key=value lines, so reading it in the shell
+# is both cheaper and exactly equivalent: first match wins, and the value is
+# everything after the first '='.
+_agmsg_role_session_field() {
+  local path="$1" key="$2" line
+  [ -f "$path" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key"=*) printf '%s\n' "${line#"$key"=}"; return 0 ;;
+    esac
+  done < "$path" 2>/dev/null
+  return 0
+}
+
 # Read back the recorded bare session id for (team, agent). Empty if no record.
 # This is the primary getter used by the boot wrapper (PR-C).
 agmsg_role_session_uuid() {
   local team="$1" agent="$2" path
   _agmsg_role_session_path_into "$team" "$agent"
   _agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" session
-}
-
-# Scan run/role-session.* for the record whose name= field equals <name> and
-# print its full body (all key=value lines). Empty if none. Matches on the whole
-# name= field (never by splitting on '-'), per the record's raison d'etre.
-# Used by the resurrect hook (PR-D) to map a pane's `-n <name>` back to a uuid.
-agmsg_role_session_lookup_by_name() {
-  local name="$1" dir f v
-  [ -n "$name" ] || return 0
-  dir="$(_actas_lock_dir)"
-  [ -d "$dir" ] || return 0
-  for f in "$dir"/role-session.*; do
-    [ -f "$f" ] || continue
-    v="$(_agmsg_role_session_field "$f" name)"
-    if [ "$v" = "$name" ]; then
-      cat "$f" 2>/dev/null || true
-      return 0
-    fi
-  done
-  return 0
 }
 
 # Print the session id of every record of <type>, one per line (unordered, may
@@ -301,4 +524,99 @@ agmsg_role_session_lookup_by_sid() {
     fi
   done
   return 0
+}
+
+# Print "<team>\t<agent>" for the ONE role whose record has type=<type>,
+# session=<sid> and project=<project_physical>, or nothing (and return 1) when
+# zero or several such records exist. <project_physical> must already be in
+# the same canonical (symlink-resolved) form agmsg_role_session_record itself
+# stores -- pass it through agmsg_canonical_path first, the same way
+# codex-record-session.sh does before recording.
+#
+# Same "exactly one or nothing" bias as every other inference in this family
+# (agmsg_role_session_recorded_uuids's subtraction in codex-record-session.sh,
+# the rollout-scan fallback there): guessing which role to hand a resumed
+# thread to is worse than not handing it to one, so an ambiguous or absent
+# answer is silence, never a pick among candidates (#1401).
+agmsg_role_session_match_unique() {
+  local type="$1" project_physical="$2" sid="$3" dir f t p v team agent match=""
+  [ -n "$type" ] && [ -n "$project_physical" ] && [ -n "$sid" ] || return 1
+  dir="$(_actas_lock_dir)"
+  [ -d "$dir" ] || return 1
+  for f in "$dir"/role-session.*; do
+    [ -f "$f" ] || continue
+    t="$(_agmsg_role_session_field "$f" type)"
+    [ "$t" = "$type" ] || continue
+    v="$(_agmsg_role_session_field "$f" session)"
+    [ "$v" = "$sid" ] || continue
+    p="$(_agmsg_role_session_field "$f" project)"
+    [ "$p" = "$project_physical" ] || continue
+    # A second qualifying record makes the answer ambiguous; give up rather
+    # than pick the first one found (readdir order is not meaningful).
+    [ -n "$match" ] && return 1
+    team="$(_agmsg_role_session_field "$f" team)"
+    agent="$(_agmsg_role_session_field "$f" agent)"
+    [ -n "$team" ] && [ -n "$agent" ] || continue
+    match="$team"$'\t'"$agent"
+  done
+  [ -n "$match" ] || return 1
+  printf '%s\n' "$match"
+  return 0
+}
+
+# Print "<socket>\t<claude_config_dir>" for this Claude Code process, or
+# nothing (rc 1) when it has no usable messaging socket. Same guard shape
+# codex-record-session.sh applies to CODEX_HOME: anything that is not an
+# absolute path, or that carries a control character, is never published as a
+# delivery destination (a malformed value would look addressable and silently
+# never deliver). CLAUDE_CONFIG_DIR falls back to ~/.claude only when unset;
+# it must never be hardcoded, since accounts can live elsewhere.
+agmsg_claude_code_native_target() {
+  local raw="${CLAUDE_CODE_MESSAGING_SOCKET:-}" socket="" config_dir="${CLAUDE_CONFIG_DIR:-${HOME:+$HOME/.claude}}"
+  case "$raw" in
+    uds:/*) socket="${raw#uds:}" ;;
+    /*) socket="$raw" ;;
+    # Native Windows: a named pipe, \\.\pipe\LOCAL\cc-msg-<hex>
+    uds:\\\\*) socket="${raw#uds:}" ;;
+    \\\\*) socket="$raw" ;;
+  esac
+  case "$socket" in *[[:cntrl:]]*) socket="" ;; esac
+  # Native Windows sets no CLAUDE_CONFIG_DIR; its default is under the user
+  # profile, which a Git Bash hook sees as $HOME (/c/Users/me) or only as
+  # %USERPROFILE% (C:\Users\me).
+  [ -n "$config_dir" ] || config_dir="${USERPROFILE:+$USERPROFILE/.claude}"
+  case "$config_dir" in
+    *[[:cntrl:]]*) config_dir="" ;;
+    /*) ;;
+    [A-Za-z]:[\\/]*) ;;
+    *) config_dir="" ;;
+  esac
+  [ -n "$socket" ] && [ -n "$config_dir" ] || return 1
+  printf '%s\t%s\n' "$socket" "$config_dir"
+}
+
+# Publish <socket>/<config_dir> into <team>/<agent>'s record for <bare_sid>,
+# then read it back: the same check the daemon applies before it will address
+# the seat, so "the record took" is verified, not assumed. rc 0 only when it did.
+agmsg_role_session_publish_messaging() {   # <team> <agent> <socket> <config_dir> <bare_sid> [<token>]
+  local team="$1" agent="$2" socket="$3" config_dir="$4" bare_sid="$5" token="${6:-}"
+  agmsg_role_session_set_messaging "$team" "$agent" "$socket" "$config_dir" "$bare_sid" "$token"
+  [ "$(agmsg_role_session_get "$team" "$agent" messaging_socket 2>/dev/null || true)" = "$socket" ] \
+    && [ "$(agmsg_role_session_get "$team" "$agent" claude_config_dir 2>/dev/null || true)" = "$config_dir" ] \
+    && [ "$(agmsg_role_session_uuid "$team" "$agent" 2>/dev/null || true)" = "$bare_sid" ]
+}
+
+# rc 0 only when agmsgd's Claude channel will accept this install's storage.
+# The answer comes from the daemon's own reader (storage-gate.mjs calls
+# readStorageDriver), run with the node the daemon itself runs on (the
+# node_path recorded at enable), not whatever node is first on PATH: an older
+# PATH node would fail the check while the daemon is fine. Declaring the
+# native channel when the daemon will refuse to deliver would leave the seat
+# with neither the daemon nor a Monitor; an unreadable node_path or a failed
+# check is "not ready".
+agmsg_claude_code_native_storage_ready() {
+  local node_path
+  node_path="$(sqlite3 -readonly -cmd '.timeout 100' "${SKILL_DIR:-}/run/install.db" 'SELECT node_path FROM meta;' 2>/dev/null)" || return 1
+  [ -n "$node_path" ] && [ -x "$node_path" ] || return 1
+  "$node_path" "${SKILL_DIR:-}/scripts/daemon/channels/storage-gate.mjs" >/dev/null 2>&1
 }

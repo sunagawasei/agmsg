@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Hooks and their child operations must not run user recovery notices.
+export AGMSG_DAEMON_NOTICE_SKIP=1
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 
@@ -44,6 +46,8 @@ RUN_DIR="$SKILL_DIR/run"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/registry-lock.sh"  # publish cc-instance only after a complete write
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/node.sh"
@@ -76,6 +80,8 @@ source "$SCRIPT_DIR/lib/session-retention.sh"
 # shell's descriptors are untouched. See lib/close-fds.sh.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/close-fds.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/terminal-context-line.sh"
 
 # Session-team code paths are gated on type CAPABILITY (type.conf declares
 # session_team=yes) AND runtime opt-in (delivery.session_team) — capability
@@ -84,6 +90,11 @@ source "$SCRIPT_DIR/lib/close-fds.sh"
 _agmsg_session_team_active() {
   agmsg_type_has "$TYPE" session_team yes && agmsg_session_team_enabled
 }
+
+# One-time introduction to agmsgd, for an install that has not turned it on.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/agmsgd-intro.sh"
+agmsg_agmsgd_intro_notice "$TYPE"
 
 # Read the hook input JSON (stdin) up-front. The hook's session_id is the
 # authoritative source for the session team, and stdin can be read only once —
@@ -540,21 +551,20 @@ agmsg_marker_gc_stale 2>/dev/null || true
 AGENT_PID=$(agmsg_agent_pid "$TYPE" 2>/dev/null || true)
 [ -n "$AGENT_PID" ] && agmsg_write_project_marker "$AGENT_PID" "$PROJECT" 2>/dev/null || true
 
-# Garbage-collect stream watermarks (#107) and readiness sentinels (#108) whose
-# owner session_id is no longer alive — left behind when a watcher dies without
-# running its EXIT trap (SIGKILL, terminal crash). Runs after the dead
-# cc-instance cleanup so actas_lock_sid_alive reflects current liveness. Both
-# are advisory (a live watcher rewrites them on attach; spawn clears the
-# sentinel before use), so this is hygiene, not correctness.
-for f in "$RUN_DIR"/watch.*.watermark; do
-  [ -f "$f" ] || continue
-  wm_sid=${f##*/}; wm_sid=${wm_sid#watch.}; wm_sid=${wm_sid%.watermark}
-  actas_lock_sid_alive "$wm_sid" || rm -f "$f"
-done
+# Garbage-collect readiness sentinels (#108) whose owner session_id is no longer
+# alive. Read progress is store-owned, so there is no per-session watermark to
+# collect.
 for f in "$RUN_DIR"/ready.*; do
   [ -f "$f" ] || continue
-  rd_sid=$(cat "$f" 2>/dev/null || true)
-  { [ -n "$rd_sid" ] && actas_lock_sid_alive "$rd_sid"; } || rm -f "$f"
+  # Deleting a ready sentinel needs a positive reason. `|| true` on the read and a
+  # boolean liveness meant "could not read it" and "could not tell" both arrived
+  # as "its owner is gone", and this line then removed a LIVE watcher's sentinel.
+  # Remove only on a read that worked plus a positive dead. (#983)
+  _rd_rc=0; rd_sid=$(cat "$f" 2>/dev/null) || _rd_rc=$?
+  _rd_alive=0; actas_lock_sid_alive "$rd_sid" || _rd_alive=$?
+  if [ "$_rd_rc" -eq 0 ] && [ -n "$rd_sid" ] && [ "$_rd_alive" -eq 1 ]; then
+    rm -f "$f"
+  fi
 done
 
 
@@ -606,7 +616,11 @@ if [ -n "$CC_PID" ]; then
       agmsg_session_team_purge_orphan_rows "$_lifecycle_team" >/dev/null || true
     fi
   fi
-  printf '%s\n' "$INSTANCE_ID" > "$STATE"
+  if ! agmsg_write_atomic "$STATE" "$INSTANCE_ID"; then
+    printf 'agmsg: could not publish the complete instance marker: %s\n' "$STATE" >&2
+    agmsg_team_lifecycle_lock_release "$_lifecycle_team"
+    exit 1
+  fi
   rm -f "$RUN_DIR/session-start-lock-failed.$CC_PID"
   # Recover this team under the same lock that published cc-instance so a
   # resume's bare-sid veto and the kill decision cannot straddle another
@@ -760,6 +774,54 @@ if agmsg_session_team_enabled; then
   agmsg_retention_sweep || true
 fi
 
+# --- Start the engine for a connected team that has none (#761, #774). ---
+# A reboot leaves every sync engine dead and nothing restarts one: the five
+# commands that start it are all operator actions. `connected` keeps printing,
+# `send` keeps succeeding locally, and the only symptom is messages not arriving
+# — which reads as "nobody wrote anything". This is the first moment after a
+# reboot when anything of ours runs, so it is where it gets started.
+#
+# #765 made the absence VISIBLE here, in this block, and that was the right
+# first step and not enough: the warning appeared only when someone opened a
+# session, and it asked the person for something the machine can do. Starting it
+# is the same trigger doing the whole job.
+#
+# BEFORE the three directive blocks below rather than inside them: there are
+# three ways out of this script (a watcher already streaming, the actas variant,
+# and the default), and a line added to one of them is missing from the other
+# two.
+#
+# WHICH TEAMS. `status` is asked for CONNECTED teams — the binding, not the
+# engine. Whether an engine is running is `sync start`'s question, under the
+# lock that makes the answer true; asking it here as well is the second answer
+# that diverges (see scripts/lib/sync-autostart.sh).
+#
+# Best-effort, and bounded IN TIME as well as in outcome. `status` is a
+# subprocess and needs python3; if it cannot run, this does nothing rather than
+# guessing. A start that fails never fails the session, and a start that is SLOW
+# never delays the Monitor directive below: the helper waits for a whole-call
+# budget (`AGMSG_SYNC_AUTOSTART_TIMEOUT_S`, 5s) and then leaves the start
+# running and moves on. An agent that will not open because a sync engine was
+# thinking is worse than a sync engine that is down.
+#
+# Reaches `monitor` and `both` only — this hook is not installed for `turn` or
+# `off`, so those modes still get the absence only from `status`.
+if [ -x "$SKILL_DIR/scripts/remote.sh" ] && [ -r "$SKILL_DIR/scripts/lib/sync-autostart.sh" ]; then
+  # shellcheck source=scripts/lib/sync-autostart.sh
+  . "$SKILL_DIR/scripts/lib/sync-autostart.sh"
+  _connected_teams="$("$SKILL_DIR/scripts/remote.sh" status 2>/dev/null \
+    | awk -F'\t' '$2 ~ /^connected/ {print $1}' || true)"
+  if [ -n "$_connected_teams" ]; then
+    # Word splitting on newlines only: a team name may contain a space, and
+    # `$(...)` unquoted would split it into two names that start nothing.
+    _old_ifs="$IFS"; IFS=$'\n'
+    # shellcheck disable=SC2086
+    set -- $_connected_teams
+    IFS="$_old_ifs"
+    agmsg_sync_autostart "$SKILL_DIR/scripts/remote.sh" "$@" || true
+  fi
+fi
+
 # --- Skip directive when a watcher is already alive for this instance. ---
 # /compact re-fires SessionStart within the same CC process and session_id, so
 # INSTANCE_ID is identical to the already-running watcher's.  Without this
@@ -773,6 +835,8 @@ if [ -f "$WATCHER_PIDFILE" ]; then
       "watch|$INSTANCE_ID|$WATCH_PROJECT|$TYPE" \
       "$SCRIPT_DIR/watch.sh" "$INSTANCE_ID" "$PROJECT" "$TYPE"; then
     cat <<EOF
+$TERMINAL_LINE
+$TEAM_LINE
 AGMSG monitor mode: a watch.sh is already streaming for this session (pid $existing).
 No action needed — the existing watcher is the active one.
 EOF
@@ -817,7 +881,17 @@ if [ -z "$ROLE_NAME" ] && ! command -v agmsg_session_start_emit_directive >/dev/
   _tab="$(printf '\t')"
   while IFS="$_tab" read -r _p_team _p_agent; do
     [ -n "$_p_team" ] && [ -n "$_p_agent" ] || continue
-    _owner="$(actas_lock_owner "$_p_team" "$_p_agent" 2>/dev/null || true)"
+    # A lock we could not READ is not a lock that isn't ours. Counting it as
+    # "not ours" can leave _narrow_n at exactly 1 from some other pair and
+    # re-seat this session onto the wrong role. Treating the whole narrowing as
+    # ambiguous is the fail-closed direction and costs an unfiltered-watcher
+    # refusal, which is the outcome this block already has for 2+. (#983)
+    _own_r="$(actas_lock_read "$_p_team" "$_p_agent" 2>/dev/null)" || _own_r="unreadable$_tab"
+    case "${_own_r%%"$_tab"*}" in
+      ok)         _owner="${_own_r#*"$_tab"}" ;;
+      absent)     continue ;;
+      *)          _narrow_n=2; break ;;
+    esac
     [ -n "$_owner" ] || continue
     _owner_bare="$(agmsg_instance_bare_sid "$_owner" 2>/dev/null || printf '%s' "$_owner")"
     if [ "$_owner_bare" = "$_bare_sid" ]; then
@@ -828,6 +902,32 @@ $PAIRS
 EOF
   if [ "$_narrow_n" -eq 1 ]; then
     ROLE_NAME="$_narrow_agent"; ROLE_TEAM="$_narrow_team"; ROLE_BASIS=actas
+  fi
+fi
+
+# Re-apply this pane's name for the seat we just re-established. herdr DROPS an
+# agent's name when the agent exits, so join and actas alone leave a resumed
+# session nameless — and a nameless pane is invisible to peek/poke. This is the
+# third caller of the naming step for exactly that reason (v1 scope, item 4).
+#
+# Only when the seat is KNOWN: an empty ROLE_NAME here is the ambiguous case the
+# block above deliberately refuses to guess at, and naming a pane for the wrong
+# seat is worse than leaving it unnamed. The bare session id is what herdr's
+# `agent list` carries (not the composite INSTANCE_ID).
+#
+# The registry is sourced with the errexit lift: on bash 3.2 a failure inside a
+# sourced file fires THIS script's `set -e`, so a plain `. x || true` would take
+# SessionStart down rather than skip the naming.
+if [ -n "$ROLE_NAME" ] && [ -n "$ROLE_TEAM" ]; then
+  _agmsg_tr_rc=0; _agmsg_tr_e=0
+  case $- in *e*) _agmsg_tr_e=1 ;; esac
+  set +e
+  # shellcheck disable=SC1091
+  [ -r "$SCRIPT_DIR/lib/terminal-registry.sh" ] && . "$SCRIPT_DIR/lib/terminal-registry.sh"
+  _agmsg_tr_rc=$?
+  [ "$_agmsg_tr_e" = 1 ] && set -e
+  if [ "$_agmsg_tr_rc" -eq 0 ] && declare -F agmsg_terminal_name_self_safe >/dev/null 2>&1; then
+    agmsg_terminal_name_self_safe "$SESSION_ID" "$ROLE_TEAM" "$ROLE_NAME" "$PROJECT" "$TYPE" record || true
   fi
 fi
 
@@ -863,6 +963,20 @@ WATCH="$SKILL_DIR/scripts/watch.sh"
   fi
 }
 
+# One where.sh call, rendered once, reused by every text-emitting exit below —
+# so a session always learns its own terminal driver and capabilities as the
+# FIRST thing in its context, before any Monitor-tool instruction, rather than
+# having to guess from env vars/grep the way #1171's incident agent did.
+TERMINAL_LINE="$(agmsg_terminal_context_line "$SESSION_ID" "$SKILL_DIR" 2>/dev/null || true)"
+[ -n "$TERMINAL_LINE" ] || TERMINAL_LINE="AGMSG terminal: could not be determined (agmsg_terminal_context_line produced no output)"
+
+# Companion to TERMINAL_LINE: that line is this session's OWN placement;
+# teammates' placement is team.sh's question, not this hook's to compute and
+# print stale — a teammate can move between this session start and the moment
+# the reader acts on it. So this points at the live command rather than a
+# snapshotted answer.
+TEAM_LINE="AGMSG team.sh <team>: shows every teammate's placement and status. To act on one, run peek.sh/poke.sh/arrange.sh <team> <name> directly — its exit code says whether it worked and why not (see each driver's own SKILL.md), so there is no need to guess reachability first."
+
 # Type-specific SessionStart behaviour (Template Method). A type may ship
 # scripts/drivers/types/<type>/_session-start.sh defining agmsg_session_start to override the
 # default no-op — codex uses it to hand the session off to the bridge. The plug
@@ -881,6 +995,7 @@ else
 fi
 
 # (INPUT / SESSION_ID were parsed at the top — stdin is read only once.)
+
 
 # --- Skip spawned worktree sub-sessions (.claude/worktrees checkouts). ---
 # Claude Code's background-task feature runs a short-lived sub-session in an
@@ -940,7 +1055,6 @@ agmsg_session_start_common_init "$_fast_path_ok"
 REARM_NOTE="
 This watch renews itself. A little before the 30-minute cap it prints one line on its own and exits: on \`agmsg watch: re-arm - ...\`, invoke Monitor again with exactly the command and description that line names (persistent: true, timeout_ms: 1800000), silently — no message to the user, no \"re-armed\", no acknowledgement, no summary, since announcing it every 30 minutes wastes tokens for no benefit; on \`agmsg watch: stopping - ...\`, do not re-arm it. If the watch is instead killed at the cap and no such line arrived (an install from before this, or a cycle that ran long), re-arm it when the expiry notification says it delivered something, or when the environment variable \`AGMSG_CC_MONITOR_KEEP_ALIVE\` is set to a non-empty value (check with \`printenv AGMSG_CC_MONITOR_KEEP_ALIVE\`)."
 WATCH_MAX_ARG="--max-seconds=1500"
-
 # Shell-quote each argv so the host can paste the command into Monitor and run
 # it verbatim. A plain '...' wrap breaks on paths with an apostrophe
 # (/Users/o'brien/...); printf %q escapes spaces, quotes and other metacharacters
@@ -978,6 +1092,8 @@ agmsg_session_start_emit_directive_default() {
       SEAT_CLAIM="no role record was found for this session, but it still owns that role's actas exclusivity lock — claimed by this seat and carried across the resume — which is taken to stand in for the record (so if that lock were stale, this seating would be too)"
     fi
     cat <<EOF
+$TERMINAL_LINE
+$TEAM_LINE
 AGMSG monitor mode (resumed role \`$ROLE_NAME\` in team \`$ROLE_TEAM\`):
 $SEAT_CLAIM, so invoke the Monitor tool now with the following parameters, before
 any other action in this session.
@@ -1021,6 +1137,8 @@ EOF
     if [ -z "$SESSION_TEAM" ] && [ "$(printf '%s\n' "$PAIRS" | grep -c '.' || true)" -gt 1 ]; then
       _seat_list="$(printf '%s\n' "$PAIRS" | awk -F'\t' 'NF>=2 && $2!="" {print "  - /agmsg actas "$2}')"
       cat <<EOF
+$TERMINAL_LINE
+$TEAM_LINE
 AGMSG monitor mode: standing down — no inbox watcher was started for this session.
 
 This resumed session could not be matched to a seat (no role-session record, and
@@ -1042,6 +1160,8 @@ EOF
       return 0
     fi
     cat <<EOF
+$TERMINAL_LINE
+$TEAM_LINE
 AGMSG monitor mode: invoke the Monitor tool now with the following parameters,
 before any other action in this session.
 

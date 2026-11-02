@@ -88,7 +88,7 @@ set -euo pipefail
 # this ADR family already applies to server-supplied JSON, held to
 # config.json too) is skipped with a stderr warning.
 #
-# --json fails closed on incompleteness (co1 delta review): if the
+# --json fails closed on incompleteness (delta review): if the
 # MAX_TEAMS bound was hit, or any team's config was skipped, --format json
 # prints NO JSON payload at all and exits 2 — a partial list must never be
 # handed to a consumer as if it were the complete, authoritative one (the
@@ -106,13 +106,17 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEAMS_DIR="$SKILL_DIR/teams"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/require-python3.sh"
+
+agmsg_require_python3 "team list" || exit 1
 
 # An explicitly empty override (AGMSG_TEAM_LIST_MAX_TEAMS=) falls back to
 # the 10000 default via bash's `:-`, same as leaving it unset — this is
 # the intended behavior, not something rejected below.
 MAX_TEAMS="${AGMSG_TEAM_LIST_MAX_TEAMS:-10000}"
 readonly _MAX_TEAMS_UPPER_BOUND=10000
-# Validated immediately (co1 delta review, two rounds): `[ "$count" -gt
+# Validated immediately (delta review, two rounds): `[ "$count" -gt
 # "$MAX_TEAMS" ]` below is a bash `test` integer comparison inside an `if`
 # condition, which `set -e` does NOT abort on — so ANY input `test` can't
 # evaluate as an in-range integer (non-numeric, zero, negative, OR an
@@ -190,10 +194,13 @@ agmsg_project_path_variants "$project_path" > "$variants_file"
 format="human"
 [ "$json" -eq 1 ] && format="json"
 
-truncated_flag=()
-[ "$truncated" -eq 1 ] && truncated_flag=(--truncated)
-
-python3 "$SCRIPT_DIR/internal/team-list.py" \
-  --entries "$work_file" --variants "$variants_file" \
-  --scope "$scope" --max-config-bytes "$MAX_CONFIG_BYTES" --format "$format" \
-  ${truncated_flag[@]+"${truncated_flag[@]}"}
+if [ "$truncated" -eq 1 ]; then
+  python3 "$SCRIPT_DIR/internal/team-list.py" \
+    --entries "$work_file" --variants "$variants_file" \
+    --scope "$scope" --max-config-bytes "$MAX_CONFIG_BYTES" --format "$format" \
+    --truncated
+else
+  python3 "$SCRIPT_DIR/internal/team-list.py" \
+    --entries "$work_file" --variants "$variants_file" \
+    --scope "$scope" --max-config-bytes "$MAX_CONFIG_BYTES" --format "$format"
+fi

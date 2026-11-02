@@ -4,23 +4,277 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-10-27
+
+This release adds plugins from GitHub: `agmsg plugin install <owner>/<repo>` adds a third-party ext-tool, terminal or agent type after showing you every file it can run (and, in chat, offering to have the agent read them first), and keeps it pinned to the commit you approved. It also hardens remote sync against compressed responses from a sync server (CVE-2026-111497); if you use remote sync, update.
+
+### Security
+- Remote sync asks sync servers for uncompressed responses and refuses any other `Content-Encoding` before reading the body, so a compressed response never reaches Node's decoders (CVE-2026-111497, Brotli decoder out-of-bounds write). This protects only agmsg's own remote sync; update Node.js itself to 22.23.4, 24.22.1, 26.12.1 or later. CI and the release job use the newest Node 22 patch (#1774, #1766)
+
+### Added
+- Plugins from GitHub: `agmsg plugin install | update | remove <owner>/<repo>[@<ref>]`. Install shows the commit, the drivers it adds and every file that can run, and installs only after you confirm. Each install is pinned to its commit; `update` shows what changed and asks again, and nothing updates on its own. A plugin driver that replaces a built-in needs `--override` (#1702, #1703, #1713, #1783)
+- Before you confirm an install or update in chat, the agent offers to read the files that will run, from a review copy of the exact commit shown, and reports what it finds. The confirmed install refuses to proceed if the fetched files differ from the copy that was read (#1794)
+- `agmsg plugin` is a verb of the `agmsg` command, and `/agmsg plugin` walks through install and update in chat (#1746, #1703)
+- One repository is one plugin: `name` in `agmsg-plugin.conf` is required, and `plugin install` ends with the next step for each new driver, including its `SETUP.md` and, for an ext-tool with setup, the save step before join (#1783, #1785, #1787, #1802)
+- ext-tools resolve through the driver registry like the other plugin axes; the smallest ext-tool is `tool.conf` plus a `handle` script (#1700, #1784)
+- Install and update warn when a new built-in is now replaced by a trusted plugin, and name the command that brings the built-in back (#1748)
+
+### Fixed
+- agmsgd: one unusable team no longer stops every team's notices (#1773)
+- `agmsg daemon enable` keeps an agmsgd that is already running (#1776)
+- agmsgd advises `install --update`, not `daemon start`, on a digest mismatch (#1769)
+- Windows: agmsgd registers a per-user task that runs without a console window (#1771)
+- Windows: UCRT64 and CLANG64 shells are recognized, and npm's extensionless Codex shim is accepted (#1772, #1768)
+- A reused bridge PID is treated as a stopped bridge (#1767)
+- Reading another agent's `history` no longer moves that agent's pane record to the reader's pane (#1770)
+- `inbox` and `history` show a multi-line body as lines instead of a literal `\n` (#1786)
+- Hints for an install with a different `--cmd` name use that install's own command (#1779)
+- `install --update --cmd <name>` no longer takes over the shared Codex shim from another install on its own (#1790)
+- Plugin and driver names with uppercase letters are refused on macOS too, where bash 3.2 under a UTF-8 locale let them through (#1793)
+
+### Documentation
+- `docs/plugins.md` and `docs/plugins.ja.md` describe installing plugins from GitHub (#1703)
+
+## [1.6.1] - 2026-10-25
+
+This release fixes agmsgd notices that could stop and never resume. If you turned agmsgd on in 1.6.0, update; nothing else is needed, and agmsgd restarts on the new code by itself. If agmsgd is off, it stays off, and the recommended setting is unchanged: agmsgd, chosen with `/agmsg delivery`.
+
+### Fixed
+- agmsgd treats a notice as delivered once it is sent: a successful `codex queue` call for Codex, or a successful socket write for Claude Code. It no longer reads either tool's internal session files to confirm the notice was seen, and no longer withholds later notices while such a check is unanswered. The next notice goes out when new unread messages arrive; a failed send records its reason in `agmsg daemon status` and is retried (#1743, #1744)
+- One stuck check can no longer stop agmsgd notices for every session. Each poll, channel and session has a time limit; work that exceeds it is abandoned with its reason shown in status, and the poll moves on. `agmsg daemon stop` and SIGTERM finish even while a poll is stuck (#1754, #1762)
+- agmsgd.log records delivery events (notices sent, failures, expired attempts, session state changes and overrun polls), never message bodies, and is size-bounded (#1755, #1762)
+- Windows: Codex sessions keep receiving notices when the start time of the `codex queue` child process cannot be read, for example when PowerShell is blocked or `pwsh` is not installed (#1731, #1734)
+- Install, update and uninstall write to the Codex profile selected by `CODEX_HOME` instead of always `~/.codex/config.toml`, and use native `C:/` paths on Windows (#1718, #1738)
+- A closed Claude Code session is no longer reported as addressable; `agmsg daemon status --all` lists sessions that cannot be reached (#1732, #1737)
+- `actas` says why a Claude Code session stayed on the Monitor instead of agmsgd (#1733, #1740)
+- `inbox` and `history` refuse an unknown team instead of reporting an empty inbox (#1714, #1739)
+- herdr: existing agent names are kept when a pane is named (#1676)
+
+### Changed
+- `install --update` copies CHANGELOG.md into the install directory and ends with one line asking the running agent to re-read the skill and tell you what changed in this version and which settings it recommends (#1741, #1742)
+
+[1.7.0]: https://github.com/fujibee/agmsg/compare/v1.6.1...v1.7.0
+[1.6.1]: https://github.com/fujibee/agmsg/compare/v1.6.0...v1.6.1
+
+## [1.6.0] - 2026-10-23
+
+### Added
+- agmsgd beta: an opt-in, per-machine resident service that delivers new-message notices to Claude Code and Codex sessions, controlled with `agmsg daemon start | stop | status | enable | disable`. It registers with launchd on macOS, `systemd --user` on Linux and Task Scheduler on Windows (Claude Code 2.1.302 or later on Windows). Nothing changes until you turn it on (#1529)
+- The delivery choice after joining a team, and `/agmsg delivery` (`/agmsg mode` keeps working as an alias), offer agmsgd first as the recommended option, then `monitor (legacy)`, `turn`, `both` and `off`, for Claude Code and Codex alike. Where agmsgd cannot run on a machine, it is not offered and the reason is shown. Choosing `monitor (legacy)` keeps agmsgd away from that project (#1529)
+- Install and update never ask and never enable agmsgd. They end with one line on how to turn it on, and the first session after an update shows a one-time notice. An update steps a running agmsgd aside and restarts it on the new code (#1529)
+
+### Fixed
+- Windows remote sync survives SSH disconnects and power loss, and the setup temp directory no longer leaks into the sync engine (#1529)
+- Lock directories work on systems whose `mkdir` reports success for an existing directory, such as Ubuntu 26.04 (#1529)
+- Refresh vulnerable dependencies, keeping @types/node on Node 22 (#1673)
+- Avoid renaming the caller during proxy registration (#1672)
+- Keep JSON arrays as arrays when a subquery result is written with json_set (#1661)
+- SQLite 3.53.4/3.54.0 CLI compatibility for init rollback and busy diagnostics (#1654)
+- Accept Codex's typing-state footer as a live widget (#1629)
+- Raise the ext-tool timeout to 30s (#1628)
+- Carry a member's placement record to the new name (#1625)
+- Preserve the caller's Codex profile (#1624)
+- Use CLAUDE_PID as the Claude Code agent pid (#1622)
+- Remove the two temp files once the slow child finishes (#1580)
+- Leave no window between taking a registry lock and recording its holder (#1592)
+- Read the owner start time with LC_ALL=C so non-English locales can spawn (#1593)
+
+### Performance
+- Skip unchanged idle cursor consumption (#1652)
+- Start a handful of processes per call instead of about 40 (#1630)
+- Skip needless delivery status and set monitor at launch (#1627)
+
+### Documentation
+- README (English and Japanese) and the reference docs describe agmsgd and the `monitor (legacy)` naming (#1529)
+- Add recovery steps to 1.5.3 for machines already affected by the temp-file leak (#1581)
+
+[1.6.0]: https://github.com/fujibee/agmsg/compare/v1.5.3...v1.6.0
+
+## [1.5.3] - 2026-10-05
+
+### Added
+- Sessions in the Claude desktop app (Code tab) and the Codex desktop app are recognized as desktop seats: team status shows them as such, and they are never recorded against a terminal pane. Message delivery is unchanged. (#1563, #1565)
+
+### Fixed
+- Remote sync no longer leaves a small temp file behind for every message it applies; on a long-running synced team these filled the temp directory (on Linux tmpfs, until it ran out of inodes) (#1572)
+- `install --update` removes the temp files leaked before this fix, and `doctor` reports them (`doctor --fix` removes them) (#1575)
+- Stop treating a missing TaskList entry as a failed watch (#1571)
+- Drop the previous name's placement record for this pane on a switch (#1568)
+- End the Claude Code watch at 1750 seconds, not 1790 (#1561)
+- Break a registry lock only when its recorded holder is gone (#1556)
+
+### Documentation
+- Ask before creating a team when remote is in use; point at delete and update (#1574)
+
+### If you use remote sync and are already affected
+Check whether you use remote sync: `~/.agents/skills/agmsg/scripts/remote.sh status` lists each team, and only teams shown as `connected` are affected.
+
+If your temp directory is already full (on Linux, commands fail with "No space left on device" even though the disk has room), free it before updating. This removes only files that match the leaked files exactly: directly in the temp directory, named `tmp.` plus 10 characters, exactly 3 bytes containing the line `ok`, and older than 10 minutes:
+
+```sh
+find "${TMPDIR:-/tmp}" -maxdepth 1 -type f -name 'tmp.??????????' -size 3c -mmin +10 -print0 | xargs -0 grep -lx --null ok | xargs -0 rm -f
+```
+
+Then update with `npx agmsg@latest install --update`, which removes the rest. Afterwards, `doctor` reports any that remain and `doctor --fix` removes them.
+
+[1.5.3]: https://github.com/fujibee/agmsg/compare/v1.5.2...v1.5.3
+
+## [1.5.2] - 2026-10-02
+
+### Added
+- Report run/ records of a team that no longer exists; remove them with --fix (#1532)
+
+### Fixed
+- The Claude Code watcher renews or stops by itself shortly before the Monitor 30-minute cap (#1553)
+- Record the Codex profile (CODEX_HOME) of a seat as optional metadata without changing delivery (#1549)
+- Pass the launcher flag to the app-server so SessionStart sees it (#1524)
+- Pass the seat key to app-server tool commands under a restricted shell environment policy (#1541)
+- Reclaim a role held by the same live process after /clear (#1540)
+- Restart the sync engine when set-endpoint is refused by the adopt check (#1539)
+- Normalize the project path before hashing the Windows bridge lease (#1522)
+- Start Codex with --no-daemon when a plain launch runs in an elevated Windows shell (#1534)
+- Ship a rendered repo-root SKILL.md with a first-run bootstrap (#1286) (#1516)
+
+### Documentation
+- State the privacy policy as principles that match current behavior (#1546)
+
+[1.5.2]: https://github.com/fujibee/agmsg/compare/v1.5.1...v1.5.2
+
+## [1.5.1] - 2026-09-28
+
+### Added
+- Add --delete and --purge-messages to team.sh (#1475) (#1482)
+- Add --force to team.sh --delete for teams with members (#1493) (#1494)
+- Report when a Codex config is missing this install's writable_roots, with the command that fixes it (#1477) (#1483)
+
+### Fixed
+- Let a live seat take a pane a dead session's record still claims (#1485) (#1486)
+- Name a missing age binary, and surface the last fatal on status (#1487) (#1488)
+
+### Documentation
+- Update the RFC to the approved design and add the architecture design (#1492)
+
+[1.5.1]: https://github.com/fujibee/agmsg/compare/v1.5.0...v1.5.1
+
+## [1.5.0] - 2026-09-25
+
+### Added
+- Orca terminal driver (1.5.0) (#1453)
+
+### Fixed
+- Re-bind a codex seat stranded on its pre-/clear thread (#1470)
+- Clean the CODEX_HOME Codex config and the OpenCode/Hermes/Grok files (#1471)
+- Don't retype the shared SKILL.md for a type with its own file (#1464)
+- Find a seat's actas lock from its registration, and name a sandbox refusal (#1461)
+
+[1.5.0]: https://github.com/fujibee/agmsg/compare/v1.4.2...v1.5.0
+
+## [1.4.2] - 2026-09-24
+
+### Added
+- One line per question in a batch, tolerate a malformed row, name max_tokens_exceeded (#1454)
+
+### Fixed
+- Recognize OpenRouter's wrapped max_tokens_exceeded 400 (#1460)
+- Stage the holder before rmdir so a release cannot delete the next owner's (#1445)
+- Skip a no-op hooks_file rewrite, preserve format and mode (#1442)
+- Remove only the install being uninstalled, add --all for every install (#1438)
+- Read the session name from session_index.jsonl (#1437)
+- Restore <team> <name> in the actas record step, and say so when they are missing (#1398)
+- Detect a type's agent process from its manifest, not a fixed list (#631)
+
+[1.4.2]: https://github.com/fujibee/agmsg/compare/v1.4.1...v1.4.2
+
+## [1.4.1] - 2026-09-23
+
+### Added
+- Add terminal_peek_styled so poke's real-draft check covers tmux (#1393)
+- poke on herdr: use pane focus to deliver past an abandoned draft, not just refuse (#1384) (#1395)
+- Add SECURITY.md and Dependabot configuration (#1404)
+
+### Fixed
+- install: add ext-tools/ to Codex sandbox writable_roots (#1380)
+- Arm the bridge request on resume when the thread has an exact role match (#1401) (#1405)
+- Stop guessing a seat's type into its placement record (#1402)
+- Distinguish a failed ps observation from proof of death (#970)
+- Fail loudly when a hooks_file write is refused (#1396)
+- Split the emit-and-observe fallback across two calls (#1386) (#1397)
+- Protect a real, stalled draft the two-snapshot check let through (#1378)
+- Use sqlite batch mode for redirected queries (#1343)
+- Refuse only when the input box actually changes (#1322) (#1376)
+- Let an e2ee team use an address the plaintext check refuses (#1019)
+- Bound the sync readiness wait by wall clock, not attempts alone (#839)
+
+### Changed
+- install: prune scripts/ files a prior release no longer ships (#1375)
+
+### Documentation
+- The JA preview page said the send waits for the adapter; it does not (#1377)
+
+[1.4.1]: https://github.com/fujibee/agmsg/compare/v1.4.0...v1.4.1
+
+## [1.4.0] - 2026-09-21
+
+### Added
+- Add TypeSafe as a second provider alongside OpenRouter (#1364)
+- Accept only the strict JSON-with-questions shape, and document how to ask (#1358)
+- Jev adapter — route a task to a model and effort (#1339)
+- Show ext-tool members as ext-tool (<tool>) without error-looking cells (#1337)
+- Slack adapter (#1336)
+- An external program as a team member, foundation (#1331)
+- Re-arm the Claude Code Monitor by default when its expiry notice shows it delivered something (#1328)
+- Reprocess quarantine rows a newer parser can now understand (#1323)
+
+### Fixed
+- Report each question's own confidence, not one joint figure (#1369)
+- Skip pane placement for ext-tool members (#1340)
+- Forward setup args and read the secret from the clipboard (#1335)
+- Bound the scoped reprocess pending-count walk (#1332)
+- Refuse to type over a live draft, and drop rearm.sh for a template procedure (#1322)
+- Restart on the new code when the installation changes (#1320)
+- Release the team config lock on SIGTERM/SIGINT (#1325)
+
+### Performance
+- Defer the renderable-types scan out of source time (#1366)
+- Cache a team's storage driver per cycle and the storage dir per process (#1333)
+- Cache lock-path invariants and skip idle-cycle reformatting (#1329)
+
+### Changed
+- Drop the request= key nothing reads (#1362)
+- Move join, delivery and row rendering behind per-type hooks (#1359)
+
+### Documentation
+- Preview page — what it is, what it does not do yet, where invocation goes (#1355)
+- Jev, ext-tool README: state that handle is not a direct entry point (#1368)
+- Promote batching multiple questions into one call in USAGE.md (#1367)
+- Fix tool.conf comments that still named only OpenRouter (#1365)
+- Add USAGE.md for the sending seat, declare request=loose (#1356)
+- Point the three stale source comments at #983 (#989)
+- Document the terminal axis and the terminal driver interface (#1357)
+
+[1.4.0]: https://github.com/fujibee/agmsg/compare/v1.3.1...v1.4.0
+
 ## [1.3.1] - 2026-09-17
 
 Teams that use remote sync should update every machine to 1.3.1 or later. From this release the client reports its version to the server, so older clients can be told apart.
+
+The Antigravity monitor remains experimental: it is usable only on a dedicated seat that no person types into, started with `agy-tui ... -- --dangerously-skip-permissions`. For interactive Antigravity use, keep the default turn delivery. It runs on macOS and Linux only; on other systems the monitor refuses to start. This release's live check covered macOS only.
 
 ### Added
 - The client sends its version to the server in an `Agmsg-Client-Version` header on every request; a request without it comes from a client older than 1.3.1 (#1290)
 - `peek` and `poke` have an agent-native substitute on terminals with no addressable pane (#1256)
 - `agy-tui` passes everything after `--` to `agy`, and rejects any other unknown option (#1291)
+- Devin is supported as an agent type (#898)
 
 ### Fixed
 - Codex: each seat runs its own app-server, and its bridge dispatcher starts only the role recorded for that seat instead of every role in the project (#1273, #1285)
-- Codex: a stale app-server URL left in a request file no longer overrides the live endpoint (#1305)
+- Codex: a stale app-server URL left in a request file no longer overrides the live endpoint (#1293, #1305)
 - `install --update` restarts a sync engine that was running, on the new code, instead of leaving it stale (#1288)
 - Receiving tolerates unknown fields in a message, so a newer sender does not get its messages rejected (#1282)
 - Claude Code Monitor directives set a 30-minute timeout (#1287). The instruction to re-arm silently on expiry is now opt-in, behind `AGMSG_CC_MONITOR_KEEP_ALIVE` (unset by default) — most seats do not need a watch kept alive across its own natural expiry, and `rearm.sh` covers the ones that do by poking every claude-code seat in a team whose delivery mode is monitor or both (#1315)
 - Antigravity monitor delivery, which is experimental, now also runs on macOS (#1253); switching an existing 1.3.0 project to monitor delivery is accepted (#1289, #1303); user-facing messages are in English (#1281); a refused claim names the process that holds the role and how to release it (#1301); the driver's messages and comments are all in English (#1313). See docs/antigravity-monitor-beta.md for its limitations before enabling it.
 - Sync engines supervised by systemd are detected (#1006)
+- Windows: every jq call in the sqlite driver forces binary output, so values read back from the server no longer carry a stray carriage return and fail the sequence check (#1277, #1278)
 - A backtick in a SQL comment no longer runs as a command substitution (#1276)
 - herdr instance names containing a backslash survive percent-decoding (#1275)
 
@@ -28,6 +282,7 @@ Teams that use remote sync should update every machine to 1.3.1 or later. From t
 - Antigravity's read-reservation guard lives in the Antigravity driver (#1271)
 
 ### Documentation
+- `mode: monitor` means the mode is configured, and the docs say how to confirm the watcher is actually running (#270)
 - Antigravity permission guidance covers the exact invocation shapes `agy` prompts for, including `bash -lc` (#1289)
 - The design RFC describes tag subscriptions, session-start identity, and delivery through the driver (#1251, #1267)
 
@@ -220,7 +475,6 @@ Teams that use remote sync should update every machine to 1.3.1 or later. From t
 - Narrow a claim I disproved myself two commits later
 - Delete a comment describing the control this one replaced
 - Point key.sh at the current design, and stop asserting the move has happened
-- Move the connect onboarding design to agmsg-cloud, and drop labels that point at nothing
 - Make the promise about this document weak enough to be true
 - Label what stands behind each claim, instead of asserting they all cite
 - Add a Japanese translation, and consolidate the derivation it mirrors
@@ -532,7 +786,7 @@ Teams that use remote sync should update every machine to 1.3.1 or later. From t
 - Support spawning into herdr panes (#495)
 - Drag files onto a pane to insert their path (#481)
 - Adaptive catch-up so a backlog doesn't crawl at 100/5s
-- Add team-list.sh (agmsg team list --json, koit-approved)
+- Add team-list.sh (agmsg team list --json)
 - Add status --json and pending list/abort (ADR 0007 addendum)
 - Consume connected team credentials
 - Add scripts/remote.sh (connect/status/disconnect/doctor) per ADR 0007
@@ -987,3 +1241,4 @@ Teams that use remote sync should update every machine to 1.3.1 or later. From t
 [1.0.4]: https://github.com/fujibee/agmsg/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/fujibee/agmsg/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/fujibee/agmsg/releases/tag/v1.0.2
+

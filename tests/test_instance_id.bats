@@ -591,6 +591,51 @@ _no_dirname_path() {
   [ -z "$output" ]
 }
 
+@test "override: CLAUDE_PID names the seat on Windows only, and only while alive (#1585)" {
+  unset AGMSG_AGENT_PID
+  # Synthetic pid and stubbed liveness / ancestor walk: a real $$ is an MSYS pid
+  # that tasklist would not know on Windows, and the walk must be pinned too.
+  _agmsg_pid_alive() { return 0; }
+  compat_get_ppid() { return 1; }
+  # Windows: a live CLAUDE_PID is taken without walking ps (which cannot see claude.exe).
+  _agmsg_platform=msys CLAUDE_PID=424242 run agmsg_agent_pid claude-code
+  [ "$status" -eq 0 ]
+  [ "$output" = "424242" ]
+  # Another host type, or a non-Windows host, never reads it.
+  _agmsg_platform=msys CLAUDE_PID=424242 run agmsg_agent_pid codex
+  [ "$status" -ne 0 ]
+  _agmsg_platform=linux CLAUDE_PID=424242 run agmsg_agent_pid claude-code
+  [ "$status" -ne 0 ]
+  # A dead pid is not trusted.
+  _agmsg_pid_alive() { return 1; }
+  _agmsg_platform=msys CLAUDE_PID=424242 run agmsg_agent_pid claude-code
+  [ "$status" -ne 0 ]
+}
+
+@test "override: a Windows hook without CLAUDE_PID finds the claude.exe ancestor through Windows" {
+  unset AGMSG_AGENT_PID CLAUDE_PID _AGMSG_COMPAT_NO_CIM
+  _agmsg_pid_alive() { return 0; }
+  compat_get_ppid() { return 1; }
+  _compat_get_winpid() { printf '7777'; }
+  # Records the question so the test can see which image was asked for.
+  powershell.exe() { printf '%s\n' "$*" > "$BATS_TEST_TMPDIR/ps-args"; printf '5480\r\n'; }
+  _agmsg_platform=msys run agmsg_agent_pid claude-code
+  [ "$status" -eq 0 ]
+  [ "$output" = "5480" ]
+  grep -Fq "claude.exe" "$BATS_TEST_TMPDIR/ps-args"
+  grep -Fq "7777" "$BATS_TEST_TMPDIR/ps-args"
+  # No claude.exe ancestor: the bare fallback, as before.
+  powershell.exe() { :; }
+  _agmsg_platform=msys run agmsg_agent_pid claude-code
+  [ "$status" -ne 0 ]
+  # Never asked off Windows or for another host type.
+  powershell.exe() { printf '5480'; }
+  _agmsg_platform=linux run agmsg_agent_pid claude-code
+  [ "$status" -ne 0 ]
+  _agmsg_platform=msys run agmsg_agent_pid codex
+  [ "$status" -ne 0 ]
+}
+
 # --- actas distinctness: the #93 payoff ---
 
 # Two instance ids that share a session_id prefix but differ in pid must be
@@ -619,6 +664,49 @@ _no_dirname_path() {
 
   kill "$pb" 2>/dev/null || true
   wait "$pb" 2>/dev/null || true
+}
+
+# --- agmsg_cc_instance_current: the strict reader of run/cc-instance.<pid> ---
+
+@test "cc_instance_current: a well-formed record for this pid prints its token" {
+  printf 'sid-new.4242\n' > "$RUN_DIR/cc-instance.4242"
+  run agmsg_cc_instance_current 4242
+  [ "$status" -eq 0 ]
+  [ "$output" = "sid-new.4242" ]
+}
+
+@test "cc_instance_current: no record is rc 1" {
+  run agmsg_cc_instance_current 4242
+  [ "$status" -eq 1 ]
+}
+
+@test "cc_instance_current: a record that cannot authorize anything is rc 2" {
+  local variant
+  for variant in empty bare wrong-pid dotted-sid multiline spaced blank-line nul symlink dangling directory; do
+    rm -rf "$RUN_DIR/cc-instance.4242"
+    case "$variant" in
+      empty) : > "$RUN_DIR/cc-instance.4242" ;;
+      bare) printf 'sid-new\n' > "$RUN_DIR/cc-instance.4242" ;;
+      wrong-pid) printf 'sid-new.4243\n' > "$RUN_DIR/cc-instance.4242" ;;
+      dotted-sid) printf 'a.b.4242\n' > "$RUN_DIR/cc-instance.4242" ;;
+      multiline) printf 'sid-new.4242\nextra\n' > "$RUN_DIR/cc-instance.4242" ;;
+      spaced) printf 'sid-new.4242 \n' > "$RUN_DIR/cc-instance.4242" ;;
+      blank-line) printf 'sid-new.4242\n\n' > "$RUN_DIR/cc-instance.4242" ;;
+      nul) printf 'sid\0-new.4242\n' > "$RUN_DIR/cc-instance.4242" ;;
+      symlink)
+        printf 'sid-new.4242\n' > "$BATS_TEST_TMPDIR/real"
+        ln -s "$BATS_TEST_TMPDIR/real" "$RUN_DIR/cc-instance.4242" ;;
+      dangling) ln -s "$BATS_TEST_TMPDIR/nowhere" "$RUN_DIR/cc-instance.4242" ;;
+      directory) mkdir "$RUN_DIR/cc-instance.4242" ;;
+    esac
+    run agmsg_cc_instance_current 4242
+    [ "$status" -eq 2 ] || { echo "$variant: rc=$status out=$output"; return 1; }
+  done
+}
+
+@test "cc_instance_current: a non-numeric pid is rc 2" {
+  run agmsg_cc_instance_current "4242x"
+  [ "$status" -eq 2 ]
 }
 
 # --- liveness: "can I signal this" is not "is this running" ---
@@ -717,6 +805,22 @@ require_eperm_pid() {
   run _agmsg_pid_valid 4294967295; [ "$status" -ne 0 ]
 }
 
+@test "instance-id: the DWORD ceiling also applies under UCRT64 and CLANG64 (#1752)" {
+  # Git for Windows 2.56 defaults new MSYS2 installs to MSYSTEM=UCRT64, and
+  # CLANG64 is another live MSYS2 environment -- neither is MINGW*/MSYS*, so
+  # a pattern that only names those two silently falls back to the POSIX
+  # pid_t ceiling on exactly the hosts #1752 was filed about.
+  for sys in UCRT64 CLANG64 CLANGARM64; do
+    run env MSYSTEM="$sys" bash -c \
+      'SKILL_DIR="'"$SKILL_DIR"'"; . "$SKILL_DIR/scripts/lib/instance-id.sh"
+       _agmsg_pid_valid 2147483648 || exit 1
+       _agmsg_pid_valid 4294967295 || exit 2
+       _agmsg_pid_valid 4294967296 && exit 3
+       exit 0'
+    [ "$status" -eq 0 ]
+  done
+}
+
 @test "instance-id: liveness answers alive on the builtin, before any subshell" {
   # The launcher polls liveness in loops that were deliberately made fork-free
   # (#466/#496). Routing them through a helper is only acceptable while the
@@ -755,6 +859,23 @@ require_eperm_pid() {
   # The counterpart, pinned so the split is not a distinction without a
   # difference: the same live pid reads as dead through the plain helper.
   ! MSYSTEM=MINGW64 PATH="$stub:$PATH" _agmsg_pid_alive $$
+}
+
+@test "pid_alive: UCRT64 and CLANG64 also route through tasklist, not kill -0 (#1752)" {
+  skip_on_windows "stubs tasklist; the real one is authoritative on Windows"
+  local stub="$BATS_TEST_TMPDIR/stub-bin"
+  mkdir -p "$stub"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$stub/tasklist"
+  chmod +x "$stub/tasklist"
+
+  for sys in UCRT64 CLANG64; do
+    MSYSTEM="$sys" PATH="$stub:$PATH" _agmsg_pid_alive_local $$
+    # Before #1752's fix, UCRT64/CLANG64 fell through to the plain kill -0
+    # path and read a live pid as alive here too -- which hid the bug. Pin
+    # the actual symptom: under the real tasklist stub (exit 0, no match),
+    # the tasklist-routed check reports dead.
+    ! MSYSTEM="$sys" PATH="$stub:$PATH" _agmsg_pid_alive $$
+  done
 }
 
 @test "pid_alive_local: an oversized pid is dead on Windows too" {
@@ -806,45 +927,152 @@ require_eperm_pid() {
   [ -z "$offenders" ] || { echo "$offenders"; false; }
 }
 
-# --- agmsg_cc_instance_current: the strict reader of run/cc-instance.<pid> ---
+# --- #983: liveness has a third answer, and it is not "dead" -------------------
 
-@test "cc_instance_current: a well-formed record for this pid prints its token" {
-  printf 'sid-new.4242\n' > "$RUN_DIR/cc-instance.4242"
-  run agmsg_cc_instance_current 4242
-  [ "$status" -eq 0 ]
-  [ "$output" = "sid-new.4242" ]
+@test "instance alive: an unreadable run dir is UNDECIDABLE, not dead" {
+  [ "$(id -u)" -eq 0 ] && skip "chmod 000 is ineffective as root"
+  mkdir -p "$SKILL_DIR/run"
+  : > "$SKILL_DIR/run/cc-instance.1"        # canary: there is something to read
+  chmod 000 "$SKILL_DIR/run"
+  local rc=0; agmsg_instance_alive "some-token" || rc=$?
+  chmod 755 "$SKILL_DIR/run" 2>/dev/null || true
+  # 2, not 1: "dead" drives reclaim, lock deletion and the watcher's own exit, so
+  # a failed read must not arrive as one.
+  [ "$rc" -eq 2 ]
 }
 
-@test "cc_instance_current: no record is rc 1" {
-  run agmsg_cc_instance_current 4242
-  [ "$status" -eq 1 ]
+@test "instance alive: an ABSENT run dir is still dead" {
+  # The partner: absent is a fact (nothing ever registered). Collapsing it into
+  # undecidable would stop every reclaim forever.
+  rm -rf "$SKILL_DIR/run"
+  local rc=0; agmsg_instance_alive "some-token" || rc=$?
+  [ "$rc" -eq 1 ]
 }
 
-@test "cc_instance_current: a record that cannot authorize anything is rc 2" {
-  local variant
-  for variant in empty bare wrong-pid dotted-sid multiline spaced blank-line nul symlink dangling directory; do
-    rm -rf "$RUN_DIR/cc-instance.4242"
-    case "$variant" in
-      empty) : > "$RUN_DIR/cc-instance.4242" ;;
-      bare) printf 'sid-new\n' > "$RUN_DIR/cc-instance.4242" ;;
-      wrong-pid) printf 'sid-new.4243\n' > "$RUN_DIR/cc-instance.4242" ;;
-      dotted-sid) printf 'a.b.4242\n' > "$RUN_DIR/cc-instance.4242" ;;
-      multiline) printf 'sid-new.4242\nextra\n' > "$RUN_DIR/cc-instance.4242" ;;
-      spaced) printf 'sid-new.4242 \n' > "$RUN_DIR/cc-instance.4242" ;;
-      blank-line) printf 'sid-new.4242\n\n' > "$RUN_DIR/cc-instance.4242" ;;
-      nul) printf 'sid\0-new.4242\n' > "$RUN_DIR/cc-instance.4242" ;;
-      symlink)
-        printf 'sid-new.4242\n' > "$BATS_TEST_TMPDIR/real"
-        ln -s "$BATS_TEST_TMPDIR/real" "$RUN_DIR/cc-instance.4242" ;;
-      dangling) ln -s "$BATS_TEST_TMPDIR/nowhere" "$RUN_DIR/cc-instance.4242" ;;
-      directory) mkdir "$RUN_DIR/cc-instance.4242" ;;
-    esac
-    run agmsg_cc_instance_current 4242
-    [ "$status" -eq 2 ] || { echo "$variant: rc=$status out=$output"; return 1; }
-  done
+@test "instance alive: an unstattable cc-instance is UNDECIDABLE for a composite token too" {
+  # The other direction of the same break (review): `[ -f ]` is false for "absent"
+  # AND for "cannot stat", and that arm answers ALIVE — so an unreadable run/
+  # made every composite token look alive and blocked legitimate reclaim. The
+  # bare-token branch already returned 2 for the same condition, so one fact
+  # meant opposite things depending on the token shape.
+  [ "$(id -u)" -eq 0 ] && skip "chmod 000 is ineffective as root"
+  mkdir -p "$SKILL_DIR/run"
+  local pid=$$                              # our own pid: alive by construction
+  : > "$SKILL_DIR/run/cc-instance.$pid"
+  chmod 000 "$SKILL_DIR/run"
+  local rc=0; agmsg_instance_alive "sid.$pid" || rc=$?
+  chmod 755 "$SKILL_DIR/run" 2>/dev/null || true
+  [ "$rc" -eq 2 ]
 }
 
-@test "cc_instance_current: a non-numeric pid is rc 2" {
-  run agmsg_cc_instance_current "4242x"
-  [ "$status" -eq 2 ]
+@test "instance alive: a composite token with NO cc-instance file is still alive" {
+  # The partner: absent is deliberate here — the pid is alive and nothing
+  # contradicts it. Collapsing that into undecidable would stop every reclaim.
+  mkdir -p "$SKILL_DIR/run"
+  rm -f "$SKILL_DIR/run/cc-instance.$$"
+  local rc=0; agmsg_instance_alive "sid.$$" || rc=$?
+  [ "$rc" -eq 0 ]
+}
+
+@test "instance alive: a run dir that can be LISTED but not entered is undecidable" {
+  # mode 0400: -r is true, -x is false. The glob still enumerates every
+  # cc-instance.* path, and then nothing can stat them. The old guard asked only
+  # for -r, so the loop ran, matched nothing, and returned a confident DEAD from
+  # a scan that had read no file at all. (Review.)
+  [ "$(id -u)" -eq 0 ] && skip "directory permissions are ineffective as root"
+  local run="$SKILL_DIR/run"
+  mkdir -p "$run"
+  printf 'sid-live\n' > "$run/cc-instance.$$"
+  chmod 0400 "$run"
+  local rc=0; agmsg_instance_alive sid-live || rc=$?
+  chmod 0755 "$run"
+  [ "$rc" -eq 2 ]
+}
+
+@test "instance alive: a listable AND enterable run dir still answers dead for an absent token" {
+  # The partner. Without it, a guard that returned 2 for every directory would
+  # pass the test above, and no stale lock would ever be reclaimed again.
+  local run="$SKILL_DIR/run"
+  mkdir -p "$run"
+  printf 'sid-someone-else\n' > "$run/cc-instance.$$"
+  chmod 0755 "$run"
+  local rc=0; agmsg_instance_alive sid-not-here || rc=$?
+  [ "$rc" -eq 1 ]
+}
+
+@test "instance alive: an EMPTY cc-instance marker for a live pid is undecidable" {
+  # A half-written marker is not "this process is someone else". Read as a plain
+  # mismatch, a scan of torn markers reports a live owner as DEAD, and dead is
+  # what licences a reclaim. Same fact as an empty lock file. (Review.)
+  local run="$SKILL_DIR/run"
+  mkdir -p "$run"
+  : > "$run/cc-instance.$$"          # live pid, marker not yet written
+  local rc=0; agmsg_instance_alive sid-live || rc=$?
+  [ "$rc" -eq 2 ]
+}
+
+@test "instance alive: a WRITTEN cc-instance marker naming someone else is still dead" {
+  # The partner. Without it, answering 2 for every marker would pass the test
+  # above and no stale lock would ever be reclaimed.
+  local run="$SKILL_DIR/run"
+  mkdir -p "$run"
+  printf 'sid-someone-else\n' > "$run/cc-instance.$$"
+  local rc=0; agmsg_instance_alive sid-live || rc=$?
+  [ "$rc" -eq 1 ]
+}
+
+@test "instance alive: an EMPTY cc-instance marker is undecidable for a COMPOSITE token too" {
+  # Composite is the ordinary owner token, so this is the path that matters most
+  # -- and it is the one I left behind when fixing the bare branch. A torn marker
+  # read as a mismatch makes a live seat's lock reclaimable. (Review.)
+  local run="$SKILL_DIR/run"
+  mkdir -p "$run"
+  : > "$run/cc-instance.$$"                 # live pid, marker not yet written
+  local rc=0; agmsg_instance_alive "sid-live.$$" || rc=$?
+  [ "$rc" -eq 2 ]
+}
+
+@test "instance alive: a composite marker naming a DIFFERENT session is still dead" {
+  # The partner: a written marker that disagrees is a real mismatch, and must
+  # stay reclaimable or a crashed seat wedges its role forever.
+  local run="$SKILL_DIR/run"
+  mkdir -p "$run"
+  printf 'sid-someone-else.%s\n' "$$" > "$run/cc-instance.$$"
+  local rc=0; agmsg_instance_alive "sid-live.$$" || rc=$?
+  [ "$rc" -eq 1 ]
+}
+
+@test "instance alive: bare and composite give the SAME answer to the same marker state" {
+  # The two branches disagreed about this file twice, in opposite directions, one
+  # review round apart: composite said ALIVE where bare said 2 (an inaccessible
+  # run/), then bare said 2 where composite said DEAD (an empty marker). Each fix
+  # moved the disagreement instead of removing it. Both now read through
+  # _agmsg_marker_read; this pins the agreement itself rather than the two
+  # answers separately, so the next edit to one branch cannot re-open the split.
+  [ "$(id -u)" -eq 0 ] && skip "directory permissions are ineffective as root"
+  local run="$SKILL_DIR/run" bare=0 comp=0
+  mkdir -p "$run"
+
+  # State 1: a live pid whose marker is present, readable and EMPTY.
+  : > "$run/cc-instance.$$"
+  bare=0; agmsg_instance_alive sid-live               || bare=$?
+  comp=0; agmsg_instance_alive "sid-live.$$"          || comp=$?
+  [ "$bare" -eq 2 ]
+  [ "$comp" -eq 2 ]
+
+  # State 2: the run directory cannot be searched.
+  printf 'sid-live.%s\n' "$$" > "$run/cc-instance.$$"
+  chmod 0400 "$run"
+  bare=0; agmsg_instance_alive sid-live               || bare=$?
+  comp=0; agmsg_instance_alive "sid-live.$$"          || comp=$?
+  chmod 0755 "$run"
+  [ "$bare" -eq 2 ]
+  [ "$comp" -eq 2 ]
+
+  # Canary/partner: with the same directory readable and the marker written, the
+  # pair agrees on a DECIDED answer too -- otherwise "both say 2 always" passes.
+  bare=0; agmsg_instance_alive sid-live               || bare=$?
+  comp=0; agmsg_instance_alive "sid-live.$$"          || comp=$?
+  [ "$bare" -eq 0 ]
+  [ "$comp" -eq 0 ]
 }

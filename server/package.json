@@ -1,0 +1,34 @@
+{
+  "name": "@agmsg/reference-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && cp -R migrations dist/migrations",
+    "dev": "tsx watch src/index.ts",
+    "migrate": "tsx src/migrate.ts",
+    "provision": "tsx src/provision.ts",
+    "retain": "tsx src/retain.ts",
+    "start": "node dist/src/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "fastify": "5.12.5",
+    "fastify-plugin": "6.0.1",
+    "json-dup-key-validator": "1.0.3",
+    "pg": "8.23.1",
+    "uuid": "14.0.3",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/pg": "8.23.1",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3"
+  }
+}

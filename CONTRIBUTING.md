@@ -7,27 +7,26 @@ Thanks for considering a contribution! agmsg is a small project; this guide is i
 ## Where to start
 
 - Read [`README.md`](README.md) for what agmsg does and how to install it.
-- Read [`ARCHITECTURE.md`](ARCHITECTURE.md) for the mental model (3-axis driver, vocabulary, dependency-management philosophy).
+- Read [`ARCHITECTURE.md`](ARCHITECTURE.md) for the mental model (4-axis driver model, vocabulary, dependency-management philosophy).
 - Browse [`docs/adr/`](docs/adr/) for the history of design decisions — they explain *why* things are the way they are.
 - The [`docs/spec/`](docs/spec/) directory contains the formal contracts; consult these when implementing or extending a driver.
 
 ## Reporting bugs and requesting features
 
-Open an issue on [`fujibee/agmsg`](https://github.com/fujibee/agmsg/issues). Include the agmsg version, the host agent (Claude Code / Codex / Cursor), and a minimal reproduction if possible.
+Open an issue on [`fujibee/agmsg`](https://github.com/fujibee/agmsg/issues). Include the agmsg version, the host agent (Claude Code, Codex, Gemini CLI, Antigravity, Copilot CLI, OpenCode, Cursor, Grok Build, Devin, or Hermes), and a minimal reproduction if possible.
 
 ## Pull requests
 
 1. Discuss substantial changes in an issue first.
 2. Branch from `main`. Keep PRs focused — one logical change per PR.
-3. Run `bats --filter-tags "!slow" tests/*.bats` while iterating, then run the
-   full `bats tests/*.bats` suite before submitting.
+3. Run the test suite: `bats tests/`.
 4. Match the surrounding code style. Bash is the primary language; use `set -euo pipefail` at the top of every script.
 5. Update docs if the change is user-visible.
 6. PRs land on `main` as a single squash commit — merge and rebase merges are disabled on the repository. Your branch's commits are collapsed into one, so write the PR title to read well as that commit's subject. There is no need to tidy your branch history before review.
 
 ## Releases
 
-See [`RELEASING.md`](RELEASING.md). The short version: bump [`VERSION`](VERSION), run `./scripts/release/sync-version.sh`, commit, tag `v$(cat VERSION)`, push. CI handles the rest.
+See [`RELEASING.md`](RELEASING.md). The short version: run `scripts/release/cut-release.sh <version>`, which prepares the release PR; the PR and the tag push each need a maintainer's approval, and CI publishes after the tag.
 
 ## Architecture Decision Records
 
@@ -59,7 +58,7 @@ If you spot a design choice in the code whose rationale is unclear, an ADR retro
 
 ## Adding a driver
 
-Bundled drivers live under `scripts/drivers/<axis>/<name>.sh`. (Top-level `.sh` files in `scripts/` are directly-invokable commands; subdirectories group implementation code.) Third-party plugin drivers live under `~/.agents/agmsg/plugins/<axis>/<name>/`. Both must implement the contract in [`docs/spec/driver-interface.md`](docs/spec/driver-interface.md).
+Bundled drivers live under `scripts/drivers/<axis>/` (a `<name>.sh` file for storage, a `<name>/` directory with its manifest for agent types and terminals). Top-level `.sh` files in `scripts/` are directly-invokable commands; subdirectories group implementation code. Third-party plugin drivers live under `<skill>/plugins/<axis>/<name>/` or a directory in `$AGMSG_PLUGIN_DIRS`, and run only after `agmsg plugin trust` (see [`docs/plugins.md`](docs/plugins.md)). Both must implement the contract in [`docs/spec/driver-interface.md`](docs/spec/driver-interface.md).
 
 A new bundled driver should arrive with:
 

@@ -22,7 +22,7 @@ config.json is locally written by our own scripts, but this is a
 read-only listing command with no reason to guess at a malformed file's
 meaning rather than skip it outright).
 
-Fail-closed in --format json specifically (co1 delta review): --scope all
+Fail-closed in --format json specifically (delta review): --scope all
 is the authority a no-arg cloud connect flow uses to decide whether its
 choice is ambiguous (one team vs several). Silently returning a partial
 list as if it were the complete one — because one team's config failed

@@ -4,9 +4,13 @@ set -euo pipefail
 # The launcher is detached from codex-monitor.sh and may outlive the shell that
 # invoked it. Never retain test-harness result/trace descriptors through the
 # dispatcher -> role child -> bridge process chain.
-# shellcheck disable=SC1091
-source "$(cd "$(dirname "$0")" && pwd)/../../../lib/close-fds.sh"
-agmsg_close_inherited_fds
+#
+# 3 and 4 are closed here, as early as the script can, and then EVERY inherited
+# descriptor is closed once lib/close-fds.sh is reachable (just below). Naming
+# the two we expect is not enough: the harness picks the number, and a bridge
+# that kept it hung a macOS CI shard for 25 minutes with every test already
+# green. See scripts/lib/close-fds.sh.
+exec 3>&- 4>&-
 
 # Runs outside Codex's tool sandbox and owns the app-server connections. The
 # dispatcher starts bridges only for roles recorded as belonging to this seat.
@@ -26,6 +30,12 @@ ROLE_PAIR="${5:-}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
+# Before anything long-lived is spawned. Nothing above forks a process that
+# outlives this script, so closing here is as good as closing at line 1 — and
+# it is the earliest point at which lib/ is resolvable.
+# shellcheck source=../../../lib/close-fds.sh
+source "$SCRIPT_DIR/../../../lib/close-fds.sh"
+agmsg_close_inherited_fds
 # shellcheck source=../../../lib/hash.sh
 source "$SCRIPT_DIR/../../../lib/hash.sh"
 # The liveness helpers. Every lifetime and lock-owner check below goes through
@@ -270,7 +280,7 @@ poll_sleep() {
 }
 
 # Any change here can change the safe subscription set. Include the request
-# thread plus each role's recorded session/project, not merely registrations:
+# thread, owner, and each role's recorded project, not merely registrations:
 # actas/resume rewrites a role record without changing identities.sh output.
 # $1 is this tick's already-resolved identity list. It is passed in rather than
 # re-resolved so one iteration runs identities.sh once, not twice.
@@ -290,7 +300,7 @@ build_safety_state() {
   while IFS="$TAB" read -r team name; do
     [ -n "$team" ] || continue
     agmsg_role_session_load "$team" "$name" 2>/dev/null || true
-    SAFETY_STATE="$SAFETY_STATE"$'\n'"$team$TAB$name$TAB$AGMSG_ROLE_SESSION_UUID$TAB$AGMSG_ROLE_SESSION_PROJECT"
+    SAFETY_STATE="$SAFETY_STATE"$'\n'"$team$TAB$name$TAB$AGMSG_ROLE_SESSION_UUID$TAB$AGMSG_ROLE_SESSION_PROJECT$TAB$AGMSG_ROLE_SESSION_OWNER"
   done <<< "$identity"
 }
 
@@ -589,7 +599,7 @@ _read_lease() {
 # (the pid is only killable in this shell's pid namespace; Windows is the #458
 # mismatch) and a no-op with no process lister.
 _reap_orphan_bridges() {
-  case "${MSYSTEM:-}" in MINGW*|MSYS*|CLANGARM*) return 0 ;; esac
+  case "${MSYSTEM:-}" in MINGW*|MSYS*|UCRT*|CLANG*) return 0 ;; esac
   command -v pgrep >/dev/null 2>&1 || return 0
   local myhost pid lease cur killed="" waited
   local lproj lpairs lhost lpid lstart lstartsrc
@@ -825,6 +835,7 @@ EOF
   agmsg_role_session_load "$team" "$name" 2>/dev/null || true
   rec_thread="$AGMSG_ROLE_SESSION_UUID"
   rec_project="$AGMSG_ROLE_SESSION_PROJECT"
+  rec_owner="$AGMSG_ROLE_SESSION_OWNER"
   rec_project_phys="$(agmsg_canonical_path "$rec_project" 2>/dev/null || printf '%s' "$rec_project")"
   if [ -z "$rec_thread" ] || [ "$rec_project_phys" != "$PROJECT_PHYS" ] \
     || [ "$rec_thread" != "${_rthread:-}" ]; then

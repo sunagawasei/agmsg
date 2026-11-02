@@ -3,12 +3,26 @@
 # One test, capping how many external commands a watch.sh poll cycle forks
 # while genuinely idle (a store that exists and is already caught up, not the
 # "no store yet" short-circuit) -- the case the fleet spends nearly all of its
-# time in, and the one #1330's first stage targets: skip the mktemp +
-# `sqlite3 :memory:` json_each/json_extract reformat pass when there is no
-# real new message_sent row (a cursor-only page was still paying for it every
-# cycle), and cache the per-(team,agent) primitives behind the actas lock path
-# (team_id, member_id, the two name-encodings) instead of recomputing them via
-# a fresh sqlite3/tr fork on every single cycle.
+# time in. Covers #1330's two stages:
+#
+#   first stage:  skip the mktemp + `sqlite3 :memory:` json_each/json_extract
+#                 reformat pass when there is no real new message_sent row (a
+#                 cursor-only page was still paying for it every cycle), and
+#                 cache the per-(team,agent) primitives behind the actas lock
+#                 path (team_id, member_id, the two name-encodings) for the
+#                 life of the process instead of recomputing them via a fresh
+#                 sqlite3/tr fork on every single cycle.
+#
+#   second stage: cache a team's storage partition driver too, but only for
+#                 the CURRENT poll cycle (never the process lifetime -- see
+#                 _agmsg_partition_load's comment in lib/storage.sh: caching
+#                 it for the process life missed a real migrate-team-store.sh
+#                 scenario, review #1329 round 2), and memoize
+#                 agmsg_storage_dir (a value that genuinely cannot change for
+#                 the life of the process). Both warmed as plain statements in
+#                 this loop, and storage.sh gained a double-source guard after
+#                 resolve-project.sh's own unconditional re-source of it was
+#                 found silently wiping both caches back to cold every cycle.
 
 load test_helper
 
@@ -40,6 +54,11 @@ teardown() {
     {
       printf '#!/usr/bin/env bash\n'
       printf "printf '%%s\\\\n' '%s' >> '%s'\n" "$cmd" "$countlog"
+      if [ "$cmd" = mktemp ]; then
+        # The real consume path creates this SQL input before its write
+        # transaction. Count it without replacing any storage behavior.
+        printf 'case "$*" in *agmsg-cursor-consume.*) printf "cursor-consume\\n" >> %q ;; esac\n' "$countlog"
+      fi
       printf "exec '%s' \"\$@\"\n" "$real"
     } > "$shimbin/$cmd"
     chmod +x "$shimbin/$cmd"
@@ -57,17 +76,36 @@ teardown() {
   # division: `sleep` is itself shimmed above, so this is the same cycle a
   # completed "sleep $INTERVAL" at the bottom of the poll loop actually saw,
   # immune to how many cycles a loaded machine fit into the fixed window.
-  local total cycles; total=$(wc -l < "$countlog" | tr -d ' ')
+  local total cycles; total=$(grep -cv '^cursor-consume$' "$countlog")
   cycles=$(grep -c '^sleep$' "$countlog")
   echo "forked sqlite3/tr/awk/sed/dirname/head/mktemp/paste: $total over $cycles idle cycles" >&3
   sort "$countlog" | uniq -c | sort -rn >&3
+  # Ignore startup/the first catch-up cycle and any incomplete final cycle.
+  # Each sleep closes one real poll; the store remains quiet throughout.
+  local measured_cycles forks sqlite_calls consumes
+  read -r measured_cycles forks sqlite_calls consumes < <(awk '
+    $0 == "sleep" {
+      if (started) { cycles++; forks += f; sqlite += s; consumes += c }
+      started=1; f=0; s=0; c=0; next
+    }
+    $0 == "cursor-consume" { c++; next }
+    { f++; if ($0 == "sqlite3") s++ }
+    END { print cycles+0, forks+0, sqlite+0, consumes+0 }
+  ' "$countlog")
+  echo "completed warm idle cycles: $measured_cycles; external commands: $forks; sqlite3 calls: $sqlite_calls; cursor consumes: $consumes" >&3
+  [ "$measured_cycles" -ge 2 ]
+  [ "$consumes" -eq 0 ]
   [ "$cycles" -ge 2 ]
   local per_cycle=$((total / cycles))
   echo "per cycle: $per_cycle" >&3
-  # Measured (this change, isolated bats env, several runs): roughly
-  # 60-75/cycle after the first-stage fixes above, against roughly 85-95/cycle
-  # on the unmodified code. Capped with headroom above the optimized figure
-  # for ordinary variance, and well under the old baseline so a regression
-  # back to it still fails this.
-  [ "$per_cycle" -le 80 ]
+  # Measured (this change, isolated bats env, several runs, stable): 45/cycle
+  # with both stages above, against 61/cycle with only #1329's first stage
+  # (main at fcf74408, before this PR) and 85-95/cycle before #1330 entirely.
+  # 70 (the prior cap) sat inside the 60-75 range #1329 alone already
+  # produces, so this test could pass on fcf74408 with none of this PR's own
+  # changes -- not a regression test for what this PR adds (review, #1333
+  # round 2). Confirmed on fcf74408 directly: 61/cycle, three runs, before
+  # settling on this cap. 55 sits strictly between the two, so losing this
+  # PR's cache (not just regressing to the pre-#1330 baseline) fails it.
+  [ "$per_cycle" -le 55 ]
 }

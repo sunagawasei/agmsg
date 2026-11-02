@@ -68,6 +68,11 @@ agmsg_resolve_codex_thread() {
     printf '%s' "$CODEX_THREAD_ID"
     return 0
   fi
+  # Hook input identifies this session directly; a rollout lookup only infers it.
+  if [[ "${SESSION_ID:-}" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+    printf '%s' "${SESSION_ID:-}"
+    return 0
+  fi
   local sessions_dir="$HOME/.codex/sessions"
   [ -d "$sessions_dir" ] || return 0
   # Compare PHYSICAL paths. agmsg may open the project via a symlinked/logical
@@ -102,18 +107,82 @@ INNER_EOF
   return 0
 }
 
+# A restart gets a new thread. Prefer this project's sole registration rather
+# than keeping an old conversation merely because its rollout is still on disk.
+# With several registrations nothing here can say which seat this is: the hook
+# runs under the profile's shared app-server daemon, whose environment (the
+# pane it names, the pid it has) belongs to whichever TUI started the daemon,
+# not to this seat (#1112, #1468). So no seat is chosen then; the session is
+# reported as unseated and the user runs actas.
+agmsg_codex_refresh_destination() {
+  local thread="$1" project="$2" pairs="$3" count chosen_team='' chosen_name=''
+  AGMSG_CODEX_REFRESHED_PAIR=''
+  [[ "$thread" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || return 1
+  # Never bind a role to the newest rollout inference from another session.
+  [ "$thread" = "${CODEX_THREAD_ID:-}" ] || [ "$thread" = "${SESSION_ID:-}" ] || return 1
+  pairs="$(printf '%s\n' "$pairs" | sort -u)"
+  count="$(printf '%s\n' "$pairs" | grep -c . || true)"
+  [ "$count" = 1 ] || return 1
+  IFS=$'\t' read -r chosen_team chosen_name <<< "$pairs"
+  [ -n "$chosen_team" ] && [ -n "$chosen_name" ] || return 1
+  local profile owner
+  # shellcheck disable=SC1091
+  . "${SKILL_DIR:-}/scripts/drivers/types/codex/_profile.sh"
+  profile="$(agmsg_codex_profile_from_env)" || return 1
+  owner="$(agmsg_instance_id "$thread" codex 2>/dev/null)" || return 1
+  agmsg_role_session_record "$chosen_team" "$chosen_name" "$thread" "$project" codex "$owner" "$profile" inactive || return 1
+  agmsg_role_session_load "$chosen_team" "$chosen_name"
+  [ "${AGMSG_ROLE_SESSION_UUID:-}" = "$thread" ] \
+    && [ "$(_agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" codex_home)" = "$profile" ] || return 1
+  AGMSG_CODEX_REFRESHED_PAIR="$chosen_team"$'\t'"$chosen_name"
+}
+
+agmsg_codex_unseated_notice() {
+  source "${SKILL_DIR:-}/scripts/lib/boot-command.sh"
+  printf 'AGMSG delivery: this session is not connected to a seat yet. Run %s in Codex to receive messages.\n' "$(agmsg_actas_prompt codex '<name>')"
+}
+
 agmsg_session_start() {
+  # #1477: report, once, if this profile's Codex config is missing this
+  # install's writable_roots (Codex installed after agmsg, so
+  # configure_codex_sandbox never saw a config to write into). Read-only,
+  # and unconditional — runs before every other branch below, several of
+  # which `exit 0` early, so the notice would otherwise never be reached on
+  # a fresh/no-bridge-needed session.
+  if ! declare -F agmsg_codex_writable_roots_notice >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    . "$SKILL_DIR/scripts/lib/codex-config.sh"
+  fi
+  agmsg_codex_writable_roots_notice "$SKILL_DIR"
   thread_id="$(agmsg_resolve_codex_thread "$PROJECT")"
-  [ -n "$thread_id" ] || exit 0
+  if [ -z "$thread_id" ]; then
+    agmsg_codex_unseated_notice
+    exit 0
+  fi
   # A recorded role belongs to its recorded Codex thread. The in-sandbox
   # fallback has no launcher to arbitrate this, so exclude a mismatched role
   # rather than ever injecting it into this session's thread (#150/#350).
   # shellcheck source=../../../lib/role-session.sh
   source "$SKILL_DIR/scripts/lib/role-session.sh"
   project_phys="$(agmsg_canonical_path "$PROJECT" 2>/dev/null || printf '%s' "$PROJECT")"
+  # #1468: /clear starts a new thread inside the same Codex process. No
+  # seat is chosen here by the process: the tool shells run under the
+  # profile's shared app-server daemon, so every seat of a profile resolves to
+  # the same pid and a pid match could move another seat's record. The only
+  # move left is agmsg_codex_refresh_destination's: the project's sole
+  # registration, never over a live owner.
+  # The hook runs in the TUI's environment; tool shells may not (see _profile.sh).
+  if [ "$thread_id" = "${CODEX_THREAD_ID:-}" ] || [ "$thread_id" = "${SESSION_ID:-}" ]; then
+    # shellcheck disable=SC1091
+    . "${SKILL_DIR:-}/scripts/drivers/types/codex/_profile.sh"
+    agmsg_codex_thread_home_publish "${RUN_DIR:-}" "$thread_id"
+  fi
+  agmsg_codex_refresh_destination "$thread_id" "$project_phys" "$PAIRS" || true
   safe_pairs=""
   while IFS=$'\t' read -r candidate_team candidate_name; do
     [ -n "$candidate_team" ] || continue
+    if [ -n "${AGMSG_CODEX_REFRESHED_PAIR:-}" ] \
+      && [ "$candidate_team"$'\t'"$candidate_name" != "$AGMSG_CODEX_REFRESHED_PAIR" ]; then continue; fi
     candidate_thread="$(agmsg_role_session_uuid "$candidate_team" "$candidate_name" 2>/dev/null || true)"
     if [ -n "$candidate_thread" ]; then
       candidate_project="$(agmsg_role_session_get "$candidate_team" "$candidate_name" project 2>/dev/null || true)"
@@ -126,6 +195,10 @@ agmsg_session_start() {
     safe_pairs="${safe_pairs:+$safe_pairs$'\n'}${candidate_team}"$'\t'"${candidate_name}"
   done <<< "$PAIRS"
   PAIRS="$safe_pairs"
+  if [ "$(printf '%s\n' "$PAIRS" | grep -c . || true)" != 1 ] \
+    || { [ "$thread_id" != "${CODEX_THREAD_ID:-}" ] && [ "$thread_id" != "${SESSION_ID:-}" ]; }; then
+    agmsg_codex_unseated_notice
+  fi
   # A request is an authority hand-off, not a best-effort hint. Never derive a
   # path from an absent RUN_DIR or publish a record whose type is empty: callers
   # that cannot provide either input must leave the previous request untouched.
@@ -158,6 +231,12 @@ agmsg_session_start() {
     # passes the URL to `codex --remote`, not as a `unix://` token this script can
     # scrape — so none of the three probes above can see it. The port file does
     # carry the URL; reuse the helper codex-record-session.sh already uses for it.
+    #
+    # Refuse rather than source an empty path or look up an empty project: an
+    # unset SKILL_DIR or PROJECT here would not fail loudly, it would just
+    # never find the app-server and fall through to the "no app_server" exit
+    # below for the wrong reason (#1234 review).
+    [ -n "${SKILL_DIR:-}" ] && [ -n "${PROJECT:-}" ] || exit 0
     if ! command -v _agmsg_codex_app_server_url >/dev/null 2>&1; then
       # shellcheck disable=SC1091
       . "$SKILL_DIR/scripts/drivers/types/codex/_app-server.sh"
@@ -200,25 +279,47 @@ EOF
   [ -n "$app_server" ] || exit 0
 
   mkdir -p "$RUN_DIR" 2>/dev/null || true
-  if [ "$pair_count" = "1" ]; then
-    IFS=$'\t' read -r key_team key_name <<EOF
-$PAIRS
-EOF
-    bridge_key="$key_team.$key_name"
-  else
-    bridge_key=$(printf '%s' "$PAIRS" | agmsg_sha1)
+  # #1470 review round 5: derived through the one shared function
+  # (agmsg_codex_bridge_key), not recomputed here from $PAIRS/$pair_count --
+  # self-fix.sh's own state check calls the SAME function for the SAME
+  # (project, thread_id), so the two can never land on different keys the
+  # way two independent re-derivations of "the safe set" eventually would.
+  if ! declare -F agmsg_codex_bridge_key >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    . "$SKILL_DIR/scripts/drivers/types/codex/_bridge-key.sh"
   fi
+  bridge_key="$(agmsg_codex_bridge_key "$PROJECT" "$thread_id")"
+  [ -n "$bridge_key" ] || exit 0
   bridge_pairs=()
   while IFS=$'\t' read -r candidate_team candidate_name; do
     bridge_pairs+=(--pair "$candidate_team"$'\t'"$candidate_name")
   done <<< "$PAIRS"
   pidfile="$RUN_DIR/codex-bridge.$bridge_key.pid"
+  # Same name the out-of-sandbox launcher uses for its own per-bridge thread
+  # record (codex-bridge-launcher.sh's thread_file) -- not shared machinery,
+  # just the same convention, so a reader who knows one knows the other, and
+  # so self-fix.sh's own state check (#1470 review) can read the truth for
+  # either architecture from one place.
+  #
+  # A live pidfile here is left ALONE even when its bound thread is stale
+  # (#1470 review round 4): "alive" only proves a pid is running, never that
+  # it is THIS bridge -- a reused pid could belong to something else
+  # entirely -- and this path, unlike the launcher, has no lease/start-token
+  # reaper to prove the old writer is actually gone before a replacement is
+  # spawned beside it (#935's hazard). Production arms the launcher
+  # (codex-monitor.sh sets AGMSG_CODEX_BRIDGE_LAUNCHER=1), which DOES have
+  # that reaper and already self-heals a thread change on its own polling
+  # cadence; this direct path's job is only to stand down safely, not to
+  # retry. self-fix.sh reads the stale thread_file it leaves behind and
+  # reports the seat as needing another pass, rather than this hook
+  # guessing at a repair it cannot safely make.
   if [ -f "$pidfile" ]; then
     bridge_pid=$(cat "$pidfile" 2>/dev/null || true)
     if [ -n "$bridge_pid" ] && _agmsg_pid_alive "$bridge_pid"; then
       exit 0
     fi
   fi
+  thread_file="$RUN_DIR/codex-bridge.$bridge_key.thread"
 
   log="$RUN_DIR/codex-bridge.$bridge_key.log"
   # An explicit AGMSG_CODEX_BRIDGE_CMD is a complete runnable (tests, custom
@@ -239,7 +340,7 @@ EOF
   # close here directly would shut descriptors belonging to the shell that
   # sourced us. The subshell is what makes it safe: the close applies to the
   # forked child, which is the process that goes on to become the bridge, and
-  # the parent keeps everything it had (review P1, co1).
+  # the parent keeps everything it had (review P1).
   #
   # The `3>&- 4>&-` stays on the spawn line as well. test_spawn_fd_guard.bats
   # requires it there and says why: a file-level close can sit inside a
@@ -260,5 +361,6 @@ EOF
       --inline-inbox \
       >>"$log" 2>&1 3>&- 4>&- &
   )
+  printf '%s' "$thread_id" > "$thread_file" 2>/dev/null || true
   exit 0
 }

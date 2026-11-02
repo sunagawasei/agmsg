@@ -23,6 +23,7 @@ load test_helper
 
 setup() {
   setup_test_env
+  TEST_LIFETIME_PIDS=""
   export SKILL_DIR="$TEST_SKILL_DIR"
   export RUN_DIR="$SKILL_DIR/run"; mkdir -p "$RUN_DIR"
   # #1254: the launcher now requires AGMSG_CODEX_SEAT_KEY (inherited from
@@ -174,6 +175,27 @@ write_request() {
   # suite, which every launcher invocation below inherits.
   printf 'codex\t%s\t%s\t%s\t%s\n' "$thread" "$app_server" "$pair_team" "$pair_name" \
     > "$RUN_DIR/codex-bridge-request.$AGMSG_CODEX_SEAT_KEY"
+}
+
+# Start the dispatcher with enough lifetime to remain eligible under a loaded
+# runner, but stop it as soon as the asynchronous bridge launch is observable.
+# A short foreground lifetime followed by a capture wait is not equivalent:
+# once the lifetime process exits, the dispatcher is no longer allowed to spawn
+# the role child that creates CAPTURE.
+run_launcher_until_capture() { # [ENV=VALUE ...]
+  sleep 30 3>&- & local parent=$!
+  env "$@" bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent" >/dev/null 2>&1 3>&- &
+  local dispatcher=$! seen=0 i
+  for i in {1..200}; do
+    if [ -f "$CAPTURE" ]; then seen=1; break; fi
+    sleep 0.1
+  done
+  kill "$parent" 2>/dev/null || true
+  wait "$parent" 2>/dev/null || true
+  # Retire the lifetime first and let the dispatcher observe that boundary.
+  # Killing the dispatcher first can strand the detached role child it spawned.
+  wait "$dispatcher" 2>/dev/null || true
+  [ "$seen" -eq 1 ]
 }
 
 # Start a signal-controlled live PID without imposing a fixed-duration sleep on
@@ -489,9 +511,34 @@ child_count_is() {
   [ "$(count_child_launchers)" -eq "$1" ]
 }
 
+wait_for_stable_child_count() {
+  local want="$1" needed=5 stable=0 i count
+  for i in {1..100}; do
+    count="$(count_child_launchers)"
+    if [ "$count" -eq "$want" ]; then
+      stable=$((stable + 1))
+      [ "$stable" -ge "$needed" ] && { printf '%s\n' "$count"; return 0; }
+    else
+      stable=0
+    fi
+    sleep 0.1
+  done
+  printf '%s\n' "$count"
+  return 1
+}
+
+wait_for_bridge_capture() {
+  local i
+  for i in {1..100}; do
+    grep -Fq -- '--pair team' "$CAPTURE" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 @test "launcher: a replacement dispatcher does not double the role children (#485)" {
   put_record team alice thread-alice "$PROJ" codex
-  export MOCK_BRIDGE_SLEEP=12
+  export MOCK_BRIDGE_SLEEP=60
   start_live_parent; local parent_a="$LAST_LIVE_PARENT"
   start_live_parent; local parent_b="$LAST_LIVE_PARENT"
 
@@ -499,6 +546,7 @@ child_count_is() {
   bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent_a" >/dev/null 2>&1 3>&- &
   local dispatcher_a=$!
   [ "$(wait_for_child_count 1)" -eq 1 ]
+  wait_for_bridge_capture
 
   # SIGKILL is what a pane teardown effectively does to a dispatcher that never
   # trapped the signal: the EXIT trap does not run, so the lock row is left
@@ -507,16 +555,45 @@ child_count_is() {
   wait "$dispatcher_a" 2>/dev/null || true
   [ "$(wait_for_child_count 1)" -eq 1 ]
 
-  # Dispatcher B reclaims the stale lock and, with an empty known_pairs, spawns
-  # a second child for the SAME pair. Without the per-role lock that child would
-  # live on and poll forever alongside the first.
-  bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent_b" >/dev/null 2>&1 3>&- &
+  # Observe B reaching the child-launch call, and wait for that child attempt to
+  # return before checking the steady state. The wrapper keeps the attempt
+  # observable without adding a fixed delay.
+  local real_nohup duplicate_started="$TEST_SKILL_DIR/duplicate-child-started"
+  local duplicate_release="$TEST_SKILL_DIR/duplicate-child-release"
+  local duplicate_done="$TEST_SKILL_DIR/duplicate-child-done"
+  local fake_bin="$TEST_SKILL_DIR/fake-bin"
+  real_nohup="$(command -v nohup)"
+  mkdir -p "$fake_bin"
+  cat > "$fake_bin/nohup" <<'EOF'
+#!/usr/bin/env bash
+if [ "${5:-}" = "${MOCK_DUPLICATE_PARENT_PID:-}" ] && [ -n "${MOCK_DUPLICATE_PARENT_PID:-}" ]; then
+  : > "$DUPLICATE_CHILD_STARTED"
+  while [ ! -e "$DUPLICATE_CHILD_RELEASE" ]; do sleep 0.05; done
+fi
+"$REAL_NOHUP" "$@" &
+child=$!
+wait "$child"
+: > "$DUPLICATE_CHILD_DONE"
+EOF
+  chmod +x "$fake_bin/nohup"
+  REAL_NOHUP="$real_nohup" MOCK_DUPLICATE_PARENT_PID="$parent_b" \
+    DUPLICATE_CHILD_STARTED="$duplicate_started" DUPLICATE_CHILD_RELEASE="$duplicate_release" \
+    DUPLICATE_CHILD_DONE="$duplicate_done" \
+    PATH="$fake_bin:$PATH" bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent_b" >/dev/null 2>&1 3>&- &
   local dispatcher_b=$!
-  # The duplicate is spawned and then has to lose the lock race; settle on the
-  # steady state rather than on whichever side of that transition we land.
-  [ "$(wait_for_child_count 1)" -eq 1 ]
-  sleep 1
-  [ "$(count_child_launchers)" -eq 1 ]
+  local duplicate_started_ok=0 duplicate_returned=0 i
+  for i in {1..100}; do
+    [ -f "$duplicate_started" ] && { duplicate_started_ok=1; break; }
+    sleep 0.1
+  done
+  [ "$duplicate_started_ok" -eq 1 ]
+  : > "$duplicate_release"
+  for i in {1..100}; do
+    [ -f "$duplicate_done" ] && { duplicate_returned=1; break; }
+    sleep 0.1
+  done
+  [ "$duplicate_returned" -eq 1 ]
+  [ "$(wait_for_stable_child_count 1)" -eq 1 ]
 
   kill "$dispatcher_b" 2>/dev/null || true
   wait "$dispatcher_b" 2>/dev/null || true
@@ -602,19 +679,14 @@ child_count_is() {
 
   put_record team alice thread-msys "$PROJ" codex
 
-  sleep 6 3>&- & local p=$!
-  MSYSTEM=MINGW64 PATH="$stubdir:$PATH" \
-    bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$p" >/dev/null 2>&1 3>&- || true
-  wait "$p" 2>/dev/null || true
-  local i
-  for i in {1..30}; do [ -f "$CAPTURE" ] && break; sleep 0.1; done
+  run_launcher_until_capture MSYSTEM=MINGW64 PATH="$stubdir:$PATH" || true
 
   # A bridge was launched at all -- this is what the whole class costs on Windows.
   [ -f "$CAPTURE" ] || { echo "no bridge was started under a blind tasklist"; false; }
   grep -q -- '--thread thread-msys' "$CAPTURE"
 }
 
-@test "launcher: windows-native starts the bridge (#567)" {
+@test "launcher: windows-native starts the bridge (#1161)" {
   skip_unless_windows "the point is the real tasklist and the real MSYS pid space"
   # The counterpart to codex-monitor's windows-native test, and the half #582
   # does NOT fix: reaching the bridged handoff is not the same as delivering a
@@ -624,11 +696,7 @@ child_count_is() {
   # started. Real tasklist, no stub.
   put_record team alice thread-win "$PROJ" codex
 
-  sleep 6 3>&- & local p=$!
-  bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$p" >/dev/null 2>&1 3>&- || true
-  wait "$p" 2>/dev/null || true
-  local i
-  for i in {1..30}; do [ -f "$CAPTURE" ] && break; sleep 0.1; done
+  run_launcher_until_capture || true
 
   [ -f "$CAPTURE" ] || { echo "no bridge was started on native Windows"; false; }
   grep -q -- '--thread thread-win' "$CAPTURE"

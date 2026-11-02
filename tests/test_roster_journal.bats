@@ -55,46 +55,69 @@ config_field() {
     CAST(readfile('$(rf "$config")') AS TEXT), '$path');"
 }
 
-# Seed a team the way the roster journal expects it: a config carrying a team_id
-# and member_ids, plus the journal that records them. join.sh does not write the
-# journal in this fork, so the tests that exercise the library build it directly.
-_seed_roster() {
-  local team="$1" name="$2" team_dir member_id
-  team_dir="$TEST_SKILL_DIR/teams/$team"
-  mkdir -p "$team_dir"
-  source "$SCRIPTS/lib/roster-journal.sh"
-  member_id="$(compat_uuid7)"
-  printf '{"name":"%s","team_id":"%s","agents":{"%s":{"member_id":"%s","registrations":[{"type":"claude-code","project":"/tmp/a"}]}}}\n' \
-    "$team" "$(compat_uuid7)" "$name" "$member_id" > "$team_dir/config.json"
-  agmsg_roster_append_joined "$team_dir" "$member_id" "$name" "2026-01-01T00:00:00Z"
-}
+@test "join records one stable identity event per new member" {
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local config="$TEST_SKILL_DIR/teams/demo/config.json"
+  local journal="$TEST_SKILL_DIR/teams/demo/roster.jsonl"
+  [ -f "$journal" ]
 
-@test "a retired member rejoins with the same identity" {
-  _seed_roster demo alice
-  local team_dir="$TEST_SKILL_DIR/teams/demo"
-  local config="$team_dir/config.json"
   local member_id
   member_id="$(config_field "$config" '$.agents.alice.member_id')"
   [[ "$member_id" =~ $UUID7_RE ]]
+  [ "$(journal_query "$journal" \
+    "SELECT count(*) FROM records
+      WHERE json_extract(event,'\$.type')='member_joined'
+        AND json_extract(event,'\$.member_id')='$member_id'
+        AND json_extract(event,'\$.name')='alice';")" -eq 1 ]
 
-  agmsg_roster_append_left "$team_dir" "$member_id" alice "2026-01-01T00:00:01Z"
-  agmsg_roster_project_config "$team_dir" "$config"
-  [ "$(journal_query "$team_dir/roster.jsonl" \
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/b
+  [ "$(journal_query "$journal" \
+    "SELECT count(*) FROM records
+      WHERE json_extract(event,'\$.type')='member_joined';")" -eq 1 ]
+
+  bash "$SCRIPTS/join.sh" demo bob codex /tmp/c
+  [ "$(journal_query "$journal" \
+    "SELECT count(*) FROM records
+      WHERE json_extract(event,'\$.type')='member_joined';")" -eq 2 ]
+}
+
+@test "leave appends identity history and retains an empty current team" {
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local team_dir="$TEST_SKILL_DIR/teams/demo"
+  local config="$team_dir/config.json"
+  local journal="$team_dir/roster.jsonl"
+  local member_id
+  member_id="$(config_field "$config" '$.agents.alice.member_id')"
+
+  run bash "$SCRIPTS/leave.sh" demo alice
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"team retained"* ]]
+  [ -d "$team_dir" ]
+  [ -f "$config" ]
+  [ -f "$journal" ]
+  [ "$(config_field "$config" '$.agents')" = "{}" ]
+  [ "$(journal_query "$journal" \
     "SELECT count(*) FROM records
       WHERE json_extract(event,'\$.type')='member_left'
         AND json_extract(event,'\$.member_id')='$member_id'
         AND json_extract(event,'\$.name')='alice';")" -eq 1 ]
-  [ "$(config_field "$config" '$.agents.alice')" = "" ]
-  [ "$(config_field "$config" '$.retired_members.alice.member_id')" = "$member_id" ]
+}
 
-  agmsg_roster_append_joined "$team_dir" "$member_id" alice "2026-01-01T00:00:02Z"
-  agmsg_roster_project_config "$team_dir" "$config"
+@test "a retired member rejoins with the same identity" {
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local config="$TEST_SKILL_DIR/teams/demo/config.json"
+  local member_id
+  member_id="$(config_field "$config" '$.agents.alice.member_id')"
+  bash "$SCRIPTS/leave.sh" demo alice
+
+  [ "$(config_field "$config" '$.retired_members.alice.member_id')" = "$member_id" ]
+  bash "$SCRIPTS/join.sh" demo alice codex /tmp/b
   [ "$(config_field "$config" '$.agents.alice.member_id')" = "$member_id" ]
   [ "$(config_field "$config" '$.retired_members.alice')" = "" ]
 }
 
 @test "journal projection keeps the first identity bound to a name" {
-  _seed_roster demo alice
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
   local team_dir="$TEST_SKILL_DIR/teams/demo"
   local config="$team_dir/config.json"
   local first second
@@ -113,27 +136,198 @@ _seed_roster() {
         AND json_extract(event,'\$.name')='alice';")" -eq 2 ]
 }
 
-@test "concurrent renames accept only the first event whose from name is current" {
-  _seed_roster demo alice
+@test "rename preserves member identity and records a compare-and-swap event" {
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
   local team_dir="$TEST_SKILL_DIR/teams/demo"
   local config="$team_dir/config.json"
   local member_id
   member_id="$(config_field "$config" '$.agents.alice.member_id')"
-  [[ "$member_id" =~ $UUID7_RE ]]
 
+  bash "$SCRIPTS/rename.sh" demo alice carol
+
+  [ "$(config_field "$config" '$.agents.carol.member_id')" = "$member_id" ]
+  [ "$(config_field "$config" '$.agents.alice')" = "" ]
+  [ "$(journal_query "$team_dir/roster.jsonl" \
+    "SELECT count(*) FROM records
+      WHERE json_extract(event,'\$.type')='member_renamed'
+        AND json_extract(event,'\$.member_id')='$member_id'
+        AND json_extract(event,'\$.from')='alice'
+        AND json_extract(event,'\$.to')='carol';")" -eq 1 ]
+}
+
+@test "rename carries a name-only legacy team's placement record to the new name, replacing a stale one (#1403)" {
+  # A journaled team's placement path is keyed by member_id (#1023), which
+  # already survives a rename on its own -- the bug this covers is specific
+  # to a name-only legacy team (no roster.jsonl), where the path is purely
+  # name-keyed and the rename has nothing else carrying it over.
+  mkdir -p "$TEST_SKILL_DIR/teams/legacy"
+  printf '%s\n' \
+    '{"name":"legacy","agents":{"alice":{"type":"claude-code","project":"/tmp/a"}}}' \
+    > "$TEST_SKILL_DIR/teams/legacy/config.json"
+
+  # A stale placement record already sitting under the NEW name, left by
+  # some unrelated former member no longer in the roster (#1403's own
+  # reproduction: a dead tmux pane from months earlier). Computed through
+  # agmsg_spawn_path itself -- the exact path a real reader (team.sh,
+  # send.sh's #1114 guard) resolves -- rather than assuming its on-disk
+  # naming scheme.
+  local alice_spawn carol_spawn
+  (
+    export SKILL_DIR="$TEST_SKILL_DIR"
+    # shellcheck disable=SC1090
+    source "$SKILL_DIR/scripts/lib/actas-lock.sh"
+    agmsg_spawn_path legacy alice > "$TEST_SKILL_DIR/alice_spawn_path"
+    agmsg_spawn_path legacy carol > "$TEST_SKILL_DIR/carol_spawn_path"
+  )
+  alice_spawn="$(cat "$TEST_SKILL_DIR/alice_spawn_path")"
+  carol_spawn="$(cat "$TEST_SKILL_DIR/carol_spawn_path")"
+  mkdir -p "$(dirname "$alice_spawn")"
+  printf 'herdr:sock:pA\t/tmp/a\tclaude-code\n' > "$alice_spawn"
+  printf 'tmux:%%9\t/tmp/long-gone\tclaude-code\n' > "$carol_spawn"
+
+  bash "$SCRIPTS/rename.sh" legacy alice carol
+
+  [ "$(config_field "$TEST_SKILL_DIR/teams/legacy/config.json" '$.agents.carol.type')" = claude-code ]
+
+  # alice's record moved to carol's path, overwriting the stale leftover --
+  # never left behind under the old name, never left alongside it under the
+  # new one.
+  [ ! -e "$alice_spawn" ]
+  [ -f "$carol_spawn" ]
+  grep -qF 'herdr:sock:pA' "$carol_spawn"
+
+  # The other half of the same fix (review round, #1625): a JOURNALED team's
+  # placement path is already keyed by member_id, not name, so renaming must
+  # not touch it at all -- the record stays exactly where it was, under the
+  # SAME path, with its original content intact. Proving this needs a live
+  # record already sitting there BEFORE the rename, not just "a file exists
+  # afterward": a version of this fix that blindly carried out the same
+  # move/replace for a journaled team too was confirmed (by hand, before
+  # this was gated off) to compute the identical id-keyed path for both
+  # names and reduce to a same-path no-op -- this only tells the two apart
+  # by also checking the content survived untouched.
+  bash "$SCRIPTS/join.sh" idteam dave claude-code /tmp/d
+  local dave_spawn
+  (
+    export SKILL_DIR="$TEST_SKILL_DIR"
+    # shellcheck disable=SC1090
+    source "$SKILL_DIR/scripts/lib/actas-lock.sh"
+    agmsg_spawn_path idteam dave > "$TEST_SKILL_DIR/dave_spawn_path"
+  )
+  dave_spawn="$(cat "$TEST_SKILL_DIR/dave_spawn_path")"
+  mkdir -p "$(dirname "$dave_spawn")"
+  printf 'herdr:sock:pD\t/tmp/d\tclaude-code\n' > "$dave_spawn"
+
+  bash "$SCRIPTS/rename.sh" idteam dave erin
+
+  [ "$(config_field "$TEST_SKILL_DIR/teams/idteam/config.json" '$.agents.erin.registrations[0].type')" = claude-code ]
+  [ -f "$dave_spawn" ]
+  grep -qF 'herdr:sock:pD' "$dave_spawn"
+
+  # A third case in the same journaled team (review round, #1625): #1023
+  # only migrates a pair's file to its id key the next time something
+  # WRITES it, so an id-having team can still have ordinary legacy
+  # name-keyed files for BOTH names if neither was ever written since #1023
+  # landed -- #1403's own reproduction. frank's real record is still a
+  # legacy file (never promoted), and a dead tmux leftover already sits
+  # under the destination name -- also still legacy, from some unrelated
+  # former member.
+  bash "$SCRIPTS/join.sh" idteam frank claude-code /tmp/f
+  local rundir frank_legacy grace_legacy
+  (
+    export SKILL_DIR="$TEST_SKILL_DIR"
+    # shellcheck disable=SC1090
+    source "$SKILL_DIR/scripts/lib/actas-lock.sh"
+    _actas_lock_dir > "$TEST_SKILL_DIR/rundir"
+  )
+  rundir="$(cat "$TEST_SKILL_DIR/rundir")"
+  frank_legacy="$rundir/spawn.idteam__frank"
+  grace_legacy="$rundir/spawn.idteam__grace"
+  printf 'herdr:sock:pF\t/tmp/f\tclaude-code\n' > "$frank_legacy"
+  printf 'tmux:%%9\t/tmp/long-gone\tclaude-code\n' > "$grace_legacy"
+
+  bash "$SCRIPTS/rename.sh" idteam frank grace
+
+  # Both legacy files are gone -- frank's never-promoted record did not stay
+  # behind under the old name, and grace's dead leftover did not survive
+  # either -- and whoever resolves grace's placement now (team.sh, the
+  # #1114 guard) reaches frank's real record, promoted to the id key.
+  [ ! -e "$frank_legacy" ]
+  [ ! -e "$grace_legacy" ]
+  (
+    export SKILL_DIR="$TEST_SKILL_DIR"
+    # shellcheck disable=SC1090
+    source "$SKILL_DIR/scripts/lib/actas-lock.sh"
+    agmsg_spawn_path idteam grace > "$TEST_SKILL_DIR/grace_resolved_path"
+  )
+  local grace_resolved
+  grace_resolved="$(cat "$TEST_SKILL_DIR/grace_resolved_path")"
+  [ -f "$grace_resolved" ]
+  grep -qF 'herdr:sock:pF' "$grace_resolved"
+
+  # A fourth case, in the LEGACY-team branch (review finding, #1625): the
+  # encoded legacy filename "<enc_team>__<enc_name>" has no separator
+  # escaping, so renaming within team "legacy" to a name containing "__"
+  # can encode to the exact same path as an unrelated pair in a DIFFERENT
+  # team -- team "a__b" agent "c" also encodes to "spawn.a__b__c". Without
+  # the same unambiguity guard the id-team branch already uses, this
+  # would mv/rm that other team's live placement record.
+  mkdir -p "$TEST_SKILL_DIR/teams/a"
+  printf '%s\n' '{"name":"a","agents":{"old":{"type":"claude-code","project":"/tmp/a"}}}' \
+    > "$TEST_SKILL_DIR/teams/a/config.json"
+  mkdir -p "$TEST_SKILL_DIR/teams/a__b"
+  printf '%s\n' '{"name":"a__b","agents":{"c":{"type":"claude-code","project":"/tmp/c"}}}' \
+    > "$TEST_SKILL_DIR/teams/a__b/config.json"
+  local shared_spawn
+  (
+    export SKILL_DIR="$TEST_SKILL_DIR"
+    # shellcheck disable=SC1090
+    source "$SKILL_DIR/scripts/lib/actas-lock.sh"
+    _actas_lock_dir > "$TEST_SKILL_DIR/rundir2"
+  )
+  shared_spawn="$(cat "$TEST_SKILL_DIR/rundir2")/spawn.a__b__c"
+  printf 'herdr:sock:LIVE\t/tmp/c\tclaude-code\n' > "$shared_spawn"
+
+  bash "$SCRIPTS/rename.sh" a old 'b__c'
+
+  grep -qF 'herdr:sock:LIVE' "$shared_spawn"
+
+  # A fifth case (review finding, #1625 round 2): the "__"-contains check
+  # above alone misses a collision caused by an underscore sitting right at
+  # the join boundary, not inside either half. Team "a" agent "_b" and team
+  # "a_" agent "b" both encode to "a___b" even though NEITHER half contains
+  # "__" on its own -- the ambiguity comes from the inserted "__" separator
+  # picking up an extra adjacent "_" from one side.
+  mkdir -p "$TEST_SKILL_DIR/teams/a2"
+  printf '%s\n' '{"name":"a2","agents":{"old2":{"type":"claude-code","project":"/tmp/x"}}}' \
+    > "$TEST_SKILL_DIR/teams/a2/config.json"
+  mkdir -p "$TEST_SKILL_DIR/teams/a2_"
+  printf '%s\n' '{"name":"a2_","agents":{"y":{"type":"claude-code","project":"/tmp/y"}}}' \
+    > "$TEST_SKILL_DIR/teams/a2_/config.json"
+  local shared_spawn2
+  shared_spawn2="$(cat "$TEST_SKILL_DIR/rundir2")/spawn.a2___y"
+  printf 'herdr:sock:LIVE2\t/tmp/y\tclaude-code\n' > "$shared_spawn2"
+
+  bash "$SCRIPTS/rename.sh" a2 old2 '_y'
+
+  grep -qF 'herdr:sock:LIVE2' "$shared_spawn2"
+}
+
+@test "concurrent renames accept only the first event whose from name is current" {
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local team_dir="$TEST_SKILL_DIR/teams/demo"
+  local config="$team_dir/config.json"
+  local member_id
+  member_id="$(config_field "$config" '$.agents.alice.member_id')"
+
+  source "$SCRIPTS/lib/roster-journal.sh"
   agmsg_roster_append_renamed "$team_dir" "$member_id" alice carol \
     "2026-01-01T00:00:00Z"
   agmsg_roster_append_renamed "$team_dir" "$member_id" alice dave \
     "2026-01-01T00:00:01Z"
   agmsg_roster_project_config "$team_dir" "$config"
 
-  [ "$(journal_query "$team_dir/roster.jsonl" \
-    "SELECT count(*) FROM records
-      WHERE json_extract(event,'\$.type')='member_renamed'
-        AND json_extract(event,'\$.member_id')='$member_id'
-        AND json_extract(event,'\$.from')='alice';")" -eq 2 ]
   [ "$(config_field "$config" '$.agents.carol.member_id')" = "$member_id" ]
-  [ "$(config_field "$config" '$.agents.alice')" = "" ]
   [ "$(config_field "$config" '$.agents.dave')" = "" ]
 }
 
@@ -240,7 +434,7 @@ EOS
 }
 
 @test "roster journal: the projection query itself reads a converted path (#669)" {
-  _seed_roster demo alice
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
   local team_dir="$TEST_SKILL_DIR/teams/demo"
 
   local bin="$BATS_TEST_TMPDIR/bin" cap="$BATS_TEST_TMPDIR/sql.txt"
@@ -274,12 +468,11 @@ EOS
   if [ "$(id -u)" = "0" ]; then
     skip "root reads through the mode bits this is about"
   fi
-  _seed_roster demo alice
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
   local journal="$TEST_SKILL_DIR/teams/demo/roster.jsonl"
   chmod 000 "$journal"
 
-  run bash -c '. "$1/lib/roster-journal.sh"; agmsg_roster_project_config "$2" "$3"' _ \
-    "$SCRIPTS" "$TEST_SKILL_DIR/teams/demo" "$TEST_SKILL_DIR/teams/demo/config.json"
+  run bash "$SCRIPTS/join.sh" demo bob claude-code /tmp/b
   chmod 644 "$journal"
 
   [ "$status" -ne 0 ]
@@ -338,7 +531,7 @@ EOS
   if [ "$(id -u)" = "0" ]; then
     skip "root reads through the mode bits this is about"
   fi
-  _seed_roster demo alice
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
   local team_dir="$TEST_SKILL_DIR/teams/demo" config="$TEST_SKILL_DIR/teams/demo/config.json"
   local before
   before="$(config_field "$config" '$.agents.alice.member_id')"
@@ -410,7 +603,13 @@ EOF
 # below. Only the named command is replaced; everything else still resolves
 # normally, so the driver is exercised rather than a crippled shell.
 _shim_failing() {
-  local name="$1" dir="$TEST_SKILL_DIR/shim-$name"
+  # Two statements, not one. `local name="$1" dir="...$name"` declares BOTH
+  # names first and only then assigns, so the `$name` in the second value
+  # expands the fresh, still-unset local -- measured: fatal under `set -u`,
+  # and silently empty without it, which would have made $dir "shim-" for
+  # every command and shadowed nothing.
+  local name="$1"
+  local dir="$TEST_SKILL_DIR/shim-$name"
   mkdir -p "$dir"
   printf '%s\n' '#!/bin/sh' 'exit 1' > "$dir/$name"
   chmod +x "$dir/$name"
@@ -819,7 +1018,7 @@ EOF
   # process behind it changes, and the argv stops matching.
   #
   # A pid cannot be recycled on demand, so the OBSERVATION is driven instead:
-  # `compat_get_cmdline` reads `ps -o args= -p` off Windows, and a `ps` stub
+  # `compat_get_cmdline` reads `ps -ww -o args= -p` off Windows, and a `ps` stub
   # answers truthfully until a marker appears and with a decoy afterwards. The
   # fake node traps TERM and drops that marker from inside the handler, so the
   # transition lands exactly between TERM and KILL. It does not exit from the
@@ -845,11 +1044,11 @@ EOF
   chmod +x "$shimdir/mktemp"
 
   # The seam: truthful until the marker exists, a decoy afterwards. Only the
-  # `-o args=` form is intercepted, so nothing else that shells out to `ps` --
+  # `-ww -o args=` form is intercepted, so nothing else that shells out to `ps` --
   # `_agmsg_pid_alive_local`'s own cross-check among them -- is affected.
   {
     printf '%s\n' '#!/bin/sh'
-    printf '%s\n' 'if [ "$1" = "-o" ] && [ "$2" = "args=" ] && [ -e "$AGMSG_TEST_TERMED" ]; then'
+    printf '%s\n' 'if [ "$1" = "-ww" ] && [ "$2" = "-o" ] && [ "$3" = "args=" ] && [ -e "$AGMSG_TEST_TERMED" ]; then'
     printf '%s\n' '  printf "%s\\n" "some-unrelated-process --after-recycle"'
     printf '%s\n' '  exit 0'
     printf '%s\n' 'fi'
@@ -948,7 +1147,7 @@ EOF
   chmod +x "$shimdir/mktemp"
   {
     printf '%s\n' '#!/bin/sh'
-    printf '%s\n' 'if [ "$1" = "-o" ] && [ "$2" = "args=" ]; then'
+    printf '%s\n' 'if [ "$1" = "-ww" ] && [ "$2" = "-o" ] && [ "$3" = "args=" ]; then'
     printf '%s\n' '  n=$(cat "$AGMSG_TEST_PS_CALLS" 2>/dev/null || echo 0)'
     printf '%s\n' '  n=$((n + 1)); printf %s "$n" > "$AGMSG_TEST_PS_CALLS"'
     printf '%s\n' '  if [ "$n" -eq 1 ]; then'
@@ -1520,6 +1719,23 @@ _roster_state_digest() {
   # Someone else's lock is still theirs.
   [ -d "$team_dir/.config.lock" ]
   rmdir "$team_dir/.config.lock"
+}
+
+@test "agmsg_roster_owner_name: a departed member's id does not resolve back to their old name (#1457)" {
+  # The reverse of agmsg_roster_name_owner, and the exact function
+  # self-fix.sh's own id-keyed lock resolution uses. A departed member is
+  # not "who it is today" -- a caller resolving an id back to a name must
+  # not walk a gone member's role into a live, named one just because the
+  # journal still remembers the name they left under.
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local team_dir="$TEST_SKILL_DIR/teams/demo"
+  local config="$team_dir/config.json"
+  local member_id
+  member_id="$(config_field "$config" '$.agents.alice.member_id')"
+  source "$SCRIPTS/lib/roster-journal.sh"
+  [ "$(agmsg_roster_owner_name "$team_dir" "$member_id")" = "alice" ]
+  agmsg_roster_append_left "$team_dir" "$member_id" alice "2026-01-01T00:00:00Z"
+  [ -z "$(agmsg_roster_owner_name "$team_dir" "$member_id")" ]
 }
 
 # --- the driver's lock is broken once nothing it started can still be writing (#53) ---

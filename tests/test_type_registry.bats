@@ -13,8 +13,22 @@
 
 load test_helper
 
-setup() { setup_test_env; }
+setup() {
+  setup_test_env
+  # shellcheck disable=SC1091
+  source "$BATS_TEST_DIRNAME/../scripts/lib/type-registry.sh"
+  # shellcheck disable=SC1091
+  source "$BATS_TEST_DIRNAME/../scripts/lib/skill-render.sh"
+}
 teardown() { teardown_test_env; }
+
+render_type() {
+  local type="$1" output="$TEST_SKILL_DIR/rendered-${1}.md"
+  if [ ! -f "$output" ]; then
+    SCRIPT_DIR="$BATS_TEST_DIRNAME/.." agmsg_render_skill "$type" agmsg "$output"
+  fi
+  printf '%s' "$output"
+}
 
 # Write a node-launcher fixture type into TEST_SKILL_DIR/scripts/drivers/types so the suite
 # exercises the spawn= (Node launcher) mechanism generically, with no dependency
@@ -34,6 +48,47 @@ write_node_launcher_fixtures() {
     "source '$SCRIPTS/lib/type-registry.sh'; agmsg_known_types | sort -u | paste -sd, -"
   [ "$status" -eq 0 ]
   [ "$output" = "claude-code,codex,cursor" ]
+}
+
+@test "type-registry: sourcing alone does not compute the renderable-types list (#631)" {
+  # This file is also sourced from resolve-project.sh, on a path resolve-project.sh
+  # re-enters every watch.sh poll cycle -- a caller wanting only agmsg_type_get/
+  # agmsg_type_dir must not pay for a walk over every known type ending in `paste`
+  # just because the file was sourced. Only calling agmsg_load_renderable_skill_types
+  # may do that work.
+  local shimbin="$BATS_TEST_TMPDIR/shim-bin" callog="$BATS_TEST_TMPDIR/calls.log"
+  mkdir -p "$shimbin"
+  : > "$callog"
+  local cmd real
+  for cmd in paste head; do
+    real="$(command -v "$cmd")"
+    {
+      printf '#!/usr/bin/env bash\n'
+      printf "printf '%%s\\\\n' '%s' >> '%s'\n" "$cmd" "$callog"
+      printf "exec '%s' \"\$@\"\n" "$real"
+    } > "$shimbin/$cmd"
+    chmod +x "$shimbin/$cmd"
+  done
+
+  run env -i PATH="$shimbin:$PATH" bash -c \
+    "source '$SCRIPTS/lib/type-registry.sh'; :"
+  [ "$status" -eq 0 ]
+  [ ! -s "$callog" ]   # sourcing alone: neither shim ran
+
+  run env -i PATH="$shimbin:$PATH" bash -c \
+    "source '$SCRIPTS/lib/type-registry.sh'
+     agmsg_load_renderable_skill_types
+     printf '%s\n' \"\$AGMSG_RENDERABLE_SKILL_TYPES\"
+     # A second call must not recompute (no second 'paste' line below).
+     agmsg_load_renderable_skill_types
+     printf '%s\n' \"\$AGMSG_RENDERABLE_SKILL_TYPES\""
+  [ "$status" -eq 0 ]
+  local first second
+  first="$(sed -n '1p' <<<"$output")"
+  second="$(sed -n '2p' <<<"$output")"
+  [ -n "$first" ]
+  [ "$first" = "$second" ]
+  [ "$(grep -c '^paste$' "$callog")" -eq 1 ]   # computed once, not twice
 }
 
 @test "type-registry: is_known_type accepts a built-in and rejects a bogus type" {
@@ -64,6 +119,111 @@ write_node_launcher_fixtures() {
   [ "$status" -ne 0 ]
 }
 
+@test "skill renderer composes every built-in type without placeholders" {
+  local type rendered
+  while IFS= read -r type; do
+    rendered="$(render_type "$type")"
+    ! grep -q '__SKILL_NAME__\|__AGENT_TYPE__\|__CMD_PREFIX__' "$rendered" \
+      || { echo "unrendered placeholder left in: $rendered" >&2; return 1; }
+    grep -Fq '<!-- agmsg:render-root -->' "$rendered"
+    grep -Fq "<!-- agmsg:render-overlay $type -->" "$rendered"
+    grep -Fq "whoami.sh \"\$(pwd)\" $type" "$rendered"
+    grep -Fq 'scripts/arrange.sh <team> <agent> <intent> <anchor-ref>' "$rendered"
+  done < <(agmsg_renderable_types "$TEST_SKILL_DIR")
+  grep -Fq "Program Files\\Git\\bin\\bash.exe" "$(render_type codex)"
+  grep -Fq 'Ensure monitor is running first' "$(render_type claude-code)"
+}
+
+renderer_failure_fixture() {
+  cp "$BATS_TEST_DIRNAME/../SKILL.md" "$SCRIPTS/SKILL.md"
+  printf 'existing rendered skill\n' > "$TEST_SKILL_DIR/rendered.md"
+}
+
+run_renderer_fixture() {
+  run env -i PATH="$PATH" SCRIPT_DIR="$SCRIPTS" bash -c \
+    "source '$SCRIPTS/lib/type-registry.sh'; source '$SCRIPTS/lib/skill-render.sh'; agmsg_render_skill codex agmsg '$TEST_SKILL_DIR/rendered.md'"
+}
+
+@test "skill renderer rejects a missing overlay without replacing the output" {
+  renderer_failure_fixture
+  rm "$SCRIPTS/drivers/types/codex/template.md"
+  run_renderer_fixture
+  [ "$status" -ne 0 ]
+  [ "$(cat "$TEST_SKILL_DIR/rendered.md")" = "existing rendered skill" ]
+}
+
+@test "skill renderer rejects an unreadable overlay without replacing the output" {
+  renderer_failure_fixture
+  chmod 000 "$SCRIPTS/drivers/types/codex/template.md"
+  run_renderer_fixture
+  [ "$status" -ne 0 ]
+  [ "$(cat "$TEST_SKILL_DIR/rendered.md")" = "existing rendered skill" ]
+}
+
+@test "skill renderer rejects an empty overlay without replacing the output" {
+  renderer_failure_fixture
+  : > "$SCRIPTS/drivers/types/codex/template.md"
+  run_renderer_fixture
+  [ "$status" -ne 0 ]
+  [ "$(cat "$TEST_SKILL_DIR/rendered.md")" = "existing rendered skill" ]
+}
+
+@test "skill renderer rejects a nonempty overlay without its input marker" {
+  renderer_failure_fixture
+  # Keep the output-side marker in the root fixture so disabling the input
+  # marker check alone cannot be masked by the final composition check.
+  printf '\n<!-- agmsg:render-overlay codex -->\n' >> "$SCRIPTS/SKILL.md"
+  printf 'valid overlay body\n' > "$SCRIPTS/drivers/types/codex/template.md"
+  run_renderer_fixture
+  [ "$status" -ne 0 ]
+  [ "$(cat "$TEST_SKILL_DIR/rendered.md")" = "existing rendered skill" ]
+}
+
+@test "skill renderer rejects a marker-valid overlay that renders no type marker" {
+  renderer_failure_fixture
+  cat > "$SCRIPTS/drivers/types/codex/template.md" <<'EOF'
+<!-- agmsg:slot unused -->
+<!-- agmsg:render-overlay __AGENT_TYPE__ -->
+<!-- /agmsg:slot unused -->
+EOF
+  run_renderer_fixture
+  [ "$status" -ne 0 ]
+  [ "$(cat "$TEST_SKILL_DIR/rendered.md")" = "existing rendered skill" ]
+}
+
+@test "every agent template exposes declarative arrange without adding a public where verb" {
+  local template type
+  while IFS= read -r type; do
+    template="$(render_type "$type")"
+    grep -q 'scripts/arrange\.sh <team> <agent> <intent> <anchor-ref>' "$template"
+    grep -q '`moved` as a performed move and `unchanged`' "$template"
+    [ "$(grep -c 'If argument starts with "where"' "$template" || true)" -eq 0 ]
+  done < <(agmsg_renderable_types "$TEST_SKILL_DIR")
+}
+
+@test "every agent template routes team identity reads through team.sh, read-only, and repairs through fix.sh (#1152)" {
+  local template type renderable_types
+  renderable_types="$(agmsg_renderable_types "$TEST_SKILL_DIR")"
+  [ -n "$renderable_types" ]
+  grep -qxF 'claude-code' <<<"$renderable_types"
+  while IFS= read -r type; do
+    template="$(render_type "$type")"
+    grep -Fq 'If argument is "team" or "team --json"' "$template"
+    grep -Fq 'team.sh $TEAM [--json]' "$template"
+    grep -Fq 'This is read-only' "$template"
+    # The externally-typed repair flags are gone on purpose (koichi's ruling,
+    # #1152): forcing a fix into another seat's pane from outside is the
+    # defect this removal exists to end, not something to keep under another
+    # name. Their absence is the property this test protects, not their
+    # presence.
+    refute grep -Fq -- '--fix-pane-names' "$template"
+    refute grep -Fq -- '--rename-sessions' "$template"
+    # Repair is self-only, through fix.sh (already documented separately).
+    grep -Fq 'scripts/fix.sh' "$template"
+    grep -Fiq 'types' "$template"
+  done <<<"$renderable_types"
+}
+
 @test "type-registry: spawnable set is exactly the three built-ins (#277, #279)" {
   run env -i PATH="$PATH" bash -c \
     "source '$SCRIPTS/lib/type-registry.sh'
@@ -89,6 +249,31 @@ write_node_launcher_fixtures() {
   [ "$(g cursor detect_proc)" = "cursor-agent cursor-agent-*" ]
 }
 
+@test "type-registry: no manifest key is named 'monitor' -- delivery_modes alone answers mode support (#1214)" {
+  # A bare `monitor=` key read as a statement about the delivery MODE, colliding
+  # with `delivery_modes=monitor` (a type can carry both: no in-session Monitor
+  # TOOL and a real, settable monitor MODE at once -- codex is exactly this).
+  # Renamed to readiness_sentinel=; this pins the rename so the confusing name
+  # cannot come back on a new or edited manifest.
+  run grep -rl '^monitor=' "$SCRIPTS/drivers/types"/*/type.conf
+  [ -z "$output" ]
+}
+
+@test "type-registry: readiness_sentinel is readable and distinct from delivery_modes' own 'monitor' (#1214)" {
+  g() { env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_type_get $1 $2"; }
+  # codex: no spawn-time handshake to await, but monitor IS a settable delivery
+  # mode -- the exact combination the old shared name could not express.
+  [ "$(g codex readiness_sentinel)" = no ]
+  [ "$(g claude-code readiness_sentinel)" = yes ]
+  case "$(g codex delivery_modes)" in *monitor*) : ;; *) return 1 ;; esac
+}
+
+@test "type-registry: session identity is a dedicated per-type datum, not inferred from detect" {
+  g() { env -i PATH="$PATH" bash -c "source '$SCRIPTS/lib/type-registry.sh'; agmsg_type_get $1 session_env"; }
+  [ "$(g claude-code)" = "CLAUDE_CODE_SESSION_ID" ]
+  [ "$(g codex)" = "CODEX_THREAD_ID" ]
+}
+
 @test "type-registry: whoami detects codex end-to-end from CODEX_THREAD_ID" {
   # Join a codex agent so whoami has a registration to report, then call it with
   # no explicit type: detection must pick codex from the manifest's detect= key.
@@ -98,25 +283,58 @@ write_node_launcher_fixtures() {
   echo "$output" | grep -q "type=codex"
 }
 
-@test "type-registry: env-detection precedence is claude-code < codex" {
-  # Reproduce whoami's manifest-driven env sweep (sorted order) and assert the
-  # historical precedence: a runtime's own session var wins in sorted order,
-  # and detect=explicit types never win.
-  sweep() {
-    env -i PATH="$PATH" "$@" bash -c "
-      source '$SCRIPTS/lib/type-registry.sh'
-      while IFS= read -r t; do
-        [ -n \"\$t\" ] || continue
-        d=\$(agmsg_type_get \"\$t\" detect)
-        if [ -z \"\$d\" ] || [ \"\$d\" = explicit ]; then continue; fi
-        for v in \$d; do [ -n \"\${!v:-}\" ] && { echo \"\$t\"; exit 0; }; done
-      done <<< \"\$(agmsg_known_types | sort -u)\"
-      echo claude-code"
+@test "type-registry: detection precedence is claude-code < codex" {
+  # Exercise the production detector so priority, process evidence, and the
+  # weak credential fallback cannot drift apart.
+  detect() {
+    env -i PATH="$PATH" "$@" bash -c \
+      "source '$SCRIPTS/lib/type-registry.sh'; source '$SCRIPTS/lib/compat.sh'; source '$SCRIPTS/lib/detect-cli-type.sh'; compat_get_comm() { echo test-shell; }; compat_get_ppid() { echo 1; }; agmsg_detect_cli_type"
   }
-  [ "$(sweep CODEX_THREAD_ID=x)" = codex ]
-  [ "$(sweep CLAUDE_CODE_SESSION_ID=x CODEX_THREAD_ID=y)" = claude-code ]
-  [ "$(sweep CODEX_SANDBOX=x)" = codex ]
-  [ "$(sweep)" = claude-code ]
+  [ "$(detect CODEX_THREAD_ID=x)" = codex ]
+  [ "$(detect CLAUDE_CODE_SESSION_ID=x CODEX_THREAD_ID=y)" = claude-code ]
+  [ "$(detect)" = claude-code ]
+}
+
+@test "type-registry: agmsg_detect_cli_type's default fallback still returns 0, and signals the fallback on a side channel only (#1402 review)" {
+  # #1402 review: an earlier version of this change made the default
+  # branch `return 1` to distinguish it from a real detection, reasoning
+  # that no existing caller checked the status. True, but irrelevant --
+  # whoami.sh's `AGENT_TYPE="${2:-$(agmsg_detect_cli_type)}"` and
+  # windows/dispatch.sh's `AGENT_TYPE="$(agmsg_detect_cli_type)"` are plain
+  # assignments under `set -e`, and a FAILING command substitution inside
+  # one of those aborts the script right there, before the assignment (and
+  # its fallback value) ever lands -- a live regression on a path every
+  # existing seat with no strong evidence went through daily. The function's
+  # own return value and stdout must stay exactly what they always were;
+  # only the side channel added for self-name.sh (#1391) may say "this was
+  # a guess, not evidence".
+  run env -i PATH="$PATH" bash -c \
+    "source '$SCRIPTS/lib/type-registry.sh'; source '$SCRIPTS/lib/compat.sh'; source '$SCRIPTS/lib/detect-cli-type.sh'; compat_get_comm() { :; }; compat_get_ppid() { :; }; agmsg_detect_cli_type; echo rc=\$?"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'claude-code\nrc=0')" ]
+
+  # The exact regression shape: a `set -e` script assigning the call's
+  # output directly must not abort when detection falls all the way through
+  # to the default.
+  run env -i PATH="$PATH" bash -c \
+    "set -euo pipefail; source '$SCRIPTS/lib/type-registry.sh'; source '$SCRIPTS/lib/compat.sh'; source '$SCRIPTS/lib/detect-cli-type.sh'; compat_get_comm() { :; }; compat_get_ppid() { :; }; AGENT_TYPE=\"\$(agmsg_detect_cli_type)\"; echo \"AGENT_TYPE=\$AGENT_TYPE\""
+  [ "$status" -eq 0 ]
+  [ "$output" = "AGENT_TYPE=claude-code" ]
+
+  # The side channel itself: 0/real-value on a real detection, 1/default on
+  # the fallback -- read via a plain-statement call, the shape self-name.sh
+  # actually uses (a command-substitution call discards it, same reason
+  # _AGMSG_AGENT_BINARIES_OUT is read the same way elsewhere in this file's
+  # sibling resolve-project.sh).
+  run env -i PATH="$PATH" bash -c \
+    "source '$SCRIPTS/lib/type-registry.sh'; source '$SCRIPTS/lib/compat.sh'; source '$SCRIPTS/lib/detect-cli-type.sh'; compat_get_comm() { :; }; compat_get_ppid() { :; }; agmsg_detect_cli_type >/dev/null; echo \"defaulted=\$_AGMSG_DETECT_CLI_TYPE_DEFAULTED out=\$_AGMSG_DETECT_CLI_TYPE_OUT\""
+  [ "$status" -eq 0 ]
+  [ "$output" = "defaulted=1 out=claude-code" ]
+
+  run env -i PATH="$PATH" CODEX_THREAD_ID=x bash -c \
+    "source '$SCRIPTS/lib/type-registry.sh'; source '$SCRIPTS/lib/compat.sh'; source '$SCRIPTS/lib/detect-cli-type.sh'; compat_get_comm() { :; }; compat_get_ppid() { :; }; agmsg_detect_cli_type >/dev/null; echo \"defaulted=\$_AGMSG_DETECT_CLI_TYPE_DEFAULTED out=\$_AGMSG_DETECT_CLI_TYPE_OUT\""
+  [ "$status" -eq 0 ]
+  [ "$output" = "defaulted=0 out=codex" ]
 }
 
 @test "type-registry: manifests are DATA — never executed" {
@@ -241,6 +459,7 @@ nodetype:
 YAML
 
   run env -u TMUX -u HERDR_ENV -u HERDR_PANE_ID AGMSG_TERMINAL="$stub_bin/record.sh {cmd}" \
+    AGMSG_TEST_PLAIN_WITNESS_ROW=$'iterm\t/dev/ttys040\t123\tSTART' \
     AGMSG_SPAWN_OPTIONS_FILE="$opts" \
     bash "$SCRIPTS/spawn.sh" nodetype nodeagent --project "$proj" --no-wait
   [ "$status" -eq 0 ]

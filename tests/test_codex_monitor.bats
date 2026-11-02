@@ -38,6 +38,7 @@ setup() {
   export TEST_PROJECT="$(mktemp -d)"
   export CALL_LOG="$TEST_PROJECT/calls.log"
   export APP_SERVER_ARGV_LOG="$TEST_PROJECT/app-server-argv.log"
+  export APP_SERVER_ENV_LOG="$TEST_PROJECT/app-server-env.log"
 
   # Fake codex for codex-monitor tests.
   #   --version            -> prints "codex-cli $FAKE_CODEX_VERSION"
@@ -63,14 +64,17 @@ case "${1:-}" in
   app-server)
     for a in "$@"; do printf ' <%s>' "$a" >> "$APP_SERVER_ARGV_LOG"; done
     printf '\n' >> "$APP_SERVER_ARGV_LOG"
+    printf 'flag=%s\n' "${AGMSG_CODEX_BRIDGE_LAUNCHER:-}" >> "$APP_SERVER_ENV_LOG"
     if [ "${FAKE_CODEX_MODE:-listen}" = "broken" ]; then
       echo "error: unexpected argument '--listen' found" >&2
       exit 2
     fi
     # Run the listener as a CHILD (no exec) so this script stays the recorded pid;
     # its argv ("...real-codex app-server --listen") is what codex-monitor's
-    # cmdline check matches. The child exits when this parent is killed.
-    python3 - <<'PY'
+    # cmdline check matches. The child is backgrounded and teardown's kill is
+    # forwarded to it: native Python on Windows never sees its parent change
+    # (os.getppid() stays put), so the loop below cannot be what ends it (#1612).
+    python3 - <<'PY' &
 import socket, sys, os
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -86,6 +90,9 @@ while True:
     except Exception:
         pass
 PY
+    child=$!
+    trap 'kill "$child" 2>/dev/null' TERM INT
+    wait "$child" 2>/dev/null || wait "$child" 2>/dev/null
     ;;
   *)
     printf 'plain-codex' >> "$CALL_LOG"
@@ -114,11 +121,23 @@ teardown() {
     kill "$pid" 2>/dev/null || true
     wait_for_pid_exit "$pid" || true
   done
+  if [ -n "${MONITOR_TEST_LAUNCHER_PID_FILE:-}" ]; then
+    # The detached dispatcher can still be initializing messages.db after the
+    # fake TUI exits. Let its foreground SQLite children and EXIT trap finish
+    # before removing their store; killing just the shell can orphan sqlite3.
+    if ! wait_for_file_contains "$MONITOR_TEST_LAUNCHER_PID_FILE" '^[0-9][0-9]*$'; then
+      echo "codex-monitor teardown: launcher did not publish its pid" >&2
+      return 1
+    fi
+    pid="$(cat "$MONITOR_TEST_LAUNCHER_PID_FILE")"
+    if ! wait_for_pid_exit "$pid"; then
+      echo "codex-monitor teardown: launcher $pid did not exit; retaining its store" >&2
+      return 1
+    fi
+  fi
   rm -rf "$TEST_PROJECT"
   teardown_test_env
 }
-
-# --- fail-open (A) ---
 
 @test "codex-monitor: port readiness waits for complete numeric content" {
   local portf="$TEST_PROJECT/delayed.port"
@@ -154,6 +173,8 @@ teardown() {
   wait "$writer_pid"
 }
 
+# --- fail-open (A) ---
+
 @test "codex-monitor: fails open to plain codex when the app-server won't start (#170)" {
   run env FAKE_CODEX_MODE=broken AGMSG_REAL_CODEX="$FAKE_CODEX" \
     bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex -- --foo
@@ -175,6 +196,47 @@ teardown() {
 
 # --- #1537: the seat key must reach tool commands under any shell_environment_policy ---
 
+# A monitor launch through the shim used to run `delivery status` twice (the shim's own
+# check, then again when `set monitor` asked the PATH shim for `codex --version`) and
+# rewrite hooks that were already in place. Each is dozens of processes, which is
+# the bulk of a Windows launch (#1613). Counted, not timed. `set` may be skipped only
+# when hooks.json is exactly what the last `set monitor` left, so a file that differs
+# in ONE entry (here SessionEnd's project) must run it again.
+@test "codex-monitor: a shim launch runs delivery status once, and set only when hooks.json is not exactly what set last left (#1613)" {
+  skip_on_windows "spawns a python socket listener; flaky on the Windows runner"
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
+  export DELIVERY_LOG="$TEST_PROJECT/delivery.log"
+  mv "$SCRIPTS/delivery.sh" "$SCRIPTS/delivery.real.sh"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$*" >> "$DELIVERY_LOG"' \
+    'exec bash "$(dirname "$0")/delivery.real.sh" "$@"' > "$SCRIPTS/delivery.sh"
+  chmod +x "$SCRIPTS/delivery.sh"
+  # codex on PATH is the shim itself, as in a real install, so any nested
+  # `codex --version` re-enters it.
+  mkdir -p "$TEST_PROJECT/shimbin"
+  ln -s "$TYPES/codex/codex-shim.sh" "$TEST_PROJECT/shimbin/codex"
+  _launch() {
+    : > "$DELIVERY_LOG"
+    run bash -c 'cd "$TEST_PROJECT" && PATH="$TEST_PROJECT/shimbin:$PATH" AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_BRIDGE_LAUNCHER_CMD=/bin/true codex'
+    [ "$status" -eq 0 ]
+    [ "$(grep -c '^status ' "$DELIVERY_LOG")" -eq 1 ]
+  }
+
+  # No marker yet: the one full set runs and leaves its marker.
+  _launch
+  [ "$(grep -c '^set ' "$DELIVERY_LOG")" -eq 1 ]
+  # Same file, same install: skipped.
+  _launch
+  [ "$(grep -c '^set ' "$DELIVERY_LOG" || true)" -eq 0 ]
+  grep -q 'plain-codex <--remote> <ws://127\.0\.0\.1:[0-9][0-9]*>' "$CALL_LOG"
+  # Only SessionEnd's project differs: not what set left, so it runs again and repairs it.
+  sed 's#session-end.sh\(.\{1,3\}\)[^ ]* \{0,1\}[^"]*"#session-end.sh\1 codex /tmp/wrong-project"#' "$TEST_PROJECT/.codex/hooks.json" > "$TEST_PROJECT/hooks.edited"
+  refute cmp -s "$TEST_PROJECT/hooks.edited" "$TEST_PROJECT/.codex/hooks.json"
+  cp "$TEST_PROJECT/hooks.edited" "$TEST_PROJECT/.codex/hooks.json"
+  _launch
+  [ "$(grep -c '^set ' "$DELIVERY_LOG")" -eq 1 ]
+  refute grep -q '/tmp/wrong-project' "$TEST_PROJECT/.codex/hooks.json"
+}
+
 @test "codex-monitor: the app-server is launched with the seat key as a shell_environment_policy.set override (#1537)" {
   skip_on_windows "spawns a python socket listener; flaky on the Windows runner"
 
@@ -189,6 +251,17 @@ teardown() {
     bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex --
   [ "$status" -eq 0 ]
   grep -q -- '<-c> <shell_environment_policy\.set\.AGMSG_CODEX_SEAT_KEY="[0-9.]\{1,\}">' "$APP_SERVER_ARGV_LOG"
+}
+
+@test "codex-monitor: the app-server inherits AGMSG_CODEX_BRIDGE_LAUNCHER=1 so SessionStart sees the launcher flag" {
+  skip_on_windows "spawns a python socket listener; flaky on the Windows runner"
+
+  # Unset the parent's flag so only the value codex-monitor sets is observed (prevents a false pass from the parent environment).
+  run env -u AGMSG_CODEX_BRIDGE_LAUNCHER FAKE_CODEX_VERSION=0.142.2 AGMSG_REAL_CODEX="$FAKE_CODEX" \
+    AGMSG_CODEX_BRIDGE_LAUNCHER_CMD=/bin/true \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex --
+  [ "$status" -eq 0 ]
+  grep -qx 'flag=1' "$APP_SERVER_ENV_LOG"
 }
 
 # --- #1254: one app-server per seat, never reused ---
@@ -381,6 +454,9 @@ EOF
 case "${1:-}" in
   --version) echo "codex-cli 0.144.1"; exit 0 ;;
   app-server)
+    printf 'flag=%s\nseat=%s\nurl=%s\n' \
+      "${AGMSG_CODEX_BRIDGE_LAUNCHER:-}" "${AGMSG_CODEX_SEAT_KEY:-}" \
+      "${AGMSG_CODEX_BRIDGE_APP_SERVER:-}" > "$TEST_PROJECT/app-server-env"
     node - <<'JS' &
 const net = require('net');
 const s = net.createServer((c) => c.destroy());
@@ -403,10 +479,34 @@ esac
 EOF
   chmod +x "$win_codex"
 
+  # Keep the real dispatcher, but retain its PID so teardown can wait for all
+  # of its DB work, including lock release, rather than racing a detached child.
+  export MONITOR_TEST_LAUNCHER_PID_FILE="$TEST_PROJECT/launcher.pid"
+  local tracked_launcher="$TEST_PROJECT/tracked-launcher"
+  cat > "$tracked_launcher" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$$" > "$MONITOR_TEST_LAUNCHER_PID_FILE"
+exec "$TYPES/codex/codex-bridge-launcher.sh" "$@"
+EOF
+  chmod +x "$tracked_launcher"
+
   run env AGMSG_REAL_CODEX="$win_codex" \
+    AGMSG_CODEX_BRIDGE_LAUNCHER_CMD="$tracked_launcher" \
     bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex --
   [ "$status" -eq 0 ]
   grep -q 'plain-codex <--remote> <ws://127\.0\.0\.1:[0-9][0-9]*>' "$CALL_LOG"
+  grep -qx 'flag=1' "$TEST_PROJECT/app-server-env"
+  grep -qx 'url=' "$TEST_PROJECT/app-server-env"
+  local seat record port restored
+  seat="$(sed -n 's/^seat=//p' "$TEST_PROJECT/app-server-env")"
+  [ -n "$seat" ]
+  record="$TEST_SKILL_DIR/run/codex-app-server.$seat.record"
+  [ -f "$record" ]
+  port="$(sed -n 's/^port=//p' "$record")"
+  restored="$(SKILL_DIR="$TEST_SKILL_DIR" AGMSG_CODEX_SEAT_KEY="$seat" \
+    bash -c 'source "$1"; _agmsg_codex_app_server_url "$2"' bash \
+      "$TYPES/codex/_app-server.sh" "$TEST_PROJECT")"
+  [ "$restored" = "ws://127.0.0.1:$port" ]
   [[ "$output" != *"did not report a listening port"* ]]
 }
 
@@ -423,4 +523,153 @@ EOF
   # codex-monitor.sh itself never writes a record path directly -- it only
   # calls the writer above.
   ! grep -q 'SEAT_RECORD"$' "$SCRIPTS/drivers/types/codex/codex-monitor.sh"
+}
+
+# --- fail-closed for a spawned seat ---
+
+@test "codex-monitor: a spawned seat (AGMSG_SPAWNED=1) fails CLOSED when the bridge cannot start" {
+  # Fail-open exists for a person at the keyboard. A seat spawned by agmsg has
+  # nobody at its pane, and a plain codex there never receives a message -- the
+  # same outcome as the shim bypass spawn was fixed to close. So with the
+  # spawn marker set, a broken bridge must refuse to start codex at all.
+  run env FAKE_CODEX_MODE=broken AGMSG_SPAWNED=1 AGMSG_REAL_CODEX="$FAKE_CODEX" \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex -- --foo
+  [ "$status" -ne 0 ]
+  # No plain codex was started, bridged or not.
+  [ ! -e "$CALL_LOG" ]
+  # And the refusal says why, and that the session was spawned.
+  printf '%s\n' "$output" | grep -qF 'Refusing to start a plain Codex'
+  printf '%s\n' "$output" | grep -qF 'AGMSG_SPAWNED=1'
+}
+
+@test "codex-monitor: the fail-open plain launch adds --no-daemon on an elevated Windows shell" {
+  run env FAKE_CODEX_MODE=broken AGMSG_WINDOWS_ELEVATED=1 AGMSG_REAL_CODEX="$FAKE_CODEX" \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex -- --foo
+  [ "$status" -eq 0 ]
+  grep -qx 'plain-codex <--no-daemon> <--foo>' "$CALL_LOG"
+
+  # Arguments that already carry --no-daemon or --remote are not given a second flag.
+  : > "$CALL_LOG"
+  run env FAKE_CODEX_MODE=broken AGMSG_WINDOWS_ELEVATED=1 AGMSG_REAL_CODEX="$FAKE_CODEX" \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex -- --no-daemon --foo
+  grep -qx 'plain-codex <--no-daemon> <--foo>' "$CALL_LOG"
+  : > "$CALL_LOG"
+  run env FAKE_CODEX_MODE=broken AGMSG_WINDOWS_ELEVATED=1 AGMSG_REAL_CODEX="$FAKE_CODEX" \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex -- --remote=ws://127.0.0.1:1
+  grep -qx 'plain-codex <--remote=ws://127.0.0.1:1>' "$CALL_LOG"
+}
+
+@test "codex-monitor: without the spawn marker the same failure still fails open (a person keeps a codex)" {
+  # The control for the test above: the ONLY difference is the marker.
+  run env FAKE_CODEX_MODE=broken AGMSG_REAL_CODEX="$FAKE_CODEX" \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex -- --foo
+  [ "$status" -eq 0 ]
+  grep -qx 'plain-codex <--foo>' "$CALL_LOG"
+}
+
+# --- #1401: a resumed seat arms its own bridge request when it can (without guessing) ---
+#
+# A restarted Codex seat used to have no bridge until either its SessionStart
+# hook eventually ran (observed taking minutes, and in at least one real case
+# never, until someone manually re-ran codex-record-session.sh) or a person did
+# that by hand -- neither automatic. The thread being resumed is already known
+# in argv, before codex itself starts, so codex-monitor.sh now arms the
+# request itself when that thread matches exactly one role's record for this
+# project.
+@test "codex-monitor: resume arms the bridge request when the thread matches exactly one role's record, and does not otherwise" {
+  local SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  source "$SKILL_DIR/scripts/lib/role-session.sh"
+  # codex-record-session.sh always records the CANONICAL (symlink-resolved)
+  # project, and codex-monitor.sh's own lookup canonicalizes the same way
+  # before matching -- macOS's mktemp -d hands back a path through /var/
+  # folders, itself a symlink to /private/var/folders, so recording the raw
+  # $TEST_PROJECT here would silently never match. Match reality, not a
+  # convenient shortcut.
+  local canon_project; canon_project="$(cd "$TEST_PROJECT" && pwd -P)"
+
+  # No matching record at all: nothing armed, and the launch still proceeds
+  # (the request stays the SessionStart hook's / a manual re-run's job, exactly
+  # as before this existed).
+  run env AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_BRIDGE_LAUNCHER_CMD=/bin/true \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command resume -- thread-unrecorded
+  [ "$status" -eq 0 ]
+  [ -z "$(ls "$TEST_SKILL_DIR"/run/codex-bridge-request.* 2>/dev/null)" ]
+
+  # Exactly one matching role: armed immediately, with that role's identity and
+  # this launch's own socket URL, in the same tab-separated shape
+  # codex-record-session.sh itself writes.
+  agmsg_role_session_record team alice thread-A "$canon_project" codex
+  run env AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_BRIDGE_LAUNCHER_CMD=/bin/true \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command resume -- thread-A
+  [ "$status" -eq 0 ]
+  local req; req="$(ls "$TEST_SKILL_DIR"/run/codex-bridge-request.* 2>/dev/null)"
+  [ -n "$req" ]
+  local line; line="$(sed -n '1p' "$req")"
+  [ "$(printf '%s' "$line" | cut -f1)" = codex ]
+  [ "$(printf '%s' "$line" | cut -f2)" = thread-A ]
+  [ "$(printf '%s' "$line" | cut -f3)" != "" ]   # the socket URL, generated per launch
+  [ "$(printf '%s' "$line" | cut -f4)" = team ]
+  [ "$(printf '%s' "$line" | cut -f5)" = alice ]
+  rm -f "$req"
+
+  # Two roles recorded against the SAME thread: ambiguous, nothing armed --
+  # guessing which role owns a resumed thread is worse than leaving it unarmed.
+  agmsg_role_session_record team bob thread-A "$canon_project" codex
+  run env AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_BRIDGE_LAUNCHER_CMD=/bin/true \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command resume -- thread-A
+  [ "$status" -eq 0 ]
+  [ -z "$(ls "$TEST_SKILL_DIR"/run/codex-bridge-request.* 2>/dev/null)" ]
+
+  # A unique match, but the write itself fails (review finding: this used to
+  # be silent, reproducing the exact "resume never gets a bridge" symptom
+  # under a different cause). Codex must still launch, and the failure must
+  # be named on stderr rather than swallowed. A fresh thread id: thread-A is
+  # now ambiguous (alice AND bob) from the case above, so it would never
+  # reach the write at all.
+  agmsg_role_session_record team bob thread-B "$canon_project" codex
+  local unwritable_dir="$TEST_PROJECT/unwritable-run"
+  mkdir -p "$unwritable_dir"
+  chmod 555 "$unwritable_dir"
+  # chmod 555 does not make the directory unwritable everywhere (Windows/NTFS,
+  # or a process holding CAP_DAC_OVERRIDE such as root). The write cannot be
+  # made to fail there, so skip rather than assert a failure that never occurs.
+  if touch "$unwritable_dir/.probe" 2>/dev/null; then
+    rm -f "$unwritable_dir/.probe"
+    chmod 755 "$unwritable_dir"
+    skip "chmod 555 does not make the directory unwritable here (Windows/NTFS or CAP_DAC_OVERRIDE such as root)"
+  fi
+  run env AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_BRIDGE_LAUNCHER_CMD=/bin/true \
+    AGMSG_CODEX_TEST_RESUME_REQUEST_DIR="$unwritable_dir" \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command resume -- thread-B
+  chmod 755 "$unwritable_dir"
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F "could not arm the bridge request for team/bob"
+  [ -z "$(ls "$unwritable_dir"/codex-bridge-request.* 2>/dev/null)" ]
+  [ -z "$(find "$unwritable_dir" -name '*.tmp' -o -name '*.[0-9]*' 2>/dev/null)" ]
+  [ -n "$(ls "$TEST_SKILL_DIR"/run/codex-app-server.*.record 2>/dev/null)" ]
+
+  # The printed fallback is meant to be pasted into an ordinary shell and run
+  # (review finding: "codex-record-session.sh <args>" alone is not a PATH
+  # command and would fail as command-not-found; it must be a full `bash
+  # <script path> <args>` line). Confirm it by actually running it -- not by
+  # grepping a substring, which the earlier, broken form would also match --
+  # and checking it reaches the real script, as bash, with the exact
+  # team/agent/project this failure was for.
+  local record_script="$TYPES/codex/codex-record-session.sh"
+  local record_spy_out="$TEST_PROJECT/record-spy.out"
+  cp "$record_script" "$record_script.orig"
+  cat > "$record_script" <<SPYEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$0" "\$1" "\$2" "\$3" > "$record_spy_out"
+SPYEOF
+  local fallback_line
+  fallback_line="$(printf '%s\n' "$output" | grep -F 'Run this by hand')"
+  fallback_line="${fallback_line#*bring it: }"
+  bash -c "$fallback_line"
+  mv "$record_script.orig" "$record_script"
+  [ "$(sed -n '1p' "$record_spy_out")" = "$record_script" ]
+  [ "$(sed -n '2p' "$record_spy_out")" = team ]
+  [ "$(sed -n '3p' "$record_spy_out")" = bob ]
+  [ "$(sed -n '4p' "$record_spy_out")" = "$TEST_PROJECT" ]
 }

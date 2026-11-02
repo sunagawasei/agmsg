@@ -12,14 +12,22 @@ set -euo pipefail
 #
 # Default (graceful): send a `ctrl:despawn` control message to <name>. The
 # member's watcher (watch.sh) sees it, drops its own role (releasing the actas
-# lock) and closes its own tmux pane — ending its CLI. We block until the lock
-# is released, up to --timeout (default 30s); on timeout the member didn't
-# respond (dead watcher, or a codex member with no Monitor) — re-run with
-# --force.
+# lock) and folds its OWN pane through the terminal driver named by its placement
+# record — so tmux AND herdr members fold themselves (a plain/OS-terminal member
+# has no addressable pane, so it drops its role and its window is closed by hand).
+# We block until the lock is released, up to --timeout; on timeout the member
+# didn't respond (dead watcher, or a monitor=no member with no watcher) — re-run
+# with --force. A `free` lock with a placement record is NOT proof the member is
+# gone (a monitor=no type never holds one): that reports `needs-force` and KEEPS
+# the record, rather than a false `ok` (#625).
 #
-# --force: skip the message and tear the member down from here using the
-# placement recorded at spawn time — kill its tmux pane/window and drop its
-# registration. For when the member's watcher can't respond.
+# --force: skip the message and tear the member down from here through the
+# terminal driver named by the placement record. The teardown must be CONFIRMED
+# (the ref resolves to a terminal, the driver loads, and terminal_despawn exits 0)
+# BEFORE the record / registration / lock are dropped — an unconfirmed teardown
+# keeps all three and reports `status=error`, so the record (the only retry
+# authority) is never deleted out from under a pane that is still alive (#625, the
+# --force side). For when the member's watcher can't respond.
 #
 # --expect-record <line> (force only): a compare-and-act guard. The live spawn
 # record must still equal <line> exactly, or despawn does nothing and reports
@@ -30,9 +38,7 @@ set -euo pipefail
 # meantime. The whole force section runs under a placement lock so the compare
 # and the rm are atomic against a concurrent spawn-record write.
 #
-# See #109. Graceful teardown's full pane-close is tmux-only (the member needs a
-# tmux pane to close); an OS-terminal member drops its role but its window must
-# be closed by hand.
+# See #109.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"  # actas-lock.sh requires SKILL_DIR
@@ -42,6 +48,7 @@ source "$SCRIPT_DIR/lib/actas-lock.sh"
 source "$SCRIPT_DIR/lib/identity-key.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/inflight.sh"
+source "$SCRIPT_DIR/lib/terminal-registry.sh"  # kill via the terminal driver
 
 die() { echo "despawn: $*" >&2; exit 1; }
 
@@ -241,14 +248,52 @@ gc_bridge_state() {
         "$SKILL_DIR/run/"*"-bridge.$TEAM.$NAME.outbound."* 2>/dev/null || true
 }
 
-# Kill the placement described by a record LINE ("<id>\t<proj>\t<type>"). ids are
-# self-describing: %N pane, @N window, pid:<n> headless bridge worker. Operates on
-# the LINE passed in, never a re-read of the file, so a caller that snapshotted
-# the record (despawn --expect-record) tears down exactly what it verified.
+# What does the terminal say about the recorded pane, RIGHT NOW? Read only —
+# nothing is closed here.
+#
+# Prints one of: no-record / gone / present / unknown.
+#
+# It resolves the record the same way kill_recorded_placement does, and stops
+# short of the kill. `terminal_despawn` cannot be used for this: measured on a
+# throwaway tmux server, `kill-pane` returns non-zero both for a pane that is
+# already gone and for one it could not close, and the driver maps both to 13.
+# Asking with it would make a graceful teardown that WORKED report needs-force.
+recorded_pane_state() {
+  [ -f "$SPAWN_REC" ] || { printf 'no-record'; return 0; }
+  local id _proj _type _fence _term _bare _out _rc=0
+  IFS=$'\t' read -r id _proj _type _fence < "$SPAWN_REC"
+  [ -n "$id" ] || { printf 'unknown'; return 0; }
+  _term="$(agmsg_terminal_ref_terminal "$id")" || { printf 'unknown'; return 0; }
+  _bare="$(agmsg_terminal_ref_id "$id")"       || { printf 'unknown'; return 0; }
+  agmsg_terminal_load "$_term" 2>/dev/null     || { printf 'unknown'; return 0; }
+  declare -F terminal_pane_state >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  _out="$(terminal_pane_state "$_bare" 2>/dev/null)" || _rc=$?
+  # The token is the answer and the code says whether it is a settled one. A
+  # non-zero (13 unsupported, 10 unreachable) is NOT an answer about the pane,
+  # whatever was printed.
+  [ "$_rc" -eq 0 ] || { printf 'unknown'; return 0; }
+  case "$_out" in
+    gone|present) printf '%s' "$_out" ;;
+    *)            printf 'unknown' ;;
+  esac
+  return 0
+}
+
+# Kill the placement described by a record LINE ("<id>\t<proj>\t<type>[\t<fence>]").
+# ids are self-describing: pid:<n> headless bridge worker, otherwise a
+# <terminal>:<id> (or legacy bare %N/@N) pane through the terminal-driver registry.
+# Operates on the LINE passed in, never a re-read of the file, so a caller that
+# snapshotted the record (despawn --expect-record) tears down exactly what it verified.
+# Returns 0 when the placement is confirmed gone; a pid: placement returns
+# kill_headless_pid's 2/4/5. A pane teardown the terminal did not confirm (the ref did
+# not resolve, the driver would not load, or terminal_despawn failed) returns 6 and
+# leaves the reason in KILL_RECORDED_REASON: the caller must keep the record, which
+# is the only retry authority.
 kill_recorded_placement() {
-  local id _proj _type result=0
-  IFS=$'\t' read -r id _proj _type <<<"${1-}"
+  local id _proj _type _fence _term _bare _reason="" result=0
+  IFS=$'\t' read -r id _proj _type _fence <<<"${1-}"
   [ -n "$id" ] || return 4
+  KILL_RECORDED_REASON=""
   case "$id" in
     pid:*)
       if kill_headless_pid "${id#pid:}" "$TEAM" "$NAME" "${_type:-codex}"; then
@@ -257,18 +302,16 @@ kill_recorded_placement() {
         result=$?
       fi
       ;;
-    herdr:*)
-      command -v herdr >/dev/null 2>&1 && herdr pane close "${id#herdr:}" 2>/dev/null || true
+    *)
+      _term="$(agmsg_terminal_ref_terminal "$id")" || return 6   # unknown/corrupt ref
+      _bare="$(agmsg_terminal_ref_id "$id")"
+      agmsg_terminal_load "$_term" 2>/dev/null || return 6       # driver would not load
+      _reason="$(terminal_despawn "$_bare" "$_fence" 2>&1)" || {
+        KILL_RECORDED_REASON="$_reason"
+        return 6
+      }
       ;;
-    %*|@*)
-      if command -v tmux >/dev/null 2>&1; then
-        case "$id" in
-          %*) tmux kill-pane   -t "$id" 2>/dev/null || true ;;
-          @*) tmux kill-window -t "$id" 2>/dev/null || true ;;
-        esac
-      fi ;;
   esac
-  printf '%s\t%s\t%s\n' "$id" "$_proj" "$_type"
   return "$result"
 }
 
@@ -322,7 +365,7 @@ if [ "$FORCE" = "1" ]; then
     rec="$(cat "$SPAWN_REC" 2>/dev/null || true)"
   fi
 
-  IFS=$'\t' read -r _id _proj _type <<<"$rec"
+  IFS=$'\t' read -r _id _proj _type _fence <<<"$rec"
   placement_result=0
   if kill_recorded_placement "$rec"; then
     placement_result=0
@@ -350,6 +393,17 @@ if [ "$FORCE" = "1" ]; then
     echo "status=unverified name=$NAME team=$TEAM reason=identity-mismatch"
     exit 2
   fi
+  if [ "$placement_result" -eq 6 ]; then
+    # Teardown NOT confirmed. Keep the record (the only retry authority), the
+    # registration and the lock, and say so — never claim a forced teardown that did
+    # not happen (the #625 shape, on the --force side).
+    if [ "$placement_lock_held" -eq 1 ]; then
+      agmsg_placement_lock_release "$TEAM" "$NAME"
+    fi
+    echo "despawn: could not confirm '$NAME' was torn down via its placement record ($_id) — the terminal driver did not report the pane closed (unknown/corrupt ref, the driver would not load, or the terminal returned an error).${KILL_RECORDED_REASON:+ Reason: $KILL_RECORDED_REASON} The record is KEPT so you can retry; check the pane manually." >&2
+    echo "status=error name=$NAME team=$TEAM note=force-teardown-unconfirmed"
+    exit 1
+  fi
   [ -n "$WATCHDOG_INTENT" ] && [ -z "$WATCHDOG_TOKEN" ] \
     && rm -f -- "$WATCHDOG_INTENT" 2>/dev/null || true
   # Confirmed kill (or already-dead placement): dead-letter outstanding turns.
@@ -367,8 +421,12 @@ if [ "$FORCE" = "1" ]; then
       "$SCRIPT_DIR/reset.sh" --team "$TEAM" "$_proj" "$_type" "$NAME" >/dev/null 2>&1 || true
     fi
   fi
-  owner="$(actas_lock_owner "$TEAM" "$NAME")"
-  [ -n "$owner" ] && actas_lock_release "$TEAM" "$NAME" "$owner" 2>/dev/null || true
+  # Releasing needs an owner we actually READ: `actas_lock_owner` answered "" for
+  # "no lock", "unreadable" and "empty" alike. (#983)
+  _own_r="$(actas_lock_read "$TEAM" "$NAME")"
+  if [ "${_own_r%%$'\t'*}" = "ok" ] && [ -n "${_own_r#*$'\t'}" ]; then
+    actas_lock_release "$TEAM" "$NAME" "${_own_r#*$'\t'}" 2>/dev/null || true
+  fi
   # Also drop the role snapshot: a forced teardown may SIGKILL the bridge before
   # its own cleanup runs, so remove run/<type>-bridge.<team>.<name>.role here too.
   rm -f "$SPAWN_REC" "$SKILL_DIR/run/${_type:-codex}-bridge.$TEAM.$NAME.role" 2>/dev/null || true
@@ -383,12 +441,34 @@ fi
 # --- Graceful ---
 [ -n "$WATCHDOG_INTENT" ] && [ -z "$WATCHDOG_TOKEN" ] \
   && rm -f -- "$WATCHDOG_INTENT" 2>/dev/null || true
-state="$(actas_lock_state "$TEAM" "$NAME" "" 2>/dev/null || echo free)"
+# No `|| echo free`: a failed classification is not "the lock is free". This
+# branch decides whether to send a `ctrl:despawn` at all, and `free` is the arm
+# that concludes the member is already gone. `unknown:` must not reach it — an
+# unverified state is a reason to stop and say so, not to act. (#983)
+state="$(actas_lock_state "$TEAM" "$NAME" "" 2>/dev/null)" || state="unknown:state_call_failed"
 case "$state" in
+  unknown:*)
+    echo "despawn: '$NAME' — could not determine who holds this role (${state#unknown:}); not sending ctrl:despawn. Check the lock and retry." >&2
+    echo "status=error name=$NAME team=$TEAM note=lock-state-unknown"
+    exit 1
+    ;;
   free)
-    echo "despawn: '$NAME' holds no live actas lock — nothing to confirm a teardown against (a codex member has no watcher; a tmux member may already be gone). If a window remains, use --force." >&2
+    # #625: a free actas lock does NOT prove the member is gone. A monitor=no type
+    # (cursor, codex) never runs a watcher and so NEVER holds a lock; a member whose
+    # watcher merely died reads identically. So split on the placement record — the
+    # positive evidence that something was spawned and may still be running.
+    if [ -f "$SPAWN_REC" ]; then
+      # A pane/process was placed and is likely still there. Do NOT delete the record
+      # (--force reads exactly this — deleting it here is what made the advised
+      # recovery impossible), and do NOT report a teardown we did not perform.
+      echo "despawn: '$NAME' holds no live actas lock, but a placement record remains — graceful despawn cannot confirm a teardown (a monitor=no member such as cursor/codex never holds a lock; a watcher may have died). Retry with --force to tear it down via the record, which is kept intact." >&2
+      echo "status=needs-force name=$NAME team=$TEAM note=no-live-lock-recorded"
+      exit 1
+    fi
+    # No placement record: nothing was spawned here to tear down (a hand-joined
+    # member, or one already gone). The free lock is all there is to act on.
+    echo "despawn: '$NAME' holds no live actas lock and has no placement record — nothing to tear down here (if a window remains, it was not launched via spawn; close it directly)." >&2
     agmsg_inflight_deadletter_for "$TEAM" "$NAME" || true
-    rm -f "$SPAWN_REC" 2>/dev/null || true
     gc_bridge_state
     echo "status=ok name=$NAME team=$TEAM note=no-live-lock"
     exit 0
@@ -404,7 +484,11 @@ wait_last=""
 wait_now=""
 wait_elapsed=0
 while true; do
-  state="$(actas_lock_state "$TEAM" "$NAME" "" 2>/dev/null || echo free)"
+  # `free` here means "the watcher let go, teardown is progressing". An
+  # unverified state is NOT that, and `|| echo free` made every failed read look
+  # like success — the wait would end and despawn would report done. Keep
+  # waiting instead: the timeout below is the honest end of this loop. (#983)
+  state="$(actas_lock_state "$TEAM" "$NAME" "" 2>/dev/null)" || state="unknown:state_call_failed"
   [ "$state" = "free" ] && break
   if ! wait_now="$(_agmsg_wait_epoch_seconds)"; then
     echo "status=timeout name=$NAME team=$TEAM after=${wait_elapsed}s"
@@ -433,17 +517,64 @@ while true; do
   sleep "$despawn_poll_interval"
 done
 
-agmsg_inflight_deadletter_for "$TEAM" "$NAME" || true
-rm -f "$SPAWN_REC" 2>/dev/null || true
-gc_bridge_state
-# Refresh telemetry after a successful state transition when the clock is
-# still readable; success itself must not be turned into a failure by a clock
-# error after the member released its role.
-if [ -n "$wait_started" ] && wait_now="$(_agmsg_wait_epoch_seconds)"; then
-  if [ "$wait_now" -lt "$wait_last" ]; then
-    wait_elapsed=0
-  else
-    wait_elapsed=$((wait_now - wait_started))
-  fi
-fi
-echo "status=ok name=$NAME team=$TEAM after=${wait_elapsed}s"
+# The lock going free means the watcher let go of it. It does NOT mean the pane
+# was closed: the watcher releases the lock (via reset.sh) BEFORE it tries to
+# close anything, and a lock whose owner has died reads as free too. Deleting the
+# record on that signal is what made #1051 unrecoverable — the record is the only
+# thing `--force` can work from, and it was gone before anyone knew the pane was
+# still open.
+#
+# So ask the terminal. The record is deleted, and success reported, only when the
+# answer is a settled `gone`.
+#
+# And ask it MORE THAN ONCE. The watcher releases the lock before it folds its
+# pane, so the moment this loop is reached the pane is still `present` on a
+# graceful teardown that is working correctly — measured on a live herdr session
+# it stayed for tens of seconds (#1097). Checking once here reported `needs-force`
+# every time, teaching everyone to reach for --force (which skips the member's own
+# cleanup — the exact habit the graceful path exists to avoid). So wait for the
+# pane to actually go, drawing from the SAME --timeout budget the lock wait used
+# (the timeout covers the pane wait, not only the lock wait): `waited` is not
+# reset. Only a pane still `present` when that budget is spent is a real
+# needs-force. `unknown` is NOT polled — it means the terminal could not be asked
+# at all (unsupported/unreachable), where waiting cannot change the answer and
+# would only burn the whole timeout before the same needs-force.
+waited="$wait_elapsed"
+_pane_state="$(recorded_pane_state)"
+while [ "$_pane_state" = "present" ] && [ "$waited" -lt "$TIMEOUT" ]; do
+  sleep 1
+  waited=$((waited + 1))
+  _pane_state="$(recorded_pane_state)"
+done
+case "$_pane_state" in
+  no-record|gone)
+    agmsg_inflight_deadletter_for "$TEAM" "$NAME" || true
+    rm -f "$SPAWN_REC" 2>/dev/null || true
+    gc_bridge_state
+    # Asking whether the record MAY go and checking that it WENT are two
+    # different questions, and this branch used to answer only the first. A
+    # record left behind (a read-only run dir, a permission failure) outlives
+    # the pane it names, and the next `--force` reads it as a live placement and
+    # tries to tear down a pane that is already gone — the same "reported
+    # success, left the caller a wrong authority" shape this whole change is
+    # about. So assert the STATE, not `rm`'s exit code.
+    if [ -e "$SPAWN_REC" ]; then
+      echo "despawn: '$NAME' was torn down, but its placement record at $SPAWN_REC could not be removed. The record now names a pane that is gone, and --force would act on it; delete it by hand." >&2
+      echo "status=error name=$NAME team=$TEAM note=record-not-removed after=${waited}s"
+      exit 1
+    fi
+    echo "status=ok name=$NAME team=$TEAM after=${waited}s"
+    ;;
+  present)
+    echo "despawn: '$NAME' released its lock but the recorded pane is STILL OPEN after ${waited}s — the teardown did not fold the window within the timeout. The placement record is kept; retry with --force to tear it down through it." >&2
+    echo "status=needs-force name=$NAME team=$TEAM note=pane-still-open after=${waited}s"
+    exit 1
+    ;;
+  *)
+    # Deliberately a different sentence from `present`: the operator's next move
+    # differs. "Still open" says close it; "could not check" says look.
+    echo "despawn: '$NAME' released its lock, but this terminal could not be asked whether the pane closed, so the teardown is unconfirmed. The placement record is kept; check the window, and use --force if it is still there." >&2
+    echo "status=needs-force name=$NAME team=$TEAM note=teardown-unverified after=${waited}s"
+    exit 1
+    ;;
+esac

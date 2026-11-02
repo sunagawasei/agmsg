@@ -1230,3 +1230,49 @@ wverdict() {
   [ "$status" -eq 0 ]
   grep -qF "broke a registry lock" <<<"$output"
 }
+
+@test "lock: a vanished namespace after marker release never restores an old holder" {
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR" || exit 1
+    rmdir() {
+      # A delayed contender has taken and released the marker and namespace.
+      command rmdir "$1" || return 1
+      return 1
+    }
+    mv() {
+      case "$1" in
+        *.holder.releasing.*)
+          # The next owner arrives just before the old rollback would overwrite it.
+          command mkdir "$TEAM_DIR/.config.lock"
+          : > "$TEAM_DIR/.config.lock/.owner"
+          printf "token SUCCESSOR\n" > "$TEAM_DIR/.config.lock.holder"
+          : > "$TEAM_DIR/rollback-attempted" ;;
+      esac
+      command mv "$@"
+    }
+    agmsg_lock_release
+    [ ! -e "$TEAM_DIR/rollback-attempted" ] || exit 2
+    [ ! -e "$TEAM_DIR/.config.lock.holder" ] || exit 3
+  '
+  [ "$status" -eq 0 ]
+}
+
+@test "lock: the timeout remedy removes a stale owner marker and preserves team data" {
+  local component remedy
+  for component in "team space \$literal" "team 'quote' \$literal"; do
+    TEAM_DIR="$BATS_TEST_TMPDIR/$component"
+    mkdir -p "$TEAM_DIR/.config.lock"
+    : > "$TEAM_DIR/.config.lock/.owner"
+    printf '%s\n' preserved > "$TEAM_DIR/config.json"
+    TRIES=1 acquire
+    [ "$status" -ne 0 ]
+    [ -f "$TEAM_DIR/.config.lock/.owner" ]
+    remedy="$(printf '%s\n' "$output" | sed -n 's/^agmsg:   //p' | tail -1)"
+    [ -n "$remedy" ]
+    run bash -c "$remedy"
+    [ "$status" -eq 0 ]
+    [ ! -d "$TEAM_DIR/.config.lock" ]
+    [ "$(cat "$TEAM_DIR/config.json")" = preserved ]
+  done
+}

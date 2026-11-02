@@ -251,13 +251,15 @@ agmsg_find_registered_project_variant() {
 # always eligible, not checked here since it is never itself an override
 # source), then $root/plugins, then each $AGMSG_PLUGIN_DIRS entry.
 _agmsg_type_external_candidate() {
-  local type="$1" root="${SKILL_DIR:-}" d
+  local type="$1" root="${SKILL_DIR:-}" kind base
   [ -n "$root" ] || return 1
-  [ -f "$root/plugins/types/$type/type.conf" ] && return 0
-  local IFS=:
-  for d in ${AGMSG_PLUGIN_DIRS:-}; do
-    [ -n "$d" ] && [ -f "$d/types/$type/type.conf" ] && return 0
-  done
+  declare -F agmsg_driver_bases >/dev/null 2>&1 \
+    || . "$root/scripts/lib/driver-registry.sh" 2>/dev/null || return 1
+  while IFS=$'\t' read -r kind base; do
+    [ "$kind" = external ] && [ -f "$base/types/$type/type.conf" ] && return 0
+  done <<EOF
+$(agmsg_driver_bases)
+EOF
   return 1
 }
 
@@ -453,6 +455,21 @@ agmsg_pid_is_agent() {
   return 1
 }
 
+# Print the Windows pid of the nearest ancestor of this shell whose image name is
+# <image> (e.g. claude.exe), asking Windows because Git Bash's ps stops at the
+# native parent. Empty and non-zero when there is none or CIM is unavailable.
+_agmsg_msys_ancestor_pid() {   # <image>
+  local image="$1" winpid found
+  [ -z "${_AGMSG_COMPAT_NO_CIM:-}" ] || return 1
+  winpid="$(_compat_get_winpid "$$" 2>/dev/null)"
+  case "$winpid" in ''|*[!0-9]*) return 1 ;; esac
+  found="$(powershell.exe -NoProfile -Command \
+    "\$id=$winpid; for(\$i=0;\$i -lt 16 -and \$id;\$i++){ \$p=Get-CimInstance Win32_Process -Filter \"ProcessId=\$id\"; if(-not \$p){break}; if(\$p.Name -ieq '$image'){\$p.ProcessId;break}; \$id=\$p.ParentProcessId }" \
+    2>/dev/null | tr -d '\r')"
+  case "$found" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$found"
+}
+
 # Walk the process tree from $$ upward, echoing the PID of the nearest ancestor
 # that looks like an agent process of <type>. Empty (return 1) when none is
 # found — e.g. a detached watcher or a plain human shell.
@@ -491,6 +508,31 @@ agmsg_agent_pid() {
         fi
         ;;
     esac
+  fi
+  # Git Bash's ps lists MSYS pids only, so the walk below never sees the native
+  # claude.exe and every Claude Code seat would fall back to the bare session id
+  # (#1585). Claude Code exports its own pid as CLAUDE_PID; on Windows only, take
+  # it when it names a live process. Claude Code re-exports it at its own
+  # startup, so a value inherited from a spawner is replaced before any seat
+  # runs. Elsewhere the walk finds the agent, so behaviour there is unchanged.
+  if [ "$type" = "claude-code" ]; then
+    _agmsg_detect_platform
+    case "$_agmsg_platform:${CLAUDE_PID:-}" in
+      msys:''|msys:0*|msys:*[!0-9]*) ;;
+      msys:*) if _agmsg_pid_alive "${CLAUDE_PID:-}" 2>/dev/null; then
+                printf '%s' "${CLAUDE_PID:-}"; return 0
+              fi ;;
+    esac
+    # A hook does not get CLAUDE_PID (only the Bash tool does), and Git Bash's ps
+    # cannot see claude.exe, so a SessionStart hook found no seat pid and the
+    # seat's delivery record was never written on --resume. Ask Windows for the
+    # nearest claude.exe ancestor instead.
+    if [ "$_agmsg_platform" = msys ]; then
+      local native
+      native="$(_agmsg_msys_ancestor_pid claude.exe)" && [ -n "$native" ] && {
+        printf '%s' "$native"; return 0
+      }
+    fi
   fi
   local pid="$$" hops=0
   while [ "${pid:-0}" -gt 1 ] && [ "$hops" -lt 20 ]; do
@@ -582,6 +624,49 @@ agmsg_registered_projects() {
       WHERE json_extract(r.value, '\$.type') = '$type_sql';
     " | tr -d '\r'
   done
+}
+
+# Echo the single type registered for <agent> in <team>'s config.json (rc 0),
+# or nothing (rc 1) when the agent has no registration there, or more than one
+# DISTINCT type across its registrations — an ambiguity this function refuses
+# to arbitrate rather than guess at.
+#
+# Used by self-name.sh (#1391): a hand-started seat's placement-record write
+# used to fill in a missing type by guessing (agmsg_detect_cli_type), and that
+# guess's own last-resort default silently produced 'claude-code' for a seat
+# of any other type whose process tree the guesser could not identify. join.sh
+# already recorded the real type when the seat joined; reading THAT back is
+# not a guess.
+agmsg_registered_type() {
+  local team="$1" agent="$2" config_file cfg_sql agent_sql out n
+  # A separate assignment, not folded into the `local` line above: `$team`
+  # there would be expanded before that line's own `team=` takes effect (a
+  # `local a=$1 b=...$a...` measured, live, to see $a as still UNSET under
+  # `set -u` -- every name in one `local` command is expanded against the
+  # PRE-command state, not against sibling names assigned earlier in the
+  # same command).
+  config_file="${SKILL_DIR:-}/teams/$team/config.json"
+  [ -n "$team" ] && [ -n "$agent" ] && [ -f "$config_file" ] || return 1
+  agent_sql=$(printf '%s' "$agent" | sed "s/'/''/g")
+  cfg_sql=$(agmsg_sql_readfile_path "$config_file")
+  out="$(sqlite3 :memory: "
+    WITH raw(json) AS (SELECT CAST(readfile('$cfg_sql') AS TEXT)),
+    cfg(json) AS (SELECT CASE WHEN json_valid(json) THEN json END FROM raw),
+    agent AS (
+      SELECT CASE
+        WHEN json_type(json_extract(value, '\$.registrations')) = 'array' THEN json_extract(value, '\$.registrations')
+        ELSE json_array(json_object('type', json_extract(value, '\$.type'), 'project', json_extract(value, '\$.project')))
+      END AS registrations
+      FROM cfg, json_each(json_extract(cfg.json, '\$.agents'))
+      WHERE key = '$agent_sql'
+    )
+    SELECT DISTINCT json_extract(r.value, '\$.type')
+    FROM agent, json_each(agent.registrations) AS r
+    WHERE json_extract(r.value, '\$.type') IS NOT NULL;
+  " 2>/dev/null | tr -d '\r')"
+  n=$(printf '%s\n' "$out" | sed '/^$/d' | wc -l | tr -d '[:space:]')
+  [ "$n" -eq 1 ] || return 1
+  printf '%s\n' "$out"
 }
 
 # Echo the main-checkout root of <start>'s git repo, but only when it is a

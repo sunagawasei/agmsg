@@ -353,6 +353,7 @@ function sendFrame(socket, value) {
 
 function handleMessage(socket, message) {
   fs.appendFileSync(log, `${message.method}\n`);
+  if (message.method === "process/spawn") fs.appendFileSync(log, `${JSON.stringify(message.params.command)}\n`);
   if (message.method === "initialize") {
     sendFrame(socket, { jsonrpc: "2.0", id: message.id, result: {} });
   } else if (message.method === "thread/resume") {
@@ -453,7 +454,8 @@ EOF
 
   run node "$TYPES/codex/codex-bridge.js" \
     --project "$PROJ" --team team --name alice --thread thread-existing \
-    --app-server "unix://$sock" --timeout 1 --interval 1 --max-wakes 1
+    --app-server "unix://$sock" --timeout 1 --interval 1 --max-wakes 1 \
+    --owner codex-session.12345
 
   kill "$server_pid" 2>/dev/null || true
 
@@ -463,6 +465,7 @@ EOF
   grep -q "initialize" "$log"
   grep -q "thread/resume" "$log"
   grep -q "process/spawn" "$log"
+  grep -q "codex-session.12345" "$log"
   grep -q "turn/start" "$log"
 }
 
@@ -3831,4 +3834,79 @@ EOF
   [ -n "$gone_line" ]
   [ "$completion_line" -lt "$second_turn_line" ]
   [ "$completion_line" -lt "$gone_line" ]
+}
+
+
+@test "codex-bridge: lease project hash agrees across native Windows and Git Bash paths" {
+  run node - "$TYPES/codex/codex-bridge.js" "$TEST_SKILL_DIR" <<'NODE'
+const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
+const { createRequire } = require("node:module");
+const filename = path.resolve(process.argv[2]);
+const mod = { exports: {} };
+const context = {
+  require: createRequire(filename), module: mod, exports: mod.exports,
+  __filename: filename, __dirname: path.dirname(filename),
+  process, console, Buffer, setTimeout, clearTimeout, setInterval, clearInterval,
+};
+// Checks the real lease write; makes no network connection and starts no process.
+vm.runInNewContext(fs.readFileSync(filename, "utf8") +
+  "\nmodule.exports.CodexBridge = CodexBridge;", context, { filename });
+const leasefile = path.join(process.argv[3], "project-hash-test.lease");
+const hash = (p) => crypto.createHash("sha1").update(p).digest("hex");
+function leaseHash(project) {
+  // writeLease delegates hashing to leaseHashes in this tree, so the minimal
+  // fake borrows the real one from the prototype.
+  mod.exports.CodexBridge.prototype.writeLease.call({
+    opts: { project }, identities: [{ team: "team", name: "alice" }], leasefile,
+    startToken: () => ({ src: "pwsh", token: "123456" }),
+    leaseHashes: mod.exports.CodexBridge.prototype.leaseHashes,
+  });
+  return fs.readFileSync(leasefile, "utf8").match(/^project=(.*)$/m)[1];
+}
+const expected = hash("/c/TEMP/project with spaces");
+assert.equal(leaseHash(String.raw`C:\TEMP\project with spaces`), expected);
+assert.equal(leaseHash("C:/TEMP/project with spaces"), expected);
+assert.equal(leaseHash("/c/TEMP/project with spaces"), expected);
+assert.notEqual(leaseHash("C:/TEMP/other project"), expected);
+assert.notEqual(leaseHash("C:/TEMP/Project with spaces"), expected);
+assert.equal(leaseHash(String.raw`\\host\share\project`), hash("//host/share/project"));
+assert.equal(leaseHash("/home/me/project"), hash("/home/me/project"));
+assert.equal(leaseHash(String.raw`/home/me/project\literal`), hash(String.raw`/home/me/project\literal`));
+fs.unlinkSync(leasefile);
+NODE
+  [ "$status" -eq 0 ]
+}
+
+@test "codex-bridge: stale unknown team is skipped silently without dropping healthy inboxes (#1714)" {
+  # Eligibility can race a team removal. Keep that stale pair eligible here.
+  printf '#!/usr/bin/env bash\nprintf "missing-team\\talice\\nteam\\talice\\n"\n' > "$TYPES/codex/eligible-pairs.sh"
+  bash "$SCRIPTS/send.sh" team bob alice "healthy message" >/dev/null
+  run node - "$TYPES/codex/codex-bridge.js" "$PROJ" <<'JS'
+const fs = require("fs");
+const Module = require("module");
+const filename = process.argv[2];
+const loaded = new Module(filename, module);
+loaded.filename = filename;
+loaded.paths = Module._nodeModulePaths(require("path").dirname(filename));
+loaded._compile(fs.readFileSync(filename, "utf8") + "\nmodule.exports.CodexBridge = CodexBridge;", filename);
+// readInboxForPrompt records in-flight state and verifies consumption through
+// helpers of its own; stub them so only the inbox read is under test.
+const context = {
+  opts: { project: process.argv[3], type: "codex" },
+  identities: [{ team: "missing-team", name: "alice" }, { team: "team", name: "alice" }],
+  turnEpoch: 0,
+  publishInflight: () => true,
+  inflightCli: () => ({ status: 0, stdout: "0\n" }),
+};
+const result = loaded.exports.CodexBridge.prototype.readInboxForPrompt.call(context);
+if (!result.includes("healthy message") || result.includes("team not found")) process.exit(1);
+console.log(result);
+JS
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"healthy message"* ]]
+  [[ "$output" != *"inbox.sh failed"* ]]
 }

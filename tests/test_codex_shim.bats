@@ -73,6 +73,41 @@ teardown() {
   ! grep -q "^monitor" "$CALL_LOG"
 }
 
+@test "codex shim: a non-monitor launch on an elevated Windows shell adds --no-daemon, and only for a session launch" {
+  bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT" >/dev/null
+
+  AGMSG_WINDOWS_ELEVATED=1 AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" \
+    run bash "$TYPES/codex/codex-shim.sh" resume --last
+  [ "$status" -eq 0 ]
+  grep -qx 'real-codex <--no-daemon> <resume> <--last>' "$CALL_LOG"
+
+  # A subcommand that is not a session launch never gets it (app-server rejects the flag).
+  : > "$CALL_LOG"
+  AGMSG_WINDOWS_ELEVATED=1 AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" \
+    run bash "$TYPES/codex/codex-shim.sh" app-server --listen ws://127.0.0.1:0
+  grep -qx 'real-codex <app-server> <--listen> <ws://127.0.0.1:0>' "$CALL_LOG"
+
+  # Already asking for --remote or --no-daemon: left exactly as given.
+  : > "$CALL_LOG"
+  AGMSG_WINDOWS_ELEVATED=1 AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" \
+    run bash "$TYPES/codex/codex-shim.sh" resume --remote ws://127.0.0.1:1
+  grep -qx 'real-codex <resume> <--remote> <ws://127.0.0.1:1>' "$CALL_LOG"
+  : > "$CALL_LOG"
+  AGMSG_WINDOWS_ELEVATED=1 AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" \
+    run bash "$TYPES/codex/codex-shim.sh" --remote=ws://127.0.0.1:1
+  grep -qx 'real-codex <--remote=ws://127.0.0.1:1>' "$CALL_LOG"
+  : > "$CALL_LOG"
+  AGMSG_WINDOWS_ELEVATED=1 AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" \
+    run bash "$TYPES/codex/codex-shim.sh" --no-daemon resume --last
+  grep -qx 'real-codex <--no-daemon> <resume> <--last>' "$CALL_LOG"
+
+  # Not elevated: unchanged.
+  : > "$CALL_LOG"
+  AGMSG_WINDOWS_ELEVATED=0 AGMSG_REAL_CODEX="$FAKE_CODEX" AGMSG_CODEX_MONITOR_CMD="$FAKE_MONITOR" \
+    run bash "$TYPES/codex/codex-shim.sh" resume --last
+  grep -qx 'real-codex <resume> <--last>' "$CALL_LOG"
+}
+
 @test "codex shim: noninteractive codex subcommands pass through even in monitor mode" {
   bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT" >/dev/null
 
@@ -104,7 +139,8 @@ teardown() {
 
     [ "$status" -eq 0 ]
     grep -Fq "real-codex <$subcommand> <test-arg>" "$CALL_LOG"
-    ! grep -q "^monitor" "$CALL_LOG"
+    ! grep -q "^monitor" "$CALL_LOG" \
+      || { echo "unexpected monitor routing for $subcommand: $(cat "$CALL_LOG")" >&3; false; }
   done
 }
 
@@ -122,7 +158,8 @@ teardown() {
       echo "unexpected routing for $subcommand: $(cat "$CALL_LOG")" >&3
       false
     }
-    ! grep -q "^real-codex" "$CALL_LOG"
+    ! grep -q "^real-codex" "$CALL_LOG" \
+      || { echo "unexpected real-codex call for $subcommand: $(cat "$CALL_LOG")" >&3; false; }
   done
 }
 
@@ -426,6 +463,93 @@ EOF
   AGMSG_CODEX_SHIM_FORCE=1 run bash "$TYPES/codex/codex-shim-install.sh" install
   [ "$status" -eq 0 ]
   [ ! -e "$sentinel" ]
+}
+
+# --- owner_install_is_gone (#1788 review) ---
+
+@test "owner_install_is_gone: an unreadable ~/.agents/skills is NOT treated as gone" {
+  # A skills dir that exists but cannot be listed (permissions, a transient
+  # mount issue) makes agmsg_install_candidates' glob expand to nothing too --
+  # otherwise indistinguishable from "genuinely uninstalled". Defaulting that
+  # ambiguity to "gone" would let a live owner's shim be reclaimed without
+  # --force, the opposite of this guard's fail-closed intent.
+  export HOME="$TEST_PROJECT/home"
+  local live="$HOME/.agents/skills/live/scripts/drivers/types/codex"
+  mkdir -p "$live"
+  touch "$HOME/.agents/skills/live/.agmsg" "$live/codex-shim.sh"
+
+  run bash -c "
+    HOME='$HOME'
+    source '$TYPES/codex/codex-shim-install.sh' >/dev/null
+    owner=\"\$(shell_quote '$live')\"
+    chmod 000 '$HOME/.agents/skills'
+    # The sourced script's own 'set -e' is still active in this shell: a
+    # bare non-zero call here would abort before the chmod restore below
+    # ever runs. Route it through if/else so its status is consumed instead.
+    if owner_install_is_gone \"\$owner\"; then rc=0; else rc=\$?; fi
+    chmod 755 '$HOME/.agents/skills'
+    exit \$rc
+  "
+  [ "$status" -ne 0 ]
+}
+
+@test "owner_install_is_gone: an unreadable install ROOT (not just its codex dir) does NOT count as missing" {
+  # One level above the codex-dir case below: a matched directory ENTRY
+  # (visible by name alone, via skills_dir's own x bit) whose own root
+  # cannot be read into must not be read as "uninstalled" either -- the
+  # .agmsg-marker-based candidate scan used to drop a root like this from
+  # consideration entirely before it ever reached the owner comparison,
+  # falling through to "no candidate matched" (review finding, reproduced
+  # with the install root itself chmod'd to 000).
+  export HOME="$TEST_PROJECT/home"
+  local live_root="$HOME/.agents/skills/live"
+  local live="$live_root/scripts/drivers/types/codex"
+  mkdir -p "$live"
+  touch "$live_root/.agmsg" "$live/codex-shim.sh"
+
+  run bash -c "
+    HOME='$HOME'
+    source '$TYPES/codex/codex-shim-install.sh' >/dev/null
+    owner=\"\$(shell_quote '$live')\"
+    chmod 000 '$live_root'
+    if owner_install_is_gone \"\$owner\"; then rc=0; else rc=\$?; fi
+    chmod 755 '$live_root'
+    exit \$rc
+  "
+  [ "$status" -ne 0 ]
+}
+
+@test "owner_install_is_gone: an unreadable matched candidate directory does NOT count as missing" {
+  # Same ambiguity one level down: once a candidate IS matched, an access
+  # failure reading INTO it must never be read as "codex-shim.sh is absent".
+  export HOME="$TEST_PROJECT/home"
+  local live="$HOME/.agents/skills/live/scripts/drivers/types/codex"
+  mkdir -p "$live"
+  touch "$HOME/.agents/skills/live/.agmsg" "$live/codex-shim.sh"
+
+  run bash -c "
+    HOME='$HOME'
+    source '$TYPES/codex/codex-shim-install.sh' >/dev/null
+    owner=\"\$(shell_quote '$live')\"
+    chmod 000 '$live'
+    if owner_install_is_gone \"\$owner\"; then rc=0; else rc=\$?; fi
+    chmod 755 '$live'
+    exit \$rc
+  "
+  [ "$status" -ne 0 ]
+}
+
+@test "owner_install_is_gone: a truly uninstalled owner (no matching candidate) IS gone" {
+  export HOME="$TEST_PROJECT/home"
+  mkdir -p "$HOME/.agents/skills/other"
+  touch "$HOME/.agents/skills/other/.agmsg"
+
+  run bash -c "
+    HOME='$HOME'
+    source '$TYPES/codex/codex-shim-install.sh' >/dev/null
+    owner_install_is_gone '/some/uninstalled/scripts/drivers/types/codex'
+  "
+  [ "$status" -eq 0 ]
 }
 
 # --- agmsg_install_candidates / agmsg_only_one_install (#553 review): these

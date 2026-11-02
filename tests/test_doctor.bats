@@ -15,7 +15,7 @@ teardown() {
 }
 
 # --- default scope: no filters = the whole installation -------------------
-#     (koit's round-2 call: other doctor-style commands -- claude/codex/brew/
+#     (settled in round 2: other doctor-style commands -- claude/codex/brew/
 #     flutter -- all default to "everything", so this one now does too. The
 #     old <project> <type>-required positional form is dropped, not kept for
 #     compatibility -- see doctor.sh's header comment.) ----------------------
@@ -120,7 +120,7 @@ teardown() {
 #     status emits scans the WHOLE run/ directory -- an installation-wide
 #     fact, not a (project, type) fact. Printing it inside every group that
 #     uses default runtime status repeats the identical line once per group;
-#     tl2 flagged this as duplication on the same real-installation run. ---
+#     review flagged this as duplication on the same real-installation run. ---
 
 @test "doctor: the install-wide 'watch processes' line appears once, not once per group" {
   # The line only appears when run/ exists (default runtime status guards
@@ -498,23 +498,59 @@ configured_off() {
 @test "doctor: --redacted also redacts the embedded delivery-status block, not just its own formatting" {
   local home_proj="$HOME/embedded-leak-check"
   mkdir -p "$home_proj"
-  bash "$SCRIPTS/join.sh" agmsg advisor codex "$home_proj" >/dev/null
-  # A live codex bridge for agmsg/advisor, minimal enough for
+  bash "$SCRIPTS/join.sh" agmsg helper codex "$home_proj" >/dev/null
+  # A live codex bridge for agmsg/helper, minimal enough for
   # _delivery.sh's agmsg_delivery_runtime_status to report it "alive": a
   # pidfile naming a real (this test's own) pid, and a matching metafile.
   mkdir -p "$TEST_SKILL_DIR/run"
-  printf '%s\n' "$$" > "$TEST_SKILL_DIR/run/codex-bridge.agmsg.advisor.pid"
+  printf '%s\n' "$$" > "$TEST_SKILL_DIR/run/codex-bridge.agmsg.helper.pid"
   {
     echo "pid=$$"
     echo "project=$home_proj"
     echo "type=codex"
-  } > "$TEST_SKILL_DIR/run/codex-bridge.agmsg.advisor.meta"
+  } > "$TEST_SKILL_DIR/run/codex-bridge.agmsg.helper.meta"
 
   run bash "$SCRIPTS/doctor.sh" --project "$home_proj" --type codex --redacted
   [ "$status" -eq 0 ]
   [[ "$output" == *"Codex bridge: team1/agent1 alive"* ]]
-  [[ "$output" != *"agmsg/advisor"* ]]
+  [[ "$output" != *"agmsg/helper"* ]]
   [[ "$output" != *"$HOME"* ]]
+}
+
+@test "doctor: a lock it cannot READ is lock=unreadable, never lock=none (#983)" {
+  [ "$(id -u)" -eq 0 ] && skip "chmod 000 is ineffective as root"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf 'sometoken.%s\n' "$$" > "$TEST_SKILL_DIR/run/actas.team__alice.session"
+  chmod 000 "$TEST_SKILL_DIR/run/actas.team__alice.session"
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type claude-code
+  chmod 644 "$TEST_SKILL_DIR/run/actas.team__alice.session"
+  # `lock=none` is a claim about the world; this is a claim about us. An
+  # operator reads `none` as "nothing here to clean up" and acts on it. Someone did
+  # exactly this today with a record he could not open: reported a seat dead,
+  # it was alive. (Review.)
+  grep -q 'lock=unreadable' <<<"$output"
+  refute grep -q 'lock=none' <<<"$output"
+}
+
+@test "doctor: a present-but-EMPTY lock is lock=empty, never lock=none (#1071)" {
+  mkdir -p "$TEST_SKILL_DIR/run"
+  : > "$TEST_SKILL_DIR/run/actas.team__alice.session"
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type claude-code
+  # The third word. The file is there and readable, and nothing in the tree
+  # writes an empty lock, so this is a torn write — reporting it as `none` is
+  # what invites the cleanup #1071 is about.
+  grep -q 'lock=empty' <<<"$output"
+  refute grep -q 'lock=none' <<<"$output"
+}
+
+@test "doctor: with no lock at all it still says lock=none (#983)" {
+  # The partner both tests above need: without it, a doctor that never printed
+  # `lock=none` would pass them, and the ordinary "nothing is claimed here" case
+  # is the one an operator reads most often.
+  mkdir -p "$TEST_SKILL_DIR/run"
+  rm -f "$TEST_SKILL_DIR/run/actas.team__alice.session"
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type claude-code
+  grep -q 'lock=none' <<<"$output"
 }
 
 # #1507: per-seat run/ records outlive their team and keep claiming its pane.
@@ -522,7 +558,7 @@ configured_off() {
 # report never deletes, the prompt defaults to no, and --yes removes exactly the
 # records whose team is provably gone -- not a live team's, not an ambiguous
 # "__" one, not an id-keyed one.
-@test "doctor: reports run/ records of a team that no longer exists, and removes only those on request (#1507)" {
+@test "doctor: reports orphaned run/ records and record-less registry locks, and removes only those on request (#1507, #865)" {
   local run_dir="$TEST_SKILL_DIR/run" gone='%2Ftmp%2Fsome%2Fproj'   # a project path used as the team name
   local id_team='11111111-1111-1111-1111-111111111111' id_member='22222222-2222-2222-2222-222222222222'
   mkdir -p "$run_dir"
@@ -544,6 +580,12 @@ configured_off() {
   bash "$SCRIPTS/join.sh" live.part worker claude-code "$PROJ" >/dev/null
   printf 'herdr:dot:w1:p5\t/proj\tclaude-code\n' > "$run_dir/spawn.live__part"
   printf '4242\n' > "$run_dir/codex-bridge.live.part.worker.pid"
+  # Registry locks (#865): one with no holder record, which nothing else ever
+  # breaks, and one that names its holder. Both are left in place by --fix: the
+  # record-less one is only listed, with the command to run by hand.
+  mkdir "$TEST_SKILL_DIR/teams/live.part/.config.lock"
+  mkdir "$TEST_SKILL_DIR/teams/team/.config.lock"
+  printf 'token t\npid 1\ncommand t\nhost h\n' > "$TEST_SKILL_DIR/teams/team/.config.lock.holder"
 
   run bash "$SCRIPTS/doctor.sh"
   [ "$status" -eq 1 ]
@@ -553,6 +595,10 @@ configured_off() {
   grep -qF 'team: /tmp/some/proj  agent: worker  pane: herdr:gone:w1:p9' <<<"$output"
   grep -qF 'team: live  agent: part  pane: herdr:dot:w1:p5' <<<"$output"
   grep -qF 'not attributable to one seat' <<<"$output"
+  grep -qF 'registry locks with no holder record' <<<"$output"
+  grep -qxF '  team: live.part' <<<"$output"
+  grep -qF "rmdir '$TEST_SKILL_DIR/teams/live.part/.config.lock'" <<<"$output"
+  [ -z "$(grep -xF '  team: team' <<<"$output")" ]
   [ -z "$(grep -F 'agent: alice' <<<"$output")" ]
   [ -z "$(grep -F 'herdr:id:w1:p3' <<<"$output")" ]
   [ -f "$run_dir/spawn.${gone}__worker" ]            # reporting deletes nothing
@@ -560,6 +606,7 @@ configured_off() {
   run bash -c 'echo n | bash "$1" --fix' _ "$SCRIPTS/doctor.sh"
   [ "$status" -eq 1 ]
   [ -f "$run_dir/spawn.${gone}__worker" ]            # the prompt defaults to no
+
 
   run bash "$SCRIPTS/doctor.sh" --fix --yes
   [ "$status" -eq 0 ]
@@ -573,6 +620,62 @@ configured_off() {
   [ -f "$run_dir/role-session.team__alice" ]
   [ -f "$run_dir/spawn.x___y" ]
   [ -f "$run_dir/spawn.${id_team}__${id_member}" ]
+  [ -d "$TEST_SKILL_DIR/teams/live.part/.config.lock" ]     # no record: listed, never removed
+  [ -d "$TEST_SKILL_DIR/teams/team/.config.lock" ]          # names its holder: kept
+  [ -f "$TEST_SKILL_DIR/teams/team/.config.lock.holder" ]
+}
+
+# --- leaked storage sync driver outcome files (#1572) ----------------------
+
+@test "doctor: reports and removes only the storage sync driver's leaked outcome files, never another tool's temp file (#1572)" {
+  local tmp_dir="$TEST_SKILL_DIR/tmp"
+  mkdir -p "$tmp_dir/sub"
+
+  # Should be removed: right location, right name, right content, old enough.
+  printf 'ok\n' > "$tmp_dir/tmp.AAAAAAAAAA"
+  printf 'busy\n' > "$tmp_dir/tmp.BBBBBBBBBB"
+  printf 'failed\n' > "$tmp_dir/tmp.CCCCCCCCCC"
+  touch -t 202001010000 "$tmp_dir"/tmp.AAAAAAAAAA "$tmp_dir"/tmp.BBBBBBBBBB "$tmp_dir"/tmp.CCCCCCCCCC
+
+  # Should survive: each wrong on exactly one of the four conditions.
+  printf 'ok\n' > "$tmp_dir/tmp.DDDDDDDDDD"      # too new (not backdated)
+  printf 'nope\n' > "$tmp_dir/tmp.EEEEEEEEEE"    # wrong content
+  touch -t 202001010000 "$tmp_dir/tmp.EEEEEEEEEE"
+  printf 'ok\n' > "$tmp_dir/tmp.short"            # wrong name shape
+  touch -t 202001010000 "$tmp_dir/tmp.short"
+  printf 'ok\n' > "$tmp_dir/sub/tmp.FFFFFFFFFF"  # right everything, wrong location (subdirectory)
+  touch -t 202001010000 "$tmp_dir/sub/tmp.FFFFFFFFFF"
+  printf 'ok\n\0' > "$tmp_dir/tmp.GGGGGGGGGG"    # "ok\n" plus a trailing NUL -- 4 bytes, not 3
+  touch -t 202001010000 "$tmp_dir/tmp.GGGGGGGGGG"
+  printf 'ok\n\0\0' > "$tmp_dir/tmp.HHHHHHHHHH"  # "ok\n" plus two trailing NULs -- 5 bytes
+  touch -t 202001010000 "$tmp_dir/tmp.HHHHHHHHHH"  # (busy's size), but reads back as "ok", not "busy"
+
+  run env TMPDIR="$tmp_dir" bash "$SCRIPTS/doctor.sh"
+  [ "$status" -eq 1 ]
+  grep -qF 'leaked storage sync driver outcome files' <<<"$output"
+  grep -qF '(3):' <<<"$output"
+  grep -qF "$tmp_dir/tmp.AAAAAAAAAA" <<<"$output"
+  grep -qF "$tmp_dir/tmp.BBBBBBBBBB" <<<"$output"
+  grep -qF "$tmp_dir/tmp.CCCCCCCCCC" <<<"$output"
+  [ -z "$(grep -F 'tmp.DDDDDDDDDD' <<<"$output")" ]
+  [ -z "$(grep -F 'tmp.EEEEEEEEEE' <<<"$output")" ]
+  [ -z "$(grep -F 'tmp.short' <<<"$output")" ]
+  [ -z "$(grep -F 'tmp.FFFFFFFFFF' <<<"$output")" ]
+  [ -z "$(grep -F 'tmp.GGGGGGGGGG' <<<"$output")" ]
+  [ -z "$(grep -F 'tmp.HHHHHHHHHH' <<<"$output")" ]
+  [ -f "$tmp_dir/tmp.AAAAAAAAAA" ]   # reporting deletes nothing
+
+  run env TMPDIR="$tmp_dir" bash "$SCRIPTS/doctor.sh" --fix --yes
+  [ "$status" -eq 0 ]
+  [ ! -e "$tmp_dir/tmp.AAAAAAAAAA" ]
+  [ ! -e "$tmp_dir/tmp.BBBBBBBBBB" ]
+  [ ! -e "$tmp_dir/tmp.CCCCCCCCCC" ]
+  [ -f "$tmp_dir/tmp.DDDDDDDDDD" ]
+  [ -f "$tmp_dir/tmp.EEEEEEEEEE" ]
+  [ -f "$tmp_dir/tmp.short" ]
+  [ -f "$tmp_dir/sub/tmp.FFFFFFFFFF" ]
+  [ -f "$tmp_dir/tmp.GGGGGGGGGG" ]
+  [ -f "$tmp_dir/tmp.HHHHHHHHHH" ]
 }
 
 # --- fork: --fix must not touch what a live or unverifiable worker still owns --

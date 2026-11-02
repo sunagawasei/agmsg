@@ -58,6 +58,46 @@ _compat_cim_cmdline() {
 }
 
 # Get full command line of a process.  Replaces: ps -o args= -p <pid>
+# Does <cmdline> name <path>?
+#
+# It has to be asked as a function because the two sides are written in
+# different alphabets and only one of them is ours. `compat_get_cmdline` returns
+# what the OS says a process was started with; the path we compare it against
+# came out of this shell. Under Git Bash those disagree for the same file:
+# `$SKILL_DIR` is `/c/Users/...`, and a native binary launched from it reports
+# `C:/Users/...`. A `case` on one against the other never fires -- so every
+# check built that way answers "not ours" about a process that IS ours, and
+# does it silently, because a non-match is the ordinary answer.
+#
+# Measured on the reporting machine (#652): the sync engine was alive, its
+# `/proc/<pid>/cmdline` read
+#   "C:\Program Files\nodejs\node.exe" C:/Users/.../internal/remote-sync.mjs run --team ossb
+# while the comparison held /c/Users/.../internal/remote-sync.mjs. Forcing the
+# CIM source instead of /proc returned the same `C:/` form, so this is not about
+# where the cmdline is read from -- both sources speak Windows.
+#
+# Five call sites compared a shell path against an OS cmdline this way. Four of
+# them decide whether to kill a stale watcher, so on Windows they answered "not
+# ours" and left it running.
+#
+# `cygpath -m` is the mixed form -- `C:/Users/...`, forward slashes -- which is
+# what MSYS hands a native binary, and therefore what the process reports.
+# Off Windows there is no cygpath and this is the plain match and nothing else,
+# the same escape `agmsg_sql_readfile_path` takes.
+agmsg_cmdline_names_path() {
+  local cmdline="$1" path="$2" native
+  [ -n "$cmdline" ] && [ -n "$path" ] || return 1
+  case "$cmdline" in *"$path"*) return 0 ;; esac
+  command -v cygpath >/dev/null 2>&1 || return 1
+  native="$(cygpath -m "$path" 2>/dev/null || true)"
+  [ -n "$native" ] || return 1
+  # Identical forms would make this second look a copy of the first, not a
+  # second chance at it.
+  [ "$native" != "$path" ] || return 1
+  case "$cmdline" in *"$native"*) return 0 ;; esac
+  return 1
+}
+
 compat_get_cmdline() {
   local pid="$1"
   [ -z "$pid" ] && return 1
@@ -80,7 +120,13 @@ compat_get_cmdline() {
       fi
       ;;
     *)
-      ps -o args= -p "$pid" 2>/dev/null
+      # -ww: without it procps-ng (Linux) ps cuts `args` to $COLUMNS even
+      # when stdout is a pipe, and Claude Code hands every hook the
+      # terminal width in COLUMNS. A truncated argv no longer names the
+      # script or ends with its arguments, so a live engine read as
+      # "unknown". -ww (unlimited width) is also accepted by BSD/macOS ps.
+      # The other `ps ... args=` readers pass -ww too.
+      ps -ww -o args= -p "$pid" 2>/dev/null
       ;;
   esac
 }
@@ -177,6 +223,19 @@ compat_file_mtime() {
   case "$_agmsg_platform" in
     macos)  stat -f %m "$file" 2>/dev/null ;;
     *)      stat -c %Y "$file" 2>/dev/null ;;
+  esac
+}
+
+# Get file permission mode as octal digits (e.g. "644"), suitable for a
+# direct `chmod` argument.
+# Replaces: stat -f %Lp (macOS) / stat -c %a (Linux/MSYS2)
+compat_file_mode() {
+  local file="$1"
+  [ -z "$file" ] && return 1
+  _agmsg_detect_platform
+  case "$_agmsg_platform" in
+    macos)  stat -f %Lp "$file" 2>/dev/null ;;
+    *)      stat -c %a "$file" 2>/dev/null ;;
   esac
 }
 

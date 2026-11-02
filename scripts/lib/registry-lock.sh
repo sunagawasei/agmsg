@@ -26,6 +26,37 @@
 # Newline-separated set of lock dirs this process currently holds.
 AGMSG_HELD_LOCKS="${AGMSG_HELD_LOCKS:-}"
 
+# mkdir(1) can report success for a racing EEXIST (uutils 0.10.0).
+# The directory remains the namespace; only the noclobber marker creator owns it.
+_agmsg_dir_take() {
+  mkdir "$1" || return $?
+  ( umask 077; set -C; : > "$1/.owner" )
+}
+
+# Call only after ownership (or a positively dead holder) is established.
+# Moving the marker aside also works on the minimal PATH without rm. If another
+# delayed contender takes the marker while rmdir runs, ownership has transferred:
+# never restore the old holder over that successor. Otherwise restore our marker
+# on failure so the caller can roll its holder record back safely.
+_agmsg_dir_drop() {
+  local dir="$1" staged="$1.owner.releasing.$$.${RANDOM:-0}" rc=0
+  if [ ! -e "$dir/.owner" ]; then
+    rmdir "$dir"
+    return $?
+  fi
+  mv "$dir/.owner" "$staged" || return $?
+  rmdir "$dir" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if ! ( umask 077; set -C; : > "$dir/.owner" ) 2>/dev/null; then
+      # The namespace may have disappeared or changed hands since rmdir.
+      # Without reacquiring the marker we have no authority to restore a holder.
+      rc=0
+    fi
+  fi
+  if command -v rm >/dev/null 2>&1; then rm -f "$staged" 2>/dev/null || :; fi
+  return "$rc"
+}
+
 # agmsg_lock_acquire <team_dir>
 # Acquire <team_dir>'s lock. <team_dir> (teams/<team>) must already exist — the
 # caller creates it for a brand-new/target team before locking, so this never

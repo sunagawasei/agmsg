@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Hooks and their child operations must not run user recovery notices.
+export AGMSG_DAEMON_NOTICE_SKIP=1
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 
@@ -28,6 +30,31 @@ source "$SCRIPT_DIR/lib/type-registry.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/process-identity.sh"
 
+# An unknown type is a usage error, not an empty inbox (#1829). Every hook
+# entry passes a registered type (its own manifest's name), so this path is
+# reached only by a manual call -- most often someone passing an agent NAME
+# where a type belongs. Left unchecked, identities.sh below treats the
+# argument as an opaque SQL filter value: an unregistered type just matches
+# zero rows, and the script falls through its normal "nothing to deliver"
+# exit 0 with no output at all, indistinguishable from a genuinely empty
+# inbox. That silence cost a real session hours of an unread message (#1829).
+#
+# Exit 1, matching this script's own `${1:?...}`/`${2:?...}` usage-error
+# convention two lines above it -- not the delivery exit-code question lower
+# in this file (see the long #658 comment there): nothing has been attempted
+# yet at this point, so there is no payload whose exit code could discard it,
+# and this message never goes through a hook runtime's stdout-JSON contract
+# at all (stderr only, nothing on stdout). Hooks never reach this branch, so
+# its exit code cannot affect hook behavior either way.
+if ! agmsg_is_known_type "$TYPE"; then
+  echo "agmsg: check-inbox.sh: '$TYPE' is not a registered agent type" >&2
+  echo "agmsg: to read an inbox by hand, use: inbox.sh <team> <agent>" >&2
+  echo "agmsg: check-inbox.sh is the per-turn hook entry point, not a way to read one" >&2
+  echo "agmsg: agent's inbox -- even with a valid type it reads the FIRST agent" >&2
+  echo "agmsg: registered for (project, type), which may not be the one you want" >&2
+  exit 1
+fi
+
 # Which hook event fired. The Stop entry runs `check-inbox.sh <type> <project>`
 # (EVENT defaults to Stop); the mid-turn PostToolUse entry (#1003) appends the
 # event as a 3rd arg so this script emits the shape that event's runtime accepts,
@@ -47,10 +74,16 @@ POSTTOOL_OUTPUT="$(agmsg_type_get "$TYPE" posttooluse_output 2>/dev/null || true
 # SILENT: codex 0.149.1 treats malformed post-tool-use JSON as a failure, and an
 # empty additionalContext on every tool call would be pure noise — so a no-op
 # turn emits no bytes, which every runtime reads as "hook did nothing".
+# Status of the write that hands a payload over. Declared before the first emit
+# (the cooldown one) so EVERY emit in this file reports through the same
+# variable: "each emit says whether it worked" is checkable, while "the emits
+# that can carry a message are guarded" needs the next reader to work out which
+# ones those are -- and that is how one of three ends up unguarded.
+EMIT_RC=0
 emit_status_json() {
   [ "$EVENT" = "PostToolUse" ] && return 0
   [ "$STOP_OUTPUT" = "json" ] || return 0
-  printf '{\n  "continue": true,\n  "systemMessage": "%s"\n}\n' "$1"
+  printf '{\n  "continue": true,\n  "systemMessage": "%s"\n}\n' "$1" || EMIT_RC=$?
 }
 
 # Hook runtimes that pass JSON do so on stdin. Interactive invocations of a
@@ -284,10 +317,13 @@ fi
 mkdir -p "$SKILL_DIR/run"
 touch "$MARKER"
 
-# Check for unread messages and mark as read
+# Check for unread messages and mark as read. Ask the active driver whether a
+# store exists (driver-level, works for jsonl too) — don't create one on a poll.
+# The check is per team, inside the loop below: a store is selected per team
+# now, so "this team has no store yet" is a normal state, and answering it
+# once for the whole process would silently stop delivery for every OTHER
+# team the moment one of them was uninitialized.
 agmsg_storage_load
-DB="$(agmsg_db_path)"
-if [ ! -f "$DB" ]; then exit 0; fi
 
 # Messages are marked read inside this loop; the whole batch is emitted after
 # it. Under `set -e` an unguarded command substitution ends the script the
@@ -308,7 +344,46 @@ if [ ! -f "$DB" ]; then exit 0; fi
 # When there are messages to hand over the status is 0 and the text says the
 # poll was partial; only when there is nothing to deliver does the status carry
 # the failure.
+# Re-assert this pane's name (#1044), once per invocation, before any delivery.
+#
+# This entry point is the only one some types ever reach: a type with no
+# SessionStart hook and no watcher (`monitor=yes`) has nothing earlier, so for
+# those the per-turn hook is where a hand-started pane first gets named. Idempotent by
+# construction — the driver sets the same two names again — and quiet when there
+# is no session id to resolve with, exactly as `join` is.
+#
+# Cost, stated rather than waved away: this adds one terminal resolution plus
+# the driver's rename calls per turn, per team. It is not cached, because the
+# only cheap thing to cache on is the session id, and a pane can be rearranged
+# under a session id that has not changed.
+#
+# No record is written: the seat's placement is `actas`'s claim, and a delivery
+# hook is not a claim of anything.
+#
+# The source carries the errexit lift: on bash 3.2 a failure inside a sourced
+# file fires THIS script's `set -e`, and nothing here may fail a delivery.
+_agmsg_tr_rc=0; _agmsg_tr_e=0
+case $- in *e*) _agmsg_tr_e=1 ;; esac
+set +e
+# shellcheck disable=SC1091
+[ -r "$SCRIPT_DIR/lib/terminal-registry.sh" ] && . "$SCRIPT_DIR/lib/terminal-registry.sh"
+_agmsg_tr_rc=$?
+[ "$_agmsg_tr_e" = 1 ] && set -e
+if [ "$_agmsg_tr_rc" -eq 0 ] && declare -F agmsg_terminal_name_self_safe >/dev/null 2>&1; then
+  # Guarded expansion, the form this file already uses above: bash 3.2 treats
+  # "${TEAM_LIST[@]}" on an empty array as unbound under `set -u` (measured). An
+  # early exit above makes the list non-empty here today, and this does not
+  # depend on that staying true.
+  for _nteam in ${TEAM_LIST[@]+"${TEAM_LIST[@]}"}; do
+    [ -n "$_nteam" ] || continue
+    agmsg_terminal_name_self_safe "${SESSION_ID:-}" "$_nteam" "$AGENT" "$PROJECT" "$TYPE" || true
+  done
+fi
+
 OUTPUT=""
+# Ids that have been FORMATTED but not yet written out: one "team<TAB>id id id"
+# entry per team. They become read only after the payload leaves this process.
+PENDING_MARKS=()
 LOOP_RC=0
 LOOP_FAILED_TEAM=""
 for team in "${TEAM_LIST[@]}"; do
@@ -362,21 +437,49 @@ for team in "${TEAM_LIST[@]}"; do
     # The whole file failed to parse; every check-inbox test on macOS died with
     # "syntax error near unexpected token `;;'". Balancing the paren fixes it and
     # is identical under bash 5.
-    case "$state" in (other:*) exit 97 ;; esac
+    # `unknown:` joins `other:` here rather than falling through to delivery.
+    # The two are different facts — someone else holds it vs we could not find
+    # out — but the action is the same: this is not our inbox to hand out on an
+    # unverified state, and 97 is the ordinary "skip this team" status the caller
+    # already continues on. Falling through would deliver, which is the direction
+    # that cannot be undone (rows get marked read). (#983)
+    case "$state" in (other:*|unknown:*) exit 97 ;; esac
 
     # Unread via the storage facade (§2.1 storage_list_unread = events ∪ legacy),
     # JSONL parsed in one pass with sqlite's JSON funcs (no jq; cf. lib/hooks-json.sh).
     # id is kept so the mark step below targets exactly the rows shown.
     UNREAD_JSONL=$(storage_list_unread "$team" "$AGENT")
     [ -n "$UNREAD_JSONL" ] || exit 98
+    # The quote is held in a variable, never written as \' in the pattern: bash 3.2
+    # (macOS /bin/bash) keeps the backslash of a \' REPLACEMENT, so the inline form
+    # doubles a quote into \'\' there while producing '' on bash 4+. Same shape as
+    # _sqlite_sync_lit_into in sqlite-sync.sh, which documents the same hazard.
+    _AGMSG_SQ="'"
     _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
-    agmsg_sqlite ':memory:' "
-      SELECT json_extract(value,'\$.from') || char(31) ||
-             replace(replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t'), char(31), char(9247)) || char(31) ||
-             json_extract(value,'\$.at') || char(31) ||
-             json_extract(value,'\$.id')
-      FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
-    "
+    # #777: this team's unread backlog grows with every message sent to it, so
+    # interpolating it into ONE argv element eventually exceeds the OS's
+    # per-argument ceiling (Linux MAX_ARG_STRLEN=131,072 bytes; smaller still
+    # on Windows/macOS) and `agmsg_sqlite` fails with "Argument list too
+    # long" -- every single poll, since the backlog that triggered it never
+    # shrinks on its own. Pass the statement on stdin instead, mirroring
+    # drivers/storage/sqlite-sync.sh:1301 (`_sqlite_data_stdin`, #882) and
+    # history.sh/inbox.sh: printf is a bash builtin, so writing a large value
+    # to a temp file never execs and can hit neither that ceiling nor argv's
+    # at all. The temp file is scoped to THIS subshell -- its EXIT trap fires
+    # when the subshell itself exits (success, `exit 98`/`exit 13` above, or a
+    # signal), never touching the outer script's own traps.
+    _agmsg_ci_sql=$(mktemp "${TMPDIR:-/tmp}/agmsg-checkinbox-rows.XXXXXX") || exit 13
+    trap 'rm -f "$_agmsg_ci_sql"' EXIT HUP INT TERM
+    {
+      printf "%s\n" "SELECT json_extract(value,'\$.from') || char(31) ||"
+      printf "%s\n" "       replace(replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t'), char(31), char(9247)) || char(31) ||"
+      printf "%s\n" "       json_extract(value,'\$.at') || char(31) ||"
+      printf "%s\n" "       json_extract(value,'\$.id')"
+      printf "FROM json_each('"
+      printf '%s' "${_arr//$_AGMSG_SQ/$_AGMSG_SQ$_AGMSG_SQ}"
+      printf "');\n"
+    } > "$_agmsg_ci_sql"
+    agmsg_sqlite ':memory:' < "$_agmsg_ci_sql"
   )
   _rc=$?
   set -e
@@ -420,13 +523,14 @@ for team in "${TEAM_LIST[@]}"; do
   # ADDITIVE: it may show a message earlier, but Stop still fetches, shows, and
   # consumes it as before. A duplicate display is harmless; an invisible loss is
   # not.
+  # DEFERRED, not skipped: what was formatted is remembered here and consumed
+  # after the payload has actually left this process. See the emit below (#677).
   if [ "$EVENT" != "PostToolUse" ] && [ "${#IDS[@]}" -gt 0 ]; then
-    storage_mark_read_batch "$team" "$AGENT" "${IDS[@]}" >/dev/null 2>&1 || true
+    PENDING_MARKS+=("$team"$'\t'"${IDS[*]}")
   fi
 done
 
-# The two emit points are NOT the same case, and treating them alike is what
-# lost messages.
+# The exit code cannot carry both the delivery and the failure report.
 #
 # The DOCUMENTED contract is that stdout is read as control JSON only on exit 0.
 # MEASURED (Claude Code 2.1.226, one-shot `claude -p`, a synthetic probe hook --
@@ -443,39 +547,10 @@ done
 # measured, the non-zero exit was never needed to preserve the delivery or to
 # report the partial failure, because the payload already carries both.
 #
-# The status line is emitted only when the poll actually completed. Printing
-# "no new messages" and then exiting non-zero states something untrue on a
-# channel that is about to be discarded anyway.
-if [ -z "$OUTPUT" ]; then
-  [ "$LOOP_RC" -eq 0 ] || exit "$LOOP_RC"
-  emit_status_json "agmsg: no new messages"
-  exit 0
-fi
-
-# New messages found.
-#
-# This is the delivering path, and the rows above were marked read INSIDE the
-# loop before we got here. The documented hook contract is that stdout is read
-# as control JSON only on exit 0. Measured (Claude Code 2.1.226, one-shot
-# `claude -p`, a synthetic probe hook -- not this script, not an interactive
-# session): the stdout control JSON was processed on exit 0, 1, 2, and 3 alike.
-# So this codebase currently depends on an area where the documented contract
-# and the observed implementation disagree -- see
-# https://github.com/fujibee/agmsg/issues/658 for the measurement.
-#
-# This fix is correct either way, which is why it doesn't bet on which
-# behavior is real: if a runtime DOES discard stdout on non-zero exit (as
-# documented), leaving the old `exit "$CLAIM_RC"` here would throw away the
-# payload that already cost these rows their unread state -- consumed and
-# never shown, worse than the failure this status was meant to protect
-# against. If a runtime does NOT discard it (as measured here), the old
-# non-zero exit was not needed to preserve the delivery or report the
-# partial failure, because the payload already carries both.
-# Exiting 0 unconditionally on this path is safe under both, so delivery and
-# the report are separated: the messages go out with exit 0, and the partial
-# failure is stated inside the payload the operator actually reads. Nothing
-# upstream mistakes a partial poll for a complete one, because the text says
-# which team stopped it and that the rest are still unread.
+# Delivery and the report are separated: the messages go out with exit 0, and
+# the partial failure is stated inside the payload the operator actually reads.
+# Nothing upstream sees a partial poll as a complete one, because the text says
+# so.
 if [ -n "$OUTPUT" ]; then
   if [ "$LOOP_RC" -ne 0 ]; then
     OUTPUT+="agmsg: this poll stopped early — team '$LOOP_FAILED_TEAM' could not be read (status $LOOP_RC)."$'\n'
@@ -497,19 +572,76 @@ if [ -n "$OUTPUT" ]; then
     # unverified part (see PR): this is the shape the 0.149.1 parser accepts.
     case "$POSTTOOL_OUTPUT" in
       hookSpecificOutput)
-        printf '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"%s"}}\n' "$ESCAPED"
+        printf '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"%s"}}\n' "$ESCAPED" || EMIT_RC=$?
         ;;
-      *) : ;;
+      # Emitted nothing (no known shape for this event), which is not the same
+      # fact as "emitted and it worked". EMIT_RC is left at 0 because there is
+      # nothing to protect: this branch reaches the consume loop with an empty
+      # PENDING_MARKS, exactly as the line above it does.
+      *) EMIT_RC=0 ;;
     esac
   else
-    cat <<ENDJSON
-{
-  "decision": "block",
-  "reason": "$ESCAPED"
-}
-ENDJSON
+    # Use the shell builtin so a closed stdout stays a failed delivery.
+    # Some cat implementations reopen missing standard fds on /dev/null and
+    # return success, which would consume messages without delivering them.
+    printf '{\n  "decision": "block",\n  "reason": "%s"\n}\n' "$ESCAPED" || EMIT_RC=$?
+  fi
+  # A test-only observation point, and the reason it has to be HERE rather than
+  # in the test: the failure this ordering exists for makes stdout unwritable, so
+  # the run that matters cannot report on itself through the payload. Running the
+  # hook a second time with a writable stdout shows that OTHER process reached
+  # the write; it says nothing about this one. The exit status goes in with it,
+  # so a test can tell "reached the emit and it failed" from "reached the emit
+  # and it worked" -- otherwise a control here would be satisfied by the happy
+  # path it is meant to exclude.
+  if [ -n "${AGMSG_TEST_MARK_BARRIER:-}" ]; then
+    printf '%s\n' "$EMIT_RC" > "$AGMSG_TEST_MARK_BARRIER.emitted"
+  fi
+  # THE PAYLOAD HAS NOW LEFT THIS PROCESS. Only here do the rows it carried stop
+  # being unread (#677).
+  #
+  # Both emits above set EMIT_RC, including the PostToolUse one that has nothing
+  # to consume today -- `PENDING_MARKS` is only filled when EVENT is not
+  # PostToolUse. Guarding only the branch that currently matters would make the
+  # invariant "the one emit that counts happens to be the guarded one" instead of
+  # "every emit reports whether it worked", and the day PostToolUse starts
+  # consuming, the guard would not cover it and nothing would say so.
+  #
+  # Before this, the mark happened while the messages were still sitting in a
+  # shell variable: "displayed" meant "formatted", not "written". watch.sh has had
+  # the right shape all along -- it consumes only the ids whose `printf`
+  # succeeded -- and this brings the third path to it.
+  #
+  # WHAT THIS PROVES, EXACTLY: that the write to this process's stdout returned
+  # success. It does NOT prove the hook runtime parsed the payload, or that the
+  # model received it. A runtime that rejects what it was handed leaves the write
+  # successful and the rows consumed, exactly as before -- which is why #1015
+  # (a Windows login shell prepending profile output, so the JSON is rejected) is
+  # NOT fixed by this ordering. Claiming otherwise would be claiming more than the
+  # exit status can carry.
+  #
+  # The reverse risk is accepted deliberately. If the write succeeds and the mark
+  # fails, the message is offered twice; if the mark precedes a failed write, it
+  # is offered never. The two are not equal -- a duplicate is visible and a
+  # silence is not -- so the failure is placed on the side the user can see.
+  if [ "${EMIT_RC:-0}" -eq 0 ]; then
+    for _pending in ${PENDING_MARKS[@]+"${PENDING_MARKS[@]}"}; do
+      _p_team="${_pending%%$'\t'*}"
+      _p_ids="${_pending#*$'\t'}"
+      [ -n "$_p_team" ] && [ -n "$_p_ids" ] || continue
+      # word-split on purpose: $_p_ids is the space-joined id list for this team
+      # shellcheck disable=SC2086
+      storage_mark_read_batch "$_p_team" "$AGENT" $_p_ids >/dev/null 2>&1 || true
+    done
   fi
   # Exit 0 even when the poll failed part-way: this is the delivering path, and
   # a non-zero status here throws the delivery away.
   exit 0
 fi
+
+# Nothing was accumulated. There is no delivery to protect, so the status is
+# free to carry the failure — and it must, because "no new messages" here would
+# claim something this run never established.
+[ "$LOOP_RC" -eq 0 ] || exit "$LOOP_RC"
+emit_status_json "agmsg: no new messages"
+exit 0

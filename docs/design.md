@@ -6,7 +6,7 @@ Developer documentation for contributors and maintainers.
 
 ## Identity Model
 
-An agent is identified by `(name, team)`. Project path and agent type (claude-code, codex, cursor) are metadata — reference information stored alongside the identity but not part of it.
+An agent is identified by `(name, team)`. Project path and agent type (claude-code, codex, gemini, …) are metadata — reference information stored alongside the identity but not part of it.
 
 - An agent can be registered from multiple projects under the same name
 - `whoami.sh` uses project path and type to suggest an identity, but the user can choose any name
@@ -56,11 +56,14 @@ Manipulated via sqlite3 JSON1 functions (no python3 dependency).
 
 ```yaml
 # agmsg configuration
-hook:
-  check_interval: 60  # seconds between inbox checks
+delivery:
+  monitor:
+    poll_interval: 5    # watch.sh poll interval, seconds
+  turn:
+    check_interval: 60  # Stop-hook cooldown, seconds between inbox checks
 ```
 
-Read/written by `config.sh` using awk. Supports dotted keys (`hook.check_interval`).
+Read/written by `config.sh` using awk. Supports dotted keys (`delivery.turn.check_interval`; `hook.check_interval` is still read as a legacy alias).
 
 ## Hook System
 
@@ -81,7 +84,7 @@ Agent responds → Stop hook fires → check-inbox.sh runs
 
 ### Cooldown
 
-A marker file (`run/.lastcheck-<agent>`) tracks the last check time. Configurable via `hook.check_interval` (default 60 seconds). It lives in the run dir (hook runtime state), not the message store, so it is unaffected by `AGMSG_STORAGE_PATH`.
+A marker file (`run/.lastcheck-<agent>`) tracks the last check time. Configurable via `delivery.turn.check_interval` (default 60 seconds; `hook.check_interval` is a legacy alias). It lives in the run dir (hook runtime state), not the message store, so it is unaffected by `AGMSG_STORAGE_PATH`.
 
 ### Claude Code vs Codex
 
@@ -106,9 +109,11 @@ three signals, none needing a stable `session_id` (Codex doesn't expose one):
    agent process PID. A slash command runs as a child of that same process, so
    it walks the ppid chain to the agent PID and reads the marker back. Trust is
    gated on the PID still being a live agent process (recycling guard); stale
-   markers are GC'd at SessionStart/SessionEnd. **Claude Code monitor/both
-   only** — Codex rejects monitor mode (no Monitor tool), so it never installs
-   `session-start.sh` and writes no marker; Codex relies on signals 2–3.
+   markers are GC'd at SessionStart/SessionEnd. Written by
+   `session-start.sh` for **Claude Code monitor (legacy) / both** sessions. Codex
+   supports monitor mode too (through the app-server bridge), but its SessionStart
+   plug exits before this marker is written, and a session in turn or off mode has
+   no such hook, so those rely on signals 2–3.
 2. **Ancestor walk.** Failing a marker, the nearest ancestor of pwd that is a
    registered project for the type wins. Git-independent — covers nested
    subdirs and worktrees that live *under* the registered project, on cc and
@@ -135,13 +140,17 @@ must track the same resolved project); direct shell invocations and
 | `history.sh` | Show message history (newest first, displayed oldest first) |
 | `join.sh` | Add agent to team (create team if needed) |
 | `leave.sh` | Remove agent from team (delete team if empty) |
-| `team.sh` | List team members; `--health <name> <type>` asserts one registration and a live bridge lease (headless claude-code/codex/cursor only) |
+| `team.sh` | List team members |
 | `whoami.sh` | Identify agent by project path and type |
 | `rename.sh` | Rename agent in config and message history |
 | `check-inbox.sh` | Hook entry point — cooldown, check, notify |
 | `config.sh` | Read/write user config (YAML) |
 
-All scripts use only `bash` and `sqlite3`. No python3 dependency.
+The scripts listed above are all in the **core** dependency tier: `bash`
+and `sqlite3` only, no python3. See Dependencies below for the full
+tiered picture — E2EE (`key.sh`) and remote (`remote.sh`, `team-list.sh`)
+add their own binaries on top of core, only for installs that use those
+features.
 
 ## Install Layout
 
@@ -182,7 +191,8 @@ either).
   manipulation via the JSON1 extension), `awk`/`sed` (config, TOML
   editing). Covers `send`/`inbox`/`history`/`team`/`join`/`leave`/`rename`
   and everything else that only talks to the local SQLite store. No
-  python3, no node, no network, no daemon.
+  python3, no node, no network, and no daemon (the optional agmsgd service, which
+  needs Node, is a separate tier the user opts into).
 - **codex agent type / launcher-based spawn** — core, plus `node`
   (`scripts/lib/node.sh` resolves it; the Codex monitor delivery bridge,
   `codex-bridge.js`, is a Node program). `spawn.sh` dies explicitly
@@ -205,25 +215,34 @@ either).
   Worse, `command -v python3` alone cannot detect this case — Apple ships
   a `/usr/bin/python3` trampoline that genuinely exists on PATH even
   without CLT installed, so a plain PATH check reports success right up
-  until something actually executes it. The check additionally consults
+  until something actually executes it. A raw string comparison against
+  `/usr/bin/python3` isn't enough either: PATH can resolve python3
+  through a symlink (e.g. `~/bin/python3 -> /usr/bin/python3`) whose
+  literal text differs from the trampoline path even though executing it
+  still reaches the trampoline, so the resolved path is followed through
+  every symlink hop — relative or absolute, portable to BSD/macOS
+  `readlink`, which has no `-f`/canonicalize flag — to its physical
+  target before comparing. The check additionally consults
   `xcode-select -p` (a real, always-present, non-interactive binary that
-  only inspects installed-tool state) whenever python3 resolves to
-  exactly `/usr/bin/python3` on Darwin — python3 itself is never executed
-  to probe for its own usability, on any platform, under any
-  circumstance; "try running it and see what happens" is exactly the
-  category of fix this exists to avoid.
+  only inspects installed-tool state) whenever that canonical target is
+  `/usr/bin/python3` on Darwin — python3 itself is never executed to
+  probe for its own usability, on any platform, under any circumstance;
+  "try running it and see what happens" is exactly the category of fix
+  this exists to avoid.
 - **remote sync data plane (the Stage-1 polling sync client)** — core,
   plus `node` (`remote-sync.sh` execs `internal/remote-sync.mjs` and its
   companion `.mjs` helpers via `AGMSG_SYNC_NODE_BIN`/`agmsg_resolve_node`).
   A second, independent reason a remote-connected team needs Node,
   separate from the control plane's python3 need above.
 
-`doctor` (`remote.sh doctor`) checks `age` and `python3`, sharing the same
-judgment helper (`agmsg_python3_usable`) that the control-plane preflight
-uses, so the diagnostic display and the actual gate can never disagree.
-It does not yet check `node` for the sync data plane — a gap, not a
-design choice; `remote-sync.sh` still fails with whatever raw error
-`agmsg_resolve_node`'s fallback produces if Node is missing.
+`doctor` (`remote.sh doctor`) checks `age`, `python3`, and `node`, sharing
+the same judgment helpers (`agmsg_python3_usable`, `agmsg_node_usable`)
+that the actual preflight gates use, so the diagnostic display and the
+gates can never disagree. `agmsg_node_usable` (`scripts/lib/node.sh`)
+reuses `agmsg_resolve_node`'s own resolution contract (`AGMSG_NODE`
+override, version-manager paths, PATH) rather than a separate raw
+`command -v node` check, so doctor's judgment of "usable" always matches
+what `remote-sync.sh` itself would actually try to run.
 
-No persistent daemon at any tier. The core tier alone makes no network
+No persistent daemon is required at any tier; the optional agmsgd service (a resident process the user chooses, needing Node) is the only one. The core tier alone makes no network
 calls; the remote tiers do, by definition.

@@ -38,6 +38,18 @@ terminal_id_split() {   # <id>
   printf '%s\t%s\n' "$_PLAIN_EMULATOR" "$_PLAIN_TTY"
 }
 
+# Plain's id already contains its emulator instance; the legacy '-' sentinel
+# names no addressable terminal and stays unqualified.
+terminal_instance_for_ref() {   # <canonical-ref>
+  local ref="$1" halves
+  _agmsg_terminal_ref_parse "$ref" || { printf 'unknown:invalid_locator\n'; return 0; }
+  [ "$_AGMSG_REF_TERM" = plain ] || { printf 'unknown:wrong_terminal\n'; return 0; }
+  [ "$_AGMSG_REF_ID" != '-' ] || { printf 'n/a:bare\n'; return 0; }
+  halves="$(terminal_id_split "$_AGMSG_REF_ID")" \
+    || { printf 'unknown:invalid_plain_id\n'; return 0; }
+  printf '%s\n' "$halves"
+}
+
 terminal_describe() {
   printf 'name=plain\n'
   printf 'backend=emulator-backed OS terminal\n'
@@ -232,6 +244,10 @@ _plain_spawn_locator() {
     printf 'plain: spawned window returned an invalid owner pid\n' >&2
     return 13 ;;
   esac
+  # The witness is written with LC_ALL=C (spawn.sh), so it is always the English
+  # form of ps's lstart. Do not widen this to other characters: every reader
+  # (here, _plain_process_witness_matches, terminal_fence) asks ps under LC_ALL=C
+  # too, and the value is only ever compared byte for byte.
   case "$start" in *[!0-9A-Za-z_:]*)
     printf 'plain: spawned window returned an invalid owner start time\n' >&2
     return 13 ;;
@@ -258,7 +274,7 @@ _plain_process_witness_matches() {   # <pid> <start> <tty> <kind>
     printf 'plain: %s process no longer controls %s\n' "$kind" "$tty" >&2
     return 10
   }
-  current_start="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//' | tr ' ' '_')"
+  current_start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//' | tr ' ' '_')"
   [ -n "$current_start" ] && [ "$current_start" = "$start" ] || {
     printf 'plain: %s process witness no longer matches pid %s\n' "$kind" "$pid" >&2
     return 10
@@ -392,6 +408,9 @@ terminal_find_by_label() { _plain_unsupported "find_by_label"; }
 terminal_label_of() { _plain_unsupported "label_of"; }
 terminal_name() { _plain_unsupported "name"; }
 
+# Plain terminals have no independent agent key to compare.
+terminal_expected_label() { printf 'n/a:no_addressable_pane\n'; }
+
 # Fence for a self-write (#1152, #1149). A plain seat is record-only: it can
 # write the placement record for the locator it was handed, and nothing else
 # (no label, key or session op exists in this implementation -- see the
@@ -423,7 +442,7 @@ terminal_fence() {   # <id> [<seat-pid>]
   case "$observed" in ''|'??'|'-'|'?') printf '%s\tunknown:tty_unobservable\n' "$emulator"; return 2 ;; esac
   case "$observed" in /dev/*) ;; *) observed="/dev/$observed" ;; esac
   [ "$observed" = "$tty" ] || { printf '%s\tunknown:tty_mismatch:%s\n' "$emulator" "$observed"; return 2; }
-  start="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//' | tr ' ' '_')"
+  start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//' | tr ' ' '_')"
   [ -n "$start" ] || { printf '%s\tunknown:tty_unobservable\n' "$emulator"; return 2; }
   printf '%s\ttty=%s,pid=%s,start=%s\n' "$emulator" "$tty" "$pid" "$start"
   return 0

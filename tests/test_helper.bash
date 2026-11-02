@@ -34,6 +34,9 @@ unset CLAUDE_CONFIG_DIR
 # of whatever the fixture set up, silently changing which branch a test
 # exercises. Tests that deliberately model a caller set these explicitly.
 unset AGMSG_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
+# Codex Desktop exports this; the codex-app driver (priority 1, exclusive)
+# keys off it and would win over every fake terminal a test sets up.
+unset CODEX_INTERNAL_ORIGINATOR_OVERRIDE
 export AGMSG_SELF_NAME=off
 
 # --- per-test watchdog (#61) -------------------------------------------------
@@ -237,8 +240,19 @@ setup_test_env() {
   unset HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_SESSION HERDR_BIN_PATH HERDR_STARTUP_CWD
   unset CLAUDE_CONFIG_DIR
   unset AGMSG_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
+  unset CODEX_INTERNAL_ORIGINATOR_OVERRIDE
   local source_test_dir="${AGMSG_TEST_SOURCE_TEST_DIR:-$BATS_TEST_DIRNAME}"
-  export TEST_SKILL_DIR="$(mktemp -d)"
+  # Saved ONCE (first call wins, via :=): a test that calls teardown_test_env
+  # and then setup_test_env again within its OWN body (several in
+  # test_remote.bats do, to re-enter with a different fixture) would
+  # otherwise have this SECOND call's `mktemp -d` run under the FIRST call's
+  # already-overridden TMPDIR (set below) -- pointed inside the very
+  # TEST_SKILL_DIR teardown just removed, so it fails outright. Always
+  # create TEST_SKILL_DIR under the REAL root, never under whatever TMPDIR
+  # setup_test_env itself last left behind.
+  : "${AGMSG_TEST_REAL_TMPDIR:=${TMPDIR:-/tmp}}"
+  export AGMSG_TEST_REAL_TMPDIR
+  export TEST_SKILL_DIR="$(TMPDIR="$AGMSG_TEST_REAL_TMPDIR" mktemp -d)"
   # shellcheck disable=SC1091
   source "$source_test_dir/../scripts/lib/close-fds.sh"
   _agmsg_wd_start "$TEST_SKILL_DIR"
@@ -273,6 +287,27 @@ setup_test_env() {
   # export is scoped to the test and needs no restore. See #41.
   export HOME="$TEST_SKILL_DIR/home"
   mkdir -p "$HOME"
+
+  # Same reasoning as HOME above, now needed for a second path: doctor.sh's
+  # leaked-outcome-file check (#1572 cleanup) scans ${TMPDIR:-/tmp} directly,
+  # installation-wide, by design -- a bare `mktemp` always lands there
+  # regardless of SKILL_DIR. Without this, every test that does not already
+  # set its own TMPDIR would have that check see whatever is really in the
+  # developer's or CI runner's own temp directory at that moment (on a
+  # machine where the real leak this exists for is still happening, that is
+  # not empty), making unrelated tests fail for a reason that has nothing to
+  # do with what they test.
+  #
+  # A SIBLING of TEST_SKILL_DIR under the real root, not a subdirectory of
+  # it: several tests build their own fixture (a "project" dir, typically)
+  # with a bare `mktemp -d`, and more than one of those compares that path
+  # against SKILL_DIR to tell "this install's own files" apart from "a
+  # project's own" -- nesting TMPDIR inside TEST_SKILL_DIR put every such
+  # fixture inside the skill's own tree too, so those tests saw their own
+  # project as part of the skill. #1038's delivery test is the one CI
+  # caught; there may be others the same way, hence the sibling instead.
+  export AGMSG_TEST_TMPDIR="$(TMPDIR="$AGMSG_TEST_REAL_TMPDIR" mktemp -d)"
+  export TMPDIR="$AGMSG_TEST_TMPDIR"
 
   # Hermeticity: the bats process inherits the developer's own
   # CLAUDE_CODE_SESSION_ID (this suite is usually run from a Claude Code session).
@@ -327,8 +362,30 @@ setup_test_env() {
 # holds $dir without naming it in argv, revisit (add an lsof pass gated on the rm
 # actually failing, so the cost is paid only when it is needed).
 _pids_referencing_dir() {   # <dir>
+  # MSYS's ps has no -o, so on Git Bash the listing below would come back empty
+  # and the reap would "succeed" having stopped nothing. Read /proc/<pid>/cmdline
+  # there instead (the source compat_get_cmdline uses). A native process reports
+  # the dir in its mixed `C:/...` form, so match both spellings.
+  # _PIDS_PROC_ROOT forces this branch on a host with a /proc-shaped tree.
+  local proc_root="${_PIDS_PROC_ROOT:-/proc}" dir="$1" alt="" f p cl
+  if [ -n "${_PIDS_PROC_ROOT:-}" ] || case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) true ;; *) false ;; esac; then
+    command -v cygpath >/dev/null 2>&1 && alt="$(cygpath -m "$dir" 2>/dev/null || true)"
+    for f in "$proc_root"/[0-9]*/cmdline; do
+      [ -r "$f" ] || continue
+      p="${f#"$proc_root"/}"; p="${p%/cmdline}"
+      [ "$p" = "$$" ] && continue
+      cl="$(tr '\0' ' ' < "$f" 2>/dev/null)" || continue
+      case "$cl" in
+        *"$dir"*) printf '%s\n' "$p" ;;
+        *) if [ -n "$alt" ] && [ "$alt" != "$dir" ]; then
+             case "$cl" in *"$alt"*) printf '%s\n' "$p" ;; esac
+           fi ;;
+      esac
+    done
+    return 0
+  fi
   ps -eo pid=,args= 2>/dev/null |
-    AGMSG_REAP_DIR="$1" awk -v me="$$" 'index($0, ENVIRON["AGMSG_REAP_DIR"]) { if ($1+0 != me+0) print $1 }'
+    AGMSG_REAP_DIR="$dir" awk -v me="$$" 'index($0, ENVIRON["AGMSG_REAP_DIR"]) { if ($1+0 != me+0) print $1 }'
 }
 
 # Reap any process still holding $TEST_SKILL_DIR, then let handles release, BEFORE the
@@ -432,6 +489,12 @@ EOF2
 _ready_path() {   # <team> <agent>
   ( SKILL_DIR="$TEST_SKILL_DIR"; source "$TEST_SKILL_DIR/scripts/lib/actas-lock.sh"; agmsg_ready_path "$1" "$2" )
 }
+_spawn_record_path() {   # <team> <agent>
+  ( SKILL_DIR="$TEST_SKILL_DIR"; source "$TEST_SKILL_DIR/scripts/lib/actas-lock.sh"; agmsg_spawn_path "$1" "$2" )
+}
+_actas_session_path() {   # <team> <agent>
+  ( SKILL_DIR="$TEST_SKILL_DIR"; source "$TEST_SKILL_DIR/scripts/lib/actas-lock.sh"; actas_lock_path "$1" "$2" )
+}
 
 teardown_test_env() {
   # Kills and un-ledgers every fixture the test registered; without this the
@@ -439,6 +502,13 @@ teardown_test_env() {
   local fixture_rc=0
   test_fixture_cleanup || fixture_rc=$?
   _reap_test_jobs || true
+  # Belt and braces alongside setup_test_env's own fix above: put TMPDIR back
+  # to the real root before removing AGMSG_TEST_TMPDIR (where this test's
+  # TMPDIR pointed) and TEST_SKILL_DIR, so nothing run between this teardown
+  # and a later setup -- in this test or, if a suite ever stopped resetting
+  # it per test, a later one -- reads a TMPDIR that no longer exists.
+  [ -n "${AGMSG_TEST_REAL_TMPDIR:-}" ] && export TMPDIR="$AGMSG_TEST_REAL_TMPDIR"
+  [ -n "${AGMSG_TEST_TMPDIR:-}" ] && rm -rf "$AGMSG_TEST_TMPDIR" 2>/dev/null
   # Try the plain rm FIRST, and only reap when it actually fails. The reaper's scan is a
   # full `ps -eo pid=,args=`; running it in EVERY teardown would add that cost to all of
   # the (vast majority of) tests that hold nothing — across the suite's hundreds of tests
@@ -866,27 +936,56 @@ assert_no_test_fixture_survivors() {
   echo "fixture-survivors=0 run_id=$run_id"
 }
 
+# Print the renderable type set from the registry rather than duplicating the
+# list in each composition assertion. The optional root is useful for tests
+# that copy scripts into an isolated skill directory.
+agmsg_renderable_types() {
+  local root="${1:-$BATS_TEST_DIRNAME/..}"
+  (
+    # shellcheck disable=SC1091
+    source "$root/scripts/lib/type-registry.sh"
+    agmsg_load_renderable_skill_types
+    printf '%s\n' $AGMSG_RENDERABLE_SKILL_TYPES
+  )
+}
+
+# A fake `tmux` that logs its argv and produces the ids/text real tmux would.
+#
+# Shared because three suites drive the terminal layer now — the registry's own
+# tests, the watcher, and per-turn delivery (#1044 gave the last two a naming
+# call). Callers set FAKEBIN and ARGV_LOG first; nothing here reads them at
+# source time, so a suite that does not want a fake terminal is unaffected.
 agmsg_install_fake_tmux() {
+  # The label this fake REMEMBERS. A pane option that is set and then never
+  # readable is not a model of tmux: `terminal_label_of` asks a pane which agmsg
+  # label it carries, and code that acts on the answer (the self-naming fast
+  # half, #1130) cannot be tested against a fake that always answers nothing.
+  # So `set-option ... @agmsg_agent <label>` is stored per pane and
+  # `display-message` replays it. Only the one format that asks for the label is
+  # answered; every other format falls through to silence exactly as before, so
+  # suites that depend on this fake's other behaviour are untouched.
   export FAKE_TMUX_STATE="${FAKE_TMUX_STATE:-$FAKEBIN/tmux.labels}"
-  : >"$FAKE_TMUX_STATE"
-  cat >"$FAKEBIN/tmux" <<EOF
+  : > "$FAKE_TMUX_STATE"
+  cat > "$FAKEBIN/tmux" <<EOF
 #!/usr/bin/env bash
 { printf 'tmux'; for a in "\$@"; do printf ' [%s]' "\$a"; done; printf '\n'; } >> "$ARGV_LOG"
 state='$FAKE_TMUX_STATE'
 args=("\$@")
 if [ "\${args[0]}" = -S ]; then args=("\${args[@]:2}"); fi
 case "\${args[0]}" in
-  new-window) echo '@7' ;;
+  new-window)   echo '@7' ;;
   split-window) echo '%9' ;;
   capture-pane) printf 'line one\nline two\n' ;;
   set-option)
+    # set-option -p -t <id> @agmsg_agent <label>
     if [ "\${args[4]}" = '@agmsg_agent' ]; then
       pane="\${args[3]}"; label="\${args[5]}"
-      [ -f "\$state" ] && grep -v "^\$pane	" "\$state" >"\$state.new" 2>/dev/null || : >"\$state.new"
-      printf '%s\t%s\n' "\$pane" "\$label" >>"\$state.new"
+      [ -f "\$state" ] && grep -v "^\$pane	" "\$state" > "\$state.new" 2>/dev/null || : > "\$state.new"
+      printf '%s\t%s\n' "\$pane" "\$label" >> "\$state.new"
       mv "\$state.new" "\$state"
     fi ;;
   display-message)
+    # display-message -p -t <id> <format>
     if [ "\${args[4]}" = '#{pane_id}|#{@agmsg_agent}' ]; then
       pane="\${args[3]}"
       label="\$(awk -F'\t' -v p="\$pane" '\$1 == p { print \$2 }' "\$state" 2>/dev/null)"
@@ -897,6 +996,14 @@ exit 0
 EOF
   chmod +x "$FAKEBIN/tmux"
   export PATH="$FAKEBIN:$PATH"
+}
+
+# Clear the agmsg label the fake tmux remembers for <pane>, without touching the
+# pane or the server -- the state "someone renamed the pane by hand" leaves.
+agmsg_fake_tmux_clear_label() {   # <pane>
+  [ -f "${FAKE_TMUX_STATE:-}" ] || return 0
+  grep -v "^$1	" "$FAKE_TMUX_STATE" > "$FAKE_TMUX_STATE.new" 2>/dev/null || : > "$FAKE_TMUX_STATE.new"
+  mv "$FAKE_TMUX_STATE.new" "$FAKE_TMUX_STATE"
 }
 
 # Skip a test on native Windows / Git Bash (MSYS/MINGW/Cygwin). Use ONLY for
@@ -922,12 +1029,51 @@ skip_unless_windows() {
   esac
 }
 
+# Skip a test only under CI (GitHub Actions sets both CI=true and
+# GITHUB_ACTIONS=true). Use for a test whose flake is specific to CI's shared,
+# loaded runners -- not a POSIX gap (see skip_on_windows above) -- so it keeps
+# running locally, where the timing that makes it flaky doesn't reproduce.
+# Each call site names the tracking issue so the skip is removed once fixed.
+skip_on_ci() {
+  if [ "${CI:-}" = "true" ] || [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    skip "${1:-flaky under CI}"
+  fi
+}
+
+# The Antigravity monitor is Linux-only: antigravity-tui-supervisor.py reads
+# /proc/<pid>/stat for every liveness check, and the control actions all go
+# through antigravity-mode.mjs, which does the same. Use for any test that
+# actually invokes the installed agy-tui shim; tests that only check install.sh's
+# own file handling (ownership, symlink replacement) do not need this.
+skip_unless_linux() {
+  [ "$(uname -s)" = Linux ] || skip "${1:-Antigravity TUI monitor is Linux-only}"
+}
+
 # In-memory sqlite for test ASSERTIONS, stripping CR. sqlite3.exe writes stdout
 # in text mode on Windows (\n -> \r\n); $(...) keeps the trailing \r, so a probe
 # like [ "$(sqlite3 :memory: 'SELECT json_valid(...)')" = "1" ] compares "1\r"
 # against "1" and fails even when the script under test wrote a correct file.
 # This is the test-side mirror of scripts/lib/storage.sh's agmsg_sqlite_mem.
 sqlite_mem() { sqlite3 :memory: "$@" | tr -d '\r'; }
+
+# Permission bits of <path> as octal, e.g. 700.
+#
+# NOT `stat -f "%Lp" "$p" 2>/dev/null || stat -c "%a" "$p"`. That idiom leans on
+# the BSD form FAILING under GNU. It does fail — but only after writing
+# filesystem information to STDOUT, because GNU reads `-f` as `--file-system`
+# and the format string as a second file operand. `2>/dev/null` hides the error
+# it then prints, not the output already written, so the capture becomes that
+# block with the real mode appended and no comparison can match. Green on macOS,
+# red on any GNU host, and the reason is invisible at the call site.
+#
+# Branch on the platform instead, the way scripts/lib/compat.sh already does for
+# mtime. One implementation so a fourth call site cannot reintroduce it.
+file_mode() {
+  case "$(uname -s)" in
+    Darwin*) stat -f "%Lp" "$1" ;;
+    *)       stat -c "%a" "$1" ;;
+  esac
+}
 
 # Resolve a file path for use inside a sqlite3 readfile('...') call in a test.
 # On native Windows, sqlite3 only reads a Windows path (C:\Users\...), not a Git
@@ -1084,6 +1230,59 @@ wait_for_file_contains() {
     _wait_file_contains "$file" "$needle"
 }
 
+# Waits for a mock HTTP fixture (mock_slack_server.py, mock_openrouter_server.py,
+# ...) to actually be ready to accept connections, not just for it to have
+# PRINTED its port -- a process can write that line before its own accept
+# loop is scheduled, and a loaded CI runner is exactly where that gap widens
+# (review finding, #1339: this is what made the slack/jev mock-server tests
+# flake on a busy macos-latest runner while ubuntu/windows stayed green).
+# Polls a real TCP connect via bash's own /dev/tcp. On timeout, prints
+# exactly what it was waiting for (the port file's path and, if it got that
+# far, the port itself) instead of leaving the caller's own assertion to
+# report a bare failure with no context.
+#
+# Uses its OWN, longer ceiling (30s, not the shared 10s _WAIT_TICKS every
+# other wait_for_* helper here uses): this waits on a fresh python3
+# subprocess actually being scheduled and finishing its own startup/import
+# work, not an in-process condition -- a real fork+exec, which a saturated
+# CI runner can push past 10s on its own even when nothing is actually
+# broken (review finding, #1339 round 2: this recurred on a LATER macos CI
+# run, that time never even reaching the port-file-written stage within the
+# old 10s bound).
+_MOCK_SERVER_WAIT_TICKS=300   # x 0.1s = 30s ceiling
+wait_for_mock_server_port() {   # <port_file> -> prints the port on stdout
+  local port_file="$1" i port=""
+  for i in $(seq 1 $_MOCK_SERVER_WAIT_TICKS); do
+    if [ -z "$port" ] && [ -f "$port_file" ]; then
+      port="$(cat "$port_file" 2>/dev/null)"
+      case "$port" in ''|*[!0-9]*) port="" ;; esac
+    fi
+    if [ -n "$port" ]; then
+      if { exec 3<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null; then
+        exec 3<&- 3>&-
+        printf '%s' "$port"
+        return 0
+      fi
+    fi
+    sleep $_WAIT_INTERVAL
+  done
+  # Names what it was waiting for AND how long -- a bare "timed out" was
+  # exactly what forced guessing at the cause the first two times this
+  # flaked (review finding, #1341: the maintainer asked for this explicitly,
+  # so a next occurrence does not start the same investigation from zero).
+  # Each tick is 0.1s, so ticks/10 and ticks%10 give exact whole and tenths
+  # digits without floating-point arithmetic (bash has none) -- accurate at
+  # both the real 30s ceiling and a test's much shorter override, rather
+  # than integer-dividing away the fraction and printing a misleading "0s".
+  local waited_s="$((_MOCK_SERVER_WAIT_TICKS / 10)).$((_MOCK_SERVER_WAIT_TICKS % 10))"
+  if [ -z "$port" ]; then
+    echo "wait_for_mock_server_port: timed out after ${waited_s}s waiting for $port_file to name a port" >&2
+  else
+    echo "wait_for_mock_server_port: timed out after ${waited_s}s waiting for 127.0.0.1:$port (from $port_file) to accept a connection" >&2
+  fi
+  return 1
+}
+
 # Positive evidence that a pid is gone. NOT `kill -0 || gone`.
 #
 # A failed `kill -0` is ESRCH (dead) or EPERM (alive, but not signalable by us —
@@ -1164,6 +1363,40 @@ setup_live_owner() {
 wait_until() {
   local timeout="$1"; shift
   _wait_poll "$timeout" "$_WAIT_INTERVAL" "condition command" "$@"
+}
+
+# A PATH containing only `bash` and `dirname` (real binaries, via symlink)
+# -- enough to exec bash itself (so `env PATH=... bash script.sh` doesn't
+# fail on "bash: command not found" before the script even starts) and for
+# remote.sh/team-list.sh to resolve SCRIPT_DIR/SKILL_DIR and reach their
+# agmsg_require_python3 preflight check, but with no `python3` findable via
+# `command -v`. Used to test the preflight check itself fails fast with a
+# clear message instead of ever invoking python3 (see
+# lib/require-python3.sh) -- deliberately NOT built by filtering the real
+# PATH's directories, so it can't accidentally still contain a python3
+# from some other directory.
+# A PATH holding what doctor needs and no age. Shadowing with a stub does not
+# work: `command -v` skips a non-executable entry and finds the real binary
+# further along, so the lookup only fails if the PATH is built from scratch --
+# the same approach path_without_python3 takes.
+path_without_age() {
+  local dir tool
+  dir="$(mktemp -d)"
+  for tool in bash dirname basename readlink python3 node uname sed grep \
+              awk cat tr mktemp; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      ln -s "$(command -v "$tool")" "$dir/$tool" 2>/dev/null || true
+    fi
+  done
+  printf '%s' "$dir"
+}
+
+path_without_python3() {
+  local dir
+  dir="$(mktemp -d)"
+  ln -s "$(command -v bash)" "$dir/bash"
+  ln -s "$(command -v dirname)" "$dir/dirname"
+  printf '%s' "$dir"
 }
 
 # Fail the test when <cmd> SUCCEEDS.

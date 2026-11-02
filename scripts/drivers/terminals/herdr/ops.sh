@@ -228,6 +228,27 @@ _herdr_pane_for_session() {
   return 2   # no candidate array path (unknown schema) -> could not answer
 }
 
+# terminal_session_live <sid> -- is <sid> among the LIVE agents right now, and
+# where (#1485)? Unlike terminal_detect, this never reads this process's OWN
+# environment: a caller asking about an ARBITRARY session (a stale placement
+# record's claimant, not itself) must not get this process's own pane back
+# just because it happens to be running under herdr too. It is the direct,
+# unconditional round trip _herdr_pane_for_session already makes; terminal_detect
+# only reaches that round trip when the environment has no pane id of its own.
+#
+# Prints "live\t<bare-pane-id>" (rc 0) when <sid> is a live agent right now,
+# "dead" (rc 0) when herdr answered and <sid> is not among them, or "unknown"
+# (rc 1) when it could not be asked at all (no sid, herdr absent/errored) --
+# the caller's existing fail-closed answer for everything it cannot decide.
+terminal_session_live() {   # <sid>
+  local sid="$1" pane hrc=0
+  [ -n "$sid" ] || { echo unknown; return 1; }
+  pane="$(_herdr_pane_for_session "$sid")" || hrc=$?
+  [ "$hrc" -eq 0 ] || { echo unknown; return 1; }
+  if [ -n "$pane" ]; then printf 'live\t%s\n' "$pane"; else echo dead; fi
+  return 0
+}
+
 # record op: we are under herdr iff HERDR_ENV=1. Resolve THIS pane from the
 # environment first: herdr sets HERDR_PANE_ID in every pane's process tree, and
 # it is the pane the process is actually in -- MEASURED 2026-09-08 on the live
@@ -279,6 +300,47 @@ terminal_detect() {
   fi
   printf '%s:%s\n' "$socket" "$pane"
   return 0
+}
+
+# Optional environment-only self identity. HERDR_ENV is the presence marker;
+# socket and pane fields without it are not trusted as a herdr placement.
+terminal_self_env() {
+  local sock id
+  if [ -z "${HERDR_ENV:-}" ] && [ -z "${HERDR_PANE_ID:-}" ] \
+    && [ -z "${HERDR_SOCKET_PATH:-}" ]; then
+    printf 'n/a:not_in_terminal\n'
+    return 0
+  fi
+  [ "${HERDR_ENV:-}" = 1 ] || {
+    printf 'unknown:herdr_presence_marker_invalid\n'
+    return 0
+  }
+  sock="$(_herdr_env_socket 2>/dev/null)" || {
+    printf 'unknown:herdr_socket_unavailable\n'
+    return 0
+  }
+  [ -n "${HERDR_PANE_ID:-}" ] || {
+    printf 'unknown:herdr_pane_id_unset\n'
+    return 0
+  }
+  id="$sock:$HERDR_PANE_ID"
+  if ! terminal_id_ok "$id"; then
+    printf 'unknown:herdr_pane_id_malformed\n'
+    return 0
+  fi
+  printf '%s\n' "$id"
+}
+
+# Socket inode/ctime distinguishes a restarted herdr server for naming marks.
+terminal_epoch() {
+  local s=""
+  [ "${HERDR_ENV:-}" = 1 ] || { printf 'n/a:not_in_terminal\n'; return 0; }
+  [ -n "${HERDR_SOCKET_PATH:-}" ] || { printf 'unknown:herdr_socket_path_unset\n'; return 0; }
+  s="$(stat -f '%i:%c' "$HERDR_SOCKET_PATH" 2>/dev/null)" \
+    || s="$(stat -c '%i:%Z' "$HERDR_SOCKET_PATH" 2>/dev/null)" \
+    || s=""
+  [ -n "$s" ] || { printf 'unknown:herdr_socket_stat_failed\n'; return 0; }
+  printf 'sock=%s\n' "$s"
 }
 
 # Read the new pane id from a herdr JSON result at one of the known paths.
@@ -366,6 +428,22 @@ terminal_id_split() {   # <id>
   sock="$(_herdr_sock_of "$1")"
   [ -n "$sock" ] || return 1
   printf '%s\t%s\n' "$sock" "$(_herdr_bare_of "$1")"
+}
+
+# Resolve the socket and pane from a canonical ref, using the ambient socket
+# only for a bare pane id as the legacy self-fix/self-rename paths did.
+terminal_instance_for_ref() {   # <canonical-ref>
+  local ref="$1" halves instance pane
+  _agmsg_terminal_ref_parse "$ref" || { printf 'unknown:invalid_locator\n'; return 0; }
+  [ "$_AGMSG_REF_TERM" = herdr ] || { printf 'unknown:wrong_terminal\n'; return 0; }
+  if halves="$(terminal_id_split "$_AGMSG_REF_ID")"; then
+    instance="${halves%%$'\t'*}"; pane="${halves#*$'\t'}"
+  else
+    instance="${HERDR_SOCKET_PATH:-}"; pane="$_AGMSG_REF_ID"
+  fi
+  [ -n "$instance" ] || { printf 'n/a:bare\n'; return 0; }
+  _agmsg_locator_instance_ok "$instance" || { printf 'unknown:instance_malformed\n'; return 0; }
+  printf '%s\t%s\n' "$instance" "$pane"
 }
 # Run one herdr CLI call ABOUT <id>: a qualified id reaches its own instance
 # through HERDR_SOCKET_PATH; a bare id keeps the ambient one. The bare pane id
@@ -813,6 +891,38 @@ terminal_peek() {
     esac
   done
   case "$lines" in ''|*[!0-9]*) lines="" ;; esac
+  _herdr_peek_impl "$id" "$src" "$lines" ""
+}
+
+# Same read as terminal_peek, but with ANSI styling preserved (herdr's
+# `--format ansi`, in place of the default `--format text` terminal_peek
+# implicitly gets). NOT a display-safe read: its stdout carries raw escape
+# sequences, so it exists only for a caller that needs to tell STYLED text
+# (dim/faint) apart from plain text -- poke.sh's real-draft check (#1322
+# round 2), never for anything shown to a human or written to a log. Same
+# args, same exit taxonomy, same argv shape as terminal_peek otherwise (one
+# extra `--format ansi` pair). Optional driver capability: a caller checks
+# `declare -F terminal_peek_styled` before relying on it, since not every
+# terminal driver offers a styled read.
+terminal_peek_styled() {
+  local id="$1"; shift
+  local src=visible lines=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --lines) src=recent; lines="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  case "$lines" in ''|*[!0-9]*) lines="" ;; esac
+  _herdr_peek_impl "$id" "$src" "$lines" ansi
+}
+
+# Shared body for terminal_peek / terminal_peek_styled. <format> is "" (herdr
+# defaults to --format text, and this omits the flag entirely so
+# terminal_peek's own argv is byte-identical to before this split existed --
+# tests assert it exactly) or "ansi" (adds --format ansi to the herdr call).
+_herdr_peek_impl() {
+  local id="$1" src="$2" lines="$3" format="$4"
   # peek is a READ op: only the pane CONTENT may reach stdout. herdr writes an error
   # JSON to STDOUT on failure (e.g. {"error":{"code":"pane_not_found",...}}), which the
   # caller would otherwise read as the pane's content — "read" and "could-not-read"
@@ -846,10 +956,16 @@ terminal_peek() {
   # `PermissionDenied (Operation not permitted)` from a sandbox that denies
   # socket operations — never reaches herdr's JSON reply at all, so dropping
   # stderr left nothing to report except a guess.
+  # bash 3.2 (macOS's /bin/bash) treats "${arr[@]}" on an EMPTY array as an
+  # unbound variable under `set -u`; the `+` form is the guard this codebase
+  # uses everywhere else an optional argument list can be empty (see
+  # poke.sh's own "${_REMAINING[@]+...}").
+  local -a _fmt_args=()
+  [ "$format" = ansi ] && _fmt_args=(--format ansi)
   if [ -n "$lines" ]; then
-    stderr_body="$(_herdr_cli "$id" pane read "$(_herdr_bare_of "$id")" --source "$src" --lines "$lines" 2>&1 1>"$tmp")" || rc=$?
+    stderr_body="$(_herdr_cli "$id" pane read "$(_herdr_bare_of "$id")" --source "$src" --lines "$lines" "${_fmt_args[@]+"${_fmt_args[@]}"}" 2>&1 1>"$tmp")" || rc=$?
   else
-    stderr_body="$(_herdr_cli "$id" pane read "$(_herdr_bare_of "$id")" --source "$src" 2>&1 1>"$tmp")" || rc=$?
+    stderr_body="$(_herdr_cli "$id" pane read "$(_herdr_bare_of "$id")" --source "$src" "${_fmt_args[@]+"${_fmt_args[@]}"}" 2>&1 1>"$tmp")" || rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
     local stdout_body=""
@@ -998,6 +1114,107 @@ terminal_poke() {
   return 0
 }
 
+# Optional driver capability (#1384, herdr only — tmux has no equivalent
+# signal, per the issue's own scope note). Prints "yes" or "no" and returns 0
+# when herdr's OWN pane list answers definitively; returns 10 with nothing
+# printed when herdr is unreachable, the listing is not valid JSON, or this
+# pane's entry cannot be found in it — never guessed as either yes or no. A
+# caller checks `declare -F terminal_pane_focused` before relying on it,
+# since not every terminal driver offers a focus signal.
+#
+# `herdr pane list`'s own per-pane `focused` field (measured live,
+# 2026-09-22: exactly one pane in the whole fleet reads focused=true at a
+# time, and moving real OS focus with `herdr agent focus` immediately flips
+# which one) is real OS-level input focus, not an agmsg notion of it — #1384
+# uses it to tell "someone is looking at this pane right now" apart from "a
+# draft was left behind and nobody is watching."
+terminal_pane_focused() {   # <id>
+  local id="$1" json esc bare besc val vrc=0
+  command -v herdr >/dev/null 2>&1 || return 10
+  bare="$(_herdr_bare_of "$id")"
+  json="$(_herdr_cli "$id" pane list 2>/dev/null)" || return 10
+  [ -n "$json" ] || return 10
+  esc="$(printf '%s' "$json" | sed "s/'/''/g")"
+  local valid
+  valid="$(sqlite3 :memory: "SELECT json_valid('$esc')" 2>/dev/null)" || vrc=$?
+  [ "$vrc" -eq 0 ] && [ "$valid" = 1 ] || return 10
+  besc="$(printf '%s' "$bare" | sed "s/'/''/g")"
+  val="$(sqlite3 :memory: "
+    SELECT json_extract(value,'\$.focused') FROM json_each('$esc','\$.result.panes')
+    WHERE json_extract(value,'\$.pane_id') = '$besc' LIMIT 1" 2>/dev/null)"
+  case "$val" in
+    1) echo yes; return 0 ;;
+    0) echo no; return 0 ;;
+    *) return 10 ;;
+  esac
+}
+
+# Optional driver capability (#1384, herdr only). Best-effort empties a
+# pane's input box via `agent send-keys`, without submitting anything: move
+# the cursor past the end of whatever is there (`down`, repeated — a no-op
+# once the cursor is already on the last line, measured live on both Claude
+# Code and Codex), then repeatedly kill from the cursor to the start of the
+# current line (`ctrl+u`, also a no-op once the box is empty — measured live
+# checking a paste-then-clear round trip leaves nothing behind on either
+# CLI). The repeat count (40 of each) is a fixed safety margin over every
+# draft measured during #1384 (at most 5 lines) — generous for anything a
+# person actually types into a chat box, not a claim that a genuinely
+# larger draft is guaranteed to clear.
+#
+# Prints "ok"/"runtime_error" and returns 0/10/12, same control-op
+# convention as terminal_poke. This does NOT confirm the box actually ended
+# up empty — that needs the TYPE's own marker/boxed knowledge (input-box.sh),
+# which this driver has no part in; the caller re-reads and re-classifies
+# the box afterward the same way it does before any other poke.
+terminal_input_clear() {   # <id>
+  local id="$1" bare body rc=0
+  command -v herdr >/dev/null 2>&1 \
+    || { echo runtime_error; echo "herdr: not on PATH — cannot reach the terminal to clear pane '$id'" >&2; return 10; }
+  bare="$(_herdr_bare_of "$id")"
+  local -a keys=()
+  local i=0
+  while [ "$i" -lt 40 ]; do keys+=(down); i=$((i + 1)); done
+  i=0
+  while [ "$i" -lt 40 ]; do keys+=(ctrl+u); i=$((i + 1)); done
+  body="$(_herdr_cli "$id" agent send-keys "$bare" "${keys[@]}" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo runtime_error
+    [ -n "$body" ] && printf '%s\n' "$body" >&2
+    echo "herdr: could not clear pane '$id' — it may be gone, or have no live agent to receive keys" >&2
+    return 12
+  fi
+  echo ok
+  return 0
+}
+
+# Optional driver capability (#1384, herdr only). Types literal text into a
+# pane's input box WITHOUT submitting — `herdr pane send-text`, a distinct
+# primitive from `agent prompt` above (terminal_poke's own submission
+# mechanism): `agent prompt` "sends text followed by encoded Enter as one
+# ordered submission" (herdr's own skill doc), so it cannot be used to
+# retype a draft that must stay a draft. `pane send-text` has no such Enter
+# ("next: herdr pane run ... sends text and Enter in one call", herdr's own
+# --help for it) — measured live, 2026-09-22: multi-line and Japanese/emoji
+# text both round-trip through it exactly, on both Claude Code and Codex.
+#
+# Prints "ok"/"runtime_error" and returns 0/10/12, same convention as
+# terminal_poke and terminal_input_clear.
+terminal_input_type() {   # <id> <text>
+  local id="$1" text="$2" bare body rc=0
+  command -v herdr >/dev/null 2>&1 \
+    || { echo runtime_error; echo "herdr: not on PATH — cannot reach the terminal to type into pane '$id'" >&2; return 10; }
+  bare="$(_herdr_bare_of "$id")"
+  body="$(_herdr_cli "$id" pane send-text "$bare" "$text" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo runtime_error
+    [ -n "$body" ] && printf '%s\n' "$body" >&2
+    echo "herdr: could not type into pane '$id' — it may be gone" >&2
+    return 12
+  fi
+  echo ok
+  return 0
+}
+
 # Derive herdr's INTERNAL resolvable agent-name key from (team, agent): a
 # COLLISION-RESISTANT 96-bit key (NOT injective — see below).
 #
@@ -1046,13 +1263,10 @@ _herdr_internal_key() {
 
 # control op: name the pane (scope Naming). Two copies:
 #   VISIBLE:    herdr pane rename <id> <team>:<agent>   (free text, ':' is fine)
-#   RESOLVABLE: herdr agent rename <id> <key>           where <key> is the
-#               collision-resistant SHA-256 derivation above — an INTERNAL key,
-#               never shown; peek/poke go by the recorded pane id, so the user never
-#               meets it. Idempotent. The visible rename is the required one; a
-#               failed agent rename (a live-name collision, or no SHA-256 tool to
-#               derive the key) is non-fatal — the pane id in the record still
-#               resolves.
+#   RESOLVABLE: retain an existing herdr agent name; otherwise assign the
+#               collision-resistant SHA-256 key above with agent rename.
+#               Failure to observe the name, retain its decision, or assign
+#               the fallback key is reported before the visible decoration.
 # <mode> is `key` or absent. Absent means both names; `key` means the resolvable
 # one only, and the caller has already decided that (the registry reads the env
 # var, so the policy lives in one place and this only carries it out).
@@ -1062,7 +1276,7 @@ _herdr_internal_key() {
 # namespace — NOT what this repo's `peek`/`poke` resolve through, which is the
 # placement record's pane id. So under `key` that name is still established and
 # only the decoration is skipped —
-# and a key that cannot be set is an error there, because nothing else happened.
+# and a missing name that cannot be set is an error there.
 # Which panes carry this agmsg label? One pane id per line; no match prints
 # nothing and still returns 0.
 #
@@ -1135,47 +1349,138 @@ terminal_label_of() {   # <id>
   return 0
 }
 
+_herdr_name_record_path() {   # <team> <agent>: companion to the placement record
+  if ! declare -F agmsg_spawn_path >/dev/null 2>&1; then
+    [ -n "${SKILL_DIR:-}" ] || return 1
+    . "$SKILL_DIR/scripts/lib/actas-lock.sh" || return 1
+  fi
+  local rec
+  rec="$(agmsg_spawn_path "$1" "$2")" || return 1
+  # Keep this outside spawn.*: placement enumerators scan that namespace.
+  printf '%s/herdr-name.%s\n' "${rec%/*}" "${rec##*/}"
+}
+
+_herdr_kept_name() {   # <team> <agent> <id>
+  local rec pane instance tid name extra fence
+  rec="$(_herdr_name_record_path "$1" "$2")" || return 1
+  [ -r "$rec" ] || return 1
+  IFS=$'\t' read -r pane instance tid name extra < "$rec" 2>/dev/null || return 1
+  [ -n "$name" ] && [ -z "$extra" ] || return 1
+  [ "$pane" = "$(_herdr_bare_of "$3")" ] || return 1
+  fence="$(terminal_fence "$3")" || return 1
+  [ "$fence" = "$(printf '%s\t%s' "$instance" "$tid")" ] || return 1
+  printf '%s\n' "$name"
+}
+
+_herdr_record_kept_name() {   # <id> <team> <agent> <name>
+  local rec fence
+  rec="$(_herdr_name_record_path "$2" "$3")" || return 1
+  fence="$(terminal_fence "$1")" || return 1
+  if ! declare -F agmsg_write_atomic >/dev/null 2>&1; then
+    [ -n "${SKILL_DIR:-}" ] || return 1
+    . "${SKILL_DIR:-}/scripts/lib/registry-lock.sh" || return 1
+  fi
+  mkdir -p "${rec%/*}" || return 1
+  agmsg_write_atomic "$rec" "$(printf '%s\t%s\t%s' "$(_herdr_bare_of "$1")" "$fence" "$4")"
+}
+
 terminal_name() {
-  local id="$1" team="$2" name="$3" mode="${4:-}" label key
+  local id="$1" team="$2" name="$3" mode="${4:-}" label key json esc current rec bare hex byte char
   label="$(_herdr_label "$team" "$name")"
 
-  # THE KEY FIRST, and its failure is fatal.
-  #
-  # The reason is NOT that peek/poke resolve through the key — an earlier
-  # revision of this comment said so and it is false in this tree: those commands
-  # resolve through the placement record's pane id, and `_herdr_internal_key` is
-  # read nowhere outside this driver. The key is the name herdr knows the agent
-  # by, on its side.
-  #
-  # The reason that survives is the one below: the caller writes the placement
-  # record only when this returns 0. Ordering the label first meant a failed
-  # DECORATION returned 13 before the key was attempted and before the record was
-  # written, so a member ended up with neither name and no record — the
-  # requirement this driver serves broke through that door. tmux has always had
-  # this order; herdr was the one driver that put the ornament in front.
-  # Two DIFFERENT failures used to leave the same word and nothing else (#1127):
-  # the key could not be COMPUTED, and the server refused to APPLY it. Both
-  # printed `runtime_error` with herdr's own stderr thrown away, so a naming
-  # failure on a live seat could not be attributed to either -- measured on this
-  # fleet, where a seat's record was repaired in the same action that failed to
-  # name, and the message said only `(runtime_error)`.
-  #
-  # The token on stdout stays `runtime_error`: it is the driver contract and
-  # callers read it. What changes is that the REASON is no longer discarded --
-  # the pattern this file already uses elsewhere, a line on stderr naming which
-  # step failed, and for the server call the server's own words with it.
-  key="$(_herdr_internal_key "$team" "$name")" || {
-    echo runtime_error
-    echo "herdr: cannot compute the internal key for '$team/$name' — the sha256 helper is unavailable, so the pane was not named" >&2
-    return 13
-  }
-  local _err _rc=0
-  _err="$(_herdr_cli "$id" agent rename "$(_herdr_bare_of "$id")" "$key" 2>&1 >/dev/null)" || _rc=$?
-  if [ "$_rc" -ne 0 ]; then
+  # Detection is passive: a newly started CLI can be agent_not_found for a
+  # few seconds. Share one bounded retry budget between observation and rename.
+  # Observe again after every failed rename: an external name may have appeared
+  # during the wait, and must be kept rather than overwritten by a stale plan.
+  local _err _rc=0 _tries=0
+  while :; do
+    # Names chosen outside agmsg are herdr's public addressing surface. Keep
+    # them; only a positively observed unnamed agent needs an internal key.
+    # Unreadable/malformed observations must not authorize an overwrite.
+    if ! json="$(_herdr_cli "$id" agent get "$(_herdr_bare_of "$id")" 2>&1)"; then
+      case "$json" in
+        *'"code":"agent_not_found"'*)
+          if [ "$_tries" -lt 50 ]; then
+            sleep 0.1 2>/dev/null || true
+            _tries=$((_tries + 1))
+            continue
+          fi
+          ;;
+      esac
+      echo runtime_error
+      echo "herdr: 'agent get' for pane '$id' failed${json:+: $json}" >&2
+      return 13
+    fi
+    esc="$(printf '%s' "$json" | sed "s/'/''/g")"
+    bare="$(printf '%s' "$(_herdr_bare_of "$id")" | sed "s/'/''/g")"
+    current="$(sqlite3 :memory: "SELECT CASE
+      WHEN json_type('$esc','\$.result.agent')='object'
+        AND json_extract('$esc','\$.result.agent.pane_id')='$bare'
+      THEN CASE
+        WHEN json_type('$esc','\$.result.agent.name') IS NULL
+          OR json_type('$esc','\$.result.agent.name')='null'
+          OR json_extract('$esc','\$.result.agent.name')='' THEN 'unnamed'
+        WHEN json_type('$esc','\$.result.agent.name')='text'
+          THEN 'kept:' || hex(CAST(json_extract('$esc','\$.result.agent.name') AS BLOB))
+        ELSE 'unknown' END
+      ELSE 'unknown' END" 2>/dev/null)" || current=unknown
+    case "$current" in
+      kept:*)
+        # Transport bytes as hex: sqlite's text output and $(...) can truncate
+        # NULs or trailing newlines before a shell-side check ever sees them.
+        hex="${current#kept:}"; key=""
+        while [ -n "$hex" ]; do
+          byte="${hex:0:2}"; hex="${hex:2}"
+          case "$byte" in
+            0?|1?|7F) current=unknown; break ;;
+          esac
+          printf -v char '%b' "\\x$byte"
+          key="$key$char"
+        done
+        case "$key" in *[[:cntrl:]]*) current=unknown ;; esac
+        if [ "$current" != unknown ] && _herdr_record_kept_name "$id" "$team" "$name" "$key"; then
+          if [ "$mode" != key ]; then
+            _herdr_cli "$id" pane rename "$(_herdr_bare_of "$id")" "$label" >/dev/null 2>&1 || true
+          fi
+          echo ok
+          return 0
+        fi
+        ;;
+      unnamed) ;;
+      *) ;;
+    esac
+    if [ "$current" != unnamed ]; then
+      echo runtime_error
+      echo "herdr: cannot observe or record the existing agent name on pane '$id'; its name was left unchanged" >&2
+      return 13
+    fi
+    # An agent that lost its name must not retain the old expected-name mark.
+    if rec="$(_herdr_name_record_path "$team" "$name")"; then
+      rm -f "$rec" || { echo runtime_error; return 13; }
+    fi
+    # peek/poke resolve by placement pane id. team status and fix use
+    # terminal_expected_label below to check the generated or retained name.
+    key="$(_herdr_internal_key "$team" "$name")" || {
+      echo runtime_error
+      echo "herdr: cannot compute the internal key for '$team/$name' — the sha256 helper is unavailable, so the pane was not named" >&2
+      return 13
+    }
+    _rc=0
+    _err="$(_herdr_cli "$id" agent rename "$(_herdr_bare_of "$id")" "$key" 2>&1 >/dev/null)" || _rc=$?
+    [ "$_rc" -eq 0 ] && break
+    case "$_err" in
+      *'"code":"agent_not_found"'*)
+        if [ "$_tries" -lt 50 ]; then
+          sleep 0.1 2>/dev/null || true
+          _tries=$((_tries + 1))
+          continue
+        fi
+        ;;
+    esac
     echo runtime_error
     echo "herdr: 'agent rename' for '$team/$name' on pane '$id' failed (rc=$_rc)${_err:+: $_err}" >&2
     return 13
-  fi
+  done
 
   # The label, and its failure is deliberately NOT fatal — the same shape tmux
   # has. Not merely for symmetry: the caller writes the placement record only
@@ -1187,6 +1492,12 @@ terminal_name() {
   fi
   echo ok
   return 0
+}
+
+# The name terminal_name established for this exact pane incarnation.
+terminal_expected_label() {   # <team> <agent> [<id>]
+  if [ -n "${3:-}" ] && _herdr_kept_name "$1" "$2" "$3"; then return 0; fi
+  _herdr_internal_key "$1" "$2"
 }
 
 # OPTIONAL OP. Observe ONE candidate pane's process facts, as a strict record.

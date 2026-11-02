@@ -6,21 +6,24 @@ This document describes the internal shape of agmsg — the mental model a contr
 
 ## Goal
 
-A cross-agent messaging primitive that works between any combination of Claude Code, Codex, Cursor, and future agent runtimes — with no daemon, no network, no shared cloud. Messages move through local files on a single machine; receivers are notified through whatever hook or streaming mechanism their host runtime provides.
+A cross-agent messaging primitive that works between any combination of Claude Code, Codex, Gemini CLI, Antigravity, and future agent runtimes — with no required daemon, no network, no shared cloud. agmsg itself runs without a daemon; the optional agmsgd (1.6.0 beta) is a resident service that is installed only when the user picks it. Messages move through local files on a single machine; receivers are notified through whatever hook or streaming mechanism their host runtime provides.
 
 The default install must work with **bash + sqlite3 only**. Any feature beyond that is opt-in and may require additional dependencies that the user agrees to install.
 
-## The 3-axis driver model
+## The 4-axis driver model
 
-agmsg is built around three orthogonal axes, each of which has exactly one **driver** active at a time. A driver is a swappable implementation behind a fixed protocol.
+agmsg is built around four orthogonal axes, each of which has exactly one **driver** active at a time (per member, for terminal — see below). A driver is a swappable implementation behind a fixed protocol.
 
 | Axis | What it abstracts | Bundled drivers |
 |---|---|---|
-| **storage** | Where messages and team state live, and how they are queried | `sqlite` (default), `jsonl-duckdb` |
-| **agent** | Per-runtime differences (hook formats, settings file locations, monitor tool availability) | `claude-code`, `codex`, `cursor` |
-| **delivery** | How a recipient is notified that a message arrived | `monitor`, `turn`, `both`, `off` |
+| **storage** | Where messages and team state live, and how they are queried | `sqlite` (default), `jsonl`, `sqlite-sync` |
+| **agent** | Per-runtime differences (hook formats, settings file locations, monitor tool availability) | `claude-code`, `codex`, `gemini`, `antigravity`, `copilot`, `opencode`, `grok-build`, `cursor`, `devin`, `hermes` (plus `agmsg-app` and `ext-tool` for non-CLI members) |
+| **delivery** | How a recipient is notified that a message arrived | `monitor` (legacy), `turn`, `both`, `off`; each agent type declares which of these it supports (`delivery_modes=` in its `type.conf`). The optional agmsgd daemon is a further way to deliver to Claude Code and Codex sessions |
+| **terminal** | The pane, window, or process a member's host-agent CLI runs under, and how to create, read, and signal it | `herdr`, `tmux`, `plain`, `orca`, `claude-desktop`, `codex-app` |
 
-The three axes are independent: any storage driver can be paired with any agent driver and any delivery mode. They share a common discovery/config/dependency-check protocol (see the spec) but expose axis-specific operations.
+The three configuration axes are independent: any storage driver can be paired with any agent driver and any delivery mode that agent driver supports. They share a common discovery/config/dependency-check protocol (see the spec) but expose axis-specific operations.
+
+**terminal is detected, not configured** — a session determines which terminal driver it is running under (or falls back to `plain`, the driver of last resort, if none matches) rather than being told. It is otherwise the same kind of driver: a fixed protocol (`terminal_*` functions, see [`docs/spec/driver-interface.md`](docs/spec/driver-interface.md) §6) behind which `herdr`, `tmux`, `orca`, and a plain OS terminal are interchangeable, and it shares the same discovery/trust protocol as the other three. Unlike them, a member can function with no terminal capability at all — `plain` degrades to "no addressable pane," and messaging keeps working; terminal only adds the ability to locate, read, or type into another member's pane.
 
 ## Driver vs plugin
 
@@ -29,7 +32,7 @@ The three axes are independent: any storage driver can be paired with any agent 
 
 Bundled drivers live under `scripts/drivers/<axis>/`. Inside `scripts/`, the top-level `.sh` files are directly-invokable commands; subdirectories group implementation code by category (`drivers/` for axis drivers, `lib/` for shared helpers).
 
-The plugin path (`~/.agents/agmsg/plugins/<axis>/<name>/`) is reserved for a future enhancement and is not implemented in v1. Until a concrete external driver is wanted, all drivers ship bundled. Both are discovered and loaded through the same protocol.
+External drivers are dropped into `<skill>/plugins/<axis>/<name>/` or into a directory listed in `$AGMSG_PLUGIN_DIRS`, and are ignored until the user opts in with `agmsg plugin trust <axis>/<name>`. Today only the `types` axis loads external drivers. Bundled and external drivers are discovered and loaded through the same protocol; see [`docs/plugins.md`](docs/plugins.md) and [ADR 0002](docs/adr/0002-driver-discovery-and-plugin-opt-in.md).
 
 agmsg does not use the terms *backend*, *extension*, *provider*, or *adapter*. `storage`, when written in user-facing documentation and CLI, is a synonym for "storage driver".
 
@@ -44,7 +47,7 @@ Drivers may require external tools (e.g. the `jsonl-duckdb` storage driver needs
 
 This keeps agmsg itself minimal and platform-agnostic. The host agent is already trusted with file and shell access, so dependency installation is naturally its responsibility.
 
-The same `AGMSG-DIRECTIVE` mechanism is used for other host-agent-coordinated actions (e.g. telling Claude Code to invoke its Monitor tool when delivery mode is set to `monitor`).
+The same `AGMSG-DIRECTIVE` mechanism is used for other host-agent-coordinated actions (e.g. telling Claude Code to invoke its Monitor tool when delivery mode is set to monitor (legacy); a session that agmsgd delivers to directly needs no such directive).
 
 ## Failure semantics
 
@@ -71,8 +74,9 @@ Message identifiers are **UUIDv7** strings. The interface treats them as opaque 
 | **bundled driver** | A driver shipped inside agmsg core |
 | **storage** | The storage axis, or its active driver, in user-facing contexts |
 | **AGMSG-DIRECTIVE** | A JSON line emitted on stdout instructing the host agent to take a specific action |
-| **host agent** | The runtime invoking agmsg scripts (Claude Code, Codex, Cursor, …) |
+| **host agent** | The runtime invoking agmsg scripts (Claude Code, Codex, Gemini CLI, Antigravity, …) |
 | **event log** | The append-only record of message lifecycle events that bundled storage drivers project queries over |
+| **placement** | A `<terminal>:<id>` reference to one member's pane/window (e.g. `tmux:/path/to/socket:%3`) |
 
 ## See also
 

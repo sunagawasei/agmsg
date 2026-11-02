@@ -6,7 +6,7 @@
 
 ## アイデンティティモデル
 
-エージェントは `(name, team)` によって識別される。プロジェクトパスとエージェントタイプ（claude-code, codex, cursor）はメタデータであり、アイデンティティと合わせて保存される参照情報だが、アイデンティティそのものの一部ではない。
+エージェントは `(name, team)` によって識別される。プロジェクトパスとエージェントタイプ（claude-code, codex, gemini）はメタデータであり、アイデンティティと合わせて保存される参照情報だが、アイデンティティそのものの一部ではない。
 
 - 同じ名前のエージェントを複数のプロジェクトから登録できる
 - `whoami.sh` はプロジェクトパスとタイプからアイデンティティを提案するが、ユーザーは任意の名前を選択できる
@@ -56,11 +56,14 @@ sqlite3 の JSON1 関数を介して操作される（python3 依存なし）。
 
 ```yaml
 # agmsg configuration
-hook:
-  check_interval: 60  # seconds between inbox checks
+delivery:
+  monitor:
+    poll_interval: 5    # watch.sh poll interval, seconds
+  turn:
+    check_interval: 60  # Stop-hook cooldown, seconds between inbox checks
 ```
 
-`config.sh` が awk を使って読み書きする。ドット区切りキー（`hook.check_interval`）をサポート。
+`config.sh` が awk を使って読み書きする。ドット区切りキー（`delivery.turn.check_interval`。`hook.check_interval` は互換のため引き続き読まれる）をサポート。
 
 ## フックシステム
 
@@ -81,7 +84,7 @@ Agent responds → Stop hook fires → check-inbox.sh runs
 
 ### クールダウン
 
-マーカーファイル（`run/.lastcheck-<agent>`）が最終チェック時刻を追跡する。`hook.check_interval`（デフォルト 60 秒）で設定可能。これは run ディレクトリ（フックのランタイム状態）に置かれ、メッセージストアには含まれないため、`AGMSG_STORAGE_PATH` の影響を受けない。
+マーカーファイル（`run/.lastcheck-<agent>`）が最終チェック時刻を追跡する。`delivery.turn.check_interval`（デフォルト 60 秒。`hook.check_interval` は互換用の別名）で設定可能。これは run ディレクトリ（フックのランタイム状態）に置かれ、メッセージストアには含まれないため、`AGMSG_STORAGE_PATH` の影響を受けない。
 
 ### Claude Code と Codex の比較
 
@@ -97,7 +100,7 @@ Agent responds → Stop hook fires → check-inbox.sh runs
 
 スラッシュコマンドはプロジェクトキーとして `"$(pwd)"` を渡す。ユーザーがセッションの実体が存在するプロジェクトのサブディレクトリや git worktree に `cd` すると、その pwd は登録済みプロジェクトと一致しなくなり、ルックアップが外れてサブディレクトリ用の幽霊レコードが作られてしまう。`lib/resolve-project.sh` は、安定した `session_id` を必要としない（Codex はそれを公開していない）3 つのシグナルを使って本当のルートを復元する。
 
-1. **プロセス単位のマーカー。** SessionStart 時に、`proj.<agent_pid>.project` が正式なプロジェクト（フックに組み込まれた `$2`）を、包含するエージェントプロセスの PID をキーとして記録する。スラッシュコマンドはその同じプロセスの子として実行されるため、ppid チェーンを遡ってエージェント PID にたどり着き、マーカーを読み戻す。信頼するかどうかは、その PID がまだ生きているエージェントプロセスであること（リサイクルガード）に依存し、古いマーカーは SessionStart/SessionEnd で GC される。**Claude Code の monitor/both のみ** — Codex は monitor モードを拒否する（Monitor ツールがない）ため `session-start.sh` をインストールせず、マーカーも書き込まない。Codex はシグナル 2〜3 に依存する。
+1. **プロセス単位のマーカー。** SessionStart 時に、`proj.<agent_pid>.project` が正式なプロジェクト（フックに組み込まれた `$2`）を、包含するエージェントプロセスの PID をキーとして記録する。スラッシュコマンドはその同じプロセスの子として実行されるため、ppid チェーンを遡ってエージェント PID にたどり着き、マーカーを読み戻す。信頼するかどうかは、その PID がまだ生きているエージェントプロセスであること（リサイクルガード）に依存し、古いマーカーは SessionStart/SessionEnd で GC される。`session-start.sh` が **Claude Code の monitor (legacy) / both** のセッションに対して書く。Codex も（app-server ブリッジ経由で）monitor モードに対応するが、その SessionStart プラグは、このマーカーを書く前に終了する。turn や off のセッションにはそのフック自体がない。これらはシグナル 2〜3 に依存する。
 2. **祖先ウォーク。** マーカーが見つからない場合、そのタイプについて登録済みプロジェクトである pwd の最も近い祖先が採用される。git に依存しないため、登録済みプロジェクトの*配下*にあるネストしたサブディレクトリや worktree を、cc と Codex の両方でカバーできる。
 3. **git 共通ディレクトリ。** それも失敗した場合、pwd の git リポジトリの登録済みメインチェックアウト（`git rev-parse --git-common-dir` 経由）を使う。これにより、祖先ウォークでは到達できない*兄弟*の worktree を復元できる。レジストリと突き合わせて検証されるため、登録がアンブレラの親ディレクトリ上にある場合は採用を見送る。
 
@@ -115,13 +118,13 @@ Agent responds → Stop hook fires → check-inbox.sh runs
 | `history.sh` | メッセージ履歴を表示（新しい順に取得し、古い順に表示） |
 | `join.sh` | エージェントをチームに追加（必要ならチームを作成） |
 | `leave.sh` | エージェントをチームから削除（チームが空になれば削除） |
-| `team.sh` | チームメンバーを一覧表示。`--health <name> <type>` は登録が1件で bridge の lease が生きていることを検査する(headless の claude-code/codex/cursor のみ) |
+| `team.sh` | チームメンバーを一覧表示 |
 | `whoami.sh` | プロジェクトパスとタイプでエージェントを識別 |
 | `rename.sh` | 設定とメッセージ履歴内でエージェント名を変更 |
 | `check-inbox.sh` | フックのエントリポイント — クールダウン、チェック、通知 |
 | `config.sh` | ユーザー設定（YAML）の読み書き |
 
-すべてのスクリプトは `bash` と `sqlite3` のみを使用する。python3 依存はない。
+上記のスクリプトはすべて **core** 依存階層に属する: `bash` と `sqlite3` のみで、python3 は不要。全体像は下記の「依存関係」を参照 — E2EE（`key.sh`）と remote（`remote.sh`、`team-list.sh`）は、その機能を使うインストールにのみ、それぞれ追加のバイナリを要求する。
 
 ## インストールレイアウト
 
@@ -160,7 +163,7 @@ Claude Code コマンドは別途 `~/.claude/commands/<cmd>.md` にインスト�
   経由のデータベース操作とJSON操作）、`awk`/`sed`（設定・TOML編集）。
   `send`/`inbox`/`history`/`team`/`join`/`leave`/`rename` など、ローカルの
   SQLiteストアとしかやり取りしないもの全てをカバーする。python3もnode
-  もネットワークもデーモンも不要。
+  もネットワークもデーモンも不要（任意の agmsgd サービスは Node を要し、ユーザーが選ぶ別の層）。
 - **codex agent type / launcher付きspawn** — coreに加えて `node`
   （`scripts/lib/node.sh` が解決する。Codex monitorの配送ブリッジ
   `codex-bridge.js` はNodeプログラム）。launcherを持つagent typeに対して
@@ -184,10 +187,17 @@ Claude Code コマンドは別途 `~/.claude/commands/<cmd>.md` にインスト�
   ことに、`command -v python3`だけではこれを検出できない —
   AppleはCLT未導入でもPATH上に実在する`/usr/bin/python3`トランポリンを
   同梱しているため、単純なPATHチェックは、実際に何かがそれを実行する
-  その瞬間まで「成功」を報告し続ける。このチェックは、python3の解決先が
-  Darwin上でちょうど`/usr/bin/python3`である場合に限り、追加で
-  `xcode-select -p`（インストール済みツールの状態を調べるだけの、実在し
-  常に存在する非対話的なバイナリ）を確認する。python3自体は、いかなる
+  その瞬間まで「成功」を報告し続ける。`/usr/bin/python3`という文字列との
+  単純な比較でも不十分: PATHはシンボリックリンク経由でpython3を解決する
+  ことがあり（例: `~/bin/python3 -> /usr/bin/python3`）、リンク先を実行
+  すればトランポリンに到達するにも関わらず、その解決結果の文字列自体は
+  トランポリンのパスと異なる。そのため解決されたパスは、相対・絶対を問わず
+  全てのシンボリックリンクのホップを辿り（`-f`/canonicalize相当のフラグが
+  無いBSD/macOSの`readlink`にも対応できる形で）、実体パスへ到達してから
+  比較する。このチェックは、その実体パスがDarwin上でちょうど
+  `/usr/bin/python3`である場合に限り、追加で`xcode-select -p`
+  （インストール済みツールの状態を調べるだけの、実在し常に存在する
+  非対話的なバイナリ）を確認する。python3自体は、いかなる
   プラットフォームでも、いかなる状況でも、自身の使用可否を確認する目的
   で実行されることは無い — 「試しに実行してみて様子を見る」という類の
   解決策こそ、このチェックが避けようとしているものそのものである。
@@ -197,9 +207,11 @@ Claude Code コマンドは別途 `~/.claude/commands/<cmd>.md` にインスト�
   ヘルパー群をexecする）。上記control planeのpython3必要性とは別の、
   独立したNode依存理由。
 
-`doctor`（`remote.sh doctor`）は`age`と`python3`を確認し、control plane
-の前段チェックと同じ判定helper（`agmsg_python3_usable`）を共有するため、
-診断表示と実際のゲートが食い違うことはない。ただし`node`（sync data
-plane向け）はまだ確認していない — 設計上の意図ではなく単なる欠落で、
-Nodeが無い場合`remote-sync.sh`は`agmsg_resolve_node`のfallbackが生成する
-生のエラーのまま失敗する。
+`doctor`（`remote.sh doctor`）は`age`・`python3`・`node`を確認し、実際の
+ゲートと同じ判定helper（`agmsg_python3_usable`、`agmsg_node_usable`）を
+共有するため、診断表示とゲートが食い違うことはない。
+`agmsg_node_usable`（`scripts/lib/node.sh`）は独自の単純な`command -v
+node`判定を新設するのではなく、`agmsg_resolve_node`自体の解決契約
+（`AGMSG_NODE`override、version-manager paths、PATH）をそのまま再利用
+しているため、doctorの「使用可能」判定は`remote-sync.sh`が実際に試みる
+ものと常に一致する。

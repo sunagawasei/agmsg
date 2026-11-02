@@ -40,6 +40,48 @@ await_barrier_reached() {
 
 # --- inbox.sh -----------------------------------------------------------
 
+@test "inbox/history: unknown teams fail on stderr before self-name hooks (#1714)" {
+  # Storage sourcing can print daemon notices too; reject before all of it.
+  printf '%s\n' 'echo storage-source-ran >&2; exit 99' > "$SCRIPTS/lib/storage.sh"
+  # A hook sentinel proves even a misplaced invocation cannot reach naming.
+  printf '%s\n' 'echo naming-hook-ran >&2; exit 99' > "$SCRIPTS/lib/self-name.sh"
+  printf '%s\n' 'echo rename-hook-ran >&2; exit 99' > "$SCRIPTS/lib/self-rename.sh"
+  local script quiet
+  for script in inbox history; do
+    for quiet in '' --quiet; do
+      run bash -c 'bash "$1" missing-team alice ${2:+"$2"} >"$3" 2>"$4"' _ \
+        "$SCRIPTS/$script.sh" "$quiet" "$TEST_SKILL_DIR/stdout" "$TEST_SKILL_DIR/stderr"
+      [ "$status" -eq 1 ]
+      [ ! -s "$TEST_SKILL_DIR/stdout" ]
+      [ "$(cat "$TEST_SKILL_DIR/stderr")" = 'agmsg: team not found: missing-team' ]
+    done
+  done
+}
+
+@test "inbox/history: joined teams without a store retain empty messages (#1714)" {
+  export AGMSG_STORAGE_PATH="$TEST_SKILL_DIR/never-written"
+  run bash "$SCRIPTS/inbox.sh" testteam alice
+  [ "$status" -eq 0 ]
+  [ "$output" = 'No new messages.' ]
+  run bash "$SCRIPTS/inbox.sh" testteam alice --quiet
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  run bash "$SCRIPTS/history.sh" testteam alice
+  [ "$status" -eq 0 ]
+  [ "$output" = 'No message history.' ]
+  [ ! -e "$AGMSG_STORAGE_PATH" ]
+}
+
+@test "inbox/history: wrong argument order never reaches naming hooks (#1714)" {
+  printf '%s\n' 'echo placement-guard-ran >&2; exit 99' > "$SCRIPTS/lib/self-name.sh"
+  local script
+  for script in inbox history; do
+    run bash "$SCRIPTS/$script.sh" session-id /tmp/project
+    [ "$status" -eq 1 ]
+    [ "$output" = 'agmsg: team not found: session-id' ]
+  done
+}
+
 @test "inbox: displays unread messages and marks exactly those as read" {
   bash "$SCRIPTS/send.sh" testteam bob alice "first"
   bash "$SCRIPTS/send.sh" testteam bob alice "second"
@@ -62,7 +104,8 @@ await_barrier_reached() {
   # Pause the run between display and mark, land a message inside the window,
   # then release. With the old blanket "WHERE read_at IS NULL" mark, the late
   # message was silently marked read without ever having been displayed.
-  AGMSG_TEST_MARK_BARRIER="$BARRIER" bash "$SCRIPTS/inbox.sh" testteam alice > "$TEST_SKILL_DIR/first-run.out" 3>&- &
+  AGMSG_TEST_MARK_BARRIER="$BARRIER" bash "$SCRIPTS/inbox.sh" testteam alice \
+    </dev/null > "$TEST_SKILL_DIR/first-run.out" 3>&- &
   bg_pid=$!
   await_barrier_reached
   bash "$SCRIPTS/send.sh" testteam bob alice "late"
@@ -169,6 +212,26 @@ _break_only_this_teams_store() {
 
 # --- check-inbox.sh ------------------------------------------------------
 
+@test "check-inbox.sh: an unregistered type is a usage error, not a silent empty inbox (#1829)" {
+  # The bug this pins: identities.sh treats the type argument as an opaque SQL
+  # filter value, so an unregistered one (most often an agent NAME passed
+  # where a type belongs) just matches zero rows -- indistinguishable, before
+  # this fix, from a real agent of a real type with nothing to deliver.
+  run bash -c 'bash "$1/check-inbox.sh" alice "$2" </dev/null 2>&1 1>/dev/null' \
+    _ "$SCRIPTS" /tmp/project-a
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -qF "'alice' is not a registered agent type"
+  [[ "$output" == *"inbox.sh <team> <agent>"* ]]
+}
+
+@test "check-inbox.sh: a registered type with nothing registered for this project stays silent (#1829)" {
+  # The negative control: #1829's fix must not turn the ordinary, harmless
+  # "no identity here" case into an error too.
+  run bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/nothing-registered-here </dev/null
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
 # What the hook runtimes actually do with a Stop-hook run, applied to a real
 # invocation of check-inbox.sh.
 #
@@ -206,60 +269,88 @@ delivered_to_operator() {
   printf '%s' "$parsed"
 }
 
-@test "check-inbox: a later team's query failure does not lose earlier teams' messages (#637)" {
-  # alice is in two teams; glob order enumerates testteam before zteam.
-  bash "$SCRIPTS/join.sh" zteam alice claude-code /tmp/project-a
-  bash "$SCRIPTS/join.sh" zteam bob claude-code /tmp/project-a
-  bash "$SCRIPTS/send.sh" testteam bob alice "early"
-  bash "$SCRIPTS/send.sh" zteam bob alice "in-zteam"
+@test "check-inbox: a broken team stops the poll without losing either side (#637)" {
+  # Three teams, so the payload's own claim can be checked against reality:
+  #   aateam  succeeds and is marked read   -> must be DELIVERED
+  #   mmteam  store unreadable              -> stops the loop
+  #   zzteam  holds an unread message       -> must stay unread, undelivered
+  #
+  # Two teams could not test this. The text says "teams after it were not
+  # checked; their messages stay unread" — with nothing after the failure that
+  # sentence was unverified, and a version that silently consumed the rest
+  # would have passed.
+  bash "$SCRIPTS/join.sh" aateam alice claude-code /tmp/project-a >/dev/null
+  bash "$SCRIPTS/join.sh" aateam bob claude-code /tmp/project-a >/dev/null
+  bash "$SCRIPTS/join.sh" mmteam alice claude-code /tmp/project-a >/dev/null
+  bash "$SCRIPTS/join.sh" zzteam alice claude-code /tmp/project-a >/dev/null
+  bash "$SCRIPTS/join.sh" zzteam bob claude-code /tmp/project-a >/dev/null
+  bash "$SCRIPTS/send.sh" aateam bob alice "before the break" >/dev/null
+  bash "$SCRIPTS/send.sh" zzteam bob alice "after the break" >/dev/null
+  _break_only_this_teams_store mmteam
 
-  # PATH shim: fail (SQLITE_BUSY-style rc=5) exactly the unread SELECT for the
-  # second team; everything else passes through to the real sqlite3. testteam's
-  # messages are read_at-stamped inside the loop before zteam is queried, so
-  # without the loop-failure guard this abort loses them silently.
-  REAL_SQLITE3="$(command -v sqlite3)"
-  mkdir -p "$TEST_SKILL_DIR/shim"
-  cat > "$TEST_SKILL_DIR/shim/sqlite3" <<SHIM
-#!/usr/bin/env bash
-for a in "\$@"; do
-  case "\$a" in
-    *"team='zteam'"*"read_at IS NULL"*) exit 5 ;;
-  esac
-done
-exec "$REAL_SQLITE3" "\$@"
-SHIM
-  chmod +x "$TEST_SKILL_DIR/shim/sqlite3"
+  run delivered_to_operator
 
-  run env PATH="$TEST_SKILL_DIR/shim:$PATH" \
-    bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a < /dev/null
-  # testteam's message was already marked read when zteam failed — it MUST
-  # still have been emitted, or it is lost forever (never re-offered).
-  [[ "$output" == *"early"* ]]
-  [[ "$output" != *"in-zteam"* ]]
-  # And emitting is not enough on its own: the documented hook contract is
-  # that stdout is read as control JSON only on exit 0. (Measured separately,
-  # not by this test: Claude Code 2.1.226 via one-shot `claude -p` with a
-  # synthetic probe hook processed the JSON on exit 0, 1, 2, and 3 alike --
-  # https://github.com/fujibee/agmsg/issues/658. This assertion holds
-  # regardless of which behavior a given runtime actually implements, which
-  # is the point: it pins the script's OWN exit code, not a claim about what
-  # any runtime does with it.) The previous version of this test asserted
-  # status 5 here, which reads as "the failure is not swallowed" but leaves
-  # the delivering path dependent on a non-zero exit for something it cannot
-  # both carry a real payload and safely claim failure with -- see the
-  # `check-inbox.sh` comment at this same branch for why exit 0 is correct
-  # either way. Asserting the emission while asserting a non-zero status made
-  # the defect look like the fix.
-  [ "$status" -eq 0 ]
-  # The failure is not swallowed either — it moved into the payload, which is
-  # the channel that survives. Named team and consequence, so a partial poll
-  # cannot be read as a complete one.
+  # The earlier team's message reached a person.
+  [[ "$output" == *"before the break"* ]]
+  # The later team's did not.
+  [[ "$output" != *"after the break"* ]]
+  # And the payload says why, naming the team it stopped on.
   [[ "$output" == *"stopped early"* ]]
-  [[ "$output" == *"zteam"* ]]
+  [[ "$output" == *"mmteam"* ]]
   [[ "$output" == *"stay unread"* ]]
-  # testteam delivered-and-read; zteam untouched, so its message re-surfaces.
-  [ "$(unread_count alice)" -eq 0 ]
-  [ "$(pair_unread_count zteam alice)" -eq 1 ]
+
+  # The claim matches the store: the later team's message is still unread, so
+  # the next poll will offer it.
+  local left
+  left="$(bash -c '
+    source "'"$SCRIPTS"'/lib/storage.sh"
+    agmsg_storage_load
+    storage_list_unread zzteam alice
+  ' | grep -c .)"
+  [ "$left" -eq 1 ]
+}
+
+@test "check-inbox: a failure with nothing accumulated does not report 'no new messages' (#637)" {
+  # The other half. With nothing to deliver there is no payload to protect, so
+  # the status is free to carry the failure — and it must, because claiming
+  # "no new messages" states something this run never established.
+  bash "$SCRIPTS/join.sh" zzlastteam alice claude-code /tmp/project-a >/dev/null
+  _break_only_this_teams_store zzlastteam
+
+  run bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a </dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"no new messages"* ]]
+}
+
+@test "bash: a condition context suppresses a nested set -e, even after a later sentinel (#637)" {
+  # The property the boundary depends on, pinned on its own so nobody has to
+  # rediscover it from a broken poll.
+  #
+  # A subshell that sets its own `set -e` still does not abort when the whole
+  # substitution is the left side of `||` — and the trap is not that the status
+  # is lost, it is that a LATER command supplies a different one. Checking only
+  # "does a failure come out" misses it whenever a sentinel follows the failure,
+  # which is exactly the shape that made a backend error read as "no unread".
+  run bash -c '
+    set -euo pipefail
+    out=$( set -euo pipefail; false; [ -n "" ] || exit 98; echo unreachable ) || rc=$?
+    printf "conditional=%s\n" "${rc:-0}"
+  '
+  [ "$status" -eq 0 ]
+  # 98, not 1: the false did not stop it, the sentinel two commands later did.
+  [[ "$output" == *"conditional=98"* ]]
+
+  run bash -c '
+    set -euo pipefail
+    set +e
+    out=$( set -euo pipefail; false; [ -n "" ] || exit 98; echo unreachable )
+    rc=$?
+    set -e
+    printf "plain=%s\n" "$rc"
+  '
+  [ "$status" -eq 0 ]
+  # 1: the failure is what came out, because nothing ran after it.
+  [[ "$output" == *"plain=1"* ]]
 }
 
 @test "check-inbox: multiple identities poll only the first agent's exact team rows" {
@@ -300,7 +391,8 @@ SHIM
 
 @test "check-inbox: a message arriving between display and mark is NOT marked read unseen" {
   bash "$SCRIPTS/send.sh" testteam bob alice "early"
-  AGMSG_TEST_MARK_BARRIER="$BARRIER" bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a > "$TEST_SKILL_DIR/check-run.out" 2>/dev/null 3>&- &
+  AGMSG_TEST_MARK_BARRIER="$BARRIER" bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a \
+    </dev/null > "$TEST_SKILL_DIR/check-run.out" 2>/dev/null 3>&- &
   bg_pid=$!
   await_barrier_reached
   bash "$SCRIPTS/send.sh" testteam bob alice "late"
@@ -315,7 +407,7 @@ SHIM
 
 # --- #1003: codex mid-turn delivery via PostToolUse emits the shape 0.149.1 wants ---
 #
-# These guard the "broken but green" tl named: a test that only checks a
+# These guard the "broken but green" case: a test that only checks a
 # PostToolUse hook entry EXISTS stays green even if check-inbox emits the wrong
 # shape. So they assert the SHAPE check-inbox actually emits, per event. (Whether
 # the model then receives it is unobserved — see the PR; measured here is only the
@@ -440,5 +532,65 @@ _codex_proj() {
   # delivered_to_operator is empty when the JSON is invalid. sqlite3 renders
   # control bytes as ^X, so only the printable parts are matched.
   [[ "$output" == *"bob: a"*"b"*"[0mc"*"d"* ]]
+}
+
+@test "inbox: an unread backlog past the argv ceiling still delivers (#1045/#777, stdin)" {
+  # The old inline-SQL path handed the whole backlog to sqlite3 as ONE argv
+  # element; once that exceeded the OS argument limit the call failed and the
+  # backlog could never clear itself. Building the statement into a temp file and
+  # passing it on stdin removes the ceiling.
+  #
+  # The backlog is built from many NORMAL-sized messages -- the real shape of the
+  # bug -- so the fixture itself never puts an oversized argument on argv. Linux
+  # caps a single argv element at 128 KB (MAX_ARG_STRLEN), which macOS does not;
+  # the earlier 200 KB single body passed on macOS and failed on the ubuntu
+  # runner with "Argument list too long". The COUNT is derived from the measured
+  # ARG_MAX so the delivered batch is guaranteed to exceed it ON THIS host -- a
+  # fixed size can sit under the limit where ARG_MAX is larger and pass green
+  # without exercising the ceiling at all.
+  local arg_max body count total i last filler
+  arg_max="$(getconf ARG_MAX)"
+  body=90000                                    # one message body, < 128 KB per-arg cap
+  count=$(( arg_max / body + 3 ))               # total payload > ARG_MAX, with margin
+  total=$(( count * body ))
+  [ "$total" -gt "$arg_max" ]                   # guarantee the ceiling is actually exceeded
+  filler="$(head -c "$body" /dev/zero | tr '\0' x)"
+  for i in $(seq 1 "$count"); do
+    bash "$SCRIPTS/send.sh" testteam bob alice "MSG${i}-${filler}-END${i}" >/dev/null
+  done
+  last="$count"
+  run bash "$SCRIPTS/inbox.sh" testteam alice
+  [ "$status" -eq 0 ]
+  grep -q "${count} new message(s):" <<<"$output"
+  # the first and last actually came through -- not a truncated or empty head
+  grep -q "MSG1-" <<<"$output"
+  grep -q "END${last}" <<<"$output"
+}
+
+# --- argv-length regression (#777) ---------------------------------------
+#
+# check-inbox.sh used to embed the whole unread backlog into ONE argv element
+# for `sqlite3 ':memory:' "<embedded SQL>"`. 100 messages of ~2000 bytes each
+# is about 200,000 bytes of body alone, well past Linux's MAX_ARG_STRLEN
+# (131,072 bytes -- measured directly in this same suite's environment, and
+# documented in scripts/history.sh; the ceiling is smaller still on Windows:
+# 32,767 characters). Before the fix this failed every single run with
+# "Argument list too long" -- the backlog that triggered it never shrinks on
+# its own, so it never recovered.
+
+@test "check-inbox: a backlog large enough to exceed the OS argv ceiling still delivers and marks read (#777)" {
+  bulk_send_direct testteam bob alice 100 2000 CIBIG
+
+  # Not delivered_to_operator() here: that helper embeds the WHOLE payload
+  # into its own single-shot json_valid('$esc') probe (an sqlite3 argv
+  # element again, just on the test side), so a body this size would trip
+  # the identical #777 ceiling one layer up and fail for a reason that has
+  # nothing to do with check-inbox.sh. Reading raw stdout directly, the way
+  # "multiple identities poll only the first agent's exact team rows" above
+  # already does, keeps this test pinned on the script under test.
+  run bash -c "echo '{}' | bash '$SCRIPTS/check-inbox.sh' claude-code /tmp/project-a"
+  [ "$status" -eq 0 ]
+  grep -qF -- "CIBIG-0-" <<< "$output"
+  grep -qF -- "CIBIG-99-" <<< "$output"
   [ "$(unread_count alice)" -eq 0 ]
 }

@@ -42,8 +42,8 @@ _agmsg_type_warn_untrusted() {
       [ -f "${dir}type.conf" ] || continue
       name="$(basename "$dir")"
       agmsg_driver_is_trusted types "$name" "${dir%/}" && continue
-      printf "agmsg: external plugin 'types/%s' found at %s but not trusted (ignored).\n       Opt in if you put it there intentionally: agmsg plugin trust types/%s\n" \
-        "$name" "${dir%/}" "$name" >&2
+      printf "agmsg: external plugin 'types/%s' found at %s but not trusted (ignored).\n       Opt in if you put it there intentionally: %s plugin trust types/%s\n" \
+        "$name" "${dir%/}" "$(agmsg_plugin_cmd "$(_agmsg_driver_root)")" "$name" >&2
     done
   done <<EOF
 $(agmsg_driver_bases)
@@ -136,6 +136,50 @@ agmsg_type_template_path() {
     /*|*..*) echo "Invalid template for $name: $rel" >&2; return 1 ;;
   esac
   printf '%s\n' "$dir/$rel"
+}
+
+# Space-separated names of eligible agent types that have a skill template.
+# Types such as agmsg-app remain in the registry but are not renderable because
+# they deliberately have no template= manifest key. Keep this derived from the
+# registry so adding a templated type cannot leave install/test composition
+# loops silently stale.
+_agmsg_renderable_types() {
+  local type
+  while IFS= read -r type; do
+    [ -n "$type" ] || continue
+    if [ -n "$(agmsg_type_get "$type" template)" ]; then
+      printf '%s\n' "$type"
+    fi
+  done < <(agmsg_known_types | sort -u)
+}
+
+# Populate $AGMSG_RENDERABLE_SKILL_TYPES, the space-separated list install.sh
+# and test_helper.bash's agmsg_renderable_types() read as a plain variable.
+# Callers that want it call this first; it is NOT computed at source time.
+#
+# This used to be a bare top-level assignment, run unconditionally every time
+# this file was sourced. That is fine for install.sh (sourced once), but this
+# file is also sourced from resolve-project.sh, which re-enters it on every
+# watch.sh poll cycle (#631) -- paying, every cycle, for a walk of every known
+# type through agmsg_type_get ending in `paste`, for a value nothing on that
+# path ever reads. Moved into a function so sourcing alone does nothing; only
+# calling this does.
+#
+# Memoized via a guard checked FIRST, not by resetting anything at source
+# time: this project has hit both nearby traps once already (a value filled
+# inside `$(...)` is discarded the instant that subshell exits, and an
+# unconditional statement run every time a file is re-sourced silently resets
+# a cache back to cold) -- neither applies here, because re-sourcing this
+# FILE only redefines this function; it never re-executes the assignment
+# below, and never touches $_AGMSG_RENDERABLE_TYPES_LOADED. Only CALLING this
+# function does that, and it refuses to repeat the work once done.
+#
+# Keep the public `agmsg_known_types` warning on explicit calls, but do not
+# leak an untrusted plugin warning into a caller that only wants this list.
+agmsg_load_renderable_skill_types() {
+  [ -n "${_AGMSG_RENDERABLE_TYPES_LOADED:-}" ] && return 0
+  AGMSG_RENDERABLE_SKILL_TYPES="$(_agmsg_renderable_types 2>/dev/null | paste -sd' ' -)"
+  _AGMSG_RENDERABLE_TYPES_LOADED=1
 }
 
 # Comma-or-space list helper: 0 if <value> is in the space-separated <name>'s <key>.

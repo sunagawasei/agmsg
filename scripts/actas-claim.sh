@@ -36,6 +36,18 @@ source "$SCRIPT_DIR/lib/actas-lock.sh"
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/role-session.sh"  # role->session record (#339)
+# Terminal registry, for naming this pane after the claim (v1 scope, item 4). The
+# errexit lift is not decoration: on bash 3.2 a failure inside a sourced file
+# fires THIS script's `set -e`, so `. x || true` would take the script down
+# instead of the guard arm. Naming must never be able to fail a claim.
+_agmsg_tr_rc=0; _agmsg_tr_e=0
+case $- in *e*) _agmsg_tr_e=1 ;; esac
+set +e
+# shellcheck disable=SC1091
+[ -r "$SCRIPT_DIR/lib/terminal-registry.sh" ] && . "$SCRIPT_DIR/lib/terminal-registry.sh"
+_agmsg_tr_rc=$?
+[ "$_agmsg_tr_e" = 1 ] && set -e
+[ "$_agmsg_tr_rc" -eq 0 ] || echo "agmsg: terminal registry unavailable; this pane will not be named" >&2
 
 # Resolve the session's real project root (see #92) before any lookup, so an
 # actas issued from a subdir/worktree claims against the registered project
@@ -68,14 +80,45 @@ claimed=""
 while IFS= read -r team; do
   [ -z "$team" ] && continue
   result=$(actas_lock_claim "$team" "$NAME" "$SESSION_ID" 2>/dev/null || true)
+  # Only an explicit `ok` counts as claimed. Everything else — the two named
+  # refusals and anything unanticipated — rolls back and reports. Naming the
+  # successes rather than the failures is the whole point: a claim that failed
+  # before it learned anything prints a verdict now, but even a verdict nobody
+  # thought of must not read as success. (#983)
   case "$result" in
+    ok) : ;;
     held:*)
+      # A new session id on the SAME live pid (Claude Code /clear, #1468/#1489)
+      # is still the same seat, so it may reclaim atomically here before the
+      # refusal below -- actas_lock_reclaim_same_process already refuses
+      # anything else (a different pid, a dead one, or an unreadable lock), so
+      # this cannot hand the role to a different live process.
+      handoff=$(actas_lock_reclaim_same_process "$team" "$NAME" "$SESSION_ID" 2>/dev/null || true)
+      if [ "$handoff" = "ok" ]; then
+        claimed="${claimed:+$claimed$'\n'}$team"
+        continue
+      fi
       # Roll back any partial claims so the user can retry cleanly.
       while IFS= read -r c_team; do
         [ -z "$c_team" ] && continue
         actas_lock_release "$c_team" "$NAME" "$SESSION_ID" 2>/dev/null || true
       done <<< "$claimed"
       printf 'status=held team=%s owner=%s\n' "$team" "${result#held:}"
+      exit 1
+      ;;
+    *)
+      # Every non-success, named or not. `unknown:<reason>` carries its reason;
+      # anything else is reported under its own word rather than being silently
+      # accepted, which is what the old fall-through did.
+      case "$result" in
+        unknown:*) _why="${result#unknown:}" ;;
+        *)         _why="claim_unrecognized" ;;
+      esac
+      while IFS= read -r c_team; do
+        [ -z "$c_team" ] && continue
+        actas_lock_release "$c_team" "$NAME" "$SESSION_ID" 2>/dev/null || true
+      done <<< "$claimed"
+      printf 'status=unverified team=%s reason=%s\n' "$team" "$_why"
       exit 1
       ;;
   esac
@@ -94,8 +137,80 @@ BARE_SID="$(agmsg_instance_bare_sid "$SESSION_ID")"
 PROJECT_PHYS="$(agmsg_canonical_path "$PROJECT")"
 while IFS= read -r team; do
   [ -z "$team" ] && continue
-  agmsg_role_session_record "$team" "$NAME" "$BARE_SID" "$PROJECT_PHYS" "$TYPE" || true
+  agmsg_role_session_record "$team" "$NAME" "$BARE_SID" "$PROJECT_PHYS" "$TYPE" "$SESSION_ID" || true
 done <<< "$TEAMS"
+
+# Once the seat is decided, move this Claude Code session onto agmsgd's direct
+# delivery when the daemon is ready and the session has a usable messaging
+# socket, so a seat chosen by actas does not depend on how many seats the
+# project registers. Prints "delivery=native" after the status line; the actas
+# procedure then skips the Monitor. Anything short of a verified record leaves
+# the Monitor path as it was.
+NATIVE_DELIVERY=0
+NATIVE_MONITOR_REASON=""
+# A project on agmsgd (agmsgd on, no explicit other mode) receives through agmsgd
+# only (#1810): when agmsgd cannot deliver yet, the session is told why and no
+# Monitor is suggested. NATIVE_AGMSGD_STATE/REASON carry that answer.
+NATIVE_AGMSGD_STATE=""
+NATIVE_AGMSGD_REASON=""
+if [ "$TYPE" = claude-code ] && [ -n "${SKILL_DIR:-}" ] \
+   && [ -r "$SKILL_DIR/scripts/lib/daemon-state.sh" ]; then
+  # shellcheck source=scripts/lib/daemon-state.sh
+  . "$SKILL_DIR/scripts/lib/daemon-state.sh"
+  command -v _agmsg_detect_platform >/dev/null 2>&1 || . "$SKILL_DIR/scripts/lib/compat.sh"
+  _agmsg_detect_platform
+  agmsg_daemon_read_state
+  # A project that chose something other than agmsgd keeps the Monitor path.
+  agmsg_daemon_apply_project_choice claude-code "$PROJECT_PHYS"
+  # A restart may still be publishing readiness. Recheck once, never wait
+  # indefinitely and never override an explicit project opt-out.
+  if [ "${AGMSGD_DESIRED:-}" = on ] && [ "${AGMSGD_HEALTH:-}" != ready ]; then
+    sleep 0.2
+    agmsg_daemon_read_state
+    agmsg_daemon_apply_project_choice claude-code "$PROJECT_PHYS"
+  fi
+  _native_health="${AGMSGD_HEALTH:-unknown}"
+  case "$_native_health" in *[!a-z_]*|'') _native_health=unknown ;; esac
+  if [ "${AGMSGD_DESIRED:-}" != on ]; then
+    # agmsgd turned off (even while the owner is still shutting down), or this
+    # project chose another mode: the project's own mode decides (the skill reads
+    # delivery.sh status), whatever the daemon's health.
+    if [ "${AGMSGD_HEALTH:-}" = ready ]; then
+      NATIVE_MONITOR_REASON=agmsgd_not_enabled
+    else
+      NATIVE_MONITOR_REASON="agmsgd_not_ready_$_native_health"
+    fi
+  elif ! _native_target="$(agmsg_claude_code_native_target 2>/dev/null)"; then
+    NATIVE_AGMSGD_STATE=blocked
+    NATIVE_AGMSGD_REASON=messaging_destination_unusable
+  elif ! agmsg_claude_code_native_storage_ready; then
+    NATIVE_AGMSGD_STATE=blocked
+    NATIVE_AGMSGD_REASON=native_storage_not_ready
+  fi
+  if [ -n "$NATIVE_MONITOR_REASON" ] || [ -n "$NATIVE_AGMSGD_REASON" ]; then
+    while IFS= read -r team; do
+      [ -z "$team" ] && continue
+      agmsg_role_session_mark_messaging_blocked "$team" "$NAME" "${NATIVE_MONITOR_REASON:-$NATIVE_AGMSGD_REASON}" "$BARE_SID" || true
+    done <<< "$TEAMS"
+  else
+    # agmsgd is on and this session has a usable destination. Record it whether
+    # or not agmsgd is running: a stopped agmsgd delivers to it as soon as it
+    # starts, with no restart.
+    NATIVE_DELIVERY=1
+    while IFS= read -r team; do
+      [ -z "$team" ] && continue
+      agmsg_role_session_publish_messaging "$team" "$NAME" "${_native_target%%$'\t'*}" "${_native_target#*$'\t'}" "$BARE_SID" "${CLAUDE_CODE_MESSAGING_TOKEN:-}" || NATIVE_DELIVERY=0
+    done <<< "$TEAMS"
+    if [ "$NATIVE_DELIVERY" -eq 0 ]; then
+      NATIVE_AGMSGD_STATE=blocked
+      NATIVE_AGMSGD_REASON=delivery_record_did_not_take
+    elif [ "${AGMSGD_HEALTH:-}" != ready ]; then
+      NATIVE_DELIVERY=0
+      NATIVE_AGMSGD_STATE=stopped
+      NATIVE_AGMSGD_REASON="agmsgd_not_ready_$_native_health"
+    fi
+  fi
+fi
 
 # A monitored Codex seat's dispatcher reads its role pair from the seat request
 # rather than inferring it from the project roster. Actas can change the role
@@ -158,6 +273,13 @@ fi
 # unnamed and unaddressable. watch.sh does the same lookup and was corrected the
 # same way (watch.sh:271); this was the remaining site.
 #
+# `retire_previous "$SESSION_ID"` (the last two arguments) drops this pane's
+# record of the name this session was acting as before, which would otherwise
+# read as another seat's and refuse this one; see
+# _agmsg_placement_retire_previous. The composite $SESSION_ID is what the actas
+# locks are owned by, so it is what a seat's lock is compared with. Only this
+# call site passes them, and only here, after the claim above has won.
+#
 # Once per claimed team, mirroring the role-session loop above: each (team, role)
 # gets its own record, because that pair is what peek/poke resolve by. The
 # VISIBLE pane name is whichever team comes last — panes have one name and a role
@@ -165,7 +287,7 @@ fi
 if declare -F agmsg_terminal_name_self_safe >/dev/null 2>&1; then
   while IFS= read -r team; do
     [ -z "$team" ] && continue
-    agmsg_terminal_name_self_safe "$BARE_SID" "$team" "$NAME" "$PROJECT_PHYS" "$TYPE" record || true
+    agmsg_terminal_name_self_safe "$BARE_SID" "$team" "$NAME" "$PROJECT_PHYS" "$TYPE" record retire_previous "$SESSION_ID" || true
   done <<< "$TEAMS"
 fi
 
@@ -211,4 +333,11 @@ while IFS= read -r team; do
   printf ' team=%s' "$team"
 done <<< "$TEAMS"
 printf '\n'
+if [ "$NATIVE_DELIVERY" -eq 1 ]; then
+  echo "delivery=native"
+elif [ -n "$NATIVE_AGMSGD_REASON" ]; then
+  printf 'delivery=agmsgd state=%s reason=%s\n' "$NATIVE_AGMSGD_STATE" "$NATIVE_AGMSGD_REASON"
+elif [ -n "$NATIVE_MONITOR_REASON" ]; then
+  printf 'delivery=monitor reason=%s\n' "$NATIVE_MONITOR_REASON"
+fi
 exit 0

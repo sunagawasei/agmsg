@@ -7,26 +7,26 @@
 ## まず読むもの
 
 - agmsg が何をするものか、どうインストールするかは [`README.md`](README.md) を読むこと。
-- メンタルモデル(3軸ドライバ、用語、依存関係管理の考え方)は [`ARCHITECTURE.md`](ARCHITECTURE.md) を読むこと。
+- メンタルモデル(4軸ドライバ、用語、依存関係管理の考え方)は [`ARCHITECTURE.md`](ARCHITECTURE.md) を読むこと。
 - 設計判断の経緯は [`docs/adr/`](docs/adr/) を眺めること — *なぜ*今の形になっているかが分かる。
 - [`docs/spec/`](docs/spec/) ディレクトリには正式な契約(コントラクト)がある。ドライバを実装・拡張する際はこれを参照すること。
 
 ## バグ報告と機能要望
 
-[`fujibee/agmsg`](https://github.com/fujibee/agmsg/issues) に issue を立てる。agmsg のバージョン、ホストエージェント(Claude Code / Codex / Cursor)、可能なら最小の再現手順を含めること。
+[`fujibee/agmsg`](https://github.com/fujibee/agmsg/issues) に issue を立てる。agmsg のバージョン、ホストエージェント(Claude Code、Codex、Gemini CLI、Antigravity、Copilot CLI、OpenCode、Cursor、Grok Build、Devin、Hermes)、可能なら最小の再現手順を含めること。
 
 ## プルリクエスト
 
 1. 大きな変更はまず issue で議論する。
 2. `main` からブランチを切る。PR は焦点を絞ること — 1 PR につき論理的な変更 1 つ。
-3. 開発中は `bats --filter-tags "!slow" tests/*.bats` を実行し、提出前に full suite の `bats tests/*.bats` を実行する。
+3. テストスイートを実行する: `bats tests/`。
 4. 周囲のコードスタイルに合わせる。Bash が主要言語であり、すべてのスクリプトの先頭で `set -euo pipefail` を使うこと。
 5. ユーザーから見える変更であれば、ドキュメントも更新する。
 6. PR は `main` に squash コミット 1 つとして着地する — リポジトリ側で merge と rebase のマージは無効にしてある。ブランチのコミットは 1 つにまとめられるので、PR のタイトルはそのままコミットの件名として読める形で書くこと。レビュー前にブランチの履歴を整える必要はない。
 
 ## リリース
 
-[`RELEASING.md`](RELEASING.md) を参照。手短に言うと: [`VERSION`](VERSION) を上げ、`./scripts/release/sync-version.sh` を実行し、コミットし、`v$(cat VERSION)` としてタグを打ち、push する。あとは CI がやってくれる。
+[`RELEASING.md`](RELEASING.md) を参照。手短に言うと: `scripts/release/cut-release.sh <version>` を実行するとリリース PR が用意される。PR とタグの push はそれぞれメンテナーの承認が要り、タグのあとに CI が公開する。
 
 ## Architecture Decision Records
 
@@ -58,7 +58,7 @@ agmsg は重要な設計判断を記録するために ADR([Architecture Decisio
 
 ## ドライバの追加
 
-バンドルされているドライバは `scripts/drivers/<axis>/<name>.sh` にある。(`scripts/` 直下の `.sh` ファイルは直接実行可能なコマンドであり、サブディレクトリは実装コードをまとめたもの。)サードパーティのプラグインドライバは `~/.agents/agmsg/plugins/<axis>/<name>/` にある。どちらも [`docs/spec/driver-interface.md`](docs/spec/driver-interface.md) にある契約を実装する必要がある。
+バンドルされているドライバは `scripts/drivers/<axis>/` 配下にある(storage は `<name>.sh`、agent タイプと terminal はマニフェストを含む `<name>/` ディレクトリ)。`scripts/` 直下の `.sh` ファイルは直接実行可能なコマンドであり、サブディレクトリは実装コードをまとめたもの。サードパーティのプラグインドライバは `<skill>/plugins/<axis>/<name>/` か `$AGMSG_PLUGIN_DIRS` のディレクトリにあり、`agmsg plugin trust` したあとにだけ動く([`docs/plugins.md`](docs/plugins.md) 参照)。どちらも [`docs/spec/driver-interface.md`](docs/spec/driver-interface.md) にある契約を実装する必要がある。
 
 新しいバンドルドライバには以下が揃っていることが望ましい:
 

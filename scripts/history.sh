@@ -14,20 +14,28 @@ LIMIT="${3:-20}"
 case "$LIMIT" in ''|*[!0-9]*) LIMIT=20 ;; esac
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib/validate.sh"
+# Refuse unknown teams before storage resolution or self-naming side effects.
+agmsg_validate_team_name "$TEAM" || exit 1
+if [ ! -f "$SCRIPT_DIR/../teams/$TEAM/config.json" ]; then
+  echo "agmsg: team not found: $TEAM" >&2
+  exit 1
+fi
 source "$SCRIPT_DIR/lib/storage.sh"
 agmsg_storage_load
 
-if [ -n "$AGENT" ]; then
-  # A team-wide history read has no acting seat; an agent-scoped read does.
-  # shellcheck disable=SC1091
-  source "$SCRIPT_DIR/lib/self-name.sh"
-  agmsg_self_name_on_action "$TEAM" "$AGENT" || true
-fi
+# <agent> here is only a filter on whose messages to show; the caller is not
+# necessarily that seat (a seat reads another seat's history all the time). So
+# this does not name the caller's pane or session after <agent> -- doing so
+# rewrote the other seat's pane record to the reader's pane (#1756). send.sh
+# and inbox.sh take the acting seat's own name and keep the self-naming.
 
-DB="$(agmsg_db_path)"
-
-if [ ! -f "$DB" ]; then
-  echo "No messages (DB not initialized)"
+# A history read must not create a store, so a team that has never been written
+# to has no file yet. Since the stores split per team that is the ordinary state
+# of a freshly joined team rather than a broken install, and it reads out the
+# same as an empty history. Driver-level, so it works for jsonl too.
+if ! storage_store_exists "$TEAM"; then
+  echo "No message history."
   exit 0
 fi
 
@@ -42,6 +50,11 @@ if [ -z "$HIST_JSONL" ]; then
 fi
 
 # Parse to "from \x1f to \x1f body \x1f at \x1f id" rows (no jq; cf. lib/hooks-json.sh).
+# The quote is held in a variable, never written as \' in the pattern: bash 3.2
+# (macOS /bin/bash) keeps the backslash of a \' REPLACEMENT, so the inline form
+# doubles a quote into \'\' there while producing '' on bash 4+. Same shape as
+# _sqlite_sync_lit_into in sqlite-sync.sh, which documents the same hazard.
+_AGMSG_SQ="'"
 _arr="[$(printf '%s' "$HIST_JSONL" | paste -sd, -)]"
 # #777: same argv-length exposure on the display path. Capping --limit does not bound this
 # one either, because a single long body can carry it past the ceiling on its own.
@@ -50,11 +63,11 @@ trap 'rm -f "$_agmsg_rows_sql"' EXIT HUP INT TERM
 {
   printf "%s\n" "SELECT json_extract(value,'\$.from') || char(31) ||"
   printf "%s\n" "       json_extract(value,'\$.to') || char(31) ||"
-  printf "%s\n" "       replace(replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t'), char(31), char(9247)) || char(31) ||"
+  printf "%s\n" "       replace(replace(replace(json_extract(value,'\$.body'), char(13), ''), char(10), char(30)), char(31), char(9247)) || char(31) ||"
   printf "%s\n" "       json_extract(value,'\$.at') || char(31) ||"
   printf "%s\n" "       json_extract(value,'\$.id')"
   printf "FROM json_each('"
-  printf '%s' "$_arr" | sed "s/'/''/g"
+  printf '%s' "${_arr//$_AGMSG_SQ/$_AGMSG_SQ$_AGMSG_SQ}"
   printf "');\n"
 } > "$_agmsg_rows_sql"
 # Windows sqlite3.exe may treat redirected stdin as interactive input unless
@@ -97,7 +110,7 @@ while IFS= read -r r; do
   trap 'rm -f "$_agmsg_unread_sql"' EXIT HUP INT TERM
   {
     printf "SELECT json_extract(value,'\$.id') FROM json_each('"
-    printf '%s' "$uarr" | sed "s/'/''/g"
+    printf '%s' "${uarr//$_AGMSG_SQ/$_AGMSG_SQ$_AGMSG_SQ}"
     printf "');\n"
   } > "$_agmsg_unread_sql"
   ids=$(agmsg_sqlite -batch ':memory:' < "$_agmsg_unread_sql")
@@ -111,5 +124,7 @@ while IFS=$'\x1f' read -r from to body ts id; do
   # An empty id (sender-side generation failed) is unread-undecidable, not a
   # blank-line match against a stray empty UNREAD_IDS entry — treat it as ○.
   if [ -n "$id" ] && printf '%s\n' "$UNREAD_IDS" | grep -Fxq "$id"; then status='●'; else status='○'; fi
-  echo "  $status [$ts] $from → $to: $body"
+  # A body's line breaks arrive as \x1e (one row per message); show them as
+  # line breaks, indented under the header (#1780).
+  echo "  $status [$ts] $from → $to: ${body//$'\x1e'/$'\n'      }"
 done <<< "$ROWS"

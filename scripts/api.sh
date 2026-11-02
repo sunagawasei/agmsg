@@ -67,6 +67,35 @@ get_teams() {
   agmsg_sqlite_mem "SELECT json_object('name', n) FROM ($query) ORDER BY n;"
 }
 
+# Where a team's messages physically live, and in what form.
+#
+# Reading the store directly is faster than going through this script, and
+# several programs outside agmsg do exactly that. This resource exists so they
+# stop HARDCODING the path: ask, then read what you were told. A team that moves
+# to its own store (connecting does that) then costs those readers nothing,
+# where a hardcoded path leaves them opening a file that still exists and has
+# none of their data in it — the failure that prompted this.
+#
+# `driver` is not decoration. A jsonl store is an append-only log, not a
+# database; a consumer that opens it with a SQLite client gets nonsense. Check
+# it before reading, and treat an unfamiliar value as "do not read this".
+get_store() {
+  local team="$1" path driver partition exists
+  path="$(agmsg_db_path "$team")" || return 1
+  driver="$(agmsg_storage_driver)"
+  partition="$(agmsg_driver_for_team partition "$team" shared)"
+  # json(...) so the field is a JSON boolean; a bare 1/0 reads as a number and a
+  # consumer testing `=== true` would silently take the wrong branch.
+  if [ -e "$path" ]; then exists="json('true')"; else exists="json('false')"; fi
+  agmsg_sqlite_mem "SELECT json_object(
+    'team', '$(agmsg_sqlesc "$team")',
+    'driver', '$(agmsg_sqlesc "$driver")',
+    'partition', '$(agmsg_sqlesc "$partition")',
+    'path', '$(agmsg_sqlesc "$path")',
+    'exists', $exists
+  );"
+}
+
 get_members() {
   local team="$1"
   local config="$SCRIPT_DIR/../teams/$team/config.json"
@@ -80,10 +109,10 @@ get_members() {
     WITH cfg AS (SELECT CAST(readfile('$path_sql') AS TEXT) AS json)
     SELECT json_object(
       'name', a.key,
-      'types', (
+      'types', json((
         SELECT json_group_array(DISTINCT json_extract(r.value, '\$.type'))
         FROM json_each(json_extract(a.value, '\$.registrations')) AS r
-      ),
+      )),
       'project', (
         SELECT json_extract(r.value, '\$.project')
         FROM json_each(json_extract(a.value, '\$.registrations')) AS r
@@ -113,7 +142,7 @@ get_messages() {
   # numeric-filtered; it is bound as an escaped SQL string literal instead.
   case "$limit" in ''|*[!0-9]*) limit=30 ;; esac
 
-  local db; db="$(agmsg_db_path)"
+  local db; db="$(agmsg_db_path "$team")"
   if [ ! -f "$db" ]; then
     return 0 # no store yet — empty result, not an error
   fi
@@ -121,7 +150,7 @@ get_messages() {
   # pure-legacy store (init-db.sh ran, storage_send never called) may have
   # messages but no events table yet — the UNION below would fail to parse
   # without it. storage_init is idempotent (CREATE TABLE IF NOT EXISTS).
-  storage_init >/dev/null
+  storage_init "$team" >/dev/null
 
   local team_sql; team_sql="$(_agmsg_sqlesc "$team")"
   local where="team='$team_sql'"
@@ -161,7 +190,11 @@ get_messages() {
       UNION ALL
       SELECT CAST(id AS TEXT) AS id, team, from_agent, to_agent, body, created_at, id AS ord
       FROM messages
-      WHERE NOT EXISTS (SELECT 1 FROM events e2 WHERE e2.legacy_id=messages.id)
+      -- Skip the copy the event log already carries. Every message is written
+      -- to both tables so external readers of the legacy one keep working
+      -- (#689); without this every message is returned twice, once under its
+      -- event id and once under the legacy rowid.
+      WHERE NOT EXISTS (SELECT 1 FROM events e2 WHERE e2.legacy_id = messages.id)
     )
     SELECT json_object(
       'type', 'message_sent',
@@ -178,7 +211,7 @@ get_messages() {
 }
 
 route_get() {
-  local resource="${1:?Usage: api.sh get teams [<team> members|messages ...]}"
+  local resource="${1:?Usage: api.sh get teams [<team> store|members|messages ...]}"
   shift
   case "$resource" in
     teams)
@@ -187,9 +220,7 @@ route_get() {
         return
       fi
       local team="$1"
-      # Rejects path traversal ('/', '\', '..') before $team is ever spliced
-      # into a filesystem path (get_members below) — was previously
-      # unvalidated at this entry point (#87 cluster / F13-F15).
+      # Validate before the value is used by the members filesystem path.
       agmsg_validate_team_name "$team" || exit 1
       shift
       local sub="${1:?Usage: api.sh get teams <team> members|messages ...}"
@@ -197,6 +228,7 @@ route_get() {
       case "$sub" in
         members) get_members "$team" ;;
         messages) get_messages "$team" "$@" ;;
+        store) get_store "$team" ;;
         *) echo "Unknown resource: teams $team $sub" >&2; exit 1 ;;
       esac
       ;;

@@ -24,12 +24,10 @@ ORIG_ARGS=("$@")
 #     of those pairs.
 #   - When [active_name] is given, narrows the subscription to only pairs
 #     whose agent name matches — useful for `actas` exclusive role mode.
-#   - Delivery follows each pair's read cursor, not the session watermark: a
-#     new session's watcher also delivers messages that were already waiting
-#     for its pairs before it started, and never re-delivers ones at or before
-#     the cursor. A restart of this session's watcher (actas/drop/clear/
-#     self-restart) therefore resumes from the cursor and does not drop
-#     messages that arrived during the restart gap. See #107.
+#   - Inbox and monitor share the driver's persistent per-(team,agent) read
+#     cursor. A restart resumes from consumed state, and a fresh watcher delivers
+#     existing unread messages instead of jumping over them. See the
+#     read-state synchronization specification.
 #   - Polls the SQLite DB at AGMSG_WATCH_INTERVAL seconds (default 1, also
 #     overridable via the delivery.monitor.poll_interval config key).
 #   - Emits one line per new message:
@@ -48,6 +46,18 @@ ORIG_ARGS=("$@")
 # "${CLAUDE_CODE_SESSION_ID:--}" and `-` is folded into the empty-arg path here.
 # project_path and agent_type are required. [--team <team>] pins the
 # subscription to one team for session-team mode.
+# `--max-seconds=N` may come before the positionals too; take it out of the
+# positional list so the parse below sees only session/project/type/name/--team.
+WATCH_MAX_SECONDS=""
+_wargs=()
+for _a in "$@"; do
+  case "$_a" in
+    --max-seconds=*) WATCH_MAX_SECONDS="${_a#--max-seconds=}" ;;
+    *) _wargs+=("$_a") ;;
+  esac
+done
+set -- ${_wargs[@]+"${_wargs[@]}"}
+unset _wargs _a
 ARG_COUNT=$#
 SESSION_ID="${1:-}"
 [ "$SESSION_ID" = "-" ] && SESSION_ID="" # #477: caller sentinel for empty session id
@@ -59,7 +69,6 @@ TEAM_PIN=""
 # `--max-seconds=N` (a trailing option only agmsg's Claude Code launch commands
 # add) turns on self-managed renewal; see _watch_renew_or_stop. It stays in
 # ORIG_ARGS so a self-restart and the re-arm line replay it.
-WATCH_MAX_SECONDS=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --max-seconds=*)
@@ -88,16 +97,40 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Polling and its child operations must never run the user-operation notice.
+export AGMSG_DAEMON_NOTICE_SKIP=1
 source "$SCRIPT_DIR/lib/storage.sh"
 agmsg_storage_load
+# Warm agmsg_storage_dir's own process-lifetime cache as a PLAIN STATEMENT,
+# not via $(...): every real caller (agmsg_db_path -> ... -> _agmsg_db_file)
+# reaches it through at least one command substitution of its own, and a
+# subshell forked from a still-cold top level can never leave the cache warm
+# for the NEXT such call -- each one forks fresh from this same cold state.
+# Doing it once here, before any subshell exists, is what lets every later
+# call (however many $(...) layers deep) inherit the already-resolved value
+# instead of re-deriving it (a `dirname`/`cd`+`pwd` resolution) on every single
+# poll cycle for a value that cannot change for the life of this process.
+agmsg_storage_dir >/dev/null
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/process-identity.sh"
+# Terminal driver registry — the graceful-despawn teardown resolves this
+# member's own pane through it. Guarded: an install predating the terminals
+# axis simply has no registry, and close_own_placement says so rather than
+# reaching for $TMUX_PANE behind its own back.
 # shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/watch-stuck-map.sh"
+[ -r "$SCRIPT_DIR/lib/terminal-registry.sh" ] && . "$SCRIPT_DIR/lib/terminal-registry.sh"
+# Same libs actas-claim.sh reads the native-delivery record through
+# (role-session.sh's messaging_socket field here, daemon-state.sh's
+# AGMSGD_HEALTH loaded lazily in _agmsg_watch_native_delivery_active below).
+# Guarded the same way: an install predating native delivery simply lacks
+# these files, and the re-arm loop falls back to its original
+# always-renew-or-stop-on-silence behavior.
+# shellcheck disable=SC1091
+[ -r "$SCRIPT_DIR/lib/role-session.sh" ] && . "$SCRIPT_DIR/lib/role-session.sh"
 
 # Fail loudly on an unknown agent_type instead of running with zero
 # subscriptions. The dominant real-world cause is a shifted argument list: a
@@ -146,7 +179,7 @@ fi
 PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
 
 # Disambiguate parallel --continue/--resume sessions that share a session_id
-# (#93). All per-process state below — pidfile, watermark, actas owner, ready
+# (#93). All per-process state below — pidfile, actas owner, ready
 # sentinel — keys on this per-process instance id rather than the bare
 # session_id, so two processes that share a session_id no longer collide on the
 # same pidfile and kill each other (#66 was a within-session dedup; here it must
@@ -155,7 +188,6 @@ PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
 # monitor/actas/drop steps pass a bare session_id and we self-derive here.
 SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$AGENT_TYPE")"
 
-DB="$(agmsg_db_path)"
 RUN_DIR="$SKILL_DIR/run"
 PIDFILE="$RUN_DIR/watch.$SESSION_ID.pid"
 LOGFILE="$RUN_DIR/watch.$SESSION_ID.log"
@@ -218,17 +250,27 @@ esac
 
 # Pairs already reported as storeless, so the notice is once per process.
 NO_STORE_REPORTED=""
-STUCK_MAP=""
-STUCK_THRESHOLD=3
-# Distinct from a bash "unbound variable" abort (status 1) so a caller that
-# greps this process's exit status can tell "delivery is unhealthy" (#1045)
-# from an ordinary crash. Referenced but never defined before this fix -- both
-# call sites hit the unbound-variable case they were meant to be distinct from.
-_AGMSG_EXIT_DELIVERY_UNHEALTHY=3
+
+# Two front doors onto one log.
+#
+# `watch_log` announces on stderr, which is right for a diagnostic nobody has to
+# act on. `watch_report` announces on STDOUT, for the ones an operator must see:
+# the shipped launcher runs the watcher with fd2 on /dev/null (#691, measured
+# while fixing #1045), so a teardown that failed and said so on stderr said so
+# nowhere. Same log file either way — the difference is only which channel the
+# person watching gets it on.
+watch_report() {
+  printf 'agmsg watch: %s\n' "$*"
+  _watch_log_file "$*"
+}
 
 watch_log() {
+  printf 'agmsg watch: %s\n' "$*" >&2
+  _watch_log_file "$*"
+}
+
+_watch_log_file() {
   local msg="$*" record size=0 bytes
-  printf 'agmsg watch: %s\n' "$msg" >&2
   mkdir -p "$RUN_DIR" 2>/dev/null || return 0
   # Built first, so the rotation decision can weigh what is actually going to
   # be appended rather than only what is already there.
@@ -283,10 +325,6 @@ if agmsg_instance_is_composite "$SESSION_ID" && ! agmsg_instance_alive "$SESSION
   LOGFILE="$RUN_DIR/watch.$SESSION_ID.log"
   watch_log "instance pid $stale_pid is gone; adopted live agent pid $live_pid (stale directive, e.g. resumed session)"
 fi
-
-watch_report() {
-  printf 'agmsg watch: %s\n' "$*"
-}
 
 # Close THIS member's own pane at the end of a graceful despawn, through the
 # terminal driver named by its placement record.
@@ -677,9 +715,9 @@ if [ -f "$PIDFILE" ]; then
   if [ -n "$prev_pid" ] && [ "$prev_pid" != "$$" ] && _agmsg_pid_alive_local "$prev_pid"; then
     prev_cmd=$(compat_get_cmdline "$prev_pid" 2>/dev/null || true)
     if [ -n "$prev_cmd" ]; then
-      case "$prev_cmd" in
-        *"$SKILL_DIR/scripts/watch.sh"*) PREV_PID_TO_DISPLACE="$prev_pid" ;;
-      esac
+      if agmsg_cmdline_names_path "$prev_cmd" "$SKILL_DIR/scripts/watch.sh"; then
+        PREV_PID_TO_DISPLACE="$prev_pid"
+      fi
     else
       # ps unavailable (sandboxed) — skip cmdline validation, rely on kill -0
       PREV_PID_TO_DISPLACE="$prev_pid"
@@ -782,7 +820,7 @@ if [ -n "$PREV_PID_TO_DISPLACE" ]; then
   kill "$PREV_PID_TO_DISPLACE" 2>/dev/null || true
 fi
 
-# --- Say when this watcher is sharing an inbox with another (#683). ---
+# --- Say when this watcher is sharing an inbox with another. ---
 #
 # A watcher started WITHOUT an active name subscribes to every (team, agent)
 # registered for this project that nobody else has claimed. The read cursor is
@@ -1057,7 +1095,7 @@ _handle_install_changed() {
       watch_report "exec of the updated watch.sh failed; exiting instead of running stale code."
       exit 1
     fi
-    watch_report "the agmsg installation kept changing across $restarts restart(s) in a row; exiting rather than looping. Restart this session (or run /agmsg actas <name>) to resume delivery."
+    watch_report "the agmsg installation kept changing across $restarts restart(s) in a row; exiting rather than looping. Restart this session (or run /agmsg actas <name>) to resume delivery.$(_agmsg_watch_agmsgd_note)"
     exit 0
   fi
 
@@ -1070,7 +1108,7 @@ _handle_install_changed() {
     return 0
   fi
 
-  watch_report "the agmsg installation was updated while this watcher was running, so it is still executing the code from before the update. Exiting rather than appearing to work. Restart this session (or run /agmsg actas <name>) to resume delivery."
+  watch_report "the agmsg installation was updated while this watcher was running, so it is still executing the code from before the update. Exiting rather than appearing to work. Restart this session (or run /agmsg actas <name>) to resume delivery.$(_agmsg_watch_agmsgd_note)"
   exit 0
 }
 
@@ -1104,6 +1142,19 @@ if [ -n "$PAIRS" ]; then
     [ -z "$_team" ] && continue
     state=$(actas_lock_state "$_team" "$_agent" "$SESSION_ID")
     case "$state" in
+      # Startup: an unverified pair is not subscribed. Falling through would have
+      # this watcher take a role whose holder it could not determine, which is
+      # how two watchers end up serving one inbox. Reported with its own word, so
+      # "someone else has it" and "we could not find out" are not the same line
+      # in the startup summary. (#983)
+      unknown:*)
+        if [ -n "$ACTIVE_NAME" ]; then
+          held="${held:+$held }${_team}/${_agent}(unverified:${state#unknown:})"
+        else
+          skipped="${skipped:+$skipped }${_team}/${_agent}(unverified:${state#unknown:})"
+        fi
+        continue
+        ;;
       other:*)
         # If the caller is asking specifically for this name (actas flow),
         # treat the conflict as a hard failure. Otherwise (broad subscribe)
@@ -1121,9 +1172,25 @@ if [ -n "$PAIRS" ]; then
       # where state-check said free but a peer claimed it between then and
       # now.
       result=$(actas_lock_claim "$_team" "$_agent" "$SESSION_ID" 2>/dev/null || true)
+      # ONLY an explicit `ok` subscribes. Every other answer — named or not —
+      # skips. The previous shape listed the two refusals and let everything else
+      # fall through to success, so a claim that failed before it learned
+      # anything (mktemp, an uncreatable lock dir, three contended reclaim
+      # rounds) printed nothing and was read as "we got it". Naming the success
+      # instead of the failures is what makes an unanticipated answer safe.
+      # (#983, review)
       case "$result" in
+        ok) : ;;
         held:*)
           held="${held:+$held }${_team}/${_agent}(${result#held:})"
+          continue
+          ;;
+        unknown:*)
+          skipped="${skipped:+$skipped }${_team}/${_agent}(unverified:${result#unknown:})"
+          continue
+          ;;
+        *)
+          skipped="${skipped:+$skipped }${_team}/${_agent}(unverified:claim_unrecognized)"
           continue
           ;;
       esac
@@ -1132,7 +1199,11 @@ if [ -n "$PAIRS" ]; then
   done <<< "$PAIRS"
   PAIRS="$filtered"
   if [ -n "$skipped" ]; then
-    echo "agmsg watch: skipping pairs held by other sessions: $skipped" >&2
+    # Not all of these are held: a pair whose lock could not be read is skipped
+    # too, and it is listed as (unverified:<reason>). Saying "held by other
+    # sessions" over that list asserts a holder we never established — the same
+    # invented certainty as doctor's `lock=none`. (#983)
+    echo "agmsg watch: not serving these pairs (held by another session, or unverified): $skipped" >&2
   fi
   if [ -n "$held" ]; then
     echo "agmsg watch: cannot claim (held by other sessions): $held" >&2
@@ -1150,46 +1221,10 @@ if [ -z "$PAIRS" ]; then
   exit 0
 fi
 
-# SUB_PAIRS holds the subscription as <team>:<agent> tokens — the argument form
-# the storage facade's watch ops take (§2.2). Live delivery goes entirely through
-# storage_watch_tip / storage_watch_after now, so no SQL WHERE clause is built here.
-SUB_PAIRS=()
-while IFS=$'\t' read -r team agent; do
-  [ -z "$team" ] && continue
-  SUB_PAIRS+=("$team:$agent")
-done <<< "$PAIRS"
-
-# Determine the starting watermark.
-#
-# The watermark is persisted per session_id, but delivery does not filter on
-# it: the poll loop passes each pair's read cursor to storage_watch_after, so
-# what a watcher streams is whatever is past that cursor. Monitor restarts are
-# routine — `actas`/`drop` do TaskStop + relaunch, `/clear`/resume re-fires the
-# SessionStart directive, and a killed watcher self-restarts — and resuming
-# from the read cursor is what keeps messages that landed in the gap between
-# the previous watcher stopping and the new one starting. See #107.
-#
-# A *fresh* session (no persisted watermark) seeds the watermark at the current
-# tip, but that seed does not suppress delivery: a message already past the
-# pair's read cursor is streamed to the new session.
-# The watermark is now an OPAQUE delivery cursor (§2.2), not an integer id — the
-# active storage driver issues and interprets it; this script only persists the
-# latest token and passes it back unchanged.
-WATERMARK_FILE="$RUN_DIR/watch.$SESSION_ID.watermark"
-persist_watermark() { printf '%s\n' "$LAST" > "$WATERMARK_FILE" 2>/dev/null || true; }
-
-LAST=""
-if [ -f "$WATERMARK_FILE" ]; then
-  # Opaque token: a single whitespace-free line. No integer validation — just
-  # strip stray surrounding whitespace.
-  LAST="$(tr -d '[:space:]' < "$WATERMARK_FILE" 2>/dev/null || true)"
-fi
-if [ -z "$LAST" ]; then
-  # Seed the watermark at the current tip; delivery still follows the read cursor.
-  LAST="$(storage_watch_tip ${SUB_PAIRS[@]+"${SUB_PAIRS[@]}"} 2>/dev/null || true)"
-  case "$LAST" in '') LAST=0 ;; esac
-  persist_watermark
-fi
+# The read frontier lives in the storage driver, once per (team,agent). Core
+# never compares its opaque local-position component. Each pair is scanned and
+# consumed independently so a broad watcher cannot advance one role merely by
+# delivering another role's traffic.
 
 # DB-open healthcheck (#197). The main loop guards every query with
 # `2>/dev/null || true`, so when sqlite3 cannot open the store the watcher keeps
@@ -1201,12 +1236,17 @@ fi
 # on stdout (the Monitor event stream) and exit, turning the silent failure into
 # a visible one. Done before the ready sentinel so we never signal "ready" for a
 # watcher that cannot read the store.
+# Resolved from this watcher's own subscription rather than a bare default:
+# the store is selected per team now. Every pair here shares a team (the
+# subscription is one project's roster); when stores actually split, this
+# becomes one check per distinct team in PAIRS.
+DB="$(agmsg_db_path "$(printf '%s\n' "$PAIRS" | head -1 | cut -f1)")" || exit 1
 if [ -f "$DB" ] && ! agmsg_sqlite "$DB" "SELECT 1;" >/dev/null 2>&1; then
   echo "ERROR: cannot open message DB $DB"
   exit 1
 fi
 
-# Signal readiness. Once the subscription is resolved and the watermark is set,
+# Signal readiness. Once the subscription is resolved and the watcher is live,
 # this watcher will deliver anything that arrives from here on, so it is safe
 # for a leader to start sending. Only exclusive (actas) watchers signal — a
 # spawned agent always starts its watcher in actas mode — and the sentinel is
@@ -1215,7 +1255,15 @@ fi
 if [ -n "$ACTIVE_NAME" ]; then
   while IFS=$'\t' read -r _rt _ra; do
     [ -z "$_rt" ] && continue
-    _rp="$(agmsg_ready_path "$_rt" "$_ra")"
+    # #1023 review: agmsg_ready_path fails (empty, rc 1) when both an
+    # id-keyed and a legacy sentinel exist for this pair. Checked explicitly
+    # -- an unchecked empty path here would silently drop the sentinel write
+    # (the redirect below fails quietly against ""), and a spawn.sh waiter
+    # would then just see a plain, unexplained status=timeout.
+    if ! _rp="$(agmsg_ready_path "$_rt" "$_ra")"; then
+      watch_log "warning: readiness sentinel path is ambiguous for '$_rt/$_ra' (both an id-keyed and a legacy sentinel exist); not signaling ready for this pair until the stale one is removed"
+      continue
+    fi
     # Stamp our session_id so cleanup (and a successor watcher) can tell whose
     # sentinel it is — keeps "present iff a live watcher is receiving" honest
     # across a quick actas restart. See #108 review.
@@ -1224,9 +1272,31 @@ if [ -n "$ACTIVE_NAME" ]; then
   done <<< "$PAIRS"
 fi
 
+# Re-assert this pane's name (#1044). Naming is an invariant, not an assignment
+# made once at a chosen place: measured across the nine agent types, no single
+# entry point covers them all — `actas` is reached by every type but does not
+# always know the session id yet, SessionStart fires at launch on claude-code
+# and on the first turn on codex and not at all on grok, the watcher exists only
+# where `monitor=yes`, and the per-turn hook is absent on hermes. So every entry
+# point that knows the session id asserts it, idempotently, and whichever
+# arrives first wins. This is the watcher's turn.
+#
+# Outside the `ACTIVE_NAME` block above on purpose: a broad watcher knows the
+# session id and its pairs just as well, and the requirement is about the pane
+# having a name, not about which mode the watcher is in.
+#
+# No record is written: holding the seat is `actas`'s claim to make, and a
+# watcher can be running for a seat it did not claim.
+if declare -F agmsg_terminal_name_self_safe >/dev/null 2>&1; then
+  while IFS=$'\t' read -r _nt _na; do
+    [ -z "$_nt" ] && continue
+    agmsg_terminal_name_self_safe "$SESSION_ID" "$_nt" "$_na" "$PROJECT_PATH" "$AGENT_TYPE" || true
+  done <<< "$PAIRS"
+fi
+
 # Pairs another session currently holds, so each departure and each return is
 # announced once instead of every cycle. Membership is not a decision -- the
-# lock is -- it only records what has already been said (#683).
+# lock is -- it only records what has already been said.
 #
 # Held as newline-separated entries and compared as EXACT strings, never as
 # patterns. A team name is arbitrary UTF-8 minus a path deny-list and an agent
@@ -1259,14 +1329,60 @@ _held_elsewhere_without() {
   printf '%s' "$out"
 }
 
+# fix 2 (#1045): a pair whose read cursor never advances while it still has pending
+# rows is STUCK -- delivery is failing every cycle and the failure is INVISIBLE: ps
+# shows a healthy process, the cursor is frozen, and stdout is silent. The symptom this
+# fixes is not "not delivered" but "not knowing it is not delivered". So count, per pair,
+# the number of CONSECUTIVE poll cycles the cursor stayed at the same value while a
+# pending batch waited -- an EVENT count, not elapsed time, which fires the same on a
+# slow and a fast machine (time would misfire on one and never fire on the other). At
+# the threshold, print WHY and exit. The report goes to STDOUT deliberately: the
+# watcher's stderr is /dev/null in every launcher we ship (#691) and the Monitor tool
+# surfaces only stdout as an event, so a reason on stderr would share the fate of the
+# delivery it reports on -- exactly the invisibility being fixed. It is a plain
+# "agmsg watch:" line, NOT the "ts | team | from -> to | body" delivery shape, so a
+# reader does not mistake it for a message. Exiting (rather than looping) makes "the
+# monitor stopped" visible; a watcher that ends without a reason cannot be told from a
+# crash (#983). The threshold is FIXED, not an env knob -- an empty/0/non-numeric knob
+# would silently disable the very guard against silence.
+STUCK_THRESHOLD=3
+# Exit status for a watcher that STOPS because delivery is unhealthy -- the store
+# read failed, or a cursor is wedged behind a pending batch. These print a reason
+# and exit, but the exit must not read as success: a supervisor or launcher that
+# only sees the process end would otherwise treat an unhealthy watcher as a clean
+# shutdown, indistinguishable from the intentional exits (install-changed,
+# session-ended, role-moved) that DO mean "done, nothing wrong". A defined
+# non-zero keeps "visible failure" visible at the process contract too. Distinct
+# from the startup exit 1 (usage / DB path / DB-open, #197) so "started, then
+# delivery broke" can be told from "never started"; the value matters only that
+# it is non-zero and stable, which the tests pin.
+_AGMSG_EXIT_DELIVERY_UNHEALTHY=75
+# The watcher was told to fold itself, released its role, and the pane is STILL
+# THERE. Distinct from 75 (delivery is unhealthy) because the operator's next
+# move is different: the placement record is deliberately left in place and
+# `despawn --force` works from it.
+_AGMSG_EXIT_TEARDOWN_INCOMPLETE=76
+# Per-pair tracker state and its map operations (_stuck_get/_stuck_set/
+# _stuck_drop). Kept in a sourced lib so the record framing -- which broke for
+# names with spaces once and must not again -- can be unit-tested away from this
+# script's poll loop; see lib/watch-stuck-map.sh for the data-structure contract.
+STUCK_MAP=""
+source "$SCRIPT_DIR/lib/watch-stuck-map.sh"
+
 # Self-managed renewal, for hosts that cap how long a watch may run (Claude Code's
-# Monitor kills one at 30 minutes and leaves no completion record). --max-seconds
-# is added only by the launch commands agmsg writes for that host; without it
-# the watcher never ends on its own. At the top of a cycle (nothing mid-delivery,
-# read cursor already consumed) past the limit it prints one line and exits 0:
-# "re-arm" when it delivered something this run or AGMSG_CC_MONITOR_KEEP_ALIVE is
-# non-empty, "stopping" otherwise. A re-armed watch resumes from the persistent
-# read cursor, so the gap loses nothing.
+# Monitor kills one at 30 minutes and leaves no completion record, which piles up
+# as "background shell command tasks did not finish" on every resume).
+# --max-seconds is added only by the launch commands agmsg writes for that host;
+# without it (every other caller) the watcher never ends on its own.
+# Shortly before the cap, at the top of a cycle (so nothing is mid-delivery and
+# the read cursor has already been consumed), the watcher decides for itself and
+# prints one line on stdout -- one notification per cycle:
+#   - it delivered something this run, or AGMSG_CC_MONITOR_KEEP_ALIVE is set:
+#     "agmsg watch: re-arm ..." naming the command and description to hand back
+#     to Monitor unchanged;
+#   - otherwise "agmsg watch: stopping ...": nothing to renew.
+# Then it exits 0. A restart resumes from the persistent read cursor, so the gap
+# before the host re-arms loses nothing.
 case "$WATCH_MAX_SECONDS" in ''|*[!0-9]*) WATCH_MAX_SECONDS="" ;; esac
 _WATCH_ELAPSED_BASE="${AGMSG_WATCH_ELAPSED_BASE:-0}"
 case "$_WATCH_ELAPSED_BASE" in ''|*[!0-9]*) _WATCH_ELAPSED_BASE=0 ;; esac
@@ -1274,9 +1390,123 @@ _WATCH_DELIVERED="${AGMSG_WATCH_DELIVERED_BASE:-0}"
 case "$_WATCH_DELIVERED" in ''|*[!0-9]*) _WATCH_DELIVERED=0 ;; esac
 unset AGMSG_WATCH_ELAPSED_BASE AGMSG_WATCH_DELIVERED_BASE
 
+# True only once agmsgd has actually taken over delivery for every pair this
+# watcher serves -- the same two reads actas-claim.sh/daemon.sh status use to
+# decide and report native delivery (daemon-state.sh's AGMSGD_HEALTH, role-
+# session.sh's messaging_socket field), reused rather than re-derived so this
+# can never disagree with what `delivery=native`/`daemon.sh status` already
+# told the seat.
+#
+# Native delivery is only ever claimed for an exclusive (actas) role (see
+# actas-claim.sh's own TYPE=claude-code, NAME-scoped gate) -- a broad watcher
+# (no ACTIVE_NAME) never has a role-session record to check, and must keep
+# renewing exactly as before.
+#
+# "Recorded" means agmsg_role_session_uuid for THIS pair equals this session's
+# own bare sid (not merely that some session claimed native once) -- a stale
+# record from a since-exited session must not stop a watcher that is this
+# seat's only remaining delivery path. AGMSGD_HEALTH=ready is re-checked every
+# call (not cached) so a daemon that stops after actas claimed native
+# correctly falls back to normal re-arming instead of leaving the seat with
+# neither channel.
+#
+# Beyond the bare sid match, this mirrors every other gate
+# claude-code-queue.mjs's createPending itself applies to the SAME record
+# before it will ever enqueue a nudge for this pair (follow-up to #1633
+# review: checking messaging_socket alone proved the record existed, not that
+# the daemon would actually treat it as addressable):
+#   - type must read "claude-code" (role_session_type_mismatch)
+#   - claude_config_dir must be non-empty, same as messaging_socket
+#     (messaging_destination_missing)
+#   - project must canonically match this watcher's own project
+#     (role_session_project_mismatch) -- agmsg_canonical_path is the same
+#     normalization actas-claim.sh applies before writing PROJECT_PHYS, so
+#     comparing against it here can never disagree with what was recorded.
+# team/agent identity mismatch (the mjs reader's own first check,
+# role_session_identity_mismatch) DOES need its own comparison here (review
+# round 2): being looked up BY (team, agent) only proves the FILENAME
+# encodes this pair -- the daemon's reader separately checks the record's own
+# team=/agent= CONTENT fields, which a corrupted or hand-edited record can
+# disagree with the name it is filed under. The shell getters have no
+# built-in enforcement of that either, so it is compared explicitly, the
+# same as every other field above.
+#
+# AGMSGD_DESIRED must also be `on`, not just HEALTH=ready (review, #1633):
+# during `daemon disable`, the intent flips to off before the still-running
+# owner finishes shutting down, so HEALTH can read `ready` for a window after
+# DESIRED already reads `off`. The queue this seat would otherwise rely on
+# (claude-code-queue.mjs createPending) refuses to enqueue at all once
+# desired != on, so stopping on HEALTH alone during that window would leave
+# the seat with no delivery path whatsoever -- exactly the failure this whole
+# check exists to avoid, just reached from the other direction (disable
+# in-flight instead of a dead executor).
+_agmsg_watch_native_delivery_active() {
+  [ "$AGENT_TYPE" = claude-code ] && [ -n "$ACTIVE_NAME" ] || return 1
+  declare -F agmsg_role_session_uuid >/dev/null 2>&1 || return 1
+  # Loaded only here: a watcher and its children otherwise never pay for it.
+  # shellcheck disable=SC1091
+  declare -F agmsg_daemon_read_state >/dev/null 2>&1 \
+    || { [ -r "$SCRIPT_DIR/lib/daemon-state.sh" ] && . "$SCRIPT_DIR/lib/daemon-state.sh"; } \
+    || return 1
+  local AGMSGD_DESIRED AGMSGD_HEALTH AGMSGD_REASON
+  agmsg_daemon_read_state
+  agmsg_daemon_apply_project_choice claude-code "$PROJECT_PATH"
+  [ "${AGMSGD_DESIRED:-}" = on ] && [ "${AGMSGD_HEALTH:-}" = ready ] || return 1
+  declare -F _agmsg_detect_platform >/dev/null 2>&1 && _agmsg_detect_platform
+  declare -F agmsg_claude_code_native_storage_ready >/dev/null 2>&1 || return 1
+  agmsg_claude_code_native_storage_ready || return 1
+  local bare_sid="$SESSION_ID"
+  if declare -F agmsg_instance_bare_sid >/dev/null 2>&1; then
+    bare_sid="$(agmsg_instance_bare_sid "$SESSION_ID")"
+  fi
+  [ -n "$bare_sid" ] || return 1
+  local _canon_project
+  _canon_project="$(agmsg_canonical_path "$PROJECT_PATH")"
+  [ -n "$_canon_project" ] || return 1
+  local _team _agent _any=0
+  while IFS=$'\t' read -r _team _agent; do
+    [ -z "$_team" ] && continue
+    _any=1
+    [ "$(agmsg_role_session_uuid "$_team" "$_agent" 2>/dev/null)" = "$bare_sid" ] || return 1
+    [ "$(agmsg_role_session_get "$_team" "$_agent" team 2>/dev/null)" = "$_team" ] || return 1
+    [ "$(agmsg_role_session_get "$_team" "$_agent" agent 2>/dev/null)" = "$_agent" ] || return 1
+    [ "$(agmsg_role_session_get "$_team" "$_agent" type 2>/dev/null)" = claude-code ] || return 1
+    [ -n "$(agmsg_role_session_get "$_team" "$_agent" messaging_socket 2>/dev/null)" ] || return 1
+    [ -n "$(agmsg_role_session_get "$_team" "$_agent" claude_config_dir 2>/dev/null)" ] || return 1
+    [ "$(agmsg_role_session_get "$_team" "$_agent" project 2>/dev/null)" = "$_canon_project" ] || return 1
+  done <<< "$PAIRS"
+  [ "$_any" -eq 1 ]
+}
+
+# What a stop message adds when this watch is the last thing delivering to a
+# session that agmsgd is not yet delivering to (#1848): agmsgd is on for this
+# project (chosen, or no choice recorded) but the native-delivery check fails
+# (no destination registered for this session, or agmsgd not ready), so once
+# the watch ends nothing delivers. The cause is not diagnosed here, only named. Prints nothing otherwise. Read only on
+# a stop path, once; it changes no stop condition.
+_agmsg_watch_agmsgd_note() {
+  [ "$AGENT_TYPE" = claude-code ] || return 0
+  declare -F agmsg_role_session_uuid >/dev/null 2>&1 || return 0
+  # shellcheck disable=SC1091
+  declare -F agmsg_daemon_read_state >/dev/null 2>&1 \
+    || { [ -r "$SCRIPT_DIR/lib/daemon-state.sh" ] && . "$SCRIPT_DIR/lib/daemon-state.sh"; } \
+    || return 0
+  # shellcheck disable=SC2034  # AGMSGD_REASON is set by the readers below, kept local
+  local AGMSGD_DESIRED AGMSGD_HEALTH AGMSGD_REASON
+  agmsg_daemon_read_state
+  agmsg_daemon_apply_project_choice claude-code "$PROJECT_PATH"
+  [ "${AGMSGD_DESIRED:-}" = on ] || return 0
+  _agmsg_watch_native_delivery_active && return 0
+  printf ' agmsgd is on for this project but is not delivering to this session yet (no destination registered for it, or agmsgd is not ready), so nothing will be delivered to it after this. Run /agmsg actas <name> (or restart this session) to register it, and /agmsg daemon status --all shows why if it still is not.'
+}
+
 _watch_renew_or_stop() {
   local elapsed=$((SECONDS + _WATCH_ELAPSED_BASE)) cmd desc arg
   [ "$elapsed" -ge "$WATCH_MAX_SECONDS" ] || return 0
+  if _agmsg_watch_native_delivery_active; then
+    watch_report "stopping - this seat's delivery has moved to agmsgd's native channel, so this watch is not re-armed"
+    exit 0
+  fi
   if [ "$_WATCH_DELIVERED" -gt 0 ] || [ -n "${AGMSG_CC_MONITOR_KEEP_ALIVE:-}" ]; then
     cmd="$(printf '%q' "$SCRIPT_DIR/watch.sh")"
     for arg in ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}; do
@@ -1288,7 +1518,7 @@ _watch_renew_or_stop() {
     [ -n "$ACTIVE_NAME" ] && [ -z "$TEAM_PIN" ] && desc="$desc (acting as $ACTIVE_NAME)"
     watch_report "re-arm - this watch is about to reach the host's time cap; invoke the Monitor tool again with command: $cmd description: $desc persistent: true timeout_ms: 1800000"
   else
-    watch_report "stopping - no messages were delivered in the last ${elapsed}s, so this watch is not re-armed (set AGMSG_CC_MONITOR_KEEP_ALIVE to keep it running)"
+    watch_report "stopping - no messages were delivered in the last ${elapsed}s, so this watch is not re-armed (set AGMSG_CC_MONITOR_KEEP_ALIVE to keep it running)$(_agmsg_watch_agmsgd_note)"
   fi
   exit 0
 }
@@ -1296,6 +1526,14 @@ _watch_renew_or_stop() {
 while true; do
   # Renewal point: see _watch_renew_or_stop above.
   [ -n "$WATCH_MAX_SECONDS" ] && _watch_renew_or_stop
+  # Advance the per-cycle cache epoch as a PLAIN STATEMENT (never via $(...) —
+  # see the actas-lock cache warming below for why): this is what lets
+  # _agmsg_partition_load's per-team driver cache (lib/storage.sh) reuse one
+  # cycle's answer across that cycle's several independent callers while
+  # still forcing a fresh read at the start of THIS new one, so a team
+  # migrated mid-run (internal/migrate-team-store.sh) is noticed within one
+  # extra cycle instead of never (#1330 second stage).
+  _AGMSG_POLL_CYCLE_EPOCH=$((_AGMSG_POLL_CYCLE_EPOCH + 1))
   # The installation changed under us (#684). _handle_install_changed execs
   # the new watch.sh in place once it can prove the generation is finished,
   # so the stream never visibly stops; its own exit paths still report on
@@ -1329,7 +1567,14 @@ while true; do
   # composite instance id is portable (Git Bash falls back to tasklist; see
   # _agmsg_pid_alive). Gated on a composite id only: a bare id (degraded, no
   # resolved agent pid) keeps the prior behavior and is not liveness-gated.
-  if agmsg_instance_is_composite "$SESSION_ID" && ! agmsg_instance_alive "$SESSION_ID"; then
+  # Exit only on a POSITIVE dead (rc 1). `! agmsg_instance_alive` was true for
+  # rc 2 as well, and rc 2 is "could not find out" — an unreadable `run/` made
+  # every watcher on the machine decide it was dead and exit, which is the same
+  # fleet-wide stop as #684's install guard by a different road. Cannot-tell is
+  # not a reason to stop; the next cycle asks again. (#983)
+  _sid_alive_rc=0
+  agmsg_instance_alive "$SESSION_ID" || _sid_alive_rc=$?
+  if agmsg_instance_is_composite "$SESSION_ID" && [ "$_sid_alive_rc" -eq 1 ]; then
     # Say which condition fired and which token it decided about (#692). The
     # guard is right; the silence is what costs. A watcher that stops here, one
     # that was killed, one that crashed early and one that was never started
@@ -1343,17 +1588,30 @@ while true; do
   [ "$WATCHDOG_INSTALL_PENDING" -eq 0 ] && maybe_run_watchdog
   while IFS=$'\t' read -r pair_team pair_agent; do
     [ -z "$pair_team" ] && continue
-    # Warm the actas-lock path cache as a PLAIN STATEMENT, never via $(...): a
+    # Warm both per-cycle caches as PLAIN STATEMENTS, never via $(...): a
     # command substitution forks a subshell, and a cache array populated
     # inside one is discarded the instant that subshell exits (the exact
     # hazard role-session.sh's own _agmsg_role_session_path_into documents,
-    # #466). Both consumers below (actas_lock_observe_cached and
-    # _pair_unchanged_since_read's actas_lock_read_cached) reach this cache
-    # through a $(...) of their own, so warming it here, in this loop's own
-    # top-level (non-subshell) frame, is what makes the warmth actually
-    # survive to the NEXT cycle instead of being rebuilt from scratch every
-    # single call (#1321 first-stage follow-up).
+    # #466). Every real consumer below (actas_lock_observe_cached,
+    # _pair_unchanged_since_read's actas_lock_read_cached, and every
+    # storage_* call this cycle that resolves this team's partition driver)
+    # reaches its own cache through a $(...) of its own, so warming both
+    # here, in this loop's own top-level (non-subshell) frame, is what makes
+    # the warmth actually survive WITHIN this cycle instead of being rebuilt
+    # from scratch on every single call (#1321 first stage; #1330 second
+    # stage for the partition-driver cache, scoped to
+    # _AGMSG_POLL_CYCLE_EPOCH rather than the process lifetime — see its own
+    # comment in lib/storage.sh for why). storage_init's OWN schema check
+    # is deliberately NOT cached this way: unlike the driver cache, its
+    # existing callers include tests and one-shot scripts that call it
+    # directly, more than once, without ever advancing the epoch -- an
+    # epoch-scoped cache there could not tell that repeat apart from a
+    # genuine same-cycle repeat, and would revive the #1001 regression this
+    # function's own fast path exists to avoid (verified: it broke "a
+    # revision mismatch runs the real init, and the stamp follows the
+    # schema").
     _actas_lock_primitives_into "$pair_team" "$pair_agent"
+    _agmsg_partition_load "$pair_team" >/dev/null 2>&1
     # Ownership is re-read every cycle, because it can change under a running
     # watcher and nothing else notices. The subscription set and the startup
     # lock check both happen once, above; a session that claims this role
@@ -1365,7 +1623,7 @@ while true; do
     # whoever polls first TAKES the row and the other sees nothing. When the
     # one that takes it is this stale process, its printf succeeds -- stdout is
     # still an open pipe to a live session -- so the id is marked read and the
-    # message is gone, delivered to a stream nobody is reading (#683).
+    # message is gone, delivered to a stream nobody is reading (#983).
     #
     # Only the lock file is read here, not the whole subscription set: losing a
     # pair is the half a running process can detect for the price of a file
@@ -1419,23 +1677,21 @@ EOF
           ;;
       esac
     fi
+    # Serve-or-skip, with the stuck-tracker drop tied to the skip (see _pair_gate
+    # in lib/watch-stuck-map.sh). held/nostore -> skip and the count is already
+    # forgotten; serve -> proceed. The transition logging stays here, keyed on the
+    # verdict, so it is announced once per transition, not once per cycle.
     _pair_gate "$pair_team" "$pair_agent" "$pair_state"
     case "$PAIR_VERDICT" in
       held:*)
         # Broad subscription: this watcher serves other roles too, so skip the
         # pair rather than ending the process -- exiting here would take down a
         # whole session's delivery because one of its roles moved elsewhere.
-        #
-        # Skipped FOR AS LONG AS someone else holds it, not permanently. When
-        # the holder goes away the lock reads free again and this watcher takes
-        # the pair back, which is the same rule the startup filter uses (a
-        # stale lock is free). Dropping it for good would be worse: the role is
-        # still registered to this project, so nobody would deliver for it
-        # until the session restarted.
-        #
-        # Announced on each transition, not each cycle -- a per-cycle message
-        # would bury the log, and announcing only the first time would make a
-        # second departure invisible.
+        # Skipped FOR AS LONG AS someone else holds it: when the holder goes away
+        # the lock reads free again and this watcher takes the pair back (a stale
+        # lock is free, the startup filter's rule). Announced on each transition,
+        # not each cycle, and not only the first time (a second departure must
+        # still be visible).
         if ! _held_elsewhere_has "${pair_team}/${pair_agent}"; then
           HELD_ELSEWHERE="${HELD_ELSEWHERE:+$HELD_ELSEWHERE
 }${pair_team}/${pair_agent}"
@@ -1541,23 +1797,10 @@ EOF
         _stuck_set "$_agmsg_pair_key" "$READ_CURSOR" "$_agmsg_n"
         ;;
       *)
-        # Free or ours. If we had stepped aside for it, say that we are taking
-        # it back -- otherwise the log shows a role leaving and never returning,
-        # which reads as a permanent drop.
-        if _held_elsewhere_has "${pair_team}/${pair_agent}"; then
-          HELD_ELSEWHERE="$(_held_elsewhere_without "${pair_team}/${pair_agent}")"
-          echo "agmsg watch: ${pair_team}/${pair_agent} is unheld again; serving it here." >&2
-        fi
+        _stuck_drop "$_agmsg_pair_key"
         ;;
     esac
     if [ "$_agmsg_has_new_message" -eq 1 ]; then
-    # This ROWS build runs on the OUT already fetched above for the
-    # stuck-tracker, not a fresh re-read: a message a concurrent sender
-    # inserts in the gap between that fetch and this point is not lost (§2.2
-    # never-skip still holds -- storage_watch_after's WHERE seq > cursor makes
-    # it turn up on the NEXT poll), just delivered up to one poll interval
-    # later than the old two-read version could have.
-    #
     # The quote is held in a variable, never written as \' in the pattern: bash 3.2
     # (macOS /bin/bash) keeps the backslash of a \' REPLACEMENT, so the inline form
     # doubles a quote into \'\' there while producing '' on bash 4+. Same shape as
@@ -1611,124 +1854,145 @@ EOF
       ROWS=""
     fi
 
-    # Deliver (#983): re-verify at the act, immediately before the print
-    # loop -- not before the ROWS build above, which can take real wall-clock
-    # time for a large body (a 200000-byte body took ~25s under macOS's stock
-    # bash 3.2's slow parameter-substitution escaping, review-measured). A
-    # check any earlier than this leaves a window, between "ownership
-    # confirmed" and this session actually writing to stdout, wide enough for
-    # the role to change hands mid-build -- exactly the exposure #983 exists
-    # to close. Checked ONCE here rather than per row: the loop's harm is a
-    # stranger's message appearing on this session's stdout, which is visible
-    # and leaves the row unread -- recoverable, unlike consuming it (the idle
-    # path's own consume, and this same batch's cursor-row consume below, get
-    # their own re-check immediately before them too, since consuming is not
-    # recoverable the same way).
+    # Deliver (#983): re-verify at the act, like the two below. Checked ONCE here
+    # rather than per row, and that is a deliberate trade rather than an oversight:
+    # the loop's harm is a stranger's message appearing on this session's stdout,
+    # which is visible and leaves the row unread — recoverable, unlike consuming it
+    # or folding on it. A lock read per row would buy a narrower window at a file
+    # read per message; the two acts whose damage is permanent get their own check
+    # immediately before them.
     _pair_verdict=0
     _pair_unchanged_since_read "$pair_team" "$pair_agent" "$pair_owner" || _pair_verdict=$?
     if [ "$_pair_verdict" -ne 0 ]; then
       _report_pair_refusal "$_pair_verdict" "$pair_team" "$pair_agent" "delivery"
       continue
     fi
-
-      while IFS=$'\x1f' read -r kind id ts team from to body cursor; do
-        [ -z "$kind" ] && continue
-        if [ "$kind" = "cursor" ]; then
-          # Trailing cursor = the resume point. Advance + persist the session
-          # watermark, then -- re-verified immediately before, mirroring the
-          # idle path's own consume below -- advance THIS pair's stored
-          # read_cursors frontier too. That second act used to be missing here:
-          # with nothing ever consuming it on this path, storage_read_cursor_get
-          # kept returning the same value next poll, storage_watch_after
-          # re-returned the same rows, and the stuck-cursor guard above fired
-          # and exited after STUCK_THRESHOLD polls on every pair that ever
-          # received a message -- independent of batch size, despite the
-          # #1045/#777 wording in that guard's message.
-          LAST="$cursor"; persist_watermark
-          _pair_verdict=0
-          _pair_unchanged_since_read "$pair_team" "$pair_agent" "$pair_owner" || _pair_verdict=$?
-          if [ "$_pair_verdict" -ne 0 ]; then
-            _report_pair_refusal "$_pair_verdict" "$pair_team" "$pair_agent" "marking them read"
-          else
-            storage_read_cursor_consume "$pair_team" "$pair_agent" "$cursor" >/dev/null 2>&1 || true
-          fi
+    FINAL_CURSOR=""
+    DELIVERED_IDS=()
+    DESPAWN_TARGET=""
+    while IFS=$'\x1f' read -r kind id ts team from to body cursor; do
+      [ -z "$kind" ] && continue
+      if [ "$kind" = "cursor" ]; then
+        FINAL_CURSOR="$cursor"
+        continue
+      fi
+      [ "$kind" = "message_sent" ] || continue
+      # An empty id (sender-side UUID generation failed) must not drop the row:
+      # the printed line uses ts/team/from/to/body, and the cursor row advances
+      # the frontier by seq, not by id.
+      [ -z "$id" ] && watch_log "message from $from to $to has no id (sender-side id generation failed); delivered anyway"
+      # Control message: a leader's `despawn` sends `ctrl:despawn` to this
+      # role. Tear ourselves down rather than printing it — drop the role
+      # (releases the lock + registration) then close our own tmux pane,
+      # which also ends the agent CLI sharing it. Deterministic teardown, no
+      # dependence on the agent LLM noticing the message. See #109.
+      if [ "$body" = "ctrl:despawn" ]; then
+        [ -n "$id" ] && DELIVERED_IDS+=("$id")
+        # Only an EXCLUSIVE watcher dedicated to exactly this role tears
+        # itself down. A broad-subscription watcher (e.g. a leader whose
+        # default watcher subscribes to every project role, including the
+        # despawn target) must NOT act on it — its $TMUX_PANE is the leader's
+        # own pane, so killing it would take down the leader's session. The
+        # spawned member's watcher runs in actas mode (ACTIVE_NAME=$to) in its
+        # own pane; that's the one meant to respond. A broad watcher `continue`s
+        # and consumes the control row without acting. An exclusive target
+        # consumes up to the control row before teardown.
+        if [ -z "$ACTIVE_NAME" ] || [ "$to" != "$ACTIVE_NAME" ]; then
           continue
         fi
-        [ "$kind" = "message_sent" ] || continue
-        # An empty id (sender-side UUID generation failed) must not drop the
-        # row: nothing below reads id -- the printed line uses ts/team/from/
-        # to/body, and the cursor row (separate branch above) advances the
-        # frontier by seq, not by id.
-        [ -z "$id" ] && watch_log "message from $from to $to has no id (sender-side id generation failed); delivered anyway"
-        # Control message: a leader's `despawn` sends `ctrl:despawn` to this
-        # role. Tear ourselves down rather than printing it — drop the role
-        # (releases the lock + registration) then close our own tmux pane,
-        # which also ends the agent CLI sharing it. Deterministic teardown, no
-        # dependence on the agent LLM noticing the message. See #109.
-        if [ "$body" = "ctrl:despawn" ]; then
-          # Only an EXCLUSIVE watcher dedicated to exactly this role tears
-          # itself down. A broad-subscription watcher (e.g. a leader whose
-          # default watcher subscribes to every project role, including the
-          # despawn target) must NOT act on it — its $TMUX_PANE is the leader's
-          # own pane, so killing it would take down the leader's session. The
-          # spawned member's watcher runs in actas mode (ACTIVE_NAME=$to) in its
-          # own pane; that's the one meant to respond. A broad watcher `continue`s
-          # and reaches the trailing cursor at batch end, so its watermark advances
-          # past this control message. The target watcher below exits BEFORE the
-          # cursor record, so it does not persist a cursor — harmless, since it
-          # drops the role and won't resume as it; a same-session resume would
-          # re-read the despawn (at-least-once) and re-tear-down idempotently. See #109.
-          if [ -z "$ACTIVE_NAME" ] || [ "$to" != "$ACTIVE_NAME" ]; then
-            continue
-          fi
-          # Read the placement record BEFORE reset.sh. reset.sh releases the
-          # actas lock, and the leader's despawn deletes the record as soon as
-          # it observes that lock go free — so reading it afterwards races the
-          # cleanup and would intermittently see nothing.
-          placed_id=""
-          spawn_rec="$(agmsg_spawn_path "$team" "$to")"
-          [ -f "$spawn_rec" ] && IFS=$'\t' read -r placed_id _ _ < "$spawn_rec"
-          # This branch exits before the batch's trailing cursor row, so consume
-          # up to THIS row here; otherwise a later watcher for the same role
-          # re-reads the despawn and tears itself down.
-          if [ -n "$cursor" ] && [ -n "$id" ]; then
-            _pair_verdict=0
-            _pair_unchanged_since_read "$pair_team" "$pair_agent" "$pair_owner" || _pair_verdict=$?
-            if [ "$_pair_verdict" -ne 0 ]; then
-              _report_pair_refusal "$_pair_verdict" "$pair_team" "$pair_agent" "marking the despawn read"
-              continue
-            fi
-            storage_read_cursor_consume "$pair_team" "$pair_agent" "$cursor" "$id" >/dev/null 2>&1 || true
-          fi
-          # This control row is an internal teardown; scope reset to its message team.
-          "$SCRIPT_DIR/reset.sh" --team "$team" "$PROJECT_PATH" "$AGENT_TYPE" "$to" "$SESSION_ID" >/dev/null 2>&1 || true
-          if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
-            tmux kill-pane -t "$TMUX_PANE" 2>/dev/null || true
-          # Closing a herdr pane needs more than "a pane id is in the
-          # environment". HERDR_* is inherited by every descendant of a herdr
-          # pane, so a watcher merely STARTED inside one — a developer running
-          # the test suite, or any agent that actas'd by hand — carries the
-          # HOST pane's id. Acting on that closes the host. Require both the
-          # full herdr environment (matching spawn's own detection) and proof
-          # that agmsg itself placed this pane: the recorded placement for this
-          # (team, agent) must name exactly the pane we are sitting in.
-          # Otherwise fall through to the manual branch. This is the herdr
-          # counterpart of the tmux path's ACTIVE_NAME gating (#109).
-          elif [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] \
-               && [ "$placed_id" = "herdr:$HERDR_PANE_ID" ] \
-               && command -v herdr >/dev/null 2>&1; then
-            herdr pane close "$HERDR_PANE_ID" 2>/dev/null || true
-          else
-            echo "agmsg watch: despawned '$to' (role dropped); close this window manually" >&2
-          fi
-          exit 0
-        fi
-        if ! printf '%s | %s | %s → %s | %s\n' "$ts" "$team" "$from" "$to" "$body"; then
-          cleanup
-          exit 0
-        fi
-        _WATCH_DELIVERED=$((_WATCH_DELIVERED + 1))
-      done <<< "$ROWS"
+        DESPAWN_TARGET="$to"
+        # Stop at the control row: rows after it belong to whoever holds the role
+        # next, so only the rows up to here are consumed below.
+        [ -n "$cursor" ] && FINAL_CURSOR="$cursor"
+        break
+      fi
+      if ! printf '%s | %s | %s → %s | %s\n' "$ts" "$team" "$from" "$to" "$body"; then
+        cleanup
+        exit 0
+      fi
+      _WATCH_DELIVERED=$((_WATCH_DELIVERED + 1))
+      [ -n "$id" ] && DELIVERED_IDS+=("$id")
+    done <<< "$ROWS"
+    # Second test seam, parked BETWEEN delivery and consume. One barrier cannot
+    # reach the consume guard: the deliver check runs first and `continue`s, so a
+    # claim landing before delivery never gets as far as the consume. That is not
+    # the consume guard being dead — it covers a claim landing DURING the delivery
+    # loop, a narrower window the first seam cannot express — but it does mean the
+    # guard needs its own seam to be provable. Measured: with only the first
+    # barrier, deleting the consume guard left every test green.
+    if [ -n "${AGMSG_TEST_CONSUME_BARRIER:-}" ]; then
+      : > "$AGMSG_TEST_CONSUME_BARRIER.reached"
+      _agmsg_consume_barrier_waited=0
+      while [ ! -e "$AGMSG_TEST_CONSUME_BARRIER.release" ]; do
+        sleep 0.05
+        _agmsg_consume_barrier_waited=$((_agmsg_consume_barrier_waited + 1))
+        [ "$_agmsg_consume_barrier_waited" -ge 1200 ] && break   # 60s, see above
+      done
+    fi
+    if [ -n "$FINAL_CURSOR" ]; then
+      # Consume (#983): the permanent one. Advancing the read frontier removes
+      # these rows from the RIGHTFUL owner's unread set for good — there is no
+      # "unread again". So the pair is re-verified immediately before it, and a
+      # pair that changed hands is left entirely alone: no consume, no cursor
+      # advance, so the session that now owns it still sees everything.
+      _pair_verdict=0
+      _pair_unchanged_since_read "$pair_team" "$pair_agent" "$pair_owner" || _pair_verdict=$?
+      if [ "$_pair_verdict" -ne 0 ]; then
+        _report_pair_refusal "$_pair_verdict" "$pair_team" "$pair_agent" "marking them read"
+        continue
+      fi
+      # Bash 3 with `set -u` treats an empty array expansion as unbound. A
+      # cursor-only page is valid, so advance it without optional IDs in that
+      # case (and preserve exact delivered IDs when there are any).
+      if [ "${#DELIVERED_IDS[@]}" -gt 0 ]; then
+        storage_read_cursor_consume "$pair_team" "$pair_agent" "$FINAL_CURSOR" \
+          "${DELIVERED_IDS[@]}" >/dev/null 2>&1 || true
+      else
+        storage_read_cursor_consume "$pair_team" "$pair_agent" "$FINAL_CURSOR" \
+          >/dev/null 2>&1 || true
+      fi
+    fi
+    # Third test seam, parked between consume and the fold. Seams follow GUARDS,
+    # not acts: a guard for act N is only exercised by a scenario that passes
+    # N-1's guard and stops at N's, so the interference has to land BETWEEN them.
+    # Measured, twice: with one seam the consume guard never ran; with two, the
+    # fold guard never ran either — the deliver guard `continue`s first, so a
+    # claim landing before delivery reaches neither. Deleting the fold guard left
+    # its own test green.
+    if [ -n "${AGMSG_TEST_FOLD_BARRIER:-}" ]; then
+      : > "$AGMSG_TEST_FOLD_BARRIER.reached"
+      _agmsg_fold_barrier_waited=0
+      while [ ! -e "$AGMSG_TEST_FOLD_BARRIER.release" ]; do
+        sleep 0.05
+        _agmsg_fold_barrier_waited=$((_agmsg_fold_barrier_waited + 1))
+        [ "$_agmsg_fold_barrier_waited" -ge 1200 ] && break   # 60s, see above
+      done
+    fi
+    if [ -n "$DESPAWN_TARGET" ]; then
+      # The hardest act to undo, so it is verified last-moment (#983). A
+      # `ctrl:despawn` is sent at exactly the moment a role changes hands, which
+      # is precisely when the state read at the top of this turn is most likely to
+      # be stale — folding on a stranger's instruction would drop OUR role and
+      # close OUR pane. Say why on stderr and keep running: the pair is simply not
+      # ours any more, which the gate will act on next turn.
+      _pair_verdict=0
+      _pair_unchanged_since_read "$pair_team" "$pair_agent" "$pair_owner" || _pair_verdict=$?
+      if [ "$_pair_verdict" -ne 0 ]; then
+        _report_pair_refusal "$_pair_verdict" "$pair_team" "$pair_agent" "its ctrl:despawn"
+        DESPAWN_TARGET=""
+        continue
+      fi
+      "$SCRIPT_DIR/reset.sh" --team "$pair_team" "$PROJECT_PATH" "$AGENT_TYPE" "$DESPAWN_TARGET" "$SESSION_ID" >/dev/null 2>&1 || true
+      # The status is used, not discarded: 1 means a pane of ours is still open.
+      # Nothing here deletes the placement record — that is what `--force` works
+      # from, and the caller now reads its presence rather than assuming.
+      _close_rc=0
+      close_own_placement "$pair_team" "$DESPAWN_TARGET" || _close_rc=$?
+      if [ "$_close_rc" -eq 1 ]; then
+        exit "$_AGMSG_EXIT_TEARDOWN_INCOMPLETE"
+      fi
+      exit 0
+    fi
     elif [ -n "$OUT" ]; then
       # No new message for THIS pair, but storage_watch_after's trailing
       # "cursor" line (present on every call, caught-up pair or not, because
@@ -1754,7 +2018,10 @@ EOF
           FINAL_CURSOR="${FINAL_CURSOR%%'"'*}"
           ;;
       esac
-      if [ -n "$FINAL_CURSOR" ]; then
+      # With no delivered IDs and an unchanged frontier, consume would only
+      # take a write transaction to store MAX(position, position). Re-read the
+      # frontier next cycle as usual; only a changed cursor needs consuming.
+      if [ -n "$FINAL_CURSOR" ] && [ "$FINAL_CURSOR" != "$READ_CURSOR" ]; then
         # Consume (#983): the same re-verification the heavy path above does
         # immediately before advancing the read frontier — a pair that
         # changed hands is left entirely alone, cursor included, so the
@@ -1773,6 +2040,6 @@ EOF
   # Run sleep in the background and `wait` for it so signal traps fire
   # immediately. Bash defers traps while a foreground builtin like `sleep`
   # is blocking, which would otherwise delay shutdown by up to $INTERVAL.
-  sleep "$INTERVAL" 19>&- &
+  sleep "$INTERVAL" 3>&- 4>&- 19>&- &
   wait $! 2>/dev/null
 done

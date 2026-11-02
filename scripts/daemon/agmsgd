@@ -1,0 +1,293 @@
+#!/usr/bin/env node
+// agmsgd's entrypoint, executed by agmsgd-launch.sh.
+//
+// FIXED BOOTSTRAP, on purpose, same reasoning as agmsgd-launch.sh: this
+// file does NOT import any other scripts/daemon/*.mjs module until AFTER
+// it has, itself, under the install-op lock, confirmed (1) an install
+// generation exists, (2) ITS OWN bytes are exactly what the completion
+// record says they should be, (3) its own BOOTSTRAP_VERSION matches the
+// record, and (4) the full scripts/ tree matches the record too. Every
+// check below is therefore self-contained -- duplicated, deliberately,
+// from lifecycle.mjs's own digest logic rather than importing it, because
+// importing it would be importing "another module" before step 4 has
+// even run. Step 4 reports a mismatch (see recordVerifyProblems) rather than
+// stopping on it; steps 1-3 still stop the start.
+//
+// install.sh extracts this exact line (`^const BOOTSTRAP_VERSION = `,
+// PR 2, 2026-09-29) and cross-checks it against agmsgd-launch.sh's own
+// `^BOOTSTRAP_VERSION=` line before writing either into the completion
+// record's bootstrap_version field.
+const BOOTSTRAP_VERSION = 2;
+
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
+
+// Set once installRoot/dbPath are known in main(), below. Every fail()
+// before that point (an argv usage error) has nothing to record against and
+// nothing to lose by skipping it -- that path only fires when something
+// other than agmsgd-launch.sh invokes this file wrong.
+let failureDbPath;
+
+// Best-effort, same convention as main.mjs's own startup-declined insert and
+// agmsgd-launch.sh's _agmsgd_launch_record_attempt: status.mjs's
+// daemon_start_attempts read is what turns this into the reason a user
+// actually sees from `agmsg daemon start`/`status` instead of the generic
+// "executor or control socket unavailable" fallback. A reader that can't see
+// this row falls back to that generic text, never a crash here -- recording
+// it is strictly additive to what daemon_start_attempts already offers for
+// every OTHER kind of start failure.
+function recordStartAttempt(reason) {
+  if (!failureDbPath) return;
+  let db;
+  try {
+    db = new DatabaseSync(failureDbPath);
+    db.exec("PRAGMA busy_timeout = 2000;");
+    db.prepare("INSERT INTO daemon_start_attempts (at, reason, executor_pid) VALUES (?, ?, ?)").run(
+      new Date().toISOString(),
+      reason,
+      process.pid,
+    );
+  } catch {
+    /* best-effort */
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
+function fail(code, message) {
+  recordStartAttempt(message);
+  process.stderr.write(`agmsgd: ${message}\n`);
+  process.exit(code);
+}
+
+// Lists the regular files under scripts/. A symlink is not followed or
+// listed; it is returned in `links` so the caller can report it.
+function collectScriptFiles(installRoot) {
+  const files = [];
+  const links = [];
+  const root = join(installRoot, "scripts");
+  function walk(dir, relPrefix) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const abs = join(dir, entry.name);
+      const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+      if (entry.isSymbolicLink()) links.push(rel);
+      else if (entry.isDirectory()) walk(abs, rel);
+      else if (entry.isFile()) files.push(rel);
+    }
+  }
+  walk(root, "scripts");
+  files.sort();
+  return { files, links };
+}
+
+const VERIFY_WARNING_PREFIX = "install-verify-warning.";
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+// Leaves the scripts/ mismatches where `agmsg daemon status` reads them, in a
+// file named for THIS process's pid. One file per pid, because this runs before
+// ownership is claimed: a second agmsgd that loses the claim must not overwrite
+// or remove what the running one left. Files of processes that are gone are
+// removed here, so a clean start leaves nothing behind. Also printed to stderr
+// (the resident manager's log). Best-effort: a failure never stops the start.
+function recordVerifyProblems(installRoot, problems) {
+  const dir = join(installRoot, "run");
+  try {
+    for (const name of readdirSync(dir)) {
+      const m = /^install-verify-warning\.(\d+)\.json$/.exec(name);
+      if (m && Number(m[1]) !== process.pid && !processAlive(Number(m[1]))) rmSync(join(dir, name), { force: true });
+    }
+    if (problems.length === 0) return;
+    const summary = problems.map((p) => `${p.kind}: ${p.path}`).join(", ");
+    process.stderr.write(`agmsgd: continuing; scripts/ does not match the completion record (${summary})\n`);
+    mkdirSync(dir, { recursive: true });
+    const target = join(dir, `${VERIFY_WARNING_PREFIX}${process.pid}.json`);
+    const tmp = `${target}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString(), problems })}\n`);
+    renameSync(tmp, target);
+  } catch (error) {
+    process.stderr.write(`agmsgd: could not record the scripts/ mismatch: ${error.message}\n`);
+  }
+}
+
+function sha256File(installRoot, relPath) {
+  return createHash("sha256").update(readFileSync(join(installRoot, relPath))).digest("hex");
+}
+
+function verifyInstallGeneration(installRoot, { incompleteOperationPath, manifestPath, dbPath, includeSchema = false }) {
+  if (existsSync(incompleteOperationPath)) {
+    fail(75, "an install or uninstall operation is incomplete; recover it before starting agmsgd");
+  }
+
+  if (!existsSync(manifestPath)) {
+    fail(0, "no completion record -- install.sh needs to run again");
+  }
+  const manifestText = readFileSync(manifestPath, "utf8");
+  const manifest = JSON.parse(manifestText);
+
+  const selfPath = "scripts/daemon/agmsgd";
+  const selfEntry = manifest.files.find((f) => f.path === selfPath);
+  if (!selfEntry) fail(75, `completion record has no entry for ${selfPath}`);
+  const selfDigest = sha256File(installRoot, selfPath);
+  if (selfDigest !== selfEntry.digest) {
+    fail(75, "this file's own digest does not match the completion record");
+  }
+
+  if (manifest.bootstrap_version !== BOOTSTRAP_VERSION) {
+    fail(75, `bootstrap version mismatch: this file is ${BOOTSTRAP_VERSION}, record has ${manifest.bootstrap_version}`);
+  }
+
+  const installDb = new DatabaseSync(dbPath, { readOnly: true });
+  installDb.exec("PRAGMA busy_timeout = 5000;");
+  let recordedInstallId;
+  try {
+    recordedInstallId = installDb.prepare("SELECT install_id FROM meta").get().install_id;
+  } finally {
+    installDb.close();
+  }
+  if (recordedInstallId !== manifest.install_id) {
+    fail(75, `install_id mismatch: install.db has ${recordedInstallId ?? "(none)"}, manifest has ${manifest.install_id}`);
+  }
+
+  if (manifest.digest_algo !== "sha256") {
+    fail(75, `unsupported digest_algo: ${manifest.digest_algo}`);
+  }
+  // A scripts/ tree that does not match the record (a file missing, a file the
+  // record does not list, a file whose bytes differ, a symlink) is reported,
+  // not fatal: one stray file such as .DS_Store must not stop delivery. The
+  // problems are returned so main() can leave them where `agmsg daemon
+  // status` shows them. The checks above (this file's own digest, bootstrap
+  // version, install_id, digest_algo) still stop the start.
+  const problems = [];
+  let onDisk = [];
+  try {
+    const found = collectScriptFiles(installRoot);
+    onDisk = found.files;
+    for (const path of found.links) problems.push({ kind: "symlink", path });
+  } catch (error) {
+    problems.push({ kind: "unreadable", path: "scripts/", detail: error.message });
+  }
+  const expected = [...manifest.files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const onDiskSet = new Set(onDisk);
+  const expectedSet = new Set(expected.map((f) => f.path));
+  for (const { path } of expected) if (!onDiskSet.has(path)) problems.push({ kind: "missing", path });
+  for (const path of onDisk) if (!expectedSet.has(path)) problems.push({ kind: "unexpected", path });
+  for (const { path, digest } of expected) {
+    if (!onDiskSet.has(path)) continue;
+    try {
+      if (sha256File(installRoot, path) !== digest) problems.push({ kind: "digest_mismatch", path });
+    } catch (error) {
+      problems.push({ kind: "unreadable", path, detail: error.message });
+    }
+  }
+
+  const schemaText = includeSchema
+    ? readFileSync(join(dirname(fileURLToPath(import.meta.url)), "schema.sql"), "utf8")
+    : undefined;
+  return { manifest, manifestText, schemaText, problems };
+}
+
+async function main() {
+  const [installRoot, desired, opGenStr] = process.argv.slice(2);
+  if (!installRoot || !desired || !opGenStr) {
+    fail(75, "usage: agmsgd <installRoot> <desired> <opGen> (only agmsgd-launch.sh should invoke this)");
+  }
+  const expectedOpGen = Number(opGenStr);
+
+  const lockPath = join(installRoot, "run", "install-op.lock.db");
+  const incompleteOperationPath = join(installRoot, "run", "install-op-incomplete.json");
+  const manifestPath = join(installRoot, "run", "install-manifest.json");
+  const dbPath = join(installRoot, "run", "install.db");
+  failureDbPath = dbPath;
+
+  const lockDb = new DatabaseSync(lockPath);
+  lockDb.exec("BEGIN EXCLUSIVE;");
+  let verified;
+  let mainModule;
+  let openInstallDb;
+  try {
+    verified = verifyInstallGeneration(installRoot, { incompleteOperationPath, manifestPath, dbPath, includeSchema: true });
+    // Before the rest of the component is imported: a mismatch that breaks the
+    // import (a missing module) must still have left its reason for status.
+    recordVerifyProblems(installRoot, verified.problems);
+
+    // All checks passed -- now, and only now, import the rest of this
+    // component. main.mjs's own module graph (owner/control/lifecycle/
+    // log/status) is loaded here, still under the lock; release it only
+    // after the component is fully loaded.
+    try {
+      mainModule = await import("./main.mjs");
+      ({ openInstallDb } = await import("./db.mjs"));
+    } catch (error) {
+      // Not a new stop: the import failing was already fatal. When scripts/ did
+      // not match the record, say so in the start attempt `agmsg daemon status`
+      // shows for a daemon that is not running, instead of an unhandled error.
+      if (verified.problems.length === 0) throw error;
+      const summary = verified.problems.map((p) => `${p.kind}: ${p.path}`).join(", ");
+      fail(1, `could not load agmsgd; scripts/ does not match the completion record (${summary}): ${error.message}`);
+    }
+  } finally {
+    lockDb.exec("COMMIT;");
+    lockDb.close();
+  }
+
+  async function prepareClaim() {
+    let claimLock;
+    try {
+      claimLock = new DatabaseSync(lockPath);
+      claimLock.exec("BEGIN EXCLUSIVE;");
+    } catch (error) {
+      claimLock?.close();
+      fail(75, `cannot recheck install state before daemon ownership claim: ${error.message}`);
+    }
+    let handedOff = false;
+    try {
+      const current = verifyInstallGeneration(installRoot, { incompleteOperationPath, manifestPath, dbPath });
+      if (current.manifestText !== verified.manifestText) {
+        fail(75, "install generation changed before daemon ownership claim");
+      }
+      // Use the shared bounded wait for CLI readers racing owner updates.
+      const db = openInstallDb(dbPath);
+      const release = () => {
+        try {
+          claimLock.exec("COMMIT;");
+        } finally {
+          claimLock.close();
+        }
+      };
+      handedOff = true;
+      return { db, release };
+    } finally {
+      if (!handedOff) {
+        claimLock.exec("COMMIT;");
+        claimLock.close();
+      }
+    }
+  }
+
+  await mainModule.main(null, {
+    installRoot,
+    manifest: verified.manifest,
+    manifestText: verified.manifestText,
+    expectedDesired: desired,
+    expectedOpGen,
+    version: verified.manifest.version,
+    prepareClaim,
+  });
+}
+
+main();

@@ -263,6 +263,79 @@ release_delayed_watch() {
   [ "$t" = "1" ]
 }
 
+# #1429: a shared, git-tracked hooks_file (e.g. a team's own .codex/hooks.json)
+# used to get an unconditional rewrite on every `set` call even when the
+# registration content was already unchanged -- a new temp file, minified to
+# one line, replacing the original via mv regardless of whether anything
+# differed. That defeated a chmod-a-w protection the file's owner set up on
+# purpose, and forced Codex to re-ask for hook-trust review on every call
+# because the file's hash kept changing.
+#
+# The file on disk is reformatted BY HAND before the second `set` call,
+# holding the exact same registration under different bytes AND different
+# object key order (`jq -S`, plus blank lines top/bottom no reindent step
+# would reproduce). Two things broke on earlier cuts of this fix, both
+# review findings, both covered here:
+#   - comparing by reindenting <tmp> to <path>'s indentation and then
+#     diffing raw bytes: a hand-formatted file that never matches
+#     json_pretty's own layout never compared equal, so it got rewritten
+#     once regardless of content (review round 1).
+#   - comparing via sqlite's plain json(): a compact rendering, but NOT
+#     canonical on object key order -- `json('{"a":1,"b":2}')` and
+#     `json('{"b":2,"a":1}')` are unequal strings in sqlite -- so a
+#     key-reordered file (e.g. hand-edited through `jq -S`) still compared
+#     "different" even though its content was identical (review round 2).
+# `set` must leave a content-identical file completely untouched, bytes AND
+# permission mode, no matter how it is formatted or how its keys are
+# ordered on disk.
+#
+# The same test then goes on to force a GENUINE content change (`set off`,
+# which strips the registration this fixture has none of otherwise) and
+# confirms the opposite: the file DOES get rewritten, and its permission
+# mode (640, set on the hand-formatted file above) survives that real
+# rewrite -- review round 2 also found the mode-restore step silently
+# swallowed a failed read of the original mode and a failed chmod after the
+# write, either of which could leave a real rewrite at the wrong mode with
+# exit 0.
+@test "delivery set monitor (codex): a hand-formatted, key-reordered hooks_file with the same registration already present is left untouched, and a genuine change still preserves its mode (#1429)" {
+  local hooks_file="$TEST_PROJECT/.codex/hooks.json"
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT"
+  [ -f "$hooks_file" ]
+
+  # jq -S sorts every object's keys (matcher/hooks, inner type/command...)
+  # into an order strip->add never rebuilds; --indent 4 plus blank lines
+  # top/bottom is a layout no indent-matching reindent step could
+  # reproduce either -- same content, different bytes and different key
+  # order.
+  { echo; jq -S --indent 4 '.' "$hooks_file"; echo; } > "$hooks_file.tmp"
+  mv "$hooks_file.tmp" "$hooks_file"
+  chmod 640 "$hooks_file"
+
+  local before_bytes before_mode
+  before_bytes="$(cat "$hooks_file")"
+  before_mode="$(file_mode "$hooks_file")"
+
+  run bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+
+  local after_bytes after_mode
+  after_bytes="$(cat "$hooks_file")"
+  after_mode="$(file_mode "$hooks_file")"
+  [ "$before_bytes" = "$after_bytes" ]
+  [ "$before_mode" = "$after_mode" ]
+
+  # Now force a genuine content change and confirm the rewrite happens
+  # (content differs) but the file's permission mode is still the one set
+  # above, not mktemp's.
+  run bash "$SCRIPTS/delivery.sh" set off codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  local changed_bytes changed_mode
+  changed_bytes="$(cat "$hooks_file")"
+  changed_mode="$(file_mode "$hooks_file")"
+  [ "$changed_bytes" != "$after_bytes" ]
+  [ "$changed_mode" = "640" ]
+}
+
 # --- mode transitions ---
 
 @test "delivery: turn -> monitor swaps hooks cleanly" {
@@ -295,6 +368,62 @@ release_delayed_watch() {
   local p
   p=$(sqlite_mem "SELECT json_extract(readfile('$(rf "$(settings_file)")'), '\$.permissions.allow[0]');")
   [ "$p" = "Bash" ]
+}
+
+@test "delivery set: does not strip a project's OWN hook merely because its command contains the skill name (#1038)" {
+  # A project's own SessionStart hook, named after the tool it cooperates
+  # with -- a natural convention, and exactly what used to trigger this:
+  # ownership was decided by instr(command, SKILL_NAME), a substring match
+  # on the bare skill name, not by the exact install path agmsg actually
+  # writes. Derived from $SCRIPTS, not hardcoded as "agmsg": the test
+  # harness copies the skill into a mktemp -d directory (test_helper.bash),
+  # so the real SKILL_NAME a running delivery.sh sees here is that
+  # directory's own basename, never the literal word "agmsg" -- a fixture
+  # hardcoding "agmsg" would pass whether or not the fix was in place, and
+  # say nothing.
+  local skill_name
+  skill_name="$(basename "$(dirname "$SCRIPTS")")"
+  mkdir -p "$TEST_PROJECT/.claude"
+  printf '%s' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"'"$TEST_PROJECT"'/scripts/'"$skill_name"'-my-wrapper.sh"}]}]}}' \
+    > "$(settings_file)"
+
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+
+  # The project's own hook survived the strip...
+  grep -q "${skill_name}-my-wrapper.sh" "$(settings_file)"
+  # ...and agmsg's own entry landed alongside it, not instead of it.
+  has_session_start "$(settings_file)"
+  local n
+  n=$(sqlite_mem "SELECT count(*) FROM json_each(json_extract(readfile('$(rf "$(settings_file)")'), '\$.hooks.SessionStart'));")
+  [ "$n" -eq 2 ]
+  # The event stays a JSON array (a subquery result passed to json_set() as
+  # plain text would be stored as a string on newer SQLite), through the
+  # strip on the way out as well.
+  [ "$(sqlite_mem "SELECT json_type(readfile('$(rf "$(settings_file)")'), '\$.hooks.SessionStart');")" = array ]
+  run bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [ "$(sqlite_mem "SELECT json_type(readfile('$(rf "$(settings_file)")'), '\$.hooks.SessionStart');")" = array ]
+  grep -q "${skill_name}-my-wrapper.sh" "$(settings_file)"
+
+  # A file an affected version already corrupted (the array stored as a
+  # string) is restored by the next set, with the user's hook intact.
+  printf '%s' '{"hooks":{"SessionStart":"[{\"hooks\":[{\"type\":\"command\",\"command\":\"'"$TEST_PROJECT"'/scripts/'"$skill_name"'-my-wrapper.sh\"}]}]"}}' \
+    > "$(settings_file)"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [ "$(sqlite_mem "SELECT json_type(readfile('$(rf "$(settings_file)")'), '\$.hooks.SessionStart');")" = array ]
+  grep -q "${skill_name}-my-wrapper.sh" "$(settings_file)"
+  has_session_start "$(settings_file)"
+
+  # An event that is not an array (an object here) is refused, naming the file
+  # and event, and the file is not touched.
+  printf '%s' '{"hooks":{"SessionStart":{"user":"kept"}}}' > "$(settings_file)"
+  cp "$(settings_file)" "$BATS_TEST_TMPDIR/object-event.json"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  grep -qF "$(settings_file): hooks.SessionStart is not an array" <<<"$output"
+  cmp "$(settings_file)" "$BATS_TEST_TMPDIR/object-event.json"
 }
 
 @test "delivery set monitor: round-trips multibyte (UTF-8) settings without a short-write reject" {
@@ -426,6 +555,36 @@ eperm_pid() {
     || { echo "expected the first line to read 'mode: off (...)', got: $output" >&2; return 1; }
   [[ "$output" == *"unrecognized"* ]] &&
     [[ "$output" == *"$TEST_PROJECT"* ]]
+}
+
+@test "delivery status: a Codex project with no hooks file reads as agmsgd-delivered only while agmsgd is on and its seats have destinations" {
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  grep -q '^mode: off (unrecognized: no settings file found' <<<"$output"
+
+  mkdir -p "$TEST_SKILL_DIR/run"
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" < "$SCRIPTS/daemon/schema.sql"
+  local boot
+  case "$(uname -s)" in
+    Darwin) boot="$(sysctl -n kern.bootsessionuuid)" ;;
+    Linux) boot="$(sed -n 's/^btime //p' /proc/stat)" ;;
+    *) skip 'POSIX beta executor evidence' ;;
+  esac
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='on';
+    UPDATE daemon_owner SET state='ready', executor_pid=$$, executor_boot_id='$boot', executor_started_at=strftime('%Y-%m-%dT%H:%M:%fZ','now');"
+  # agmsgd on, but alice has no recorded destination yet: unchanged.
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  grep -q '^mode: off (unrecognized: no settings file found' <<<"$output"
+
+  source "$SCRIPTS/lib/role-session.sh"
+  agmsg_role_session_record team alice thread-1 "$TEST_PROJECT" codex "" "$TEST_PROJECT/codex-home"
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "${output%%$'\n'*}" = "mode: agmsgd (agmsgd delivers to this project's Codex seats; no hooks file needed)" ]
+
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='off';"
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  grep -q '^mode: off (unrecognized: no settings file found' <<<"$output"
 }
 
 @test "delivery status: a settings file that exists but is not valid JSON is also unrecognized, not deliberate off (review)" {
@@ -1402,6 +1561,27 @@ JSON
   [ ! -f "$TEST_SKILL_DIR/run/cc-instance.$dead_pid" ]
 }
 
+@test "session-start: a failed cc-instance write publishes no partial marker and is loud (#1079)" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
+  local bin="$BATS_TEST_TMPDIR/marker-write-bin" real_mv
+  real_mv="$(command -v mv)"
+  mkdir -p "$bin"
+  cat > "$bin/mv" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do last="\$arg"; done
+case "\$last" in *'/cc-instance.$$') exit 1 ;; esac
+exec "$real_mv" "\$@"
+EOF
+  chmod +x "$bin/mv"
+
+  run env AGMSG_RESOLVE_PROJECT=0 AGMSG_AGENT_PID="$$" PATH="$bin:$PATH" \
+    bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<<'{"session_id":"write-failed"}'
+  [ "$status" -ne 0 ]
+  printf '%s\n' "$output" | grep -Fq 'could not publish the complete instance marker'
+  [ ! -e "$TEST_SKILL_DIR/run/cc-instance.$$" ]
+}
+
 # --- session-id resolution: vendor field-name differences (cursor) ---
 # Cursor-style payloads may carry the session id as camelCase "sessionId"; Claude uses snake_case "session_id" (and so
 # does Cursor -- measured on cursor-agent 2026.09.10-fd3934a, top-level and
@@ -1773,7 +1953,9 @@ EOF
   # issue's own FIFO repro. A plain `sleep N | check-inbox.sh` does NOT
   # reproduce this: bash waits for every pipeline member, so it looks like a
   # hang even when the hook itself exits immediately.
-  { printf '%s' '{"stop_hook_active":false,"session_id":"repro-381"}'; sleep 300; } \
+  # Replace the writer shell so killing writer_pid also closes inherited Bats
+  # descriptors, instead of leaving an orphan sleep holding the runner open.
+  { printf '%s' '{"stop_hook_active":false,"session_id":"repro-381"}'; exec sleep 300; } \
     3>&- 4>&- > "$fifo" &
 
   local newpath="$bindir:$PATH"
@@ -1833,7 +2015,8 @@ JSON
   wait "$pid" 2>/dev/null || true
 
   grep -q "new-for-bob"   /tmp/agmsg-as-bob
-  ! grep -q "new-for-alice" /tmp/agmsg-as-bob
+  ! grep -q "new-for-alice" /tmp/agmsg-as-bob \
+    || { echo "forbidden message leaked to bob" >&2; rm -f /tmp/agmsg-as-bob; return 1; }
   rm -f /tmp/agmsg-as-bob
 }
 
@@ -2291,11 +2474,18 @@ JSON
   local cw
   cw=$(sqlite_mem "SELECT json_extract(readfile('$(rf "$hook_file")'), '\$.hooks.Stop[0].hooks[0].commandWindows');")
   [ -n "$cw" ]
-  [[ "$cw" == *"Program Files\\Git\\bin\\bash.exe"* ]]
-  [[ "$cw" == *"GIT_BASH"* ]]
-  [[ "$cw" == *"-lc"* ]]
-  [[ "$cw" != *".agents/bin"* ]]
-  [[ "$cw" == *"check-inbox.sh"* ]]
+  # Was five non-final `[[ ]]`, four of which could not fail this test on bash
+  # 3.2 (#670) -- including the one pinning the login flag, so on macOS the flag
+  # this whole entry turns on was asserted by nothing. `grep -Fq` fails everywhere.
+  printf '%s' "$cw" > "$TEST_PROJECT/cw"
+  grep -Fq 'Program Files\Git\bin\bash.exe' "$TEST_PROJECT/cw"
+  grep -Fq 'GIT_BASH' "$TEST_PROJECT/cw"
+  # Still a LOGIN shell, anchored on the invocation rather than on a bare `-l`
+  # that any word could contain. `-lc` became `-l <script>` when the payload
+  # moved off the shell's stdout (#1015); what has to stay true is the `-l`.
+  grep -Fq '& $b -l ' "$TEST_PROJECT/cw"
+  refute grep -Fq '.agents/bin' "$TEST_PROJECT/cw"
+  grep -Fq 'check-inbox.sh' "$TEST_PROJECT/cw"
 }
 
 @test "delivery set turn (claude-code): Stop entry has NO commandWindows (regression guard)" {
@@ -2307,6 +2497,196 @@ JSON
   cw=$(sqlite_mem "SELECT json_extract(readfile('$(rf "$hook_file")'), '\$.hooks.Stop[0].hooks[0].commandWindows');")
   [ -z "$cw" ]
 }
+
+# --- #1015: the login shell's stdout is not the payload's channel -------------
+#
+# The wrapper runs the hook through a LOGIN shell, and everything the profile
+# prints lands on that shell's stdout ahead of the JSON. Codex parses the whole
+# stream as one document, so one line of profile chatter loses the message --
+# after the rows have been consumed.
+#
+# This runs on every platform on purpose. The mechanism is bash's, not
+# Windows's: `-l` reads the profile chain everywhere, so a Linux or macOS runner
+# reproduces it exactly. Confining the control to the Windows legs would leave
+# the property unwatched on eleven of the twelve.
+#
+# What it models and what it does not: the bash half is executed for real, and
+# `cygpath` is stubbed with the identity function because here the two path
+# spaces are the same. The PowerShell half is NOT executed -- it is asserted on
+# as a string in the test below this one, which is the honest split: this test
+# can prove the payload survives a talking profile, and it cannot prove
+# PowerShell quotes it correctly.
+@test "codex Windows hook: what the login profile prints does not reach the payload (#1015)" {
+  skip_on_windows "commandWindows is not written on native Windows (#182)"
+  bash "$SCRIPTS/join.sh" testteam alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/send.sh" testteam bob alice "profile-must-not-eat-this" --force >/dev/null
+  bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT" >/dev/null
+
+  local hook_file="$TEST_PROJECT/.codex/hooks.json" cw cmd
+  cw=$(sqlite_mem "SELECT json_extract(readfile('$(rf "$hook_file")'), '\$.hooks.Stop[0].hooks[0].commandWindows');")
+  [ -n "$cw" ]
+
+  # The bash command is the single-quoted argument PowerShell writes to a temp
+  # script, with its own single quotes doubled by windows_wrap. READ out rather
+  # than restated here, so this test follows the wrapper.
+  cmd=$(printf '%s' "$cw" | sed "s/.*WriteAllText(\\\$s,'//; s/',(New-Object.*//")
+  cmd=$(printf '%s' "$cmd" | sed "s/''/'/g")
+  [ -n "$cmd" ]
+
+  # The profile prints, and it also puts something on PATH -- both halves of why
+  # `-l` is there in the first place. Supplied rather than waited for: a Git Bash
+  # install whose profile happens to be silent never shows the defect and would
+  # make this pass for the wrong reason. HOME is the harness's sandbox (#41).
+  local bin="$TEST_PROJECT/bin"
+  mkdir -p "$bin"
+  printf '#!/bin/sh\nshift\nprintf "%%s" "$1"\n' > "$bin/cygpath"
+  chmod +x "$bin/cygpath"
+  printf 'echo "PROFILE-CHATTER"\nexport PATH="%s:$PATH"\n' "$bin" > "$HOME/.bash_profile"
+
+  # The login shell's own stdout goes nowhere, exactly as PowerShell's Out-Null
+  # sends it; the payload is whatever the wrapper arranged to be printed instead.
+  local payload="$TEST_PROJECT/hook-payload" shell_stdout="$TEST_PROJECT/shell-stdout"
+  # `-lc` rather than a script file: the wrapper has PowerShell write the same
+  # text to a temp script and run it under `bash -l`, and what is under test here
+  # is what a LOGIN shell does to that text -- identical either way, and this
+  # keeps the PowerShell half out of a test that cannot run PowerShell.
+  echo '{}' | AGMSG_HOOK_OUT="$payload" bash -lc "$cmd" > "$shell_stdout" 2>/dev/null
+
+  # Positive control, FIRST: the hook ran and the message really was delivered.
+  # Without it, a wrapper that emitted nothing at all satisfies everything below.
+  # The existence check is separate so a wrapper that stopped writing the file
+  # says so, instead of failing as a grep error on a missing path.
+  [ -s "$payload" ]
+  grep -Fq "profile-must-not-eat-this" "$payload"
+
+  # The defect.
+  refute grep -Fq "PROFILE-CHATTER" "$payload"
+
+  # And the consequence codex sees: it parses the whole stream as one document.
+  [ "$(sqlite_mem "SELECT json_valid(CAST(readfile('$(rf "$payload")') AS TEXT));")" = "1" ]
+
+  # The profile did talk. Without this the test also passes on a machine where
+  # nothing was ever printed -- which is the state it is meant to survive, not
+  # the state it is meant to run in.
+  grep -Fq "PROFILE-CHATTER" "$shell_stdout"
+}
+
+# The half the test above cannot execute. PowerShell is not run here, so this
+# asserts the SHAPE of the string that will be: the payload leaves through a
+# temp file, the shell's own stdout is discarded, and the thing that finally
+# prints it is PowerShell -- which read no profile. It cannot prove the wrapper
+# works; it catches the wrapper being quietly returned to the shape that does
+# not (#1015).
+#
+# THIS IS NOT A SUBSTITUTE FOR THE EXECUTION LEG BELOW, and the record of why is
+# worth more than the assertion: the first version of this file asserted the
+# shape, went green, and shipped a wrapper that PowerShell could not run. A shape
+# assertion only ever covers the ways we imagined it breaking -- that version
+# banned `\"` while the plain `"` went out. The leg that RUNS it is what caught
+# that, and it is the one that reaches past what we imagined. Keep both: this one
+# is fast and notices someone removing a piece; that one notices reality.
+@test "codex Windows hook: the wrapper does not print through the login shell (#1015)" {
+  skip_on_windows "commandWindows is not written on native Windows (#182)"
+  bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT" >/dev/null
+  local cwf="$TEST_PROJECT/commandWindows"
+  sqlite_mem "SELECT json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.Stop[0].hooks[0].commandWindows');" > "$cwf"
+  [ -s "$cwf" ]
+
+  # A place for the payload that is not the shell's stdout.
+  grep -Fq 'AGMSG_HOOK_OUT' "$cwf"
+  grep -Fq 'GetTempFileName' "$cwf"
+  grep -Fq 'WriteAllText' "$cwf"
+
+  # THE one that was missing, and it cost a red Windows leg. PowerShell does not
+  # escape a double quote when it hands a native process an argument: the
+  # argument splits there, and bash receives a truncated `-c` string
+  # (`unexpected EOF while looking for matching )`). So the arguments to `& $b`
+  # must contain NO double quote at all -- not merely no `\"`, which is what the
+  # first version of this test checked while the plain form shipped. The command
+  # itself is full of them; it reaches bash through a file instead.
+  printf '%s' "$(sed 's/.*& [$]b //; s/ | Out-Null.*//' "$cwf")" > "$TEST_PROJECT/native-args"
+  [ -s "$TEST_PROJECT/native-args" ]
+  # Both spellings are covered, and both were checked rather than reasoned about:
+  # a mutation putting `"` in the arguments and a mutation putting `\"` there
+  # each turn this red, each after grepping the mutated output to confirm the
+  # bytes actually went in.
+  refute grep -Fq '"' "$TEST_PROJECT/native-args"
+
+  # The login shell's stdout is thrown away, and PowerShell prints the file.
+  grep -Fq 'Out-Null' "$cwf"
+  grep -Fq 'Get-Content' "$cwf"
+
+  # The status the hook reports is the command's, not the cleanup's.
+  grep -Fq 'exit $rc' "$cwf"
+
+  # PowerShell reads a backslash-escaped quote as a literal backslash and ends
+  # the string there, which is why the codex template warns about it.
+  refute grep -Fq '\"' "$cwf"
+}
+
+# The half the two tests above cannot reach: PowerShell actually running the
+# string. This is the only place the wrapper is EXECUTED as written, so it is
+# the only evidence that the fix works on the platform it exists for -- the rest
+# is a shape assertion and a bash-half simulation.
+#
+# It drives a stub command rather than check-inbox: what has never been executed
+# anywhere is the PowerShell plumbing, and a stub isolates it from the store, the
+# registration and the hook's own logic, which other tests already cover.
+#
+# The string goes through a .ps1 file rather than `-Command "$cw"`: it contains
+# `$b`, `$o` and single quotes, and handing it to PowerShell through a shell
+# argument is a second quoting layer this test is not about.
+#
+# The name carries `windows-wrapper` because the Windows matrix leg selects by
+# `-f`; renaming it without the workflow stops it running anywhere at all, which
+# is indistinguishable from it passing.
+@test "windows-wrapper: PowerShell prints the payload and not the profile (#1015)" {
+  skip_unless_windows "the wrapper is PowerShell; only Windows can run it"
+  . "$SCRIPTS/lib/hooks-json.sh"
+
+  local emit="$TEST_PROJECT/emit.sh"
+  printf '#!/bin/sh\nprintf %%s "{\\"decision\\":\\"block\\",\\"reason\\":\\"windows-payload\\"}"\n' > "$emit"
+  chmod +x "$emit"
+
+  # The condition under test: a login profile that talks.
+  printf 'echo PROFILE-CHATTER\n' > "$HOME/.bash_profile"
+
+  local ps1="$TEST_PROJECT/wrap.ps1"
+  # Single-quoted the way delivery.sh quotes it, so the `''` doubling inside
+  # windows_wrap is exercised rather than bypassed.
+  windows_wrap "sh '$emit'" > "$ps1"
+  [ -s "$ps1" ]
+
+  run powershell -NoProfile -ExecutionPolicy Bypass -File "$ps1"
+
+  # Positive control first: the payload really came through. Without it a
+  # PowerShell that failed to launch bash at all passes the two lines below.
+  printf '%s' "$output" > "$TEST_PROJECT/ps-stdout"
+  grep -Fq 'windows-payload' "$TEST_PROJECT/ps-stdout"
+  refute grep -Fq 'PROFILE-CHATTER' "$TEST_PROJECT/ps-stdout"
+  [ "$(sqlite_mem "SELECT json_valid(CAST(readfile('$(rf "$TEST_PROJECT/ps-stdout")') AS TEXT));")" = "1" ]
+
+  # The status is the command's, carried across the cleanup.
+  [ "$status" -eq 0 ]
+
+  # The empty poll: no messages, so the command writes nothing and PowerShell has
+  # an empty file to print. What codex must not receive is junk, so the assertion
+  # is on that and not on a guess about what `Get-Content -Raw` does with an empty
+  # file -- whitespace passes, anything else is a finding. Left uncovered until
+  # this leg existed, because nothing on a POSIX host can answer it.
+  local quiet="$TEST_PROJECT/quiet.sh"
+  printf '#!/bin/sh\nexit 0\n' > "$quiet"
+  chmod +x "$quiet"
+  local ps1q="$TEST_PROJECT/wrap-quiet.ps1"
+  windows_wrap "sh '$quiet'" > "$ps1q"
+  run powershell -NoProfile -ExecutionPolicy Bypass -File "$ps1q"
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" > "$TEST_PROJECT/ps-quiet"
+  # The profile still talked; what it printed still must not arrive.
+  refute grep -Fq 'PROFILE-CHATTER' "$TEST_PROJECT/ps-quiet"
+  [ "$(tr -d ' \t\r\n' < "$TEST_PROJECT/ps-quiet" | wc -c | tr -d ' ')" = "0" ]
+}
+
 
 # --- #1003: codex mid-turn PostToolUse hook install/strip/status wiring ---
 #
@@ -2521,22 +2901,6 @@ skip_if_no_special_fs() {
   [[ "$cmd" == *'a\b'* ]]
 }
 
-@test "delivery set monitor: project path with a single quote can't break SessionStart/SessionEnd argument boundaries (F14 hardening)" {
-  skip_if_no_special_fs
-  local proj="$TEST_PROJECT/al'ice"
-  mkdir -p "$proj"
-  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$proj"
-  [ "$status" -eq 0 ]
-  local hf="$proj/.claude/settings.local.json"
-  local hfq; hfq=$(sql_lit "$hf")
-  [ "$(sqlite_mem "SELECT json_valid(readfile('$hfq'));")" = "1" ]
-  local ss se
-  ss=$(sqlite_mem "SELECT json_extract(readfile('$hfq'), '\$.hooks.SessionStart[0].hooks[0].command');")
-  se=$(sqlite_mem "SELECT json_extract(readfile('$hfq'), '\$.hooks.SessionEnd[0].hooks[0].command');")
-  eval "set -- $ss"; [ "$#" -eq 3 ]; [ "$3" = "$proj" ]
-  eval "set -- $se"; [ "$#" -eq 3 ]; [ "$3" = "$proj" ]
-}
-
 @test "delivery set monitor: existing settings with single-quoted hook commands stays valid JSON (#134)" {
   # The reporter's trigger: settings.local.json already holds hook commands
   # containing single quotes. Pre-fix, re-adding our entries produced malformed
@@ -2653,6 +3017,67 @@ JSON
 }
 
 
+@test "cursor is accepted as an agent type (turn mode)" {
+  run bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Delivery mode set to 'turn'" ]]
+  [ -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
+  grep -q "check-inbox.sh" "$TEST_PROJECT/.cursor/rules/agmsg.mdc"
+}
+
+@test "cursor set turn: rule file tells the agent to run where.sh, not guess its terminal" {
+  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT"
+  grep -q "where.sh" "$TEST_PROJECT/.cursor/rules/agmsg.mdc"
+  grep -q "team.sh" "$TEST_PROJECT/.cursor/rules/agmsg.mdc"
+}
+
+@test "cursor rule file is an always-apply .mdc (Cursor CLI auto-load)" {
+  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT" >/dev/null
+  # First non-empty line opens the frontmatter; alwaysApply must be declared so
+  # the Cursor CLI applies the rule on every turn.
+  [ "$(head -1 "$TEST_PROJECT/.cursor/rules/agmsg.mdc")" = "---" ]
+  grep -q "alwaysApply: true" "$TEST_PROJECT/.cursor/rules/agmsg.mdc"
+}
+
+@test "cursor supports off mode: removes rule file" {
+  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT"
+  [ -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
+  run bash "$SCRIPTS/delivery.sh" set off cursor "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [ ! -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
+}
+
+@test "cursor rejects monitor mode" {
+  run bash "$SCRIPTS/delivery.sh" set monitor cursor "$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "not supported" ]]
+  [ ! -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
+}
+
+@test "cursor rejects both mode" {
+  run bash "$SCRIPTS/delivery.sh" set both cursor "$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "not supported" ]]
+  [ ! -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
+}
+
+@test "cursor rejects monitor: does NOT delete an existing turn rule" {
+  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT" >/dev/null
+  [ -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
+  run bash "$SCRIPTS/delivery.sh" set monitor cursor "$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  [ -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
+}
+
+@test "cursor set turn: idempotent across repeats" {
+  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT"
+  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT"
+  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT"
+  [ -f "$TEST_PROJECT/.cursor/rules/agmsg.mdc" ]
+  local count
+  count=$(grep -c "check-inbox.sh" "$TEST_PROJECT/.cursor/rules/agmsg.mdc")
+  [ "$count" -eq 1 ]
+}
 @test "session-start.sh for codex starts bridge when monitor launcher env is present" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
   _seed_role_record team alice thread-123 "$TEST_PROJECT" codex
@@ -2750,6 +3175,174 @@ EOF
 
   [ ! -f "$log" ]
 }
+
+@test "session-start.sh for codex does not choose a /clear seat by process: with several seats none moves, even one whose owner names the same live pid (#1468)" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" team bob codex "$TEST_PROJECT" >/dev/null
+  local old=11111111-1111-4111-8111-111111111111 new=22222222-2222-4222-8222-222222222222
+  local rec_a="$TEST_SKILL_DIR/run/role-session.team__alice" rec_b="$TEST_SKILL_DIR/run/role-session.team__bob"
+  # Seats of a profile run under one app-server daemon, so a stale owner left
+  # on one seat names the pid every seat resolves to, and that pid stays alive
+  # across the /clear. The other seat (the one actually cleared) has no owner.
+  sleep 60 &
+  local pid=$!
+  SKILL_DIR="$TEST_SKILL_DIR" bash -c '
+    source "$1/lib/role-session.sh"
+    agmsg_role_session_record team alice "$2" "$4" codex "$2.$5"
+    agmsg_role_session_record team bob "$3" "$4" codex
+  ' _ "$SCRIPTS" "$old" "33333333-3333-4333-8333-333333333333" "$TEST_PROJECT" "$pid"
+  local before_a before_b
+  before_a="$(cat "$rec_a")"; before_b="$(cat "$rec_b")"
+  mkdir -p "$BATS_TEST_TMPDIR/profile"
+  printf '{"session_id":"%s","source":"clear"}' "$new" \
+    | env -u CODEX_THREAD_ID CODEX_HOME="$BATS_TEST_TMPDIR/profile" AGMSG_AGENT_PID="$pid" \
+      bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null
+  kill "$pid" 2>/dev/null || true
+  [ "$(cat "$rec_a")" = "$before_a" ]
+  [ "$(cat "$rec_b")" = "$before_b" ]
+  # The thread's profile is still published, as for any session.
+  [ -f "$TEST_SKILL_DIR/run/codex-thread-home.$new" ]
+}
+
+@test "session-start.sh for codex keeps #1607's recovery after /clear: the project's sole registration follows the new thread (#1468)" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  local old=11111111-1111-4111-8111-111111111111 new=22222222-2222-4222-8222-222222222222
+  local rec="$TEST_SKILL_DIR/run/role-session.team__alice"
+  SKILL_DIR="$TEST_SKILL_DIR" bash -c '
+    source "$1/lib/role-session.sh"
+    agmsg_role_session_record team alice "$2" "$3" codex
+  ' _ "$SCRIPTS" "$old" "$TEST_PROJECT"
+  mkdir -p "$BATS_TEST_TMPDIR/profile"
+  printf '{"session_id":"%s","source":"clear"}' "$new" \
+    | env -u CODEX_THREAD_ID CODEX_HOME="$BATS_TEST_TMPDIR/profile" \
+      bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null
+  grep -qx "session=$new" "$rec"
+}
+
+@test "session-start.sh for codex never picks a seat by the pane its environment names, and says the conversation is unseated (#1468)" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" team bob codex "$TEST_PROJECT" >/dev/null
+  local old_a=11111111-1111-4111-8111-111111111111 old_b=33333333-3333-4333-8333-333333333333
+  local new=22222222-2222-4222-8222-222222222222
+  local rec_a="$TEST_SKILL_DIR/run/role-session.team__alice" rec_b="$TEST_SKILL_DIR/run/role-session.team__bob"
+  # The hook runs under the profile's shared app-server daemon, so the pane in
+  # its environment is the one that started the daemon: here, bob's, while the
+  # /clear happened in another seat. bob's placement record and naming mark
+  # both agree with that pane.
+  local sock="$BATS_TEST_TMPDIR/herdr.sock" ref epoch
+  : > "$sock"
+  SKILL_DIR="$TEST_SKILL_DIR" HERDR_ENV=1 HERDR_SOCKET_PATH="$sock" HERDR_PANE_ID=w1:p17 bash -c '
+    source "$1/lib/terminal-registry.sh"; source "$1/lib/role-session.sh"
+    here="$(agmsg_terminal_self_env)"; IFS=$'"'"'\t'"'"' read -r t id epoch <<< "$here"
+    ref="$(agmsg_terminal_ref "$t" "$id")"
+    agmsg_role_session_record team alice "$2" "$4" codex
+    agmsg_role_session_record team bob "$3" "$4" codex
+    printf "%s\t%s\tcodex\n" "$ref" "$4" > "$(agmsg_spawn_path team bob)"
+    agmsg_role_session_mark_named team bob "$ref" "$epoch" "$4" codex
+  ' _ "$SCRIPTS" "$old_a" "$old_b" "$TEST_PROJECT"
+  local before_a before_b out
+  before_a="$(cat "$rec_a")"; before_b="$(cat "$rec_b")"
+  mkdir -p "$BATS_TEST_TMPDIR/profile"
+  out="$(printf '{"session_id":"%s","source":"clear"}' "$new" \
+    | env -u CODEX_THREAD_ID CODEX_HOME="$BATS_TEST_TMPDIR/profile" \
+      HERDR_ENV=1 HERDR_SOCKET_PATH="$sock" HERDR_PANE_ID=w1:p17 \
+      bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT")"
+  [ "$(cat "$rec_a")" = "$before_a" ]
+  [ "$(cat "$rec_b")" = "$before_b" ]
+  grep -q "not connected to a seat" <<<"$out"
+  grep -q "actas" <<<"$out"
+}
+
+# #1477: Codex installed after agmsg never gets this install's writable_roots
+# (configure_codex_sandbox only writes them into a Codex config that already
+# existed at install time), and nothing later says so. session-start.sh's
+# codex plug now reports it, once, read-only, before any of the bridge
+# branches below it (several of which exit 0 early and would otherwise never
+# reach a check placed after them).
+@test "session-start.sh for codex reports missing writable_roots, once, and stays silent once they are present" {
+  # A CODEX_HOME inherited from the real environment (this repo's own .envrc
+  # pins one) would make agmsg_codex_config_paths also check that SECOND,
+  # real profile's config.toml -- unset it so this test's only config is the
+  # throwaway $HOME/.codex/config.toml below, never the developer's own.
+  unset CODEX_HOME
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  mkdir -p "$HOME/.codex"
+  local code_config="$HOME/.codex/config.toml"
+
+  # RED: a config with NONE of this install's writable_roots.
+  cat > "$code_config" <<'EOF'
+[sandbox_workspace_write]
+writable_roots = ["/some/other/path"]
+EOF
+  run env CODEX_THREAD_ID="thread-notice-red" \
+    bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  grep -qF "agmsg: Codex cannot write agmsg's data yet -- run 'npx agmsg install --update' once" <<< "$output"
+
+  # GREEN: the same config, now carrying every root this install needs.
+  cat > "$code_config" <<EOF
+[sandbox_workspace_write]
+writable_roots = ["$TEST_SKILL_DIR/db", "$TEST_SKILL_DIR/teams", "$TEST_SKILL_DIR/run", "$TEST_SKILL_DIR/ext-tools"]
+EOF
+  run env CODEX_THREAD_ID="thread-notice-green" \
+    bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  refute grep -qF "agmsg: Codex cannot write agmsg's data yet" <<< "$output"
+
+  # WINDOWS: install.sh's configure_codex_sandbox converts each writable path
+  # through `cygpath -m` (MSYS /c/... -> native C:/...) before writing it, so
+  # a real Windows config.toml carries the CONVERTED form. A fake cygpath
+  # models that conversion here; the notice must check the same converted
+  # form, or it would report "missing" forever even right after a correct
+  # install --update (#1483 review).
+  # This test's own paths are not in MSYS /c/... form (it runs on macOS/Linux),
+  # so the fake unconditionally prefixes "C:" rather than modeling the real
+  # /c/foo -> C:/foo rewrite -- what matters here is that BOTH the config this
+  # test writes and agmsg_codex_writable_paths route through the identical
+  # fake, proving they agree, not reproducing the exact Windows string shape.
+  # `command -v cygpath` on PATH is also what sqlpath.sh's agmsg_sql_readfile_path
+  # gates on -- identities.sh (which session-start.sh calls on its way to the
+  # codex driver) reads every team's config.json through it. A fake that
+  # converts EVERY path it sees, real cygpath -w included, hands sqlite a
+  # bogus string for config.json on this (non-Windows) test box, sqlite's
+  # readfile() returns NULL, identities.sh finds no pairs, and session-start.sh
+  # exits before ever reaching the notice -- a false green having nothing to
+  # do with the fix. Converting ONLY this install's four writable_paths, and
+  # passing every other path through unchanged, keeps every other cygpath
+  # caller in the sourced scripts working against a real, readable path, the
+  # way a real Windows cygpath would (it converts a config.json path into a
+  # native one that the real sqlite3.exe there CAN open, just not into one
+  # this Unix sqlite3 can).
+  local stubdir="$TEST_SKILL_DIR/stub-bin"
+  mkdir -p "$stubdir"
+  cat > "$stubdir/cygpath" <<EOF
+#!/usr/bin/env bash
+# Strips the leading path component the way real cygpath -m strips the MSYS
+# drive segment (/c/Users/foo -> C:/Users/foo): the raw path must NOT survive
+# as a substring of the converted one, or a test built on this fake could
+# pass by accident even without the real fix.
+shift
+case "\$1" in
+  "$TEST_SKILL_DIR/db"|"$TEST_SKILL_DIR/teams"|"$TEST_SKILL_DIR/run"|"$TEST_SKILL_DIR/ext-tools")
+    printf 'C:%s\n' "\${1#/*/}"
+    ;;
+  *)
+    printf '%s\n' "\$1"
+    ;;
+esac
+EOF
+  chmod +x "$stubdir/cygpath"
+
+  cat > "$code_config" <<EOF
+[sandbox_workspace_write]
+writable_roots = ["$(PATH="$stubdir:$PATH" cygpath -m "$TEST_SKILL_DIR/db")", "$(PATH="$stubdir:$PATH" cygpath -m "$TEST_SKILL_DIR/teams")", "$(PATH="$stubdir:$PATH" cygpath -m "$TEST_SKILL_DIR/run")", "$(PATH="$stubdir:$PATH" cygpath -m "$TEST_SKILL_DIR/ext-tools")"]
+EOF
+  run env CODEX_THREAD_ID="thread-notice-windows" PATH="$stubdir:$PATH" \
+    bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  refute grep -qF "agmsg: Codex cannot write agmsg's data yet" <<< "$output"
+}
+
 
 @test "delivery set monitor (codex): installs SessionStart and prints Codex shell function" {
   run bash "$SCRIPTS/delivery.sh" set monitor codex "$TEST_PROJECT"
@@ -3114,11 +3707,6 @@ EOF
     > "$rollout_dir/rollout-2020-01-01T00-00-00-stale-by-name-uuid.jsonl"
   printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"id\":\"newer-by-name-uuid\",\"cwd\":\"$TEST_PROJECT\"}}" \
     > "$rollout_dir/rollout-2026-06-17T00-00-00-newer-by-name-uuid.jsonl"
-  # Stays a real sleep. This is not waiting for a process to settle — it is
-  # separating two mtimes far enough apart that the code under test can order
-  # them, and filesystem timestamp granularity is a whole second on some of the
-  # filesystems CI runs on. There is no condition to poll for: the thing being
-  # waited on is the clock itself.
   sleep 1
   touch "$rollout_dir/rollout-2020-01-01T00-00-00-stale-by-name-uuid.jsonl"
 
@@ -3505,68 +4093,56 @@ EOF
   grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
 }
 
-# The one diagnostic reachable on every store layout that carries a multibyte
-# name: a watcher started on a dead composite instance id says so and exits.
-# `_mb_dead_watch <sid> <cap>` runs it once and leaves the record in the log.
-_mb_dead_watch() {
-  local wpid
-  AGMSG_WATCH_LOG_MAX_BYTES="$2" bash "$SCRIPTS/watch.sh" "$1" "$TEST_PROJECT" claude-code \
-    >/dev/null 2>/dev/null &
-  wpid=$!
-  if ! wait_for_pid_exit "$wpid"; then
-    kill "$wpid" 2>/dev/null || true
-    wait "$wpid" 2>/dev/null || true
-    echo "watch.sh kept running on a dead instance id" >&2
-    return 1
-  fi
-  wait "$wpid" 2>/dev/null || true
-}
-
-# A UTF-8 locale for the character count; without one chars == bytes and the
-# case cannot tell the two units apart.
-_mb_utf8_locale() {
-  local utf8
-  utf8="$(locale -a 2>/dev/null | grep -i -m1 -E '^(en_US|C)\.utf-?8$' || true)"
-  [ -n "$utf8" ] || return 1
-  export LC_ALL="$utf8"
-}
-
 @test "watch: the cap is bytes, not characters (#691)" {
   # `${#record}` counts CHARACTERS in a UTF-8 locale while the cap and stat are
   # BYTES, so a multibyte diagnostic passes a character check and lands over the
-  # byte ceiling. Instance ids and team names may legally be Unicode, so this is
-  # reachable, not theoretical.
+  # byte ceiling. Team names may legally be Unicode and the storeless notice
+  # puts the name in the record, so this is reachable, not theoretical.
   #
-  # The cap has to sit in the window where the character count fits and the byte
-  # count does not, so the padding is computed from the record this fixture
-  # actually produces rather than guessed.
-  _mb_utf8_locale || skip "no UTF-8 locale available"
-  local dead sid log record chars bytes pad cap live
-  dead="$(bash -c 'echo $$')"
-  wait_for_pid_exit "$dead" || { echo "pid $dead is still alive" >&2; return 1; }
-  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
-  sid="境界検査のためのとても長い日本語.$dead"
-  log="$TEST_SKILL_DIR/run/watch.$sid.log"
+  # Two attempts failed to measure it before this one, and both failed the same
+  # way -- the mutation stayed green. First the record was the liveness guard's,
+  # which is pure ASCII. Then the padding was large enough that BOTH counts
+  # crossed the cap, so the two answers agreed. The gap only shows in the window
+  # where chars fit and bytes do not, so the padding is computed from the record
+  # this fixture actually produces rather than guessed.
+  local log db record chars bytes pad cap live
+  bash "$SCRIPTS/join.sh" "境界検査のためのとても長い日本語チーム名" alice claude-code "$TEST_PROJECT" >/dev/null
+  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path 境界検査のためのとても長い日本語チーム名')"
+  rm -f "$db"
+  log="$TEST_SKILL_DIR/run/watch.mb-session.log"
   mkdir -p "$TEST_SKILL_DIR/run"
 
   # Pass 1: an effectively unlimited cap, purely to observe the record.
-  _mb_dead_watch "$sid" 1000000
-  record="$(grep 'no longer alive' "$log" | head -1)"
-  [ -n "$record" ] || { echo "the multibyte diagnostic never appeared" >&2; return 1; }
+  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=1000000 \
+    bash "$SCRIPTS/watch.sh" mb-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  local wpid=$! waited=0
+  while [ "$waited" -lt 100 ]; do
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  record="$(grep 'no store yet' "$log" | head -1)"
+  [ -n "$record" ] || { echo "the notice naming the team never appeared" >&2; return 1; }
   chars=${#record}
   bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]')"
   # The two answers must actually differ, or this fixture proves nothing.
   [ "$bytes" -gt "$chars" ] || { echo "record is not multibyte: $chars/$bytes" >&2; return 1; }
 
   # Pass 2: a cap inside the window -- chars say it fits, bytes say it does not.
-  # The slack absorbs a pid with one more digit than pass 1's.
+  cap=$(( 120 + chars + 1 ))
   pad=120
-  cap=$(( pad + chars + 1 + 5 ))
   rm -f "$log" "$log.1"
   head -c "$pad" /dev/zero | tr '\0' 'x' > "$log"
-  _mb_dead_watch "$sid" "$cap"
+  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=$cap \
+    bash "$SCRIPTS/watch.sh" mb-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wpid=$!; waited=0
+  while [ "$waited" -lt 100 ]; do
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    grep -q 'no store yet' "$log.1" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
 
-  [ -f "$log.1" ] || { echo "no rotation: chars=$chars bytes=$bytes cap=$cap" >&2; return 1; }
   live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
   [ "$live" -le "$cap" ] \
     || { echo "live log is $live bytes, cap $cap (chars=$chars bytes=$bytes pad=$pad)" >&2; return 1; }
@@ -3580,17 +4156,22 @@ _mb_utf8_locale() {
   # The cap has to sit in the window where the character count would NOT
   # rotate, or the two behaviours agree and the case proves nothing. Same
   # derivation as the multibyte case: observe the record, then set the cap.
-  _mb_utf8_locale || skip "no UTF-8 locale available"
-  local dead sid log record chars bytes cap pad shim
-  dead="$(bash -c 'echo $$')"
-  wait_for_pid_exit "$dead" || { echo "pid $dead is still alive" >&2; return 1; }
-  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
-  sid="境界検査のためのとても長い日本語.$dead"
-  log="$TEST_SKILL_DIR/run/watch.$sid.log"
+  local log db record chars bytes cap pad live shim wpid waited
+  bash "$SCRIPTS/join.sh" "境界検査のためのとても長い日本語チーム名" alice claude-code "$TEST_PROJECT" >/dev/null
+  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path 境界検査のためのとても長い日本語チーム名')"
+  rm -f "$db"
+  log="$TEST_SKILL_DIR/run/watch.nowc-session.log"
   mkdir -p "$TEST_SKILL_DIR/run"
 
-  _mb_dead_watch "$sid" 1000000
-  record="$(grep 'no longer alive' "$log" | head -1)"
+  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=1000000 \
+    bash "$SCRIPTS/watch.sh" nowc-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wpid=$!; waited=0
+  while [ "$waited" -lt 100 ]; do
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  record="$(grep 'no store yet' "$log" | head -1)"
   [ -n "$record" ] || { echo "no record to size the fixture from" >&2; return 1; }
   chars=${#record}
   bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]')"
@@ -3598,7 +4179,7 @@ _mb_utf8_locale() {
 
   # In the window: the character count fits, the real byte count does not.
   pad=120
-  cap=$(( pad + chars + 1 + 5 ))
+  cap=$(( pad + chars + 1 ))
   rm -f "$log" "$log.1"
   head -c "$pad" /dev/zero | tr '\0' 'x' > "$log"
 
@@ -3606,15 +4187,21 @@ _mb_utf8_locale() {
   shim="$TEST_SKILL_DIR/shim"; mkdir -p "$shim"
   printf '#!/bin/sh\nexit 1\n' > "$shim/wc"; chmod +x "$shim/wc"
 
-  PATH="$shim:$PATH" _mb_dead_watch "$sid" "$cap"
+  PATH="$shim:$PATH" AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=$cap \
+    bash "$SCRIPTS/watch.sh" nowc-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wpid=$!; waited=0
+  while [ "$waited" -lt 100 ]; do
+    [ -f "$log.1" ] && break
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
 
-  [ -f "$log.1" ] || { echo "the unmeasurable record was written without rotating" >&2; return 1; }
-  local live
   live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
   [ "$live" -le "$cap" ] \
     || { echo "live log is $live bytes, cap $cap (chars=$chars bytes=$bytes pad=$pad)" >&2; return 1; }
   # And the diagnostic was not lost to the conservative choice.
-  grep -q 'no longer alive' "$log" || { echo "the record was dropped" >&2; cat "$log" >&2; return 1; }
+  grep -q 'no store yet' "$log" || { echo "the record was dropped" >&2; cat "$log" >&2; return 1; }
 }
 
 @test "watch: an invalid log cap falls back to the default, not to no bound (#691)" {
@@ -3742,4 +4329,228 @@ _mb_utf8_locale() {
   [ "$status" -eq 0 ] || return 1
   run bash -c "printf '%s\n' \"\$1\" | grep -q 'taken by the watcher'" _ "$output"
   [ "$status" -ne 0 ] || { echo "the hook re-offered a consumed message" >&2; return 1; }
+}
+
+# --- #677: the rows are consumed only after the payload is written ------------
+#
+# The hook formatted its messages into a variable, marked them read, and only
+# then wrote them out. Anything that went wrong in between consumed the rows and
+# showed the user nothing — the message still in `history.sh`, gone from
+# `inbox.sh`, looking exactly like a delivery failure.
+#
+# The pair below is the whole claim: identical setup, the only difference being
+# whether the write can succeed.
+@test "check-inbox: a message whose payload was written is consumed (#677)" {
+  bash "$SCRIPTS/join.sh" testteam alice codex "$TEST_PROJECT"
+  bash "$SCRIPTS/join.sh" testteam bob   codex "$TEST_PROJECT"
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  bash "$SCRIPTS/send.sh" testteam bob alice "written and consumed"
+
+  run bash -c "echo '{}' | bash '$SCRIPTS/check-inbox.sh' codex '$TEST_PROJECT'"
+  [ "$status" -eq 0 ]
+  # `grep -Fq`, not `[[ =~ ]]`: a non-final [[ ]] cannot fail a test on bash 3.2
+  # (#670), and this is the assertion that watches the whole change -- a payload
+  # that lost its message body while the mark still succeeded would otherwise sit
+  # green next to the "No new messages" below.
+  printf '%s' "$output" | grep -Fq "written and consumed"
+
+  # Consumed: a second look offers nothing.
+  run bash "$SCRIPTS/inbox.sh" testteam alice
+  printf '%s' "$output" | grep -Fq "No new messages"
+}
+
+@test "check-inbox: a message whose payload could not be written stays unread (#677)" {
+  bash "$SCRIPTS/join.sh" testteam alice codex "$TEST_PROJECT"
+  bash "$SCRIPTS/join.sh" testteam bob   codex "$TEST_PROJECT"
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  bash "$SCRIPTS/send.sh" testteam bob alice "must survive an unwritable stdout"
+
+  # stdout CLOSED, so the write of the payload fails. Everything else is the same
+  # as the test above — which is what makes this a comparison and not a smoke
+  # test.
+  #
+  # The barrier variable names a prefix, not a wait: `.release` is created first
+  # so the run never blocks on it. What it buys is two markers the run leaves
+  # behind — `.reached` when the rows are formatted and `.emitted` when the emit
+  # has been attempted — because a run whose stdout is closed cannot tell the
+  # test anything through the payload, and "the message is unread" is equally
+  # true of a run that did nothing at all.
+  local barrier="$BATS_TEST_TMPDIR/mark-barrier"
+  : > "$barrier.release"
+  AGMSG_TEST_MARK_BARRIER="$barrier" \
+    run bash -c "echo '{}' | bash '$SCRIPTS/check-inbox.sh' codex '$TEST_PROJECT' >&-"
+
+  # THE control, and it is taken inside the run that failed: `.emitted` is
+  # written immediately after the emit, so its existence says THIS run reached
+  # the write, and the status it carries says the write is what failed.
+  #
+  # Two weaker forms were tried and both are recorded here because each looks
+  # sufficient. A barrier before the mark proves only that the rows were
+  # FORMATTED. Re-running the hook with a writable stdout proves that a
+  # DIFFERENT process reached the write — a separate run succeeding is not
+  # evidence about this one. Neither excludes the case this test exists to
+  # exclude: an early exit that leaves the message unread for a reason that has
+  # nothing to do with the write.
+  [ -e "$barrier.emitted" ]
+  # Not just "it got there" — it got there and FAILED. Without this the happy
+  # path satisfies the line above.
+  [ "$(cat "$barrier.emitted")" != "0" ]
+
+  # Implied by `.emitted` (the emit sits inside `if [ -n "$OUTPUT" ]`), kept
+  # because it fails nearer the cause when the run stops before formatting.
+  [ -e "$barrier.reached" ]
+
+  # And the row itself survived intact — still deliverable, with its body. This
+  # is a claim about the ROW, not about the failed run. Asserted BEFORE any
+  # `inbox.sh`: inbox displays AND consumes, so reading it first would take the
+  # row away and leave this measuring its own side effect. (Measured — that is
+  # exactly what the first draft of this test did.)
+  run bash -c "echo '{}' | bash '$SCRIPTS/check-inbox.sh' codex '$TEST_PROJECT'"
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq "must survive an unwritable stdout"
+
+  # ...and now it is consumed, by the run that could write it.
+  run bash "$SCRIPTS/inbox.sh" testteam alice
+  printf '%s' "$output" | grep -Fq "No new messages"
+}
+
+# The fact the emit guards lean on: mid-turn delivery shows a message but does
+# not consume it, so the PostToolUse branch reaches the consume loop with nothing
+# pending. Unpinned, that stops being true the moment someone makes PostToolUse
+# mark read — and the guard comments would then be describing a tree that no
+# longer exists (#1003/#677).
+@test "check-inbox (PostToolUse): shows a message without consuming it (#1003)" {
+  bash "$SCRIPTS/join.sh" testteam alice codex "$TEST_PROJECT"
+  bash "$SCRIPTS/join.sh" testteam bob   codex "$TEST_PROJECT"
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  bash "$SCRIPTS/send.sh" testteam bob alice "mid-turn, still unread"
+
+  run bash -c "echo '{}' | bash '$SCRIPTS/check-inbox.sh' codex '$TEST_PROJECT' PostToolUse"
+  [ "$status" -eq 0 ]
+  # Positive control: it really did deliver. Without this, the assertion below
+  # also passes when the hook did nothing at all.
+  printf '%s' "$output" | grep -Fq "mid-turn, still unread"
+  printf '%s' "$output" | grep -Fq "hookSpecificOutput"
+
+  # ...and the row is still there for Stop to deliver and consume.
+  run bash "$SCRIPTS/inbox.sh" testteam alice
+  printf '%s' "$output" | grep -Fq "mid-turn, still unread"
+}
+
+# A `herdr` that logs its argv and answers `agent list` with a roster holding one
+# session, so a lookup BY that session id succeeds. Deliberately not the registry
+# suite's fixture: that one pins the measured JSON shape, which is a different
+# job from the one here.
+_fake_herdr_with_session() {
+  local sid="$1"
+  cat > "$FAKEBIN/herdr" <<EOF
+#!/usr/bin/env bash
+{ printf 'herdr'; for a in "\$@"; do printf ' [%s]' "\$a"; done; printf '\n'; } >> "$ARGV_LOG"
+if [ "\$1" = agent ] && [ "\$2" = list ]; then
+  printf '{"id":"1","result":{"type":"list","agents":[{"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"%s"},"pane_id":"wC:p4","display_agent":"x","name":"k"}]}}\n' "$sid"
+elif [ "\$1" = agent ] && [ "\$2" = get ]; then
+  printf '{"result":{"agent":{"pane_id":"%s","name":"k"}}}\n' "\$3"
+elif [ "\$1" = pane ] && [ "\$2" = get ]; then
+  echo '{"result":{"pane":{"terminal_id":"term_delivery"}}}'
+fi
+exit 0
+EOF
+  chmod +x "$FAKEBIN/herdr"
+  export PATH="$FAKEBIN:$PATH"
+}
+
+# --- the per-turn hook re-asserts the pane's name (#1044) ---------------------
+#
+# For several agent types this is the ONLY entry point that ever knows the
+# session id: grok-build has no SessionStart hook, and `readiness_sentinel=yes` holds on two
+# of the nine, so a hand-started pane on the rest is first named from here.
+# Naming is an invariant re-asserted at every entry point, not an assignment made
+# once somewhere — measured across the nine types, no single place covers them.
+@test "check-inbox: names this pane on the way through (#1044)" {
+  # This test's whole subject is the naming primitive firing, exercised
+  # against a fake tmux on $FAKEBIN -- never a real terminal -- so it opts
+  # back into the primitive's own default (on) rather than the harness's
+  # #1095 off (test_helper.bash), the same way test_terminal_registry.bats
+  # already does for its own naming-focused tests.
+  unset AGMSG_SELF_NAME
+  export FAKEBIN="$TEST_SKILL_DIR/fakebin" ARGV_LOG="$TEST_SKILL_DIR/argv.log"
+  mkdir -p "$FAKEBIN"; : > "$ARGV_LOG"
+  agmsg_install_fake_tmux
+  export TMUX="/tmp/fake,1,0" TMUX_PANE="%1"
+
+  bash "$SCRIPTS/join.sh" nameteam alice claude-code "$TEST_PROJECT"
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+  : > "$ARGV_LOG"   # drop whatever join itself did; this test is about the hook
+
+  run bash -c "echo '{}' | bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT'"
+  [ "$status" -eq 0 ]
+
+  grep -Fq '[@agmsg_agent] [nameteam:alice]' "$ARGV_LOG"
+}
+
+# The other half of the same rule, and the half that is easy to lose: no session
+# id is "there was nothing to resolve with", not "resolution failed". It stays
+# quiet, and it must not go naming panes it cannot identify.
+#
+# A differential pair, because the two halves differ in exactly one input. The
+# first attempt asserted `herdr agent list` as a positive control for the no-sid
+# run and it failed — measured: with no session id the resolver does not ask
+# herdr anything at all, because there is nothing to ask BY. So the control is
+# the same invocation carrying a session id, which does reach herdr and does
+# rename; the silence of the other half means something only next to it. This
+# differential is also the qualified-instance seam control for #1055.
+@test "check-inbox: no session id names nothing; the same call with one does (#1044, #1055)" {
+  # Same reason as the sibling test above: naming itself is what this test
+  # verifies, against a fake herdr, never a real terminal.
+  unset AGMSG_SELF_NAME
+  export FAKEBIN="$TEST_SKILL_DIR/fakebin" ARGV_LOG="$TEST_SKILL_DIR/argv.log"
+  mkdir -p "$FAKEBIN"; : > "$ARGV_LOG"
+  _fake_herdr_with_session "sess-x"
+  # The instance selector is common to both arms. The only differing input
+  # remains the type-specific session id below; without it, even a fully
+  # qualified Herdr environment must not name any pane.
+  export HERDR_ENV=1 HERDR_SOCKET_PATH=/run/herdr.sock
+  unset TMUX TMUX_PANE
+
+  bash "$SCRIPTS/join.sh" nameteam alice claude-code "$TEST_PROJECT"
+  bash "$SCRIPTS/config.sh" set delivery.turn.check_interval 0 >/dev/null
+
+  # No session id on stdin.
+  : > "$ARGV_LOG"
+  run bash -c "echo '{}' | bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT'"
+  [ "$status" -eq 0 ]
+  refute grep -Fq 'herdr [pane] [rename]' "$ARGV_LOG"
+
+  # The same call, one input different.
+  : > "$ARGV_LOG"
+  run bash -c "printf '%s' '{\"session_id\":\"sess-x\"}' | bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT'"
+  [ "$status" -eq 0 ]
+  grep -Fq 'herdr [pane] [rename] [wC:p4] [nameteam:alice]' "$ARGV_LOG"
+}
+
+# --- #1234 review: an unreadable SKILL_DIR must refuse before any write, not
+# be treated as "nothing to preserve". agmsg_delivery_apply/rulefile_apply
+# each rm -f the existing rule file before rendering the new one; without a
+# guard placed BEFORE that removal, an empty SKILL_DIR would delete a correct
+# existing rule file and replace it with one whose guidance paths are broken
+# ("/scripts/where.sh" etc, from ${SKILL_DIR:-}-defaulted reads -- the shape
+# of the first attempt at this fix, which is exactly what this pins against).
+# delivery.sh itself always derives SKILL_DIR structurally and can never pass
+# it through empty, so these call the plug functions directly, the same way
+# delivery.sh's own sourced context would, with SKILL_DIR explicitly unset.
+
+@test "cursor: SKILL_DIR unset refuses before writing, and an existing rule survives (#1234 review)" {
+  bash "$SCRIPTS/delivery.sh" set turn cursor "$TEST_PROJECT" >/dev/null
+  local rule="$TEST_PROJECT/.cursor/rules/agmsg.mdc"
+  [ -f "$rule" ]
+  local before; before="$(cat "$rule")"
+  run env -u SKILL_DIR bash -c '
+    resolve_hooks_file() { printf "%s\n" "'"$rule"'"; }
+    source "'"$SCRIPTS"'/drivers/types/cursor/_delivery.sh"
+    agmsg_delivery_apply cursor "'"$TEST_PROJECT"'" turn
+  '
+  [ "$status" -ne 0 ]
+  printf '%s' "$output" | grep -q SKILL_DIR
+  [ -f "$rule" ]
+  [ "$(cat "$rule")" = "$before" ]
 }

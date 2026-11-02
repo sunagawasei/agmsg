@@ -11,10 +11,10 @@ set -euo pipefail
 # every type. --project / --type / --team narrow it and combine freely. This
 # matches how claude/codex/brew/flutter doctor all behave (no scope argument,
 # default to everything) rather than requiring a cross-section up front --
-# koit's call, made explicit because the earlier <project> <type>-required
+# Made explicit here because the earlier <project> <type>-required
 # form had it backwards: a reporter who doesn't already know which project/type
 # to name can't use a doctor that demands one. Positional <project> <type> is
-# not kept for compatibility -- koit judged it not worth carrying (see PR/report
+# not kept for compatibility -- it was judged not worth carrying (see PR/report
 # history for round 2), and a stale positional form alongside flags that mean
 # something different by default would be its own source of confusion.
 #
@@ -106,6 +106,8 @@ RUN_DIR="$SKILL_DIR/run"
 . "$SCRIPT_DIR/lib/type-registry.sh"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/validate.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/stale-outcome-files.sh"
 
 # --- orphaned run/ records (#1507) -----------------------------------------
 #
@@ -331,6 +333,36 @@ _doctor_print_pinned() {
   echo
 }
 
+# --- leaked storage sync driver outcome files (#1572) -----------------------
+#
+# AGMSG_SQLITE_OUTCOME_FILE (lib/storage.sh `_agmsg_sqlite_recording`, read by
+# scripts/internal/storage-sync-driver.sh) used to go unremoved on every
+# ordinary successful "apply"/"read-apply" call before #1572, on an install
+# made before that fix. See lib/stale-outcome-files.sh for the exact match
+# criteria (location, name, size, content, age) this only ever removes a
+# file matching all of.
+STALE_OUTCOME_FILES=""
+_doctor_scan_stale_outcome_files() {
+  STALE_OUTCOME_FILES="$(agmsg_stale_outcome_candidates)"
+}
+
+_doctor_print_stale_outcome_files() {
+  local n dir example_n=0
+  [ -n "$STALE_OUTCOME_FILES" ] || return 0
+  n="$(printf '%s\n' "$STALE_OUTCOME_FILES" | grep -c . || true)"
+  dir="$(_agmsg_stale_outcome_dir)"
+  echo "leaked storage sync driver outcome files in $dir (#1572, fixed; left over from before the fix) ($n):"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    example_n=$((example_n + 1))
+    [ "$example_n" -le 5 ] || continue
+    echo "  $f"
+  done <<< "$STALE_OUTCOME_FILES"
+  if [ "$n" -gt 5 ]; then echo "  ... and $((n - 5)) more"; fi
+  echo "  remove them with: doctor.sh --fix"
+  echo
+}
+
 # --- --fix: its own mode, not a flag on the report -------------------------
 #
 # Lists what would go, asks once (--yes skips only the question), then removes
@@ -346,46 +378,82 @@ if [ "$FIX" = 1 ]; then
     exit 2
   fi
   _doctor_scan_orphan_run_records
-  if [ -z "$ORPHAN_SEATS" ]; then
-    echo "nothing to fix: no orphaned run/ records."
+  _doctor_scan_stale_outcome_files
+  if [ -z "$ORPHAN_SEATS" ] && [ -z "$STALE_OUTCOME_FILES" ]; then
+    echo "nothing to fix: no orphaned run/ records, no leaked outcome files."
     if [ -n "$ORPHAN_AMBIGUOUS$ORPHAN_PINNED" ]; then echo; _doctor_print_orphans; _doctor_print_pinned; fi
     exit 0
   fi
-  _doctor_print_orphans
-  _doctor_print_pinned
-  if [ "$ASSUME_YES" != 1 ]; then
-    printf 'Remove the records listed above? (y/n) [n]: '
-    read -r _doctor_answer || _doctor_answer=""
-    case "$_doctor_answer" in y|Y) ;; *) echo "Aborted; nothing removed."; exit 1 ;; esac
-  fi
-  _doctor_removed=0 _doctor_skipped=0 _doctor_failed=0 _doctor_failed_files=""
-  while IFS="$_DOCTOR_US" read -r _s _team _agent _pane _files; do
-    [ -n "$_s" ] || continue
-    # The scan is older than the question above: a team of this name may have
-    # been created while it waited, and its records now belong to a live team.
-    # Checked again, right before each seat's files go.
-    _enc_team="$(_actas_lock_encode "$_team")"
-    case $'\n'"$(_doctor_existing_enc_teams)"$'\n' in
-      *$'\n'"$_enc_team"$'\n'*) _doctor_skipped=$((_doctor_skipped + 1)); continue ;;
+  _doctor_aborted=0 _doctor_failed=0
+  if [ -n "$ORPHAN_SEATS" ]; then
+    _doctor_print_orphans
+    _doctor_print_pinned
+    if [ "$ASSUME_YES" != 1 ]; then
+      printf 'Remove the orphaned run/ records listed above? (y/n) [n]: '
+      read -r _doctor_answer || _doctor_answer=""
+      case "$_doctor_answer" in y|Y) ;; *) echo "Aborted; run/ records not removed."; _doctor_aborted=1; _doctor_answer="" ;; esac
+    else
+      _doctor_answer=y
+    fi
+    case "$_doctor_answer" in
+      y|Y)
+        _doctor_removed=0 _doctor_skipped=0 _doctor_failed_files=""
+        while IFS="$_DOCTOR_US" read -r _s _team _agent _pane _files; do
+          [ -n "$_s" ] || continue
+          # The scan is older than the question above: a team of this name may
+          # have been created while it waited, and its records now belong to a
+          # live team. Checked again, right before each seat's files go.
+          _enc_team="$(_actas_lock_encode "$_team")"
+          case $'\n'"$(_doctor_existing_enc_teams)"$'\n' in
+            *$'\n'"$_enc_team"$'\n'*) _doctor_skipped=$((_doctor_skipped + 1)); continue ;;
+          esac
+          # A worker may have started (or a record been rewritten) since the scan.
+          if _doctor_spawn_veto "$_s"; then _doctor_skipped=$((_doctor_skipped + 1)); continue; fi
+          _seat_failed=0
+          for _f in $_files; do
+            if ! rm -f "$RUN_DIR/$_f"; then
+              _seat_failed=1; _doctor_failed_files="${_doctor_failed_files:+$_doctor_failed_files }$_f"
+            fi
+          done
+          if [ "$_seat_failed" = 1 ]; then _doctor_failed=$((_doctor_failed + 1)); else _doctor_removed=$((_doctor_removed + 1)); fi
+        done <<< "$ORPHAN_SEATS"
+        echo "removed the run/ records of $_doctor_removed seat(s)."
+        if [ "$_doctor_skipped" -gt 0 ]; then
+          echo "left $_doctor_skipped seat(s) alone: their team exists now, or a worker is running."
+        fi
+        if [ "$_doctor_failed" -gt 0 ]; then
+          echo "failed to remove records of $_doctor_failed seat(s); still present: $_doctor_failed_files" >&2
+        fi
+        ;;
     esac
-    # A worker may have started (or a record been rewritten) since the scan.
-    if _doctor_spawn_veto "$_s"; then _doctor_skipped=$((_doctor_skipped + 1)); continue; fi
-    _seat_failed=0
-    for _f in $_files; do
-      if ! rm -f "$RUN_DIR/$_f"; then
-        _seat_failed=1; _doctor_failed_files="${_doctor_failed_files:+$_doctor_failed_files }$_f"
-      fi
-    done
-    if [ "$_seat_failed" = 1 ]; then _doctor_failed=$((_doctor_failed + 1)); else _doctor_removed=$((_doctor_removed + 1)); fi
-  done <<< "$ORPHAN_SEATS"
-  echo "removed the run/ records of $_doctor_removed seat(s)."
-  if [ "$_doctor_skipped" -gt 0 ]; then
-    echo "left $_doctor_skipped seat(s) alone: their team exists now, or a worker is running."
   fi
-  if [ "$_doctor_failed" -gt 0 ]; then
-    echo "failed to remove records of $_doctor_failed seat(s); still present: $_doctor_failed_files" >&2
-    exit 1
+  if [ -z "$ORPHAN_SEATS" ] && [ -n "$ORPHAN_AMBIGUOUS$ORPHAN_PINNED" ]; then
+    # Only reached here when ORPHAN_SEATS was empty: otherwise the block
+    # above already printed these sections.
+    _doctor_print_orphans
+    _doctor_print_pinned
   fi
+  # Independent of the orphan-records section above: either can be present
+  # without the other, so one being empty (or its own prompt declined) never
+  # skips the other.
+  if [ -n "$STALE_OUTCOME_FILES" ]; then
+    [ -n "$ORPHAN_SEATS$ORPHAN_AMBIGUOUS$ORPHAN_PINNED" ] && echo
+    _doctor_print_stale_outcome_files
+    if [ "$ASSUME_YES" != 1 ]; then
+      printf 'Remove the leaked outcome files listed above? (y/n) [n]: '
+      read -r _doctor_answer || _doctor_answer=""
+      case "$_doctor_answer" in y|Y) ;; *) echo "Aborted; outcome files not removed."; _doctor_aborted=1; _doctor_answer="" ;; esac
+    else
+      _doctor_answer=y
+    fi
+    case "$_doctor_answer" in
+      y|Y)
+        _doctor_outcome_removed="$(printf '%s\n' "$STALE_OUTCOME_FILES" | agmsg_remove_stale_outcome_files)"
+        echo "removed $_doctor_outcome_removed leaked outcome file(s)."
+        ;;
+    esac
+  fi
+  [ "$_doctor_aborted" -eq 0 ] && [ "$_doctor_failed" -eq 0 ] || exit 1
   exit 0
 fi
 
@@ -727,9 +795,9 @@ _redact_text() {
 # --- scan one (project, type) pair, buffer its block ------------------------
 #
 # Buffered into REPORT_BLOCKS rather than printed inline: the summary line
-# koit asked for has to come FIRST on screen ("撃った人が最初に見るのはそ
-# こ"), but its counts (teams/registrations/warnings) aren't known until
-# every pair in the scope has been scanned. Nothing here is large enough for
+# has to come FIRST on screen -- it is the first thing the person who ran
+# the command looks at -- but its counts (teams/registrations/warnings)
+# aren't known until every pair in the scope has been scanned. Nothing here is large enough for
 # buffering to matter -- even the whole install across every team is a
 # handful of KB.
 REPORT_BLOCKS=""
@@ -844,21 +912,55 @@ _doctor_scan_pair() {
 
       _redact_team "$team"; dteam="$_REDACT_OUT"
       _redact_agent "$agent"; dagent="$_REDACT_OUT"
-      owner="$(actas_lock_owner "$team" "$agent")"
-
+      # `lock=none` is a claim about the world; an unreadable lock is a claim
+      # about us. The reader that fed this line answered "" for both, so doctor
+      # printed "no lock" for a lock it could not read — which is exactly the
+      # output an operator uses to conclude there is nothing here to clean up.
+      # (Review.) A real instance the same day: someone read a record they could
+      # not open, reported
+      # a seat as dead, and it was alive. A diagnostic that says `none` when it
+      # means `could not look` makes people repeat that. Three reads, three
+      # words. (#983)
+      _own_r="$(actas_lock_read "$team" "$agent")"
+      case "${_own_r%%$'\t'*}" in
+        unreadable|ambiguous)
+          reg_lines="${reg_lines}$(printf '  %-22s lock=unreadable' "$dteam/$dagent")"$'\n'
+          _redact_project "$project"
+          _warn "[$_REDACT_OUT] lock could not be read: $dteam/$dagent (not reported as absent)"
+          continue
+          ;;
+        absent)
+          reg_lines="${reg_lines}$(printf '  %-22s lock=none' "$dteam/$dagent")"$'\n'
+          continue
+          ;;
+      esac
+      owner="${_own_r#*$'\t'}"
+      # Read fine, and empty. A distinct fact from both of the above: the file is
+      # there and nothing in the tree ever writes it empty, so this is a torn
+      # write, not a free role. Saying `none` here would invite the cleanup that
+      # #1071 is about.
       if [ -z "$owner" ]; then
-        reg_lines="${reg_lines}$(printf '  %-22s lock=none' "$dteam/$dagent")"$'\n'
+        reg_lines="${reg_lines}$(printf '  %-22s lock=empty' "$dteam/$dagent")"$'\n'
+        _redact_project "$project"
+        _warn "[$_REDACT_OUT] lock file is present but empty: $dteam/$dagent (torn write; not reported as free)"
         continue
       fi
       _any_owner=1
 
-      if agmsg_instance_alive "$owner"; then
-        alive_word="alive"
-      else
-        alive_word="STALE"
-        _redact_project "$project"
-        _warn "[$_REDACT_OUT] stale lock: $dteam/$dagent (owner=$(_redact_owner "$owner"))"
-      fi
+      # Three-way: `alive` is a fact, `STALE` is a fact, and "could not find out"
+      # is neither. Reporting the third as STALE is a diagnostic that invents its
+      # own finding — and doctor's whole job is to be believed. (#983)
+      _alive_rc=0
+      agmsg_instance_alive "$owner" || _alive_rc=$?
+      case "$_alive_rc" in
+        0) alive_word="alive" ;;
+        1) alive_word="STALE"
+           _redact_project "$project"
+           _warn "[$_REDACT_OUT] stale lock: $dteam/$dagent (owner=$(_redact_owner "$owner"))" ;;
+        *) alive_word="unknown"
+           _redact_project "$project"
+           _warn "[$_REDACT_OUT] lock owner liveness could not be determined: $dteam/$dagent (owner=$(_redact_owner "$owner")); not treating it as stale" ;;
+      esac
 
       cc_note=""
       if agmsg_instance_is_composite "$owner"; then
@@ -890,7 +992,7 @@ _doctor_scan_pair() {
           # Only when the lock itself is legitimately live: a stale lock
           # having no watcher is unremarkable (already covered above), but
           # an alive lock with no watcher means the role claims exclusivity
-          # and isn't receiving -- the shape #605 and koit's own example
+          # and isn't receiving -- the shape #605 and the reported example
           # both were.
           if [ "$alive_word" = "alive" ]; then
             _redact_project "$project"
@@ -1032,6 +1134,22 @@ if [ -n "$GLOBAL_WATCH_LINE" ]; then
     _warn "watcher pidfile present but process not running, installation-wide (see the 'watch processes' line above)"
   fi
 fi
+# Daemon health is install-wide, including when Node is unavailable. Read
+# without starting, repairing or registering anything.
+if [ -f "$RUN_DIR/install.db" ]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/lib/daemon-state.sh"
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/lib/daemon-seats.sh"
+  agmsg_daemon_read_state
+  if [ "${AGMSGD_DESIRED:-unknown}" = on ] && [ "${AGMSGD_HEALTH:-unknown}" != ready ]; then
+    _warn "$(_redact_text "$(agmsg_daemon_recovery_text)" "$SKILL_DIR")"
+  elif [ "${AGMSGD_HEALTH:-unknown}" = unknown ]; then
+    _warn 'agmsgd: install record could not be read; daemon health is unknown'
+  fi
+  REPORT_BLOCKS="${REPORT_BLOCKS}agmsgd beta: intent=${AGMSGD_DESIRED:-unknown} health=${AGMSGD_HEALTH:-unknown}"$'\n'
+  REPORT_BLOCKS="${REPORT_BLOCKS}$(agmsg_daemon_seat_report status)"$'\n\n'
+fi
 # Orphaned per-seat run/ records (#1507): like the watcher line above, an
 # installation-wide fact -- no --project/--type/--team narrows it. Reported and
 # counted here, never removed (see --fix).
@@ -1051,6 +1169,12 @@ _doctor_scan_stuck_locks
 if [ -n "$LOCKS_STUCK" ]; then
   _warn "teams/ holds registry lock(s) nothing can judge, and every command for those teams waits on them (see 'registry locks nothing here can judge' above); remove one by hand only when every agmsg sync and seat is stopped"
 fi
+# Leaked storage sync driver outcome files (#1572): installation-wide too,
+# and only ever left by an install made before that fix.
+_doctor_scan_stale_outcome_files
+if [ -n "$STALE_OUTCOME_FILES" ]; then
+  _warn "$(_agmsg_stale_outcome_dir) holds leaked storage sync driver outcome file(s) from before #1572 (see 'leaked storage sync driver outcome files' above); fix them with: doctor.sh --fix"
+fi
 WARN_COUNT="$(printf '%s\n' "$WARNINGS" | grep -c . || true)"
 
 echo "$TEAM_COUNT team(s), $TOTAL_PAIR_COUNT registration(s), $WARN_COUNT warning(s)"
@@ -1063,6 +1187,7 @@ printf '%s' "$REPORT_BLOCKS"
 _doctor_print_pinned
 _doctor_print_orphans
 _doctor_print_locks
+_doctor_print_stale_outcome_files
 
 if [ -n "$WARNINGS" ]; then
   echo "warnings:"
