@@ -153,7 +153,10 @@ agmsg_delivery_apply() {
   # is attacker-influenceable and a bare '...' literal breaks out of its
   # argument boundary on an embedded quote).
   case "$mode" in
-    monitor)
+    # agmsgd installs the same hooks as monitor: session-start.sh runs on every
+    # prompt and, for a project on agmsgd, publishes the destination instead of
+    # starting inject-watch.sh.
+    monitor|agmsgd)
       local ss se
       ss="$(_agmsg_shq "$SKILL_DIR/scripts/session-start.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       se="$(_agmsg_shq "$SKILL_DIR/scripts/session-end.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
@@ -185,7 +188,7 @@ agmsg_delivery_apply() {
       ;;
     *)
       rm -f "$tmp_state"
-      echo "Unknown mode: $mode (use monitor|turn|both|off)" >&2
+      echo "Unknown mode: $mode (use monitor|turn|both|off|agmsgd)" >&2
       return 1
       ;;
   esac
@@ -221,7 +224,14 @@ agmsg_delivery_status() {
   fi
   local mode="off"
   if [ "$has_ss" = "1" ] && [ "$has_st" = "1" ]; then mode="both"
-  elif [ "$has_ss" = "1" ]; then mode="monitor"
+  elif [ "$has_ss" = "1" ]; then
+    mode="monitor"
+    # The hooks are monitor's; the project's recorded choice says who delivers.
+    if ! declare -F agmsg_delivery_choice_get >/dev/null 2>&1; then
+      # shellcheck disable=SC1091
+      . "$SKILL_DIR/scripts/lib/daemon-state.sh"
+    fi
+    [ "$(agmsg_delivery_choice_get "$type" "$project")" != agmsgd ] || mode="agmsgd"
   elif [ "$has_st" = "1" ]; then mode="turn"
   fi
   echo "mode: $mode"
@@ -248,12 +258,12 @@ agmsg_delivery_status() {
 # New extension point (delivery.sh's do_set does not call this yet — wiring it
 # in is [subtask:D]'s job). cursor-agent has no Monitor tool of its own, so
 # monitor/both delivery needs a herdr pane to stream the watcher's output into;
-# without one, the mode would silently do nothing observable. turn/off need
-# neither, so they always pass.
+# agmsgd needs one too, as the pane agmsgd injects into. Without one, the mode
+# would silently do nothing observable. turn/off need neither, so they always pass.
 agmsg_delivery_preflight() {
   local type="$1" project="$2" mode="$3"
   case "$mode" in
-    monitor|both)
+    monitor|both|agmsgd)
       if ! command -v herdr >/dev/null 2>&1; then
         echo "cursor $mode delivery needs the herdr binary on PATH (not found)" >&2
         return 1

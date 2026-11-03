@@ -75,7 +75,7 @@ Sending, reading, history and search go straight to the stores through the `agms
 
 ### 3.4 Delivery: choosing the channel, and the notice tag
 
-- Each registration has exactly one channel. If its pane is known for certain, the notice goes to the pane. If it certainly has no pane, the channel of its type is used (stream for Claude Code, hook for Codex). If it cannot be determined, nothing is written anywhere, delivery stops, and the reason shows in the status view. This avoids falling back to a lower channel and writing into someone else's session.
+- Each registration has exactly one channel. If its pane is known for certain, the notice goes to the pane. If it certainly has no pane, the channel of its type is used (stream for Claude Code, hook for Codex). A cursor session running in a herdr pane is the exception: it is delivered by the cursor channel, which sends the same notice text to that pane through herdr, using the herdr socket recorded with the registration. A cursor session outside herdr has no channel here and keeps turn delivery. If it cannot be determined, nothing is written anywhere, delivery stops, and the reason shows in the status view. This avoids falling back to a lower channel and writing into someone else's session.
 - What gets delivered is "unread and not yet noticed" (for hooks: "unread"). A notice does not mark anything read. A message becomes read only when `inbox` or a hook hands over its body.
 - Notices are at-least-once: the same notice can appear twice. That never affects read state.
 - Each session has at most one delivery reservation in flight. The target is checked again right before writing. While an external child process is still running for that session, nothing more is sent.
@@ -111,6 +111,7 @@ sequenceDiagram
 - A session connects to the daemon through a socket inside the install (a different name for each daemon generation) and registers itself. The daemon checks the registered session's token before sending it a notice.
 - The daemon never sends messages on anyone's behalf. Sending is always the session's own `agmsg`.
 - Stream (Claude Code): the daemon sends the notice, and the client replies "delivered" once it has written it to its output. If the connection drops, the reservation survives, and the same client can reconnect and report the result.
+- Cursor channel (cursor-agent in herdr): the daemon types the notice text into the session's herdr pane. The record holds the pane's locator qualified by the herdr socket, because the daemon does not inherit the session's environment. No message body is sent, only the notice.
 - Hook (Codex and others): on each turn the hook asks the daemon, receives the unread bodies, hands them over and marks them read. One turn's delivery is a single operation, so a crash in the middle neither duplicates nor loses anything.
 - For a pane-only session, the hook is not given the bodies (the daemon writes to the pane instead).
 - If the daemon is stopped, Claude Code stream sessions move to the thin watcher from their next session start. Nothing unread is lost.
@@ -207,7 +208,7 @@ To check in 2.0.0 release candidates: the switch on a copy of a real store (matc
 | Within an install, at most one session holds an identity | Overlap with another install or another machine is not prevented (diagnostics only) |
 | Sends and reads are accepted only with the current holder's token | Not while the groundwork is deactivated |
 | A session never has two channels chosen at once | Duplicates after a crash are within at-least-once |
-| Notices arrive (at-least-once) | The same notice can appear twice. Writing to a pane is no proof the model saw it. Only for the supported types and channels (the Codex desktop app is outside v1) |
+| Notices arrive (at-least-once) | The same notice can appear twice. Writing to a pane is no proof the model saw it. Only for the supported types and channels (the Codex desktop app is outside v1; cursor only inside herdr) |
 | A notice does not mark anything read | — |
 | Text written to a pane never acts as terminal control or key input | This is kept at the level of form only. It cannot stop a subject from posing as an instruction inside the tag, or a model from following it. The tag does not prove the sender |
 | An external tool is never started twice for the same message | Right after an upgrade, while untraceable runs from the older version remain, it may run in parallel with another message to the same member (no upper bound on that period is promised). Messages that arrived before the switch are not run |
@@ -254,7 +255,7 @@ To check in 2.0.0 release candidates: the switch on a copy of a real store (matc
 | migration check | `agmsg migrate --check`. Runs the same switch as 2.0.0 on a copy of the real store and compares. Can be run any number of times during 1.x |
 | rc | a release candidate cut before 2.0.0 (`2.0.0-rc.N`), to check on real machines |
 | groundwork / activate / deactivate | the release that turns on name holding and the send gate. Activating turns it on; deactivating returns to the earlier state |
-| channel | how a notice travels: pane, stream (Claude Code) or hook (Codex and others) |
+| channel | how a notice travels: pane, stream (Claude Code), hook (Codex and others) or cursor (a herdr pane) |
 | thin watcher | how Claude Code receives when there is no daemon (the successor of today's `watch.sh`) |
 | tag addressing / subscription | sending to every member subscribed to a tag. Recipients are fixed at send time |
 | ext-tool | the mechanism that makes an external program a team member. One ledger row per message |

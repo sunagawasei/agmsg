@@ -67,7 +67,7 @@ agmsg_install_db_ensure_meta() {   # <install_db_path>
 # Returns 1 on any sqlite failure.
 agmsg_install_db_apply_schema() {   # <install_db_path> <schema_sql_path>
   local db="$1" schema="$2" col present
-  for col in node_path node_version codex_path; do
+  for col in node_path node_version codex_path herdr_path; do
     # One scalar per column: a multi-line result carries a CR on every line
     # from native Windows sqlite3.exe, which a name comparison would miss.
     present="$(agmsg_sqlite_capture "$db" "SELECT count(*) FROM pragma_table_info('meta') WHERE name = '$col';")" || return 1

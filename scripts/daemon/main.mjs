@@ -20,6 +20,8 @@ import { createCodexQueueChannel } from "./channels/codex-queue.mjs";
 import { ensureCodexChannelSchema } from "./channels/codex-queue-store.mjs";
 import { createClaudeCodeQueueChannel } from "./channels/claude-code-queue.mjs";
 import { ensureClaudeCodeChannelSchema } from "./channels/claude-code-queue-store.mjs";
+import { createCursorQueueChannel } from "./channels/cursor-queue.mjs";
+import { ensureCursorChannelSchema } from "./channels/cursor-queue-store.mjs";
 
 import { withDeadline, PollDeadlineError, CHANNEL_DEADLINE_MS, CYCLE_DEADLINE_MS, STOP_DEADLINE_MS } from './poll-deadline.mjs';
 
@@ -29,6 +31,7 @@ export async function prepareClaimWithCodexSchema(prepareClaim) {
   const prepared = await prepareClaim();
   ensureCodexChannelSchema(prepared.db);
   ensureClaudeCodeChannelSchema(prepared.db);
+  ensureCursorChannelSchema(prepared.db);
   return prepared;
 }
 
@@ -244,6 +247,7 @@ export async function main(db, { installRoot, manifest, manifestText, expectedDe
   channelHooks.push(...(createChannels ? createChannels({ db, installRoot, expectedOpGen }) : [
     createCodexQueueChannel({ db, installRoot, expectedOpGen }),
     createClaudeCodeQueueChannel({ db, installRoot, expectedOpGen }),
+    createCursorQueueChannel({ db, installRoot, expectedOpGen }),
   ]));
 
   process.on("SIGTERM", () => doStop("normal"));

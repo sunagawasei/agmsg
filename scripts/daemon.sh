@@ -48,7 +48,7 @@ AGMSGD_WHOAMI="${AGMSGD_WHOAMI:-}"
 
 _usage() {
   cat >&2 <<'EOF'
-usage: agmsg daemon start|stop|status|enable|disable|offer <type>
+usage: agmsg daemon start|stop|status|enable|disable|fill-herdr|offer <type>
 status options: --json (machine-readable), --all (include older destinations)
 EOF
 }
@@ -188,22 +188,24 @@ _with_op_lock_run() {
   fi
   if [ -n "$statements" ]; then
     # Upgrade rc.1 inside this connection's operation lock and transaction.
-    local has_codex_path
-    printf '%s\n' "SELECT count(*) FROM pragma_table_info('meta', 'installdb') WHERE name='codex_path';" >&8
-    IFS= read -r -t 10 has_codex_path <&9 || has_codex_path=""
-    has_codex_path="${has_codex_path%$'\r'}"
-    if [ "$has_codex_path" = 0 ]; then
-      printf '%s\n' 'ALTER TABLE installdb.meta ADD COLUMN codex_path TEXT;' >&8
-    elif [ "$has_codex_path" != 1 ]; then
-      printf 'ROLLBACK;\n.quit\n' >&8 2>/dev/null || true
-      exec 8>&-
-      exec 9<&-
-      wait "$lock_pid" 2>/dev/null || true
-      rm -f "$lock_dir/in" "$lock_dir/out"
-      rmdir "$lock_dir"
-      echo 'agmsg daemon: could not inspect the Codex executable column' >&2
-      return 1
-    fi
+    local meta_col has_meta_col
+    for meta_col in codex_path herdr_path; do
+      printf '%s\n' "SELECT count(*) FROM pragma_table_info('meta', 'installdb') WHERE name='$meta_col';" >&8
+      IFS= read -r -t 10 has_meta_col <&9 || has_meta_col=""
+      has_meta_col="${has_meta_col%$'\r'}"
+      if [ "$has_meta_col" = 0 ]; then
+        printf '%s\n' "ALTER TABLE installdb.meta ADD COLUMN $meta_col TEXT;" >&8
+      elif [ "$has_meta_col" != 1 ]; then
+        printf 'ROLLBACK;\n.quit\n' >&8 2>/dev/null || true
+        exec 8>&-
+        exec 9<&-
+        wait "$lock_pid" 2>/dev/null || true
+        rm -f "$lock_dir/in" "$lock_dir/out"
+        rmdir "$lock_dir"
+        echo "agmsg daemon: could not inspect the meta column $meta_col" >&2
+        return 1
+      fi
+    done
     printf '%s\n.print APPLIED\n' "$statements" >&8
     if ! IFS= read -r -t 10 applied <&9 || [ "${applied%$'\r'}" != "APPLIED" ]; then
       printf 'ROLLBACK;\n.quit\n' >&8 2>/dev/null || true
@@ -654,6 +656,32 @@ _resolve_codex() {
   done
 }
 
+# Absolute path of the first executable herdr on PATH. The daemon does not
+# inherit a session's PATH, so enable records this for the cursor channel.
+_resolve_herdr() {
+  local candidate dir rest="${PATH:-}:"
+  while [ -n "$rest" ]; do
+    dir="${rest%%:*}"
+    rest="${rest#*:}"
+    [ -n "$dir" ] || dir=.
+    candidate="$dir/herdr"
+    case "$candidate" in *[[:cntrl:]]*) continue ;; esac
+    [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+    dir="$(cd "$(dirname "$candidate")" && pwd -P)" || continue
+    printf '%s\n' "$dir/$(basename "$candidate")"
+    return 0
+  done
+  return 1
+}
+
+# SQL that records the herdr path only where meta.herdr_path is empty; fails
+# when herdr is not found.
+_herdr_fill_sql() {
+  local herdr_path
+  herdr_path="$(_resolve_herdr)" || return 1
+  printf "UPDATE meta SET herdr_path = '%s' WHERE COALESCE(herdr_path, '') = '';" "$(printf '%s' "$herdr_path" | sed "s/'/''/g")"
+}
+
 # Returns 0 when ready, 1 on timeout, 2 when a launcher declined because the
 # intent moved on after it read it (a unit that just registered can launch in
 # the gap before this run's own op_gen bump); the caller starts once more.
@@ -723,10 +751,13 @@ cmd_start() {
   if [ -n "$codex_path" ]; then
     codex_fill="UPDATE meta SET codex_path = '$(printf '%s' "$codex_path" | sed "s/'/''/g")' WHERE COALESCE(codex_path, '') = '';"
   fi
+  # Same for meta.herdr_path, which the cursor channel needs to reach a pane.
+  local herdr_fill
+  herdr_fill="$(_herdr_fill_sql 2>/dev/null || true)"
   local new_op_gen
   local start_where=""
   [ -z "$only_gen" ] || start_where=" WHERE desired = 'on' AND op_gen = $only_gen"
-  _with_op_lock "$record_node_sql $codex_fill UPDATE daemon_intent SET desired = 'on', op_gen = op_gen + 1, set_by = 'start', set_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')$start_where;"
+  _with_op_lock "$record_node_sql $codex_fill $herdr_fill UPDATE daemon_intent SET desired = 'on', op_gen = op_gen + 1, set_by = 'start', set_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')$start_where;"
   new_op_gen="$(agmsg_sqlite "$INSTALL_DB" "SELECT op_gen FROM daemon_intent;")"
   # The guarded UPDATE applied only if it left "on" at op_gen+1 written by start.
   if [ -n "$only_gen" ] && [ "$(agmsg_sqlite "$INSTALL_DB" "SELECT desired || '|' || op_gen || '|' || set_by FROM daemon_intent;")" != "on|$((only_gen + 1))|start" ]; then
@@ -915,13 +946,16 @@ cmd_enable() {
   if [ -z "$codex_path" ] && _has_codex_seat; then
     echo 'agmsg daemon enable: no usable Codex executable found; Codex seats stay blocked until enabled again with Codex available.' >&2
   fi
+  # Empty is fine: herdr is needed only by cursor seats, so enable never fails on it.
+  local herdr_path
+  herdr_path="$(_resolve_herdr 2>/dev/null || true)"
   # Whether a unit was already registered decides what a failure may undo: a
   # unit that was there before this run (and may be running agmsgd) is left
   # alone; only one this run created is removed.
   local was_registered=0
   ! _service_registered || was_registered=1
   _with_op_lock "
-    UPDATE meta SET node_path = '$(printf '%s' "$node_path" | sed "s/'/''/g")', node_version = '$node_version', codex_path = '$(printf '%s' "$codex_path" | sed "s/'/''/g")';
+    UPDATE meta SET node_path = '$(printf '%s' "$node_path" | sed "s/'/''/g")', node_version = '$node_version', codex_path = '$(printf '%s' "$codex_path" | sed "s/'/''/g")', herdr_path = '$(printf '%s' "$herdr_path" | sed "s/'/''/g")';
     UPDATE daemon_intent SET desired = 'on';
   " _register "$node_path" || {
     if [ "$OP_LOCK_NOT_ACQUIRED" = 1 ]; then
@@ -1050,6 +1084,22 @@ cmd_disable() {
   _path_hint disable
 }
 
+# `agmsg daemon fill-herdr` -- records herdr's path when meta.herdr_path is
+# empty, whether or not agmsgd is running. Choosing agmsgd for cursor needs it
+# even when an earlier enable or start (for another type) left it empty.
+cmd_fill_herdr() {
+  local fill_sql
+  fill_sql="$(_herdr_fill_sql)" || {
+    echo "agmsg daemon fill-herdr: no herdr executable found on PATH, so agmsgd cannot reach cursor sessions. Nothing was changed." >&2
+    return 1
+  }
+  _ensure_install_db_schema
+  _with_op_lock "$fill_sql" || {
+    echo "agmsg daemon fill-herdr: could not record the herdr path" >&2
+    return 1
+  }
+}
+
 # `agmsg daemon offer <type>` -- read-only. One line saying whether the delivery
 # choice screen should offer agmsgd for this agent type:
 #   agmsgd=on                       turned on and running; do not ask again
@@ -1061,6 +1111,14 @@ cmd_offer() {
   local type="${1:-}" desired node_path found
   case "$type" in
     claude-code|codex) ;;
+    cursor)
+      # cursor is reached through its herdr pane, so no herdr means no delivery
+      # even when agmsgd itself is on.
+      if ! _resolve_herdr >/dev/null 2>&1; then
+        echo "agmsgd=unavailable reason=agmsgd reaches cursor sessions through herdr, and no herdr executable was found"
+        return 0
+      fi
+      ;;
     *) echo "agmsgd=unavailable reason=agmsgd does not deliver to $type sessions"; return 0 ;;
   esac
   desired="$(sqlite3 -readonly -cmd '.timeout 100' "$INSTALL_DB" 'SELECT desired FROM daemon_intent;' 2>/dev/null | tr -d '\r' || true)"
@@ -1108,6 +1166,7 @@ case "${1:-}" in
   status) shift; cmd_status "$@" ;;
   enable) cmd_enable ;;
   disable) cmd_disable ;;
+  fill-herdr) cmd_fill_herdr ;;
   offer) shift; cmd_offer "$@" ;;
   *) _usage; exit 2 ;;
 esac

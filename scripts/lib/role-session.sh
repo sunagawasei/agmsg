@@ -620,3 +620,107 @@ agmsg_claude_code_native_storage_ready() {
   [ -n "$node_path" ] && [ -x "$node_path" ] || return 1
   "$node_path" "${SKILL_DIR:-}/scripts/daemon/channels/storage-gate.mjs" >/dev/null 2>&1
 }
+
+# Print "<socket>:<wN:pX>" (the herdr locator agmsgd addresses a cursor pane by)
+# for the pane this process runs in, or nothing (rc 1) when the herdr
+# environment is absent or not in herdr's own id grammar. A bare pane id is never
+# printed: the same wN:pX names a different pane in every herdr instance. The
+# grammar check is the herdr driver's own terminal_id_ok, run in a subshell so
+# its terminal_* functions never leak into the caller.
+agmsg_cursor_herdr_locator() {
+  local sock="${HERDR_SOCKET_PATH:-}" pane="${HERDR_PANE_ID:-}"
+  [ -n "$sock" ] && [ -n "$pane" ] || return 1
+  case "$sock" in /*) ;; *) return 1 ;; esac
+  (
+    if ! declare -F agmsg_terminal_load >/dev/null 2>&1; then
+      # shellcheck disable=SC1091
+      . "$SKILL_DIR/scripts/lib/terminal-registry.sh" || exit 1
+    fi
+    agmsg_terminal_load herdr >/dev/null 2>&1 || exit 1
+    # $pane must itself be bare: a qualified id in HERDR_PANE_ID would make the
+    # locator name two sockets.
+    [ -z "$(_herdr_sock_of "$pane")" ] && terminal_id_ok "$sock:$pane"
+  ) || return 1
+  printf '%s:%s\n' "$sock" "$pane"
+}
+
+# Overwrite ONLY the cursor destination fields (and session= when <bare_sid> is
+# given), leaving every other field untouched. Like set_messaging this never
+# creates a record: the caller records the seat first.
+agmsg_role_session_set_herdr_messaging() {
+  _agmsg_role_session_write _agmsg_role_session_set_herdr_messaging_unlocked "$@" || true
+}
+
+_agmsg_role_session_set_herdr_messaging_unlocked() {   # <team> <agent> <locator> <terminal_id> <conversation_id> [<bare_sid>]
+  local team="$1" agent="$2" locator="$3" terminal_id="$4" conv="$5" bare_sid="${6:-}"
+  [ -n "$team" ] && [ -n "$agent" ] && [ -n "$locator" ] && [ -n "$terminal_id" ] && [ -n "$conv" ] || return 0
+  case "$locator$terminal_id$conv$bare_sid" in *[[:cntrl:]]*) return 0 ;; esac
+  local path dir tmp line
+  _agmsg_role_session_path_into "$team" "$agent"
+  path="$_AGMSG_ROLE_SESSION_PATH"
+  [ -f "$path" ] || return 0
+  dir="$(_actas_lock_dir)"
+  tmp="$(mktemp "$dir/.role-session.XXXXXX" 2>/dev/null)" || return 0
+  {
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        herdr_locator=*|herdr_terminal_id=*|cursor_conversation_id=*|messaging_blocked=*) ;;
+        session=*) [ -z "$bare_sid" ] && printf '%s\n' "$line" ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$path"
+    [ -z "$bare_sid" ] || printf 'session=%s\n' "$bare_sid"
+    printf 'herdr_locator=%s\n' "$locator"
+    printf 'herdr_terminal_id=%s\n' "$terminal_id"
+    printf 'cursor_conversation_id=%s\n' "$conv"
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# Publish the cursor destination for <bare_sid>, then read it back: rc 0 only
+# when the record holds all three fields and names this session.
+agmsg_role_session_publish_herdr_messaging() {   # <team> <agent> <locator> <terminal_id> <conversation_id> <bare_sid>
+  local team="$1" agent="$2" locator="$3" terminal_id="$4" conv="$5" bare_sid="$6"
+  agmsg_role_session_set_herdr_messaging "$team" "$agent" "$locator" "$terminal_id" "$conv" "$bare_sid"
+  [ "$(agmsg_role_session_get "$team" "$agent" herdr_locator 2>/dev/null || true)" = "$locator" ] \
+    && [ "$(agmsg_role_session_get "$team" "$agent" herdr_terminal_id 2>/dev/null || true)" = "$terminal_id" ] \
+    && [ "$(agmsg_role_session_get "$team" "$agent" cursor_conversation_id 2>/dev/null || true)" = "$conv" ] \
+    && [ "$(agmsg_role_session_uuid "$team" "$agent" 2>/dev/null || true)" = "$bare_sid" ]
+}
+
+# The session cannot publish a herdr destination (<reason>, snake_case): drop the
+# old one, which names a pane this session may no longer hold, and record why in
+# the same messaging_blocked field the Claude channel uses. <expected_bare_sid>
+# is checked under the write lock; rc 1 says nothing was changed.
+agmsg_role_session_mark_herdr_blocked() {   # <team> <agent> <reason> <expected_bare_sid>
+  _agmsg_role_session_write _agmsg_role_session_mark_herdr_blocked_unlocked "$@"
+}
+
+_agmsg_role_session_mark_herdr_blocked_unlocked() {
+  local team="$1" agent="$2" reason="$3" expect="${4:-}" path dir tmp line current=""
+  case "$reason" in ''|*[!a-z_]*) return 1 ;; esac
+  [ -n "$team" ] && [ -n "$agent" ] && [ -n "$expect" ] || return 1
+  _agmsg_role_session_path_into "$team" "$agent"
+  path="$_AGMSG_ROLE_SESSION_PATH"
+  [ -f "$path" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in session=*) current="${line#session=}"; break ;; esac
+  done < "$path"
+  [ "$current" = "$expect" ] || return 1
+  dir="$(_actas_lock_dir)"
+  tmp="$(mktemp "$dir/.role-session.XXXXXX" 2>/dev/null)" || return 1
+  {
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        herdr_locator=*|herdr_terminal_id=*|cursor_conversation_id=*|messaging_blocked=*) ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$path"
+    printf 'messaging_blocked=%s\n' "$reason"
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$path" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}

@@ -93,13 +93,25 @@ case "$ACTION" in
     elif [ "$mode" = agmsgd ] || { [ "$TYPE" != claude-code ] && { [ "$chosen" = agmsgd ] || { [ -z "$chosen" ] && [ "$offer" = agmsgd=on ]; }; }; }; then
       # For Claude Code delivery.sh decides (agmsgd only while it is on), so this
       # line cannot say agmsgd where SessionStart and actas use the Monitor.
-      echo "this project: agmsgd — no Monitor is armed here; the session hooks only start agmsgd's delivery"
+      if [ "$TYPE" = cursor ]; then
+        echo "this project: agmsgd — no inject watcher is started here; agmsgd sends the notice to the session's herdr pane"
+      else
+        echo "this project: agmsgd — no Monitor is armed here; the session hooks only start agmsgd's delivery"
+      fi
     elif [ -n "$mode" ]; then
       echo "this project: $(_mode_label "$mode")"
     fi
     printf '%s\n' "$out"
     ;;
   agmsgd)
+    # A daemon enabled earlier for another type can be ready with no herdr path
+    # recorded, and every cursor seat would then stay blocked.
+    if [ "$TYPE" = cursor ]; then
+      case "$offer" in
+        agmsgd=unavailable*) ;;
+        *) bash "$SCRIPT_DIR/daemon.sh" fill-herdr || { echo "agmsg delivery: agmsgd was not chosen; this project's delivery is unchanged" >&2; exit 1; } ;;
+      esac
+    fi
     case "$offer" in
       agmsgd=on) ;;
       agmsgd=not-running*)

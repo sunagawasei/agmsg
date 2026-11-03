@@ -149,6 +149,16 @@ export function readOwnerAndIntentReadOnly(installRoot) {
       if (!String(error?.message ?? "").includes("no such table")) throw error;
       claudeCodeSeats = { state: "unavailable", reason: "channel_not_initialized", seats: [] };
     }
+    let cursorSeats;
+    try {
+      cursorSeats = {
+        state: "ok",
+        seats: db.prepare("SELECT seat, herdr_locator, state, reason, checked_at FROM beta_cursor_seat ORDER BY seat").all(),
+      };
+    } catch (error) {
+      if (!String(error?.message ?? "").includes("no such table")) throw error;
+      cursorSeats = { state: "unavailable", reason: "channel_not_initialized", seats: [] };
+    }
     let codexPending = [];
     try {
       codexPending = db.prepare("SELECT seat, created_at, children FROM beta_codex_queue WHERE state='pending' ORDER BY created_at, id").all();
@@ -167,7 +177,7 @@ export function readOwnerAndIntentReadOnly(installRoot) {
       owner.state === "none" || owner.executor_pid == null
         ? null
         : isAlive({ pid: owner.executor_pid, bootId: owner.executor_boot_id, startedAt: owner.executor_started_at });
-    return { owner, intent, alive, codexSeats, claudeCodeSeats, codexPending, codexExpired, lastAttempt };
+    return { owner, intent, alive, codexSeats, claudeCodeSeats, cursorSeats, codexPending, codexExpired, lastAttempt };
   } finally {
     db.close();
   }
@@ -210,9 +220,9 @@ async function main() {
     process.stderr.write("usage: status.mjs <installRoot>\n");
     process.exit(2);
   }
-  let owner, intent, alive, codexSeats, claudeCodeSeats, codexPending, codexExpired, lastAttempt;
+  let owner, intent, alive, codexSeats, claudeCodeSeats, cursorSeats, codexPending, codexExpired, lastAttempt;
   try {
-    ({ owner, intent, alive, codexSeats, claudeCodeSeats, codexPending, codexExpired, lastAttempt } = readOwnerAndIntentReadOnly(installRoot));
+    ({ owner, intent, alive, codexSeats, claudeCodeSeats, cursorSeats, codexPending, codexExpired, lastAttempt } = readOwnerAndIntentReadOnly(installRoot));
   } catch (error) {
     // An input that can be detected as an error is reported at
     // that entry point, with a nonzero exit -- not a raw stack trace, and
@@ -240,7 +250,7 @@ async function main() {
   const pollTimeout = readPollTimeout(installRoot);
   const pollText = pollTimeout ? `Last poll timeout: ${pollTimeout.channel ?? 'unknown'} ${pollTimeout.seat ?? ''} ${pollTimeout.reason} (${pollTimeout.at ?? 'unknown time'})\n` : '';
   process.stdout.write(
-    json ? `${JSON.stringify({ ...result, poll_timeout: pollTimeout, install_verify_warning: installVerifyWarning, codex_seats: codexSeats, claude_code_seats: claudeCodeSeats, codex_pending: codexPending, codex_expired: codexExpired, node_sqlite_experimental: true, node_version: process.version })}\n` : `${result.text}\n${formatInstallVerifyWarning(installVerifyWarning)}${pollText}${formatSkippedTeams("Claude Code", claudeCodeSeats)}${formatSkippedTeams("Codex", codexSeats)}${formatClaudeSeats(claudeCodeSeats, all)}${formatUnregisteredPending(installRoot, codexPending, all)}`,
+    json ? `${JSON.stringify({ ...result, poll_timeout: pollTimeout, install_verify_warning: installVerifyWarning, codex_seats: codexSeats, claude_code_seats: claudeCodeSeats, cursor_seats: cursorSeats, codex_pending: codexPending, codex_expired: codexExpired, node_sqlite_experimental: true, node_version: process.version })}\n` : `${result.text}\n${formatInstallVerifyWarning(installVerifyWarning)}${pollText}${formatSkippedTeams("Claude Code", claudeCodeSeats)}${formatSkippedTeams("Cursor", cursorSeats)}${formatSkippedTeams("Codex", codexSeats)}${formatClaudeSeats(claudeCodeSeats, all)}${formatClaudeSeats(cursorSeats, all, "Cursor", "herdr_locator")}${formatUnregisteredPending(installRoot, codexPending, all)}`,
   );
   process.exitCode = result.exitCode;
 }
@@ -298,7 +308,7 @@ function formatSkippedTeams(label, inventory) {
   return text;
 }
 
-function formatClaudeSeats(inventory, all) {
+function formatClaudeSeats(inventory, all, product = "Claude Code", destination = "messaging_socket") {
   let omitted = 0;
   const lines = [];
   for (const seat of inventory?.seats ?? []) {
@@ -307,18 +317,18 @@ function formatClaudeSeats(inventory, all) {
     if (chosen) {
       let label;
       try { label = JSON.parse(seat.seat).join("/"); } catch { label = "unidentified seat"; }
-      lines.push(`Claude Code ${label}: ${chosen === "monitor" ? "monitor (legacy)" : chosen} chosen; agmsgd does not deliver here`);
+      lines.push(`${product} ${label}: ${chosen === "monitor" ? "monitor (legacy)" : chosen} chosen; agmsgd does not deliver here`);
       continue;
     }
-    if (!all && (seat.state === "unaddressable" || !seat.messaging_socket)) {
+    if (!all && (seat.state === "unaddressable" || !seat[destination])) {
       omitted += 1;
       continue;
     }
     let label;
     try { label = JSON.parse(seat.seat).join("/"); } catch { label = "unidentified seat"; }
-    lines.push(`Claude Code ${label}: last daemon observation: ${seat.state}${seat.reason ? ` (${seat.reason})` : ""}`);
+    lines.push(`${product} ${label}: last daemon observation: ${seat.state}${seat.reason ? ` (${seat.reason})` : ""}`);
   }
-  if (omitted) lines.push(`Claude Code seats: ${omitted} unavailable destination records hidden. View them with: agmsg daemon status --all`);
+  if (omitted) lines.push(`${product} seats: ${omitted} unavailable destination records hidden. View them with: agmsg daemon status --all`);
   return lines.length ? `${lines.join("\n")}\n` : "";
 }
 

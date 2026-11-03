@@ -21,8 +21,10 @@ export function openInstallDb(path, { readonly = false } = {}) {
     db.exec(readFileSync(SCHEMA_PATH, "utf8"));
     // Additive upgrade from rc.1; existing enable settings remain intact.
     withImmediateTransaction(db, () => {
-      if (!db.prepare("SELECT 1 FROM pragma_table_info('meta') WHERE name='codex_path'").get()) {
-        db.exec("ALTER TABLE meta ADD COLUMN codex_path TEXT");
+      for (const column of ["codex_path", "herdr_path"]) {
+        if (!db.prepare("SELECT 1 FROM pragma_table_info('meta') WHERE name=?").get(column)) {
+          db.exec(`ALTER TABLE meta ADD COLUMN ${column} TEXT`);
+        }
       }
     });
   }

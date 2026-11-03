@@ -4,7 +4,7 @@ import { assertPollActive, pollSignal, withDeadline, SEAT_DEADLINE_MS, PollDeadl
 import { deliveryEvent, recordPollTimeout } from './log.mjs';
 
 export function createSeatPoller({ db, installRoot, channel, saveTimeout, log, timeoutMs = SEAT_DEADLINE_MS }) {
-  const prefix = channel === 'codex' ? 'beta_codex' : 'beta_claude';
+  const prefix = { codex: 'beta_codex', cursor: 'beta_cursor' }[channel] ?? 'beta_claude';
   let current;
   let cancelled = false;
   const lifetime = new AbortController();

@@ -58,6 +58,8 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/inbox-target.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/process-identity.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/daemon-state.sh"
 
 HERDR="${AGMSG_HERDR_CMD:-herdr}"
 POLL_INTERVAL="${AGMSG_INJECT_POLL_INTERVAL:-2}"
@@ -398,6 +400,9 @@ poll_new() {
 }
 
 while :; do
+  # A project that chose agmsgd is delivered to by the daemon; two deliverers
+  # would inject each message twice. EXIT still runs _cleanup.
+  [ "$(agmsg_delivery_choice_get "$TYPE" "$PROJECT" 2>/dev/null || true)" != agmsgd ] || exit 0
   retry_journal
   poll_new
   # Background + wait (not a foreground sleep) so TERM/INT are handled the
