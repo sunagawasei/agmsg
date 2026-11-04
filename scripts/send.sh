@@ -6,7 +6,7 @@ set -euo pipefail
 #   send.sh <team> <from> <to> --body-file <path> [flags]       # body read from a file
 #   send.sh <team> <from> <to> --body - [flags]                 # body read from stdin
 #   send.sh <team> <from> <to> --stdin [flags]                  # same as --body -
-#   flags: [--force] [--wait] [--timeout <sec>] [--interval <sec>]
+#   flags: [--force]
 #
 # --body-file matches poke.sh, for the same reason (#507) AND to close #1101: a caller
 # who learned --body-file from poke used to have send take the literal string
@@ -22,34 +22,12 @@ set -euo pipefail
 # can't hit ARG_MAX or be mangled by shell quoting — the bridge workers use it for exactly
 # that.
 #
-# Without --wait: insert the message and return immediately (legacy behavior).
-#
-# With --wait: after sending, BLOCK in the foreground until <to> replies back to
-# <from> — i.e. a message with id greater than the one just sent, from_agent=<to>,
-# to_agent=<from>, same team — then print that reply and exit 0. On timeout,
-# print `status=timeout` and exit 2.
-#
-#   Exits:
-#     0  reply received (with --wait), or message sent (without --wait)
-#     2  --wait timed out with no reply
-#
-# Why id-scoped rather than read_at-scoped (cf. watch-once.sh): the reply wait
-# keys on `id > <sent_id>` + sender, so it ignores any pre-existing unread
-# backlog and never collides with a monitor watcher's id-watermark cursor. The
-# inbox does NOT need to be drained first, and --wait never marks anything read
-# (inbox.sh remains the sole read cursor).
-#
-# Intended use (Claude Code): when you send a message expecting a reply and want
-# the assistant to stay "busy" instead of ending its turn, pass --wait so the
-# foreground block holds the turn open (and the terminal's "running" state) until
-# the reply lands. Bash tool calls cap at 10 min, so keep --timeout below that
-# (e.g. 540) and loop send --wait calls within a single turn for longer
-# exchanges. A monitor watcher will also surface the same reply as a duplicate
-# event afterward — treat the --wait result as authoritative and ignore it.
+# send.sh only inserts the message and returns. The reply reaches the sender
+# through its own delivery (agmsgd, monitor, or turn hook), not through this command.
 
 die() { echo "send.sh: $*" >&2; exit 1; }
 
-TEAM="${1:?Usage: send.sh <team> <from> <to> <message|--stdin|--body-file PATH|--body -> [--force] [--wait] [--timeout <sec>] [--interval <sec>]}"
+TEAM="${1:?Usage: send.sh <team> <from> <to> <message|--stdin|--body-file PATH|--body -> [--force]}"
 FROM="${2:?Missing from agent}"
 TO="${3:?Missing to agent}"
 shift 3
@@ -89,28 +67,22 @@ case "$BODY" in
   *) echo "send: refusing an empty message body (nothing but whitespace)" >&2; exit 1 ;;
 esac
 
-WAIT=0
 FORCE=0
-TIMEOUT="${AGMSG_SEND_WAIT_TIMEOUT:-300}"
-INTERVAL="${AGMSG_SEND_WAIT_INTERVAL:-2}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --stdin) shift ;;   # tolerated after the body, as before
     --force) FORCE=1; shift ;;
-    --wait) WAIT=1; shift ;;
-    --timeout) TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
-    --interval) INTERVAL="${2:?--interval needs seconds}"; shift 2 ;;
+    --wait|--timeout|--interval)
+      echo "send: $1 was removed; the reply is delivered to your session, so send and end the turn" >&2
+      exit 1 ;;
     -h|--help)
-      echo "Usage: send.sh <team> <from> <to> <message|--stdin|--body-file PATH|--body -> [--force] [--wait] [--timeout <sec>] [--interval <sec>]"
+      echo "Usage: send.sh <team> <from> <to> <message|--stdin|--body-file PATH|--body -> [--force]"
       exit 0 ;;
     *) echo "send: unknown option: $1" >&2; exit 1 ;;
   esac
 done
 
-case "$TIMEOUT" in ''|*[!0-9]*) echo "send: --timeout must be a whole number of seconds" >&2; exit 1 ;; esac
-case "$INTERVAL" in ''|*[!0-9]*) echo "send: --interval must be a whole number of seconds" >&2; exit 1 ;; esac
-[ "$INTERVAL" -gt 0 ] || INTERVAL=1
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
@@ -334,49 +306,3 @@ if [ -n "${MSG_ID:-}" ] && [ -f "$TEAM_CONFIG" ]; then
     done
   fi
 fi
-
-[ "$WAIT" -eq 1 ] || exit 0
-
-# --- reply wait -----------------------------------------------------------
-# Block until <to> replies to <from> with a message newer than the one we sent.
-# Newlines in the body are flattened to a literal "\n" so the printed reply
-# stays a single line — same convention as watch.sh's stream.
-T_ESC="$(printf '%s' "$TEAM" | sed "s/'/''/g")"
-F_ESC="$(printf '%s' "$FROM" | sed "s/'/''/g")"
-O_ESC="$(printf '%s' "$TO" | sed "s/'/''/g")"
-E_ESC="$(printf '%s' "$SENT_EVENT_ID" | sed "s/'/''/g")"
-SENT_ID="$(agmsg_sqlite "$DB" \
-  "SELECT legacy_id FROM events WHERE type='message_sent' AND id='$E_ESC' LIMIT 1;" \
-  2>/dev/null | tr -d '\r')"
-case "$SENT_ID" in ''|*[!0-9]*) echo "send: could not resolve sent message id" >&2; exit 1 ;; esac
-REPLY_WHERE="id > $SENT_ID AND team='$T_ESC' AND from_agent='$O_ESC' AND to_agent='$F_ESC'"
-deadline=$(( $(date +%s) + TIMEOUT ))
-
-while true; do
-  if [ -f "$DB" ]; then
-    row="$(agmsg_sqlite -separator $'\x1f' "$DB" "
-      SELECT id, created_at, team, from_agent, to_agent,
-             replace(replace(replace(body, char(13), ''), char(10), '\\n'), char(31), char(9247))
-      FROM messages
-      WHERE $REPLY_WHERE
-      ORDER BY id LIMIT 1;
-    " 2>/dev/null || true)"
-    if [ -n "$row" ]; then
-      IFS=$'\x1f' read -r rid ts rteam rfrom rto rbody <<< "$row"
-      printf 'status=reply id=%s\n' "$rid"
-      printf '%s | %s | %s → %s | %s\n' "$ts" "$rteam" "$rfrom" "$rto" "$rbody"
-      exit 0
-    fi
-  fi
-
-  now=$(date +%s)
-  if [ "$now" -ge "$deadline" ]; then
-    echo "status=timeout"
-    exit 2
-  fi
-  sleep_for="$INTERVAL"
-  remaining=$(( deadline - now ))
-  [ "$remaining" -lt "$sleep_for" ] && sleep_for="$remaining"
-  [ "$sleep_for" -gt 0 ] || sleep_for=1
-  sleep "$sleep_for"
-done

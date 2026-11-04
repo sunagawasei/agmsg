@@ -3,8 +3,8 @@
 # session-team mode (opt-in delivery.session_team): each Claude session uses its
 # own team s-<bare-session-uuid>, so concurrent / resumed sessions sharing a
 # project directory are isolated (no cross-session crosstalk). PR1 = the
-# crosstalk-stop core: whoami resolution, watch --team pinning, team-scoped
-# ask/wait, and the lazy-codex no-op guard.
+# crosstalk-stop core: whoami resolution, watch --team pinning, and the
+# lazy-codex no-op guard.
 
 load test_helper
 
@@ -97,28 +97,6 @@ wait_for_db_body() {
 
   grep -q "MSG-in-AAA" "$TEST_SKILL_DIR/w.log"
   ! grep -q "MSG-in-BBB" "$TEST_SKILL_DIR/w.log"
-}
-
-# --- ask/--wait is team-scoped: the reply-matching isolation -----------------
-
-@test "ask/--wait only matches a reply in the same team" {
-  enable_st
-  bash "$SCRIPTS/join.sh" s-AAA claude claude-code "$PROJ" >/dev/null
-  bash "$SCRIPTS/join.sh" s-AAA codex codex "$PROJ" >/dev/null
-  bash "$SCRIPTS/join.sh" s-BBB claude claude-code "$PROJ" >/dev/null
-  bash "$SCRIPTS/join.sh" s-BBB codex codex "$PROJ" >/dev/null
-  AGMSG_SEND_WAIT_INTERVAL=1 bash "$SCRIPTS/send.sh" s-AAA claude codex "Q" --wait --timeout 12 \
-    >"$TEST_SKILL_DIR/ask.log" 2>/dev/null &
-  local pid=$!
-  wait_for_file_contains "$TEST_SKILL_DIR/ask.log" "Sent to codex in team s-AAA"
-  bash "$SCRIPTS/send.sh" s-BBB codex claude "wrong-team-reply" >/dev/null  # other session team
-  wait_for_db_body "wrong-team-reply"
-  bash "$SCRIPTS/send.sh" s-AAA codex claude "right-reply" >/dev/null       # our team
-  wait "$pid" 2>/dev/null || true
-
-  grep -q "status=reply" "$TEST_SKILL_DIR/ask.log"
-  grep -q "right-reply" "$TEST_SKILL_DIR/ask.log"
-  ! grep -q "wrong-team-reply" "$TEST_SKILL_DIR/ask.log"
 }
 
 # --- send.sh cross-session isolation guard -----------------------------------

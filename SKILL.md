@@ -170,38 +170,11 @@ Four entries are needed because a rule matches the command string as written, an
 
 The allowlist does not enable sandboxing by itself. Use `/sandbox` in Claude Code to choose a sandbox mode, or add `"enabled": true` alongside `"filesystem"` under `"sandbox"` to configure it in settings. The allowlist has no effect until sandboxing is enabled.
 
-**Session-team mode (`delivery.session_team`).** When this config is enabled, your identity is your OWN per-session team `s-$CLAUDE_CODE_SESSION_ID` (agent `claude`). `whoami.sh` already returns it, so `$TEAM`/`$AGENT` resolve to the session team with no extra step, and each Claude session is fully isolated — you never see other sessions' traffic. The session's codex worker is started lazily: **before the first `send`/`ask` to codex, run** `~/.agents/skills/agmsg/scripts/ensure-codex.sh "$(pwd)"`. It brings up a headless codex in your session team (and is a no-op when the mode is off, so it is always safe to run first). On `--continue`/`--resume` the team name is unchanged (same session id), but the previous generation's team is removed when its owner dies, so the resumed session starts with an empty team: prior messages and history are not available.
+**Session-team mode (`delivery.session_team`).** When this config is enabled, your identity is your OWN per-session team `s-$CLAUDE_CODE_SESSION_ID` (agent `claude`). `whoami.sh` already returns it, so `$TEAM`/`$AGENT` resolve to the session team with no extra step, and each Claude session is fully isolated — you never see other sessions' traffic. The session's codex worker is started lazily: **before the first `send` to codex, run** `~/.agents/skills/agmsg/scripts/ensure-codex.sh "$(pwd)"`. It brings up a headless codex in your session team (and is a no-op when the mode is off, so it is always safe to run first). On `--continue`/`--resume` the team name is unchanged (same session id), but the previous generation's team is removed when its owner dies, so the resumed session starts with an empty team: prior messages and history are not available.
 
-**IMPORTANT — cross-session isolation.** `$TEAM` for `send.sh`/`ask` MUST come from `whoami.sh` output (the Identity section above). Never derive the team from pidfiles, process listings, or `ls run/codex-bridge.*` — other sessions may have live bridges whose team names look similar, and using the wrong team would leak your messages into another session. As a backstop, `send.sh` refuses a send INTO another session's private team (`s-<id>`) when it is not this session's own; project-team sends are unaffected, and a deliberate cross-session send needs `AGMSG_ALLOW_CROSS_TEAM=1`. `ensure-codex.sh` also prints `ensure-codex: … in team '<name>'` on its session-team success paths so you can confirm it targeted your session's team.
+**IMPORTANT — cross-session isolation.** `$TEAM` for `send.sh` MUST come from `whoami.sh` output (the Identity section above). Never derive the team from pidfiles, process listings, or `ls run/codex-bridge.*` — other sessions may have live bridges whose team names look similar, and using the wrong team would leak your messages into another session. As a backstop, `send.sh` refuses a send INTO another session's private team (`s-<id>`) when it is not this session's own; project-team sends are unaffected, and a deliberate cross-session send needs `AGMSG_ALLOW_CROSS_TEAM=1`. `ensure-codex.sh` also prints `ensure-codex: … in team '<name>'` on its session-team success paths so you can confirm it targeted your session's team.
 
-**send vs ask — pick by whether you expect a reply.** Use `ask` for any message
-where you want an answer back (questions, requests, consultations, code-review
-asks). Use `send` for one-way traffic (notifications, acknowledgements,
-fire-and-forget, control). The difference is busy-keep: `ask` blocks until the
-reply lands so the session keeps "running"; `send` returns immediately.
-
-If argument starts with "ask" (e.g. "ask misaki does the server look healthy?"):
-This is the request/reply sibling of `send` — it sends, then BLOCKS in the
-foreground until <to_agent> replies to you, holding the assistant turn (and the
-terminal's "running" indicator) open the whole time. This is the busy-keep path:
-prefer it whenever you expect an answer so the session does not go idle while waiting.
-1. Parse target agent and message from the arguments.
-2. If `<to_agent>` is `codex`, first run `~/.agents/skills/agmsg/scripts/ensure-codex.sh "$(pwd)"` (lazily starts this session's codex in session-team mode; no-op otherwise). Then determine which team the target agent belongs to, and run:
-   `~/.agents/skills/agmsg/scripts/send.sh $TEAM $AGENT <to_agent> "<message>" --wait --timeout 540`
-   (equivalently `dispatch.sh ... ask <to_agent> "<message>"`).
-3. On success it prints `status=reply` + the reply line. Read it and continue
-   **in the same turn**: to keep the exchange unbroken, fire the next `ask`
-   without emitting a final response (a final text response ends the turn and the
-   terminal goes idle).
-4. A Bash tool call caps at 10 minutes, so keep `--timeout` under that (≈540s) and
-   loop `ask` calls within the turn for longer waits. On timeout it prints
-   `status=timeout` and exits 2 — re-run to keep waiting, or stop and yield.
-5. `ask`/`--wait` is id-scoped (it waits for a reply newer than this send), so it
-   needs no inbox draining and coexists with monitor delivery. A monitor watcher
-   also delivers the same reply as a later duplicate event — the `ask` output is
-   authoritative; ignore the duplicate. Do not fire parallel `ask`s on the same
-   from/to pair: with no conversation id yet, concurrent asks can't be correlated
-   and the first reply satisfies whichever was waiting.
+**Replies arrive on their own.** `send.sh` inserts the message and returns; there is no `ask` and no `--wait`. The reply reaches this session through its delivery (agmsgd, monitor, or the turn hook) as a new notice, so after sending, continue other work or end the turn. Never run a command that blocks waiting for the reply: it keeps a shell open and holds the turn "running" for nothing.
 If argument starts with "send" and `<to_agent>` is `codex`, first run `~/.agents/skills/agmsg/scripts/ensure-codex.sh "$(pwd)"` (lazily starts this session's codex in session-team mode; no-op otherwise), then follow the normal send flow.
 
 

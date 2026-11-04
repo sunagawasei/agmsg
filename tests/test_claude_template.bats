@@ -116,3 +116,8 @@ setup() {
   run grep -Fq 'that is the reliable check' "$TEMPLATE"
   [ "$status" -ne 0 ]
 }
+
+@test "Claude rendered skill does not recommend a blocking wait for replies" {
+  run grep -Eq -- '--wait --timeout|busy-keep|If argument starts with "ask"' "$RENDERED"
+  [ "$status" -ne 0 ]
+}

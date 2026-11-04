@@ -71,7 +71,6 @@ test_role_session.bats	12	3
 test_roster_journal.bats	81	63
 test_self_name.bats	63	28
 test_self_proof.bats	2	2
-test_send_wait.bats	21	14
 test_session_end_budget.bats	24	24
 test_session_end_drain.bats	28	15
 test_session_end_teardown.bats	11	3
