@@ -1240,6 +1240,7 @@ class CodexBridge {
     };
     this.client.on("process/exited", this.clientHandler("process/exited", (params) => this.onProcessExited(params)));
     this.client.on("error", this.clientHandler("error", (params) => this.onServerError(params)));
+    this.client.on("item/completed", this.clientHandler("item/completed", (params) => this.onItemCompleted(params)));
     this.client.on("item/agentMessage/delta", this.clientHandler("item/agentMessage/delta", (params) => this.onAgentMessageDelta(params)));
     this.client.on("thread/status/changed", this.clientHandler("thread/status/changed", (params) => this.onThreadStatus(params)));
     this.client.on("turn/started", this.clientHandler("turn/started", (params) => {
@@ -1806,7 +1807,46 @@ class CodexBridge {
     const snapshot = this.turnSnapshots.get(epoch);
     if (!snapshot) return;
     this.dropTurnEpoch(epoch);
+    this.relayUnrepliedTurn(snapshot);
     this.settleInflightEpoch(epoch, snapshot.pairs);
+  }
+
+  // A worker that finishes a turn without calling send.sh leaves its answer only
+  // in this bridge's log, and the sender never gets an agmsgd notice. Check per
+  // consumed sender whether the worker sent anything since the turn started, and
+  // relay the turn's final agent message when it did not.
+  relayUnrepliedTurn(snapshot) {
+    if (!snapshot || !snapshot.sendersByPair) return;
+    for (const pair of snapshot.pairs) {
+      const senders = snapshot.sendersByPair.get(`${pair.team}\t${pair.name}`) || [];
+      for (const sender of senders) {
+        if (this.workerSentSince(pair, sender, snapshot.startedAt)) continue;
+        const text = (snapshot.finalText || "").trim();
+        const body = text
+          ? `[bridge-relay] ${pair.name} finished the turn without sending a reply; its final message follows.\n\n${text}`
+          : `[bridge-notice] ${pair.name} finished the turn without sending a reply and produced no final message. Resend to retry.`;
+        console.error(`codex-bridge: ${pair.name} sent no reply to ${sender}; relaying ${text ? "its final message" : "a notice"}`);
+        if (!this.sendAgmsg(sender, body, pair)) this.queueOutbound(sender, body, pair);
+      }
+    }
+  }
+
+  // history.sh prints "  <mark> [<ts>] <from> → <to>: <body>" headers; body
+  // continuation lines are indented deeper, so the header pattern is unambiguous.
+  // A history read that fails counts as "sent" so a broken read never double-sends.
+  workerSentSince(pair, sender, startedAt) {
+    const result = spawnSync(
+      BASH_BIN,
+      [path.join(SCRIPTS_DIR, "history.sh"), pair.team, pair.name, "200"],
+      { cwd: this.opts.project, encoding: "utf8" },
+    );
+    if (result.error || result.status !== 0) return true;
+    const header = /^ {2}\S \[([^\]]+)\] (\S+) \u2192 (\S+?):/;
+    for (const line of String(result.stdout || "").split(/\r?\n/)) {
+      const m = header.exec(line);
+      if (m && m[2] === pair.name && m[3] === sender && m[1] >= startedAt) return true;
+    }
+    return false;
   }
 
   async onTurnCompleted(params = {}) {
@@ -1955,7 +1995,9 @@ class CodexBridge {
     // senders rather than stay silent, then drop the entry.
     for (const [epoch] of Array.from(this.turnSnapshots)) {
       console.error(`codex-bridge: orphaned snapshot for turn epoch ${epoch}; notifying its senders and dropping it`);
+      const orphan = this.turnSnapshots.get(epoch);
       this.dropTurnEpoch(epoch);
+      this.relayUnrepliedTurn(orphan);
       this.compensateInflightEpoch(epoch, "turn outcome unknown",
         "the turn ended without a completion signal");
     }
@@ -1984,6 +2026,8 @@ class CodexBridge {
     }
     this.activeTurnEpoch = this.turnEpoch;
     if (hasConsumption) {
+      consumption.startedAt = utcNowSecond();
+      consumption.finalText = "";
       this.turnSnapshots.set(this.turnEpoch, consumption);
     }
     this.pendingConsumption = null;
@@ -2206,6 +2250,19 @@ class CodexBridge {
     return { action: "decline", content: null, _meta: null };
   }
 
+  // Keep the turn's last agent message so relayUnrepliedTurn() has something to
+  // forward when the worker never called send.sh. Commentary is not the answer.
+  onItemCompleted(params) {
+    if (!params || params.threadId !== this.threadId) return;
+    const item = params.item;
+    if (!item || item.type !== "agentMessage" || item.phase === "commentary") return;
+    if (typeof item.text !== "string" || !item.text.trim()) return;
+    const turnId = params.turnId || "";
+    const epoch = (turnId && this.turnIdToEpoch.get(turnId)) || this.activeTurnEpoch;
+    const snapshot = this.turnSnapshots.get(epoch);
+    if (snapshot) snapshot.finalText = item.text;
+  }
+
   onAgentMessageDelta(params) {
     if (params.threadId !== this.threadId) return;
     // Same funnel: a delta is partial by name, so the flag it leaves behind is
@@ -2239,7 +2296,7 @@ class CodexBridge {
         "",
         this.inlineInboxText.trim(),
         "",
-        "Continue the conversation in this Codex thread. If a reply to an agmsg sender is needed, send it with:",
+        "Continue the conversation in this Codex thread. Your text output is NOT delivered to the sender. Send every answer to the agmsg sender with:",
         `${send} ${this.identity.team} ${this.identity.name} <to> <message>`,
       ].join("\n");
     }
@@ -2247,7 +2304,7 @@ class CodexBridge {
       ...rolePrefix,
       `agmsg has unread messages for ${this.identity.team}/${this.identity.name}.`,
       `Run: ${inbox} ${this.identity.team} ${this.identity.name}`,
-      "Read the messages and continue the conversation. If a reply is needed, send it with:",
+      "Read the messages and continue the conversation. Your text output is NOT delivered to the sender. Send every answer with:",
       `${send} ${this.identity.team} ${this.identity.name} <to> <message>`,
     ].join("\n");
   }
@@ -2276,6 +2333,9 @@ class CodexBridge {
     // + unread-count both passed below) -- the only ones settleInflightEpoch
     // may later tell to drop their durable record.
     const verifiedPairs = [];
+    // pair key -> senders whose messages that pair consumed this epoch. Used to
+    // check, per pair, that the worker answered the senders it was handed.
+    const sendersByPair = new Map();
     const nextEpoch = this.turnEpoch + 1;
     let reservedEpoch = false;
     for (const pair of this.identities) {
@@ -2342,6 +2402,7 @@ class CodexBridge {
         continue;
       }
       verifiedPairs.push(pair);
+      sendersByPair.set(`${pair.team}\t${pair.name}`, Array.from(pairBySender.keys()));
       for (const [sender, ids] of pairBySender) {
         if (!bySender.has(sender)) bySender.set(sender, []);
         bySender.get(sender).push(...ids);
@@ -2361,14 +2422,14 @@ class CodexBridge {
       return "";
     }
     this.turnEpoch = nextEpoch;
-    this.pendingConsumption = { bySender, pairs: verifiedPairs };
+    this.pendingConsumption = { bySender, pairs: verifiedPairs, sendersByPair };
     return sections.join("\n\n");
   }
 
-  sendAgmsg(to, body) {
+  sendAgmsg(to, body, from = this.identity) {
     const result = spawnSync(
       BASH_BIN,
-      [path.join(SCRIPTS_DIR, "send.sh"), this.identity.team, this.identity.name, to, "--stdin"],
+      [path.join(SCRIPTS_DIR, "send.sh"), from.team, from.name, to, "--stdin"],
       { cwd: this.opts.project, encoding: "utf8", input: body },
     );
     return !result.error && result.status === 0;
@@ -2425,9 +2486,9 @@ class CodexBridge {
     }
   }
 
-  queueOutbound(to, body) {
+  queueOutbound(to, body, from = this.identity) {
     const entries = this.readOutbound();
-    entries.push({ to, body });
+    entries.push({ to, body, team: from.team, name: from.name });
     this.writeOutbound(entries);
   }
 
@@ -2437,7 +2498,8 @@ class CodexBridge {
     const remaining = [];
     for (const entry of entries) {
       if (!entry || !entry.to || !entry.body) continue;   // drop corrupt entries
-      if (this.sendAgmsg(entry.to, entry.body)) {
+      const from = entry.team && entry.name ? { team: entry.team, name: entry.name } : this.identity;
+      if (this.sendAgmsg(entry.to, entry.body, from)) {
         console.error(`codex-bridge: delivered spooled notice to ${entry.to}`);
       } else {
         remaining.push(entry);
@@ -2801,6 +2863,10 @@ function parseMaxId(stdout) {
 // Best-effort human-readable reason from a turn/failed payload. The app-server
 // ships { turn: { error } } or { error }; fall back to "unknown reason" and
 // truncate so a huge payload cannot bloat the compensation notice.
+function utcNowSecond() {
+  return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
 function unescapeMachineBody(text) {
   return String(text || "")
     .replace(/\\t/g, "\t")

@@ -1625,6 +1625,97 @@ EOF
   printf '%s\n' "$fake"
 }
 
+write_final_message_fake() {
+  # Completes a turn after an agentMessage item; with FAKE_SEND_CMD set it first
+  # runs that command, standing in for the worker calling send.sh itself.
+  local fake="$TEST_SKILL_DIR/fake-app-server-final-message.js"
+  cat >"$fake" <<'EOF'
+const readline = require("readline");
+const { spawnSync } = require("child_process");
+const rl = readline.createInterface({ input: process.stdin });
+
+function send(value) {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  } else if (message.method === "thread/start") {
+    send({ jsonrpc: "2.0", id: message.id, result: { thread: { id: "thread-1", status: { type: "idle" } } } });
+  } else if (message.method === "process/spawn") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+    setTimeout(() => {
+      send({
+        jsonrpc: "2.0",
+        method: "process/exited",
+        params: { processHandle: message.params.processHandle, exitCode: 0, stdout: "status=pending count=1 max_id=1\n", stderr: "" },
+      });
+    }, 10);
+  } else if (message.method === "turn/start") {
+    send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: message.params.threadId, turn: { id: "turn-1" } } });
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+    // history timestamps have 1s resolution; wait so the reply lands after the turn start second
+    setTimeout(() => {
+      if (process.env.FAKE_SEND_CMD) spawnSync("/bin/sh", ["-c", process.env.FAKE_SEND_CMD]);
+      send({
+        jsonrpc: "2.0",
+        method: "item/completed",
+        params: {
+          threadId: message.params.threadId,
+          turnId: "turn-1",
+          completedAtMs: 0,
+          item: { type: "agentMessage", id: "item-1", text: "final answer text", phase: "final_answer" },
+        },
+      });
+      send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: "turn-1" } } });
+    }, 10);
+  } else if (message.method === "process/kill") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  }
+});
+EOF
+  printf '%s\n' "$fake"
+}
+
+@test "codex-bridge: inline-inbox relays the final message when the worker sent no reply" {
+  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
+  if [ "$status" -ne 0 ]; then
+    skip "node child_process.spawn is not available in this sandbox"
+  fi
+
+  bash "$SCRIPTS/send.sh" team bob alice "question" >/dev/null
+  local fake
+  fake="$(write_final_message_fake)"
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake" run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --max-wakes 1 --inline-inbox
+
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/inbox.sh" team bob
+  [[ "$output" == *"[bridge-relay]"* ]]
+  [[ "$output" == *"final answer text"* ]]
+}
+
+@test "codex-bridge: inline-inbox does not relay when the worker already replied" {
+  run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
+  if [ "$status" -ne 0 ]; then
+    skip "node child_process.spawn is not available in this sandbox"
+  fi
+
+  bash "$SCRIPTS/send.sh" team bob alice "question" >/dev/null
+  local fake
+  fake="$(write_final_message_fake)"
+  FAKE_SEND_CMD="bash $SCRIPTS/send.sh team alice bob 'real reply'" \
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake" run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --max-wakes 1 --inline-inbox
+
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/inbox.sh" team bob
+  [[ "$output" == *"real reply"* ]]
+  refute grep -q "bridge-relay" <<<"$output"
+}
+
 @test "codex-bridge: inline-inbox turn/failed notifies the sender instead of losing the message" {
   run node -e 'const r = require("child_process").spawnSync("/bin/sh", ["-c", "true"]); if (r.error) { console.error(r.error.message); process.exit(1); }'
   if [ "$status" -ne 0 ]; then
