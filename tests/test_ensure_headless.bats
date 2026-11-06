@@ -83,6 +83,26 @@ CONF
   grep -q -- "codex codex --team s-sess-CODEX --project $PROJ --headless" "$TEST_SKILL_DIR/spawn.args"
 }
 
+@test "ensure-codex: a failed spawn reports spawn.sh's own output, a successful one stays silent" {
+  local stub_bin
+  stub_bin="$(write_pgrep_stub miss)"
+  cat > "$TEST_SKILL_DIR/scripts/spawn.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "spawn: no such project dir" >&2
+exit 3
+STUB
+  chmod +x "$TEST_SKILL_DIR/scripts/spawn.sh"
+  run env PATH="$stub_bin:$PATH" CLAUDE_CODE_SESSION_ID=sess-CODEX \
+    bash "$SCRIPTS/ensure-codex.sh" "$PROJ"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"spawn.sh: spawn: no such project dir"* ]]
+  printf '#!/usr/bin/env bash\necho noisy-success\nexit 0\n' > "$TEST_SKILL_DIR/scripts/spawn.sh"
+  run env PATH="$stub_bin:$PATH" CLAUDE_CODE_SESSION_ID=sess-CODEX \
+    bash "$SCRIPTS/ensure-codex.sh" "$PROJ"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *noisy-success* ]]
+}
+
 @test "ensure-headless: claude-code uses its type bridge and explicit name" {
   enable_claude_headless_fixture
   local stub_bin
