@@ -365,6 +365,19 @@ start_bridge() {
   [ "$status" -ne 0 ]
 }
 
+@test "provenance: with ps denied, a live bridge's record still authorizes and a dead one does not" {
+  mk_claude_team parent
+  mkdir -p "$BATS_TEST_TMPDIR/nops"
+  printf '#!/bin/sh\nexit 126\n' > "$BATS_TEST_TMPDIR/nops/ps"; chmod +x "$BATS_TEST_TMPDIR/nops/ps"
+  start_bridge worker-sid s-parent
+  sendas s-parent CLAUDE_CODE_SESSION_ID=worker-sid PATH="$BATS_TEST_TMPDIR/nops:$PATH"
+  [ "$status" -eq 0 ]
+  kill "$BRIDGE_PID" 2>/dev/null || true
+  wait "$BRIDGE_PID" 2>/dev/null || true
+  sendas s-parent CLAUDE_CODE_SESSION_ID=worker-sid PATH="$BATS_TEST_TMPDIR/nops:$PATH"
+  [ "$status" -ne 0 ]
+}
+
 @test "provenance: the record is private, written through an unpredictable temp, and a symlink in its place is not followed" {
   start_bridge worker-sid s-parent
   local rec="$TEST_SKILL_DIR/run/headless-sid.worker-sid.$BRIDGE_PID"

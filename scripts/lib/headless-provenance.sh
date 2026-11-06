@@ -69,7 +69,13 @@ agmsg_headless_provenance_allows() {
     [ -n "$rec_start" ] || continue
     _agmsg_pid_alive "$rec_pid" || continue
     now_start="$(agmsg_pid_start_token "$rec_pid" 2>/dev/null || true)"
-    [ -n "$now_start" ] && [ "$now_start" = "$rec_start" ] || continue
+    if [ -n "$now_start" ]; then
+      [ "$now_start" = "$rec_start" ] || continue
+    else
+      # The worker's sandbox denies ps, so its own start token cannot be read:
+      # fall back to a signal-only liveness check rather than refusing every reply.
+      [ "$(_agmsg_pid_signal_presence "$rec_pid")" = alive ] || continue
+    fi
     # A live record for this sid. The sid is bound to ONE team: live records
     # that name different teams make it ambiguous and authorize nothing.
     if [ "$rec_team" = "$team" ]; then found=1; else other=1; fi
