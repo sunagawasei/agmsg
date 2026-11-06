@@ -233,9 +233,11 @@ if pgrep -f "$BRIDGE_SIG" >/dev/null 2>&1; then
   exit 0
 fi
 
-if "$SCRIPT_DIR/spawn.sh" "$TYPE" "$NAME" --team "$TEAM" --project "$PROJECT" --headless >/dev/null 2>&1; then
+# Keep spawn's output so a failure can say why; a success stays silent.
+if spawn_out="$("$SCRIPT_DIR/spawn.sh" "$TYPE" "$NAME" --team "$TEAM" --project "$PROJECT" --headless 2>&1)"; then
   echo "ensure-${TYPE}: spawned headless ${TYPE} '$NAME' in team '$TEAM'"
 else
-  echo "ensure-${TYPE}: failed to spawn ${TYPE} '$NAME' in team '$TEAM' — run spawn.sh directly to see why" >&2
+  echo "ensure-${TYPE}: failed to spawn ${TYPE} '$NAME' in team '$TEAM'" >&2
+  [ -z "$spawn_out" ] || printf '%s\n' "$spawn_out" | tail -n 20 | sed 's/^/ensure-'"${TYPE}"': spawn.sh: /' >&2
   exit 1
 fi
