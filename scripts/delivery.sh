@@ -563,6 +563,13 @@ agmsg_delivery_status_default() {
     case "$count" in ''|*[!0-9]*) count=0 ;; esac
     echo "  PostToolUse entries:  $count"
   fi
+  # Entry counts include other tools' hooks, and a missing file prints none.
+  # Only this file is read; hooks in other settings layers are not.
+  if [ "$has_ss" = "1" ]; then
+    echo "  agmsg SessionStart hook: found"
+  else
+    echo "  agmsg SessionStart hook: not found"
+  fi
 }
 agmsg_delivery_status() { agmsg_delivery_status_default "$@"; }
 

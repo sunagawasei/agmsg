@@ -37,6 +37,16 @@ teardown() {
   [ "$n" -eq 0 ]
 }
 
+@test "send: an unregistered from agent gets the join and actas-claim next step, a to agent does not" {
+  run bash "$SCRIPTS/send.sh" testteam dummy bob "hi"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"join.sh testteam dummy"* ]]
+  [[ "$output" == *"actas-claim.sh"* ]]
+  run bash "$SCRIPTS/send.sh" testteam alice dummy "hi"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"actas-claim.sh"* ]]
+}
+
 @test "send: rejects an unregistered to agent and does not insert" {
   run bash "$SCRIPTS/send.sh" testteam alice dummy "hi"
   [ "$status" -ne 0 ]

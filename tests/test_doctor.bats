@@ -915,3 +915,48 @@ _seat_files() {   # <agent> -> how many of the 4 records exist
   [ -d "$teams/live.part/.config.lock" ]
   [ -f "$teams/multi/.config.lock/holder.a" ]
 }
+
+# --- claude-code on agmsgd needs the agmsg SessionStart hook ----------------
+
+_doctor_agmsgd_on() {
+  mkdir -p "$TEST_SKILL_DIR/run"
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" < "$SCRIPTS/daemon/schema.sql"
+  local boot
+  case "$(uname -s)" in
+    Darwin) boot="$(sysctl -n kern.bootsessionuuid)" ;;
+    Linux) boot="$(sed -n 's/^btime //p' /proc/stat)" ;;
+    *) skip 'POSIX beta executor evidence' ;;
+  esac
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='on';
+    UPDATE daemon_owner SET state='ready', executor_pid=$$, executor_boot_id='$boot', executor_started_at=strftime('%Y-%m-%dT%H:%M:%fZ','now');"
+}
+
+@test "doctor: agmsgd project without a settings file warns that the SessionStart hook is missing" {
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  _doctor_agmsgd_on
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ"
+  [[ "$output" == *"no agmsg SessionStart hook found"* ]]
+}
+
+@test "doctor: another tool's SessionStart entry does not hide a missing agmsg hook" {
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  _doctor_agmsgd_on
+  mkdir -p "$PROJ/.claude"
+  printf '%s' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/usr/bin/true"}]}]}}' > "$PROJ/.claude/settings.local.json"
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ"
+  [[ "$output" == *"no agmsg SessionStart hook found"* ]]
+}
+
+@test "doctor: agmsgd project with the agmsg SessionStart hook installed does not warn" {
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  bash "$SCRIPTS/delivery.sh" set monitor claude-code "$PROJ" >/dev/null
+  _doctor_agmsgd_on
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ"
+  [[ "$output" != *"no agmsg SessionStart hook found"* ]]
+}
+
+@test "doctor: a project not on agmsgd does not get the SessionStart hook warning" {
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ"
+  [[ "$output" != *"no agmsg SessionStart hook found"* ]]
+}

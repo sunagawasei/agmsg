@@ -1012,6 +1012,15 @@ _doctor_scan_pair() {
     fi
   fi
 
+  # agmsgd delivery still needs the SessionStart hook: it joins the session to
+  # its team and records the destination agmsgd delivers to.
+  if [ "$type" = claude-code ] && [ "$pair_count" -gt 0 ] \
+     && case "$mode" in agmsgd*) true ;; *) false ;; esac \
+     && printf '%s\n' "$delivery_output" | grep -q "agmsg SessionStart hook: not found"; then
+    _redact_project "$project"
+    _warn "[$_REDACT_OUT] agmsgd delivery but no agmsg SessionStart hook found in this project's settings.local.json (other settings layers are not checked); unless one is active elsewhere, new sessions are not auto-registered and need join.sh and actas-claim.sh by hand; to install it: agmsg delivery agmsgd --type claude-code --project <project>"
+  fi
+
   # codex's per-role lines always carry a parenthetical reason (e.g. "stale
   # pidfile (pid 123 not running)") -- a genuine per-(project, type) fact,
   # unlike the installation-wide "N stale pidfiles" default-runtime-status

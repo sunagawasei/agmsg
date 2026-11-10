@@ -224,6 +224,9 @@ if [ "$FORCE" -ne 1 ]; then
         FROM cfg, json_each(json_extract(cfg.json, '\$.agents'));
       ")
       echo "Error: $role agent '$name' is not registered in team '$TEAM' (registered: ${roster:-none}). Use --force to bypass." >&2
+      if [ "$role" = from ]; then
+        echo "Next: register the sender with: join.sh $TEAM $name <type> <project>. For Claude Code, then run: actas-claim.sh <project> claude-code $name <session_id> (join alone leaves the reply notice undeliverable)." >&2
+      fi
       return 1
     fi
     return 0
