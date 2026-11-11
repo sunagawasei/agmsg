@@ -125,6 +125,50 @@ fake_session() {
   [ "$(_owner_only T alice)" = "sid-after-clear.$$" ]
 }
 
+@test "actas-claim: another live session's session team does not block this session's own team" {
+  skip_on_windows "actas live-session liveness under Git Bash (#182)"
+  local sid_a="db564d72-eac6-4c55-8e65-44c3cc8b771a"
+  local sid_b="6d20a21e-765e-4c5d-9f15-dab98f8729e5"
+  fake_register "s-$sid_a" claude
+  fake_register "s-$sid_b" claude
+  fake_session "$sid_a" >/dev/null       # this test process is session A, the live owner
+  echo "$sid_a" > "$(actas_lock_path "s-$sid_a" claude)"
+
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p1 claude-code claude "$sid_b"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "status=ok" ]]
+  [[ "$output" =~ "team=s-$sid_b" ]]
+  refute grep -qF "team=s-$sid_a" <<< "$output"
+  [ "$(_owner_only "s-$sid_b" claude)" = "$sid_b" ]
+  [ "$(_owner_only "s-$sid_a" claude)" = "$sid_a" ]   # A's lock untouched
+}
+
+@test "actas-claim: claims the project team and own session team, skips other sessions' teams" {
+  local sid_a="db564d72-eac6-4c55-8e65-44c3cc8b771a"
+  local sid_b="6d20a21e-765e-4c5d-9f15-dab98f8729e5"
+  fake_register T claude
+  fake_register "s-$sid_a" claude
+  fake_register "s-$sid_b" claude
+
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p1 claude-code claude "$sid_b"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "team=T" ]]
+  [[ "$output" =~ "team=s-$sid_b" ]]
+  refute grep -qF "team=s-$sid_a" <<< "$output"
+  refute test -e "$(actas_lock_path "s-$sid_a" claude)"
+}
+
+@test "actas-claim: status=not_registered when only another session's team has the name" {
+  local sid_a="db564d72-eac6-4c55-8e65-44c3cc8b771a"
+  local sid_b="6d20a21e-765e-4c5d-9f15-dab98f8729e5"
+  fake_register "s-$sid_a" claude
+
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p1 claude-code claude "$sid_b"
+  [ "$status" -eq 2 ]
+  [[ "$output" =~ "status=not_registered" ]]
+  refute test -e "$(actas_lock_path "s-$sid_a" claude)"
+}
+
 @test "actas-claim: status=not_registered when name is unknown" {
   fake_register T alice
   fake_session "sid-me" >/dev/null

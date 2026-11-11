@@ -60,11 +60,23 @@ PROJECT="$(agmsg_resolve_project "$PROJECT" "$TYPE")"
 # a parallel --continue/--resume session can't appear to already own the role.
 SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$TYPE")"
 
+# Another live session's session team registers the same (project, type, name),
+# so identities.sh lists it too. Claiming it would hit that session's lock and
+# roll back this session's own claim, so only this session's own session team
+# and non-session teams are candidates.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/session-team.sh"
+OWN_SESSION_TEAM="$(agmsg_session_hook_team "$TYPE" "$(agmsg_instance_bare_sid "$SESSION_ID")")"
+
 # Find the team(s) this name is registered to for the given project/type.
 TEAMS=""
 while IFS=$'\t' read -r team agent; do
   [ -z "$team" ] && continue
   [ "$agent" = "$NAME" ] || continue
+  if [ "$team" != "$OWN_SESSION_TEAM" ] \
+     && [ "$(agmsg_session_team_class "$team")" != project ]; then
+    continue
+  fi
   TEAMS="${TEAMS:+$TEAMS$'\n'}$team"
 done < <("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE")
 
