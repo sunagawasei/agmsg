@@ -232,6 +232,7 @@ async function main() {
   }
   const reachable = owner.state === "ready" && owner.socket ? await probeSocket(owner.socket) : false;
   const result = classify({ owner, intent, alive, reachable, lastAttempt });
+  const daemonUp = owner.state === "ready" && alive === true && reachable;
 
   // The CLI suppresses Node's ExperimentalWarning category for managed SQLite
   // usage. Ordinary warnings and errors are still surfaced.
@@ -250,7 +251,7 @@ async function main() {
   const pollTimeout = readPollTimeout(installRoot);
   const pollText = pollTimeout ? `Last poll timeout: ${pollTimeout.channel ?? 'unknown'} ${pollTimeout.seat ?? ''} ${pollTimeout.reason} (${pollTimeout.at ?? 'unknown time'})\n` : '';
   process.stdout.write(
-    json ? `${JSON.stringify({ ...result, poll_timeout: pollTimeout, install_verify_warning: installVerifyWarning, codex_seats: codexSeats, claude_code_seats: claudeCodeSeats, cursor_seats: cursorSeats, codex_pending: codexPending, codex_expired: codexExpired, node_sqlite_experimental: true, node_version: process.version })}\n` : `${result.text}\n${formatInstallVerifyWarning(installVerifyWarning)}${pollText}${formatSkippedTeams("Claude Code", claudeCodeSeats)}${formatSkippedTeams("Cursor", cursorSeats)}${formatSkippedTeams("Codex", codexSeats)}${formatClaudeSeats(claudeCodeSeats, all)}${formatClaudeSeats(cursorSeats, all, "Cursor", "herdr_locator")}${formatUnregisteredPending(installRoot, codexPending, all)}`,
+    json ? `${JSON.stringify({ ...result, poll_timeout: pollTimeout, install_verify_warning: installVerifyWarning, codex_seats: codexSeats, claude_code_seats: claudeCodeSeats, cursor_seats: cursorSeats, codex_pending: codexPending, codex_expired: codexExpired, node_sqlite_experimental: true, node_version: process.version })}\n` : `${result.text}\n${formatInstallVerifyWarning(installVerifyWarning)}${pollText}${formatSkippedTeams("Claude Code", claudeCodeSeats)}${formatSkippedTeams("Cursor", cursorSeats)}${formatSkippedTeams("Codex", codexSeats)}${formatClaudeSeats(claudeCodeSeats, all, "Claude Code", "messaging_socket", daemonUp)}${formatClaudeSeats(cursorSeats, all, "Cursor", "herdr_locator", daemonUp)}${formatUnregisteredPending(installRoot, codexPending, all)}`,
   );
   process.exitCode = result.exitCode;
 }
@@ -308,7 +309,9 @@ function formatSkippedTeams(label, inventory) {
   return text;
 }
 
-function formatClaudeSeats(inventory, all, product = "Claude Code", destination = "messaging_socket") {
+// A seat row only repeats the last state the daemon recorded; with the daemon
+// stopped nothing refreshes it, so say that instead of a stale "addressable".
+function formatClaudeSeats(inventory, all, product = "Claude Code", destination = "messaging_socket", daemonUp = true) {
   let omitted = 0;
   const lines = [];
   for (const seat of inventory?.seats ?? []) {
@@ -326,7 +329,7 @@ function formatClaudeSeats(inventory, all, product = "Claude Code", destination 
     }
     let label;
     try { label = JSON.parse(seat.seat).join("/"); } catch { label = "unidentified seat"; }
-    lines.push(`${product} ${label}: last daemon observation: ${seat.state}${seat.reason ? ` (${seat.reason})` : ""}`);
+    lines.push(`${product} ${label}: last daemon observation: ${seat.state}${seat.reason ? ` (${seat.reason})` : ""}${daemonUp ? "" : "; agmsgd is not running, so this is stale and messages are not being delivered"}`);
   }
   if (omitted) lines.push(`${product} seats: ${omitted} unavailable destination records hidden. View them with: agmsg daemon status --all`);
   return lines.length ? `${lines.join("\n")}\n` : "";

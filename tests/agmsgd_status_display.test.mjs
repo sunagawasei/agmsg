@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { openInstallDb } from '../scripts/daemon/db.mjs';
 import { ensureCodexChannelSchema } from '../scripts/daemon/channels/codex-queue-store.mjs';
+import { ensureClaudeCodeChannelSchema } from '../scripts/daemon/channels/claude-code-queue-store.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const thread = '01a101a5-3599-7d62-a149-4c8182bcf007';
@@ -275,4 +276,13 @@ test('status exposes the last poll timeout with channel, seat and reason in text
   assert.equal(JSON.parse(result.stdout).poll_timeout.reason, 'seat_poll_deadline');
   const plain = spawnSync(process.execPath, [script, root], { encoding: 'utf8' });
   assert.match(plain.stdout, /Last poll timeout: codex.*alice.*seat_poll_deadline/);
+});
+
+test('a seat row says the daemon is not running when nothing is refreshing it', t => {
+  const { root, db } = fixture(t);
+  ensureClaudeCodeChannelSchema(db);
+  db.prepare("INSERT INTO beta_claude_seat (seat, messaging_socket, state, reason, checked_at) VALUES (?, ?, 'addressable', '', ?)")
+    .run('["s-x","claude"]', '/tmp/sock', new Date().toISOString());
+  const plain = spawnSync(process.execPath, [join(root, 'scripts/daemon/status.mjs'), root], { encoding: 'utf8' });
+  assert.match(plain.stdout, /Claude Code s-x\/claude: last daemon observation: addressable; agmsgd is not running, so this is stale/);
 });

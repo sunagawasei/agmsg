@@ -89,13 +89,13 @@ export async function startup(db, { installRoot, expectedDesired, expectedOpGen,
 }
 
 // One poll cycle. Returns
-// {action: "continue"} | {action: "step_aside", reason} |
+// {action: "continue"} | {action: "step_aside", reason, detail} |
 // {action: "stop", reason} -- callers act on the verdict; this function
 // itself performs no shutdown steps.
 export async function pollOnce(db, installRoot, { gen, expectedOpGen, watchState }) {
   const drift = await watchForDrift(installRoot, watchState);
   if (drift.changed) {
-    return { action: "step_aside", reason: "stepped_aside_for_update" };
+    return { action: "step_aside", reason: "stepped_aside_for_update", detail: drift.reason };
   }
   const intent = db.prepare("SELECT op_gen FROM daemon_intent").get();
   if (intent.op_gen !== expectedOpGen) {
@@ -263,7 +263,10 @@ export async function main(db, { installRoot, manifest, manifestText, expectedDe
     polling = true;
     try {
       const verdict = await pollCycle(db, installRoot, { gen, expectedOpGen, watchState, signal: lifetime.signal }, channelHooks);
-      if (verdict.action !== "continue") await doStop(verdict.reason);
+      if (verdict.action !== "continue") {
+        if (verdict.detail) logLine(installRoot, `stepping aside: ${verdict.detail}`);
+        await doStop(verdict.reason);
+      }
     } catch (error) {
       logLine(installRoot, `poll: timer failed: ${error.message}`);
       await doStop('poll_failed');

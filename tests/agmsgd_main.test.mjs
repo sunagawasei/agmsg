@@ -105,6 +105,7 @@ test("pollOnce: continues when nothing changed, steps aside on drift, stops on a
     verdict = await pollOnce(db, root, { gen: 1, expectedOpGen: 0, watchState });
     assert.equal(verdict.action, "step_aside");
     assert.equal(verdict.reason, "stepped_aside_for_update");
+    assert.match(verdict.detail, /scripts\/ changed in place: .*scripts\/x\.sh$/);
 
     db.close();
   } finally {
