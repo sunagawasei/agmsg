@@ -329,7 +329,11 @@ function formatClaudeSeats(inventory, all, product = "Claude Code", destination 
     }
     let label;
     try { label = JSON.parse(seat.seat).join("/"); } catch { label = "unidentified seat"; }
-    lines.push(`${product} ${label}: last daemon observation: ${seat.state}${seat.reason ? ` (${seat.reason})` : ""}${daemonUp ? "" : "; agmsgd is not running, so this is stale and messages are not being delivered"}`);
+    // A seat claimed within the last poll interval still shows the earlier
+    // state; the age lets the reader tell that from a stuck seat.
+    const age = Math.max(0, Math.round((Date.now() - Date.parse(seat.checked_at)) / 1000));
+    const checked = Number.isFinite(age) ? `, checked ${age}s ago` : "";
+    lines.push(`${product} ${label}: last daemon observation: ${seat.state}${seat.reason ? ` (${seat.reason})` : ""}${checked}${daemonUp ? "" : "; agmsgd is not running, so this is stale and messages are not being delivered"}`);
   }
   if (omitted) lines.push(`${product} seats: ${omitted} unavailable destination records hidden. View them with: agmsg daemon status --all`);
   return lines.length ? `${lines.join("\n")}\n` : "";

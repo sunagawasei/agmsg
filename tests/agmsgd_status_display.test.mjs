@@ -284,5 +284,14 @@ test('a seat row says the daemon is not running when nothing is refreshing it', 
   db.prepare("INSERT INTO beta_claude_seat (seat, messaging_socket, state, reason, checked_at) VALUES (?, ?, 'addressable', '', ?)")
     .run('["s-x","claude"]', '/tmp/sock', new Date().toISOString());
   const plain = spawnSync(process.execPath, [join(root, 'scripts/daemon/status.mjs'), root], { encoding: 'utf8' });
-  assert.match(plain.stdout, /Claude Code s-x\/claude: last daemon observation: addressable; agmsgd is not running, so this is stale/);
+  assert.match(plain.stdout, /Claude Code s-x\/claude: last daemon observation: addressable, checked \d+s ago; agmsgd is not running, so this is stale/);
+});
+
+test('a seat row shows how long ago the daemon last checked it', t => {
+  const { root, db } = fixture(t);
+  ensureClaudeCodeChannelSchema(db);
+  db.prepare("INSERT INTO beta_claude_seat (seat, messaging_socket, state, reason, checked_at) VALUES (?, ?, 'unaddressable', 'role_session_missing', ?)")
+    .run('["s-y","claude"]', '/tmp/sock', new Date(Date.now() - 30000).toISOString());
+  const plain = spawnSync(process.execPath, [join(root, 'scripts/daemon/status.mjs'), root, '--all'], { encoding: 'utf8' });
+  assert.match(plain.stdout, /Claude Code s-y\/claude: last daemon observation: unaddressable \(role_session_missing\), checked (29|30|31|32)s ago/);
 });
